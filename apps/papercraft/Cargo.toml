@@ -1,0 +1,21 @@
+[package]
+name = "papercraft"
+version.workspace = true
+edition.workspace = true
+description = "A native notebook and handwriting studio, built in pure Rust."
+license.workspace = true
+publish = false
+
+[dependencies]
+papercraft-tablet.workspace = true
+papercraft-engine.workspace = true
+papercraft-ui-egui.workspace = true
+eframe.workspace = true
+egui.workspace = true
+log.workspace = true
+
+[build-dependencies]
+winres = "0.1.12"
+
+[lints]
+workspace = true

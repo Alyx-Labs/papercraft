@@ -1,0 +1,60 @@
+name: Deploy Web (GitHub Pages)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/papercraft-web/**"
+      - "apps/papercraft/assets/branding/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "CNAME"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build WebAssembly Bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Trunk
+        run: cargo install --locked trunk
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+      - name: Build GitHub Pages bundle
+        working-directory: apps/papercraft-web
+        run: trunk build --release --public-url ./
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

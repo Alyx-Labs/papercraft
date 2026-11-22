@@ -1,0 +1,34 @@
+# Rust / Cargo build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# OS & desktop metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editors & IDEs
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# Local scratch, logs & temporary outputs
+*.tmp
+*.bak
+*.log
+
+# User-generated notebook exports
+/exports/
+
+# Local example notebooks (not tracked in Git)
+/notebook-exemplo/
+
+# WebAssembly / Trunk build output
+/dist/

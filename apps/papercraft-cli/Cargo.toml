@@ -1,0 +1,19 @@
+[package]
+name = "papercraft-cli"
+version.workspace = true
+edition.workspace = true
+description = "Headless CLI and automation tool for PaperCraft notebooks"
+license.workspace = true
+publish = false
+
+[dependencies]
+papercraft-doc.workspace = true
+papercraft-compose.workspace = true
+papercraft-raster.workspace = true
+papercraft-engine.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

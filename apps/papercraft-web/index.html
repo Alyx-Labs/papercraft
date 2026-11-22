@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>PaperCraft - Online Handwriting & Notes Studio</title>
+    <meta name="description" content="Pure Rust handwriting, drawing, and notebook studio running 100% in the browser via WebAssembly.">
+    
+    <link data-trunk rel="icon" href="../papercraft/assets/branding/papercraft-128.png" />
+    <link data-trunk rel="rust" data-bin="papercraft_app" />
+    
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #1a1a1a;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: none;
+        }
+
+        #the_canvas_id {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            touch-action: none;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #ffffff;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            text-align: center;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+            pointer-events: none;
+        }
+
+        .spinner {
+            width: 44px;
+            height: 44px;
+            border: 4px solid rgba(255, 255, 255, 0.15);
+            border-top: 4px solid #6366f1;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        <div class="spinner"></div>
+        <div style="font-size: 1.1rem; font-weight: 500; letter-spacing: 0.5px;">Loading PaperCraft Web...</div>
+        <div style="font-size: 0.85rem; opacity: 0.6;">Pure Rust &amp; WebAssembly Note Studio</div>
+    </div>
+
+    <canvas id="the_canvas_id"></canvas>
+</body>
+</html>

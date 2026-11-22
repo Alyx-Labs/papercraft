@@ -1,0 +1,12 @@
+[package]
+name = "papercraft-ops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Immutable snapshot undo/redo history for PaperCraft"
+
+[dependencies]
+papercraft-doc.workspace = true
+
+[lints]
+workspace = true

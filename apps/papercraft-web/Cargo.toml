@@ -1,0 +1,61 @@
+[package]
+name = "papercraft-web"
+version.workspace = true
+edition.workspace = true
+description = "PaperCraft online web preview running in WebAssembly"
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "papercraft_app"
+path = "src/main.rs"
+
+[dependencies]
+papercraft-engine.workspace = true
+papercraft-sync.workspace = true
+papercraft-sync-protocol.workspace = true
+papercraft-ui-egui.workspace = true
+eframe.workspace = true
+egui.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+web-sys = { version = "0.3", features = [
+    "Blob",
+    "BlobPropertyBag",
+    "ClipboardEvent",
+    "DataTransfer",
+    "DataTransferItem",
+    "DataTransferItemList",
+    "Document",
+    "DomRect",
+    "Element",
+    "Event",
+    "EventTarget",
+    "File",
+    "FileList",
+    "Headers",
+    "HtmlAnchorElement",
+    "HtmlCanvasElement",
+    "HtmlInputElement",
+    "MouseEvent",
+    "PointerEvent",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "Storage",
+    "Url",
+    "Window",
+    "console",
+] }
+
+[lints]
+workspace = true

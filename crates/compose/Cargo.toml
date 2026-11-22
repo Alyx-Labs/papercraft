@@ -1,0 +1,20 @@
+[package]
+name = "papercraft-compose"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic CPU page compositor rendering paper templates, ink strokes, and placed text"
+
+[dependencies]
+papercraft-geom.workspace = true
+papercraft-color.workspace = true
+papercraft-raster.workspace = true
+papercraft-doc.workspace = true
+papercraft-paint.workspace = true
+flate2.workspace = true
+fontdue = "0.9.3"
+hayro.workspace = true
+image.workspace = true
+
+[lints]
+workspace = true

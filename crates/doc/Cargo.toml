@@ -1,0 +1,17 @@
+[package]
+name = "papercraft-doc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-data document model for PaperCraft ink strokes, pens, stabilizers, pressure curves, and paper templates"
+
+[dependencies]
+papercraft-geom.workspace = true
+papercraft-color.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

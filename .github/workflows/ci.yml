@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  workspace-checks:
+    name: Layers, Clippy & Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Verify architecture layers
+        run: cargo xtask layers
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+  web-wasm:
+    name: WebAssembly & Trunk Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Trunk
+        run: cargo install --locked trunk
+      - name: Check wasm32 target
+        run: cargo check --target wasm32-unknown-unknown -p papercraft-web --all-targets
+      - name: Clippy wasm32 target
+        run: cargo clippy --target wasm32-unknown-unknown -p papercraft-web --all-targets --no-deps -- -D warnings
+      - name: Build release bundle
+        working-directory: apps/papercraft-web
+        run: trunk build --release

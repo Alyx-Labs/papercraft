@@ -1,0 +1,27 @@
+[package]
+name = "papercraft-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless session state and JSON command registry for PaperCraft"
+
+[dependencies]
+papercraft-geom.workspace = true
+papercraft-color.workspace = true
+papercraft-raster.workspace = true
+papercraft-doc.workspace = true
+papercraft-ops.workspace = true
+papercraft-paint.workspace = true
+papercraft-compose.workspace = true
+papercraft-format.workspace = true
+papercraft-sync-protocol.workspace = true
+papercraft-sync.workspace = true
+image.workspace = true
+uuid.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

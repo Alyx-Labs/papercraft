@@ -1,0 +1,19 @@
+[package]
+name = "papercraft-sync-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared wire protocol, DTOs, and validation for PaperCraft account and sync"
+
+[dependencies]
+papercraft-doc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+
+[lints]
+workspace = true

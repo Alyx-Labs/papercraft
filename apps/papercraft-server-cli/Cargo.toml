@@ -1,0 +1,33 @@
+[package]
+name = "papercraft-server-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Self-hosted PaperCraft account and offline-first sync server"
+
+[dependencies]
+papercraft-doc.workspace = true
+papercraft-format.workspace = true
+papercraft-sync.workspace = true
+papercraft-sync-protocol.workspace = true
+axum.workspace = true
+tokio.workspace = true
+redb.workspace = true
+argon2.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ureq.workspace = true
+papercraft-engine.workspace = true
+
+[lints]
+workspace = true
