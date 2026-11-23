@@ -180,7 +180,7 @@ cargo run -p papercraft
 6. **Verify offline resilience**: stop the server (**Stop** in `papercraft-server`, or `Ctrl+C` in Terminal 1), create or edit notebooks in Desktop or Web (even close and reopen Desktop or refresh the Web tab), then start the server again and click **Sync Now** (or wait for auto-sync).
 
 > [!NOTE]
-> **HTTPS / Mixed-Content rule for browsers:** When running Web locally at `http://127.0.0.1:8080`, `http://127.0.0.1:8787` works directly. If you later host `papercraft-web` on an `https://` site (such as GitHub Pages), browsers block requests to remote `http://` addresses—place `papercraft-server-cli` or `papercraft-server` behind an `https://` TLS reverse proxy for remote HTTPS web access.
+> **HTTPS / Mixed-Content rule for browsers:** When running Web locally at `http://127.0.0.1:8080`, `http://127.0.0.1:8787` works directly. When using the hosted `https://` web client ([web.papercraft.ink](https://web.papercraft.ink/)) or your own `https://` GitHub Pages deployment, browsers block requests to remote `http://` addresses—place `papercraft-server-cli` or `papercraft-server` behind an `https://` TLS reverse proxy for remote HTTPS web access.
 
 ---
 

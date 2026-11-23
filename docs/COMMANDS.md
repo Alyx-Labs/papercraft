@@ -99,7 +99,7 @@ You can also double-click `target\release\papercraft.exe` in Windows Explorer or
 
 ## 3. Web App (`papercraft-web` — WebAssembly)
 
-The browser version is located in `apps/papercraft-web`. It runs 100% client-side via WebAssembly and saves local data in browser `localStorage` (`papercraft_workspace_v1`).
+The browser version is located in `apps/papercraft-web` (hosted live demo: **[https://web.papercraft.ink/](https://web.papercraft.ink/)**). It runs 100% client-side via WebAssembly and saves local data in browser `localStorage` (`papercraft_workspace_v1`).
 
 > Make sure you ran the one-time Web prerequisites first (`rustup target add wasm32-unknown-unknown` and `cargo install --locked trunk`).
 

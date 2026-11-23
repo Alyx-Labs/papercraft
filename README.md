@@ -11,7 +11,7 @@
   <a href="https://github.com/alyxhard/papercraft/releases/latest"><img alt="Release v0.1.0" src="https://img.shields.io/badge/release-v0.1.0%20(alpha)-f59e0b?style=flat-square"></a>
   <a href="#downloads"><img alt="Downloads for Windows, Linux, and macOS" src="https://img.shields.io/badge/downloads-Windows%20%7C%20Linux%20%7C%20macOS-10b981?style=flat-square"></a>
   <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust-b7410e?style=flat-square&logo=rust">
-  <a href="https://alyxhard.github.io/papercraft/"><img alt="Desktop and Web app" src="https://img.shields.io/badge/app-desktop%20%26%20web-2f7bf5?style=flat-square"></a>
+  <a href="https://web.papercraft.ink/"><img alt="Live Web Demo" src="https://img.shields.io/badge/live%20demo-web.papercraft.ink-2f7bf5?style=flat-square"></a>
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-3a3a3a?style=flat-square">
 </p>
 
@@ -22,6 +22,7 @@
 </p>
 
 <p align="center">
+  <a href="https://web.papercraft.ink/">🌐 Live Demo</a> ·
   <a href="#downloads">⬇️ Downloads</a> ·
   <a href="#project-status--vision-initial-alpha">Alpha &amp; Vision</a> ·
   <a href="#features">Features</a> ·
@@ -75,6 +76,8 @@ PaperCraft is built around three simple principles:
 
 ## Downloads
 
+> **Live Web Demo:** Try PaperCraft directly in your browser at **[https://web.papercraft.ink/](https://web.papercraft.ink/)** — runs 100% client-side via WebAssembly with no installation required.
+
 Pre-built binaries are published on [GitHub Releases (`v0.1.0`)](https://github.com/alyxhard/papercraft/releases/latest) for **Windows**, **Linux**, and **macOS**. PaperCraft ships as **two separate standalone apps**—install the Desktop App on its own for offline note-taking, and add the Server only if you want self-hosted multi-device sync:
 
 <table>
@@ -103,7 +106,7 @@ Pre-built binaries are published on [GitHub Releases (`v0.1.0`)](https://github.
 <details>
 <summary><b>WebAssembly bundle, SHA-256 checksums, headless CLI server, and platform notes</b></summary>
 
-- **Web app (GitHub Pages):** [alyxhard.github.io/papercraft](https://alyxhard.github.io/papercraft/) — runs 100% client-side in your browser via WebAssembly (or download [papercraft-web.zip](https://github.com/alyxhard/papercraft/releases/latest/download/papercraft-web.zip) to host on any static web server).
+- **Live Web Demo (WebAssembly):** [web.papercraft.ink](https://web.papercraft.ink/) — runs 100% client-side in your browser via WebAssembly (or download [papercraft-web.zip](https://github.com/alyxhard/papercraft/releases/latest/download/papercraft-web.zip) to host on any static web server).
 - **Checksums & all assets:** [SHA256SUMS.txt](https://github.com/alyxhard/papercraft/releases/latest/download/SHA256SUMS.txt) on the [GitHub Releases page](https://github.com/alyxhard/papercraft/releases/latest).
 - **Headless terminal server (`papercraft-server-cli`):** For Linux/server hosts without a desktop tray, build from source with `cargo build --release -p papercraft-server-cli`.
 - **macOS notice:** macOS `.dmg` builds are compiled and packaged in GitHub Actions, but remain **experimental** (not yet tested on physical Mac hardware).
@@ -266,7 +269,7 @@ Install the Rust toolchain (**1.95+**, via [rustup](https://rustup.rs/)), clone 
 | **Windows (`x86_64`)** | Supported & tested | Native Desktop (`papercraft`), Server Tray App (`papercraft-server`), CLI server, full Windows Ink hardware stylus (pressure, tilt, barrel buttons, eraser end), clipboard text/image paste | Primary tested alpha platform |
 | **Linux (`x86_64`, Wayland & X11)** | Supported (CI-verified) | Native Desktop (`papercraft`), Server Tray App (`papercraft-server` via `ksni`), CLI server, `zenity`/`kdialog` file dialogs, `wl-clipboard`/`xclip`/`xsel` text & image clipboard paste, `/sys/class/input` stylus detection | Native XInput2 / Wayland `zwp_tablet_v2` barrel/tilt monitor is planned; full stylus barrel/tilt works today in Linux browsers via WebAssembly `PointerEvent` |
 | **macOS (`aarch64`)** | Experimental — **needs community testing** | Compiles in GitHub Actions release builds with `osascript` file dialogs and `pbpaste`/`pbcopy` text & image clipboard support | **Not yet tested on physical Mac hardware** — bug reports and test feedback from macOS users are very welcome; native AppKit stylus hook is planned |
-| **Web (WebAssembly)** | Supported & tested | Runs 100% client-side in modern browsers on Windows, Linux, macOS, and tablets; W3C `PointerEvent` stylus pressure, tilt, rotation, barrel buttons, and inverted eraser end | Local cache in `localStorage`, optional sync via self-hosted server |
+| **Web (WebAssembly)** | Supported & tested | Runs 100% client-side in modern browsers on Windows, Linux, macOS, and tablets ([web.papercraft.ink](https://web.papercraft.ink/)); W3C `PointerEvent` stylus pressure, tilt, rotation, barrel buttons, and inverted eraser end | Local cache in `localStorage`, optional sync via self-hosted server |
 
 ### Quick command reference
 
@@ -299,7 +302,9 @@ Install the Rust toolchain (**1.95+**, via [rustup](https://rustup.rs/)), clone 
 
 ### 2. Web (`papercraft-web`, WebAssembly)
 
-Install the WebAssembly target and [Trunk](https://trunkrs.dev/) **once** before running or building Web:
+Try the hosted live demo at **[https://web.papercraft.ink/](https://web.papercraft.ink/)**, or run and build it locally from source.
+
+Install the WebAssembly target and [Trunk](https://trunkrs.dev/) **once** before running or building Web locally:
 
 ```bash
 rustup target add wasm32-unknown-unknown
@@ -421,6 +426,7 @@ Community participation is at the heart of this initial alpha—bug reports, usa
 
 ## Documentation
 
+- [Live Web Demo](https://web.papercraft.ink/) — try PaperCraft directly in your browser (100% client-side WebAssembly).
 - [Command Reference](docs/COMMANDS.md) — separated guide for dev mode, Windows `.exe` builds (Desktop & Server Tray App), Web builds, and server commands.
 - [Self-hosted account and sync guide](docs/self-hosted-sync-server.md) — set up, run, and configure sync via the Server Tray App (`papercraft-server`) or headless CLI (`papercraft-server-cli`).
 - [Web & GitHub Pages deployment](docs/GITHUB_PAGES.md) — build and deploy the WebAssembly browser version.

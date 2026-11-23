@@ -2,6 +2,8 @@
 
 A 100% client-side web build of PaperCraft powered by **Rust + WebAssembly (WASM)** running directly in the browser.
 
+> **Live Web Demo:** [**https://web.papercraft.ink/**](https://web.papercraft.ink/)
+
 - **Zero backend required**: Runs entirely in the browser with no Node.js, Python, or database server.
 - **Stylus and pen input**: Supports pressure, tilt, and touch via native browser `PointerEvent` events.
 - **Hardware-accelerated graphics**: Renders via WebGL / WebGPU on an HTML5 `<canvas>`.
@@ -17,7 +19,7 @@ PaperCraft includes [`.github/workflows/pages.yml`](../.github/workflows/pages.y
 1. Open your repository on GitHub and go to **Settings → Pages**.
 2. Under **Build and deployment → Source**, select **GitHub Actions**.
 3. Trigger the **Deploy Web (GitHub Pages)** workflow from the **Actions** tab (or push a change to `main`).
-4. Once complete, the app will be live at **`https://alyxhard.github.io/papercraft/`** (and GitHub automatically displays the deployment environment under **Deployments** in the repository sidebar).
+4. Once complete, the app will be live at **`https://web.papercraft.ink/`** (configured via [`CNAME`](../CNAME); forks without a custom domain deploy to `https://<username>.github.io/papercraft/`, and GitHub automatically displays the deployment environment under **Deployments** in the repository sidebar).
 
 > [!NOTE]
 > The workflow passes `--public-url ./` into `trunk build --release`, so asset paths resolve relatively and work on project subpaths (`/papercraft/`), custom domains (`/`), and reverse proxies without needing a rebuild when switching domains.
