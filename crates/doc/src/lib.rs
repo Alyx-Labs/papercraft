@@ -2902,7 +2902,7 @@ impl StabilizationPreset {
         Self::SimpleDirect,
     ];
 
-    /// The 4 active smoothing styles exposed in Settings → Pen alongside the strength slider.
+    /// The 4 stabilization presets available to the engine and CLI alongside percentage strength.
     pub const UI_STYLES: &[Self] = &[
         Self::Adaptive,
         Self::ModeledSpring,
@@ -2978,7 +2978,7 @@ impl StabilizationPreset {
                 adjust_for_zoom: true,
                 catch_up: false,
                 catch_up_on_end: true,
-                streamline_amount: 0.0,
+                streamline_amount: (0.30 * s).clamp(0.0, 0.32),
                 prediction_ms: 0.0,
                 ..base
             },
@@ -3172,8 +3172,8 @@ impl Default for SmoothingConfig {
 impl SmoothingConfig {
     /// Threshold below which smoothing behaves as direct 1:1 tracking (`Off`).
     pub const SMOOTHING_OFF_EPSILON: f32 = 0.005;
-    /// Default adaptive smoothing strength (`35%`) balancing tremor reduction and sharp turns.
-    pub const DEFAULT_ADAPTIVE_STRENGTH: f32 = 0.35;
+    /// Default adaptive smoothing strength (`25%`) balancing tremor reduction and crisp corners.
+    pub const DEFAULT_ADAPTIVE_STRENGTH: f32 = 0.25;
 
     const fn classic_arithmetic_buffer_base() -> Self {
         Self {
@@ -3214,7 +3214,7 @@ impl SmoothingConfig {
         Self::classic_arithmetic_buffer_base()
     }
 
-    /// Default input stabilization configuration (`Adaptive` 2D 1€ filter at `35%`).
+    /// Default input stabilization configuration (`Adaptive` 2D 1€ filter at `25%`).
     pub fn input_stabilization_default() -> Self {
         StabilizationPreset::Adaptive.to_smoothing_config()
     }
@@ -8152,8 +8152,8 @@ mod tests {
         let def_sm = SmoothingConfig::default();
         assert_eq!(def_sm.stabilizer_mode, StabilizerMode::OneEuro);
         assert_eq!(def_sm.preset(), StabilizationPreset::Adaptive);
-        assert!((def_sm.effective_strength() - 0.35).abs() < 1e-6);
-        assert_eq!(def_sm.strength_percent(), 35);
+        assert!((def_sm.effective_strength() - 0.25).abs() < 1e-6);
+        assert_eq!(def_sm.strength_percent(), 25);
     }
 
     #[test]

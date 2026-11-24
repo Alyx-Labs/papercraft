@@ -26,6 +26,7 @@ const HEADER_ROW_HEIGHT: f32 = 28.0;
 const MAX_CONTENT_WIDTH: f32 = 940.0;
 const RAIL_WIDTH: f32 = 228.0;
 const COMPACT_BREAKPOINT: f32 = 760.0;
+const GITHUB_REPO_URL: &str = "https://github.com/alyxhard/papercraft";
 
 /// Renders the dedicated Profile & Cloud Sync screen.
 pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
@@ -621,6 +622,8 @@ fn draw_active_section_content(
                 draw_section_card(ui, t, |ui| {
                     submit_on_enter = render_auth_card_contents(app, ui, t, true);
                 });
+                ui.add_space(10.0);
+                draw_self_hosted_download_disclaimer(app, ui, t);
                 if test_on_enter && !app.view.account.is_testing() {
                     trigger_test_connection(app, ui.ctx());
                 }
@@ -677,6 +680,95 @@ fn draw_active_section_content(
         draw_status_banner(ui, BannerTone::Error, err, t);
     }
     render_auth_banners(app, ui, t);
+}
+
+fn draw_self_hosted_download_disclaimer(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    let mut open_github = false;
+    let frame_resp = egui::Frame::new()
+        .fill(t.toolbar_bg)
+        .stroke(Stroke::new(1.0, t.border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin {
+            left: 16,
+            right: 12,
+            top: 9,
+            bottom: 9,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+                paint_icon(
+                    ui.painter(),
+                    icon_rect.translate(Vec2::new(0.0, 1.5)),
+                    Icon::Info,
+                    t.text_muted,
+                );
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                "Note: Connecting to a local server requires downloading and running PaperCraft Server. If you want the standalone local desktop app as well, download it from GitHub.",
+                            )
+                            .size(11.0)
+                            .color(t.text_muted),
+                        )
+                        .wrap(),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        let (link_icon_rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                        paint_icon(ui.painter(), link_icon_rect, Icon::Link, t.text_muted);
+                        let link_resp = ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new("github.com/alyxhard/papercraft")
+                                        .size(11.0)
+                                        .color(t.accent),
+                                )
+                                .sense(Sense::click()),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text("Open GitHub to download PaperCraft Server or Desktop");
+                        if link_resp.hovered() {
+                            ui.painter().hline(
+                                link_resp.rect.x_range(),
+                                link_resp.rect.bottom() - 1.0,
+                                Stroke::new(1.0, t.accent),
+                            );
+                        }
+                        if link_resp.clicked() {
+                            open_github = true;
+                        }
+                    });
+                });
+            });
+        });
+
+    let bar_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            frame_resp.response.rect.left() + 6.0,
+            frame_resp.response.rect.top() + 8.0,
+        ),
+        egui::pos2(
+            frame_resp.response.rect.left() + 8.5,
+            frame_resp.response.rect.bottom() - 8.0,
+        ),
+    );
+    if bar_rect.height() > 2.0 {
+        ui.painter().rect_filled(
+            bar_rect,
+            CornerRadius::same(2),
+            t.text_muted.gamma_multiply(0.45),
+        );
+    }
+
+    if open_github {
+        let _ = crate::open_external_url(app, ui.ctx(), GITHUB_REPO_URL);
+    }
 }
 
 fn draw_signed_in_workspaces_section(
@@ -894,5 +986,111 @@ mod tests {
 
         crate::close_profile_screen(&mut app);
         assert_eq!(app.view.screen, AppScreen::Home);
+    }
+
+    #[test]
+    fn signed_out_cloud_account_disclaimer_renders_and_opens_github_url() {
+        use std::sync::{Arc, Mutex};
+
+        let opened: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let opened_hook = Arc::clone(&opened);
+        let hooks = crate::PlatformHooks {
+            open_url: Some(Box::new(move |url| {
+                opened_hook.lock().unwrap().push(url.to_string());
+            })),
+            ..crate::PlatformHooks::default()
+        };
+
+        let ctx = egui::Context::default();
+        let mut app = PaperCraftApp::new(papercraft_engine::Session::default(), hooks);
+        crate::open_profile_screen(&mut app);
+
+        let find_text_center = |shapes: &[ClippedShape], needle: &str| -> Option<egui::Pos2> {
+            fn visit(shape: &Shape, needle: &str) -> Option<egui::Pos2> {
+                match shape {
+                    Shape::Text(text) if text.galley.text() == needle => {
+                        Some(text.pos + text.galley.rect.center().to_vec2())
+                    }
+                    Shape::Vec(items) => items.iter().find_map(|s| visit(s, needle)),
+                    _ => None,
+                }
+            }
+            shapes.iter().find_map(|c| visit(&c.shape, needle))
+        };
+
+        let mut time = 0.0_f64;
+        let run_settled = |ctx: &egui::Context,
+                           app: &mut PaperCraftApp,
+                           time: &mut f64|
+         -> (String, Vec<ClippedShape>) {
+            let mut text = String::new();
+            let mut out_shapes = Vec::new();
+            for _ in 0..4 {
+                *time += 0.05;
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 800.0),
+                    )),
+                    time: Some(*time),
+                    predicted_dt: 0.05,
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(raw, |ui| {
+                    crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                    show(app, ui);
+                });
+                text = collect_text(&out.shapes);
+                out_shapes = out.shapes.clone();
+                out.drop_without_applying_deltas();
+            }
+            (text, out_shapes)
+        };
+
+        let (light_text, shapes) = run_settled(&ctx, &mut app, &mut time);
+        assert!(light_text.contains("PaperCraft Server"));
+        assert!(light_text.contains("standalone local desktop app"));
+        assert!(light_text.contains("github.com/alyxhard/papercraft"));
+
+        let link_pos = find_text_center(&shapes, "github.com/alyxhard/papercraft")
+            .expect("GitHub disclaimer link should render");
+        for pressed in [true, false] {
+            time += 0.05;
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(time),
+                predicted_dt: 0.05,
+                events: vec![
+                    egui::Event::PointerMoved(link_pos),
+                    egui::Event::PointerButton {
+                        pos: link_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                show(&mut app, ui);
+            });
+            out.drop_without_applying_deltas();
+        }
+        assert_eq!(
+            *opened.lock().unwrap(),
+            vec!["https://github.com/alyxhard/papercraft".to_string()]
+        );
+
+        let _ = app
+            .session
+            .execute("theme.set", &serde_json::json!({ "theme": "Dark" }));
+        let (dark_text, _) = run_settled(&ctx, &mut app, &mut time);
+        assert!(dark_text.contains("PaperCraft Server"));
+        assert!(dark_text.contains("standalone local desktop app"));
+        assert!(dark_text.contains("github.com/alyxhard/papercraft"));
     }
 }

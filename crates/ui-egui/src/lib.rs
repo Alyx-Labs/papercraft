@@ -59,7 +59,6 @@ pub enum AppScreen {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SettingsTab {
     #[default]
-    Pen,
     Appearance,
     Telemetry,
 }
@@ -509,7 +508,7 @@ impl Default for ViewState {
             template_import_name: String::new(),
             template_import_pdf_page: 0,
             template_import_error: None,
-            settings_tab: SettingsTab::Pen,
+            settings_tab: SettingsTab::Appearance,
             pan_dragging: false,
             active_touch_id: None,
             active_pointer_stroke: false,
@@ -3160,7 +3159,7 @@ mod tests {
         assert!(view.pages_sidebar_open);
         assert!(!view.inspector_open);
         assert_eq!(view.active_modal, None);
-        assert_eq!(view.settings_tab, SettingsTab::Pen);
+        assert_eq!(view.settings_tab, SettingsTab::Appearance);
         assert_eq!(default_pen_kind(), PenKind::FountainPen);
     }
 

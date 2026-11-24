@@ -90,9 +90,10 @@ impl OneEuroFilter1D {
     }
 }
 
-const ONE_EURO_D_CUTOFF_HZ: f64 = 3.0;
+const ONE_EURO_D_CUTOFF_HZ: f64 = 3.5;
 
-/// Coupled isotropic 2D position + scalar pressure/tilt adaptive 1€ Stabilizer.
+/// Coupled isotropic 2D position + scalar pressure/tilt adaptive 1€ Stabilizer with
+/// sharp-corner cusp anchoring for crisp fast handwriting turns.
 #[derive(Clone, Debug)]
 pub struct OneEuroStabilizer {
     min_cutoff: f64,
@@ -103,6 +104,8 @@ pub struct OneEuroStabilizer {
     y_prev: f64,
     vx_prev: f64,
     vy_prev: f64,
+    prev_dir: Option<(f64, f64)>,
+    consistent_steps: u8,
     fp: OneEuroFilter1D,
     ftx: OneEuroFilter1D,
     fty: OneEuroFilter1D,
@@ -126,16 +129,16 @@ impl OneEuroStabilizer {
         let s = f64::from(if strength.is_finite() {
             strength.clamp(0.0, 1.0)
         } else {
-            0.35
+            0.25
         });
         let zoom_scale = if adjust_for_zoom && zoom.is_finite() {
             f64::from(zoom.clamp(0.25, 8.0))
         } else {
             1.0
         };
-        // Strength 0 -> min_cutoff=10.0 Hz, beta=0.12; Strength 1 -> min_cutoff=0.40 Hz, beta=0.0048.
+        // Strength 0 -> min_cutoff=10.0 Hz, beta=0.14; Strength 1 -> min_cutoff=0.40 Hz, beta=0.0056.
         let min_cutoff = 10.0 * (0.04_f64).powf(s);
-        let beta = 0.12 * (0.04_f64).powf(s);
+        let beta = 0.14 * (0.04_f64).powf(s);
         Self {
             min_cutoff,
             beta,
@@ -145,6 +148,8 @@ impl OneEuroStabilizer {
             y_prev: 0.0,
             vx_prev: 0.0,
             vy_prev: 0.0,
+            prev_dir: None,
+            consistent_steps: 0,
             fp: OneEuroFilter1D::new(),
             ftx: OneEuroFilter1D::new(),
             fty: OneEuroFilter1D::new(),
@@ -185,6 +190,50 @@ impl OneEuroStabilizer {
         (x_hat, y_hat)
     }
 
+    /// Anchors sharp stroke cusps (`<~70°` turn after `>= 2` aligned steps) so fast
+    /// handwriting corners stay crisp while single-sample tremor flips keep smoothing.
+    fn maybe_anchor_cusp(&mut self, p: StrokeSample, out: &mut Vec<StrokeSample>) {
+        let Some(prev) = self.last_raw else {
+            return;
+        };
+        let dx = p.x - prev.x;
+        let dy = p.y - prev.y;
+        let len = dx.hypot(dy);
+        if !len.is_finite() || len * self.zoom_scale < 3.0 {
+            return;
+        }
+        let cur_dir = (dx / len, dy / len);
+        let Some(prev_dir) = self.prev_dir else {
+            self.prev_dir = Some(cur_dir);
+            self.consistent_steps = 1;
+            return;
+        };
+        let cos_theta = prev_dir.0 * cur_dir.0 + prev_dir.1 * cur_dir.1;
+        if cos_theta < 0.35 && self.consistent_steps >= 2 {
+            if self.initialized {
+                self.x_prev = prev.x;
+                self.y_prev = prev.y;
+                self.vx_prev = 0.0;
+                self.vy_prev = 0.0;
+            }
+            if out
+                .last()
+                .is_none_or(|emitted| sample_differs(emitted, &prev))
+            {
+                out.push(prev);
+                self.last_filtered = Some(prev);
+            }
+            self.prev_dir = Some(cur_dir);
+            self.consistent_steps = 1;
+        } else if cos_theta >= 0.35 {
+            self.prev_dir = Some(cur_dir);
+            self.consistent_steps = self.consistent_steps.saturating_add(1);
+        } else {
+            self.prev_dir = Some(cur_dir);
+            self.consistent_steps = 1;
+        }
+    }
+
     pub fn push(&mut self, sample: StrokeSample, out: &mut Vec<StrokeSample>) {
         let p = sample.sanitized();
         let dt_ms = match self.last_time_ms {
@@ -192,6 +241,7 @@ impl OneEuroStabilizer {
             Some(_) if self.last_raw.is_some() => 4.0,
             _ => SMOOTHING_STEP_MS,
         };
+        self.maybe_anchor_cusp(p, out);
         self.last_time_ms = Some(p.time_ms);
         self.last_raw = Some(p);
 
@@ -485,6 +535,20 @@ impl GaussianStabilizer {
 /// Taubin ($\lambda / \mu$) StreamLine fairing that removes hand wobble while preserving loop volume
 /// and keeping stroke endpoints anchored.
 pub fn apply_streamline(points: &[StrokeSample], amount: f32) -> Vec<StrokeSample> {
+    run_taubin_fairing(points, amount, false)
+}
+
+/// Corner-preserving Taubin ($\lambda / \mu$) StreamLine fairing that pins deliberate corners
+/// (`cos(theta) <= 0.35`) while smoothing gradual hand wobble.
+pub fn apply_corner_safe_streamline(points: &[StrokeSample], amount: f32) -> Vec<StrokeSample> {
+    run_taubin_fairing(points, amount, true)
+}
+
+fn run_taubin_fairing(
+    points: &[StrokeSample],
+    amount: f32,
+    corner_safe: bool,
+) -> Vec<StrokeSample> {
     let amt = f64::from(if amount.is_finite() {
         amount.clamp(0.0, 1.0)
     } else {
@@ -502,25 +566,41 @@ pub fn apply_streamline(points: &[StrokeSample], amount: f32) -> Vec<StrokeSampl
     let mut tmp = cur.clone();
 
     for _ in 0..passes {
-        taubin_step(&cur, &mut tmp, lambda);
-        taubin_step(&tmp, &mut cur, mu);
+        taubin_step(&cur, &mut tmp, lambda, corner_safe);
+        taubin_step(&tmp, &mut cur, mu, corner_safe);
     }
     cur
 }
 
-fn taubin_step(src: &[StrokeSample], dst: &mut [StrokeSample], weight: f64) {
+fn taubin_step(src: &[StrokeSample], dst: &mut [StrokeSample], weight: f64, corner_safe: bool) {
     let n = src.len();
     dst.copy_from_slice(src);
     for i in 1..(n - 1) {
         let prev = src[i - 1];
         let mid = src[i];
         let next = src[i + 1];
+        let local_w = if corner_safe {
+            let v1x = mid.x - prev.x;
+            let v1y = mid.y - prev.y;
+            let v2x = next.x - mid.x;
+            let v2y = next.y - mid.y;
+            let l1 = v1x.hypot(v1y);
+            let l2 = v2x.hypot(v2y);
+            let dot = if l1 > 1e-6 && l2 > 1e-6 {
+                (v1x * v2x + v1y * v2y) / (l1 * l2)
+            } else {
+                1.0
+            };
+            weight * ((dot - 0.35) / 0.65).clamp(0.0, 1.0)
+        } else {
+            weight
+        };
         let avg_x = 0.5 * (prev.x + next.x);
         let avg_y = 0.5 * (prev.y + next.y);
         let avg_p = 0.5 * (prev.pressure + next.pressure);
-        let wf = weight as f32;
-        dst[i].x = mid.x + weight * (avg_x - mid.x);
-        dst[i].y = mid.y + weight * (avg_y - mid.y);
+        let wf = local_w as f32;
+        dst[i].x = mid.x + local_w * (avg_x - mid.x);
+        dst[i].y = mid.y + local_w * (avg_y - mid.y);
         dst[i].pressure = (mid.pressure + wf * (avg_p - mid.pressure)).clamp(0.0, 1.0);
     }
 }
@@ -2172,6 +2252,11 @@ mod tests {
         let v_tip = Point::new(70.0, 110.0);
 
         let adaptive = crate::smooth_stroke_samples(&v_stroke, &SmoothingConfig::default(), 1.0);
+        let adaptive_high = crate::smooth_stroke_samples(
+            &v_stroke,
+            &StabilizationPreset::Adaptive.to_smoothing_config_with_strength(0.80),
+            1.0,
+        );
         let classic = crate::smooth_stroke_samples(
             &v_stroke,
             &SmoothingConfig::classic_arithmetic_buffer(),
@@ -2184,6 +2269,7 @@ mod tests {
         );
 
         let adaptive_err = min_dist_to_point(&adaptive, v_tip);
+        let adaptive_high_err = min_dist_to_point(&adaptive_high, v_tip);
         let classic_err = min_dist_to_point(&classic, v_tip);
         let direct_err = min_dist_to_point(&direct, v_tip);
 
@@ -2192,8 +2278,12 @@ mod tests {
             "0% smoothing must hit corner vertex exactly, got {direct_err:.3}"
         );
         assert!(
-            adaptive_err < 10.0 && adaptive_err < classic_err * 0.45,
-            "Adaptive 35% should preserve fast 60 Hz corner far better than classic buffer: adaptive={adaptive_err:.2}px, classic={classic_err:.2}px"
+            adaptive_err < 4.0 && adaptive_err < classic_err * 0.45,
+            "Adaptive 25% should preserve fast 60 Hz corner far better than classic buffer: adaptive={adaptive_err:.2}px, classic={classic_err:.2}px"
+        );
+        assert!(
+            adaptive_high_err < 8.0,
+            "Adaptive 80% should anchor sharp turns cleanly: adaptive_high={adaptive_high_err:.2}px"
         );
     }
 

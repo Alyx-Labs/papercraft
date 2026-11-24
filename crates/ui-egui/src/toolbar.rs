@@ -4,8 +4,8 @@ use egui::{Color32, CornerRadius, FontId, Sense, Stroke, StrokeKind, Vec2};
 use papercraft_color::Color;
 use papercraft_doc::{
     EraserMode, HighlighterMode, ListItemKind, PaletteTarget, PenKind, SavedElement, ShapeKind,
-    ShapeLineStyle, TextAlignment, TextFont, TextItem, TextStyleAttr, find_text_url_spans,
-    parse_list_line_prefix, sanitize_link_url,
+    ShapeLineStyle, SmoothingConfig, StabilizationPreset, TextAlignment, TextFont, TextItem,
+    TextStyleAttr, find_text_url_spans, parse_list_line_prefix, sanitize_link_url,
 };
 use papercraft_engine::ToolKind;
 use papercraft_geom::{Affine2, Point};
@@ -3387,7 +3387,7 @@ fn push_pen_quick_bar(
 
     if show_highlighter_modes {
         let eff_strength = pen.smoothing.effective_strength();
-        let sm_label = crate::inspector::smoothing_value_label(eff_strength);
+        let sm_label = smoothing_value_label(eff_strength);
         let sm_tip = format!(
             "Stroke smoothing ({}) — {}\nClick to adjust or disable for faster sharp turns.",
             sm_label,
@@ -4776,6 +4776,306 @@ pub(crate) fn show_elements_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui) 
     }
 }
 
+const SMOOTHING_QUICK_LEVELS: [(&str, f32, &str); 4] = [
+    (
+        "Off",
+        0.0,
+        "Disable smoothing (1:1 direct tracking, zero corner lag)",
+    ),
+    (
+        "Low",
+        0.25,
+        "Light smoothing for fast handwriting with crisp turns",
+    ),
+    ("Med", 0.50, "Balanced smoothing for everyday notes"),
+    (
+        "High",
+        0.80,
+        "Strong smoothing for deliberate curves and precision lines",
+    ),
+];
+
+const SMOOTHING_TRACK_H: f32 = 12.0;
+const SMOOTHING_THUMB_R: f32 = 7.2;
+const SMOOTHING_THUMB_HOVER_R: f32 = 8.2;
+
+#[derive(Clone, Copy, Default)]
+struct SmoothingSliderDragState {
+    active: bool,
+    needs_persist: bool,
+}
+
+fn smoothing_value_label(strength: f32) -> String {
+    let clean = if strength.is_finite() {
+        strength.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if clean <= SmoothingConfig::SMOOTHING_OFF_EPSILON {
+        "Off".to_string()
+    } else {
+        let pct = (clean * 100.0).round().clamp(1.0, 100.0) as u8;
+        format!("{pct}%")
+    }
+}
+
+fn apply_smoothing_strength(app: &mut PaperCraftApp, kind: PenKind, strength: f32, persist: bool) {
+    let clean = if strength.is_finite() {
+        strength.clamp(0.0, 1.0)
+    } else {
+        SmoothingConfig::DEFAULT_ADAPTIVE_STRENGTH
+    };
+    let _ = app.session.execute(
+        "pen.setSmoothing",
+        &json!({
+            "kind": kind,
+            "preset": StabilizationPreset::Adaptive,
+            "stabilizer_strength": clean,
+            "persist": persist,
+        }),
+    );
+}
+
+fn draw_smoothing_quick_switch(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    strength: f32,
+    t: &Tokens,
+) -> Option<f32> {
+    let s = if strength.is_finite() {
+        strength.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let active_idx = if s <= SmoothingConfig::SMOOTHING_OFF_EPSILON {
+        Some(0)
+    } else {
+        SMOOTHING_QUICK_LEVELS
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, (_, val, _))| (s - *val).abs() <= 0.04)
+            .map(|(idx, _)| idx)
+    };
+    let options: Vec<SwitchOption<'_>> = SMOOTHING_QUICK_LEVELS
+        .iter()
+        .map(|(label, _, tip)| SwitchOption::new(None, Some(*label), tip, true))
+        .collect();
+    let (clicked, _) = segmented_switch(
+        ui,
+        id_salt,
+        &options,
+        active_idx,
+        SwitchLayout::EqualWidth,
+        t,
+    );
+    clicked.and_then(|idx| SMOOTHING_QUICK_LEVELS.get(idx).map(|(_, val, _)| *val))
+}
+
+fn update_smoothing_slider_drag(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    drag_id: egui::Id,
+    clean_cur: f32,
+    travel_min_x: f32,
+    travel_w: f32,
+) -> Option<(f32, bool)> {
+    let pos_to_val = |pos: egui::Pos2| -> f32 {
+        let frac = ((pos.x - travel_min_x) / travel_w).clamp(0.0, 1.0);
+        ((frac * 100.0).round() / 100.0).clamp(0.0, 1.0)
+    };
+    let mut state = ui
+        .ctx()
+        .data(|d| d.get_temp::<SmoothingSliderDragState>(drag_id))
+        .unwrap_or_default();
+    let pointer_pos = resp
+        .interact_pointer_pos()
+        .or_else(|| ui.input(|i| i.pointer.interact_pos()));
+    let mut emission = None;
+
+    if resp.dragged_by(egui::PointerButton::Primary) {
+        state.active = true;
+        if let Some(pos) = pointer_pos {
+            let next = pos_to_val(pos);
+            if (next - clean_cur).abs() >= 0.005 {
+                state.needs_persist = true;
+                emission = Some((next, false));
+            }
+        }
+    } else if state.active {
+        let final_val = pointer_pos.map(pos_to_val).unwrap_or(clean_cur);
+        if state.needs_persist || (final_val - clean_cur).abs() >= 0.005 {
+            emission = Some((final_val, true));
+        }
+        state = SmoothingSliderDragState::default();
+    } else if resp.clicked_by(egui::PointerButton::Primary)
+        && let Some(pos) = pointer_pos
+    {
+        let next = pos_to_val(pos);
+        if (next - clean_cur).abs() >= 0.005 {
+            emission = Some((next, true));
+        }
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(drag_id, state));
+    emission
+}
+
+fn paint_smoothing_slider_readout(
+    ctx: &egui::Context,
+    id: egui::Id,
+    thumb_center: egui::Pos2,
+    label: &str,
+    t: &Tokens,
+) {
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, id));
+    let galley = painter.layout_no_wrap(label.to_string(), FontId::proportional(11.0), t.text);
+    let pill_size = galley.size() + Vec2::new(12.0, 6.0);
+    let screen = ctx.content_rect().shrink(4.0);
+    let left = (thumb_center.x - pill_size.x * 0.5).clamp(
+        screen.left(),
+        (screen.right() - pill_size.x).max(screen.left()),
+    );
+    let top = (thumb_center.y + 14.0).clamp(
+        screen.top(),
+        (screen.bottom() - pill_size.y).max(screen.top()),
+    );
+    let pill_rect = egui::Rect::from_min_size(egui::pos2(left, top), pill_size);
+    painter.rect(
+        pill_rect,
+        CornerRadius::same(6),
+        t.field_bg,
+        Stroke::new(1.0, t.border),
+        StrokeKind::Inside,
+    );
+    painter.galley(
+        egui::pos2(
+            pill_rect.center().x - galley.size().x * 0.5,
+            pill_rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        t.text,
+    );
+}
+
+fn draw_smoothing_strength_slider(
+    ui: &mut egui::Ui,
+    id_salt: impl egui::AsIdSalt,
+    current_strength: f32,
+    width: f32,
+    t: &Tokens,
+) -> Option<(f32, bool)> {
+    let clean_cur = if current_strength.is_finite() {
+        current_strength.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(width.max(80.0), 26.0), Sense::click_and_drag());
+    let track_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 4.0, rect.center().y - SMOOTHING_TRACK_H * 0.5),
+        egui::pos2(
+            rect.right() - 4.0,
+            rect.center().y + SMOOTHING_TRACK_H * 0.5,
+        ),
+    );
+    let cap_pad = SMOOTHING_TRACK_H * 0.5;
+    let travel_min_x = track_rect.left() + cap_pad;
+    let travel_max_x = (track_rect.right() - cap_pad).max(travel_min_x + 1.0);
+    let travel_w = (travel_max_x - travel_min_x).max(1.0);
+
+    let drag_id = ui.make_persistent_id(id_salt);
+    let emission =
+        update_smoothing_slider_drag(ui, &resp, drag_id, clean_cur, travel_min_x, travel_w);
+    let display_val = emission.map_or(clean_cur, |(v, _)| v);
+    let is_dragging = resp.dragged_by(egui::PointerButton::Primary);
+    let anim_frac = ui
+        .ctx()
+        .animate_value_with_time(
+            drag_id.with("frac"),
+            display_val,
+            if is_dragging {
+                0.0
+            } else {
+                crate::motion::MICRO_DURATION_S
+            },
+        )
+        .clamp(0.0, 1.0);
+    let hover_t = crate::motion::hover_factor(
+        ui.ctx(),
+        drag_id.with("hov"),
+        resp.hovered() && !is_dragging,
+    );
+    let drag_t = crate::motion::hover_factor(ui.ctx(), drag_id.with("act"), is_dragging);
+    let active_t = hover_t.max(drag_t);
+
+    let thumb_cx = travel_min_x + anim_frac * travel_w;
+    let thumb_center = egui::pos2(thumb_cx, track_rect.center().y);
+    if ui.is_rect_visible(track_rect) {
+        let track_bg = if t.is_dark {
+            t.panel_bg
+        } else {
+            crate::motion::lerp_color(t.canvas_bg, t.border, 0.28)
+        };
+        let fill_color = if display_val <= SmoothingConfig::SMOOTHING_OFF_EPSILON {
+            t.text_muted
+        } else {
+            crate::motion::lerp_color(t.accent, t.accent_hover, active_t)
+        };
+        let track_border =
+            crate::motion::lerp_color(t.border, t.accent.gamma_multiply(0.65), active_t);
+        let p = ui.painter();
+        let cr = CornerRadius::same(6);
+        p.rect_filled(track_rect, cr, track_bg);
+        if display_val > SmoothingConfig::SMOOTHING_OFF_EPSILON {
+            let fill_right = (thumb_cx + cap_pad).clamp(
+                (track_rect.left() + SMOOTHING_TRACK_H).min(track_rect.right()),
+                track_rect.right(),
+            );
+            p.rect_filled(
+                egui::Rect::from_min_max(track_rect.min, egui::pos2(fill_right, track_rect.max.y)),
+                cr,
+                fill_color,
+            );
+        }
+        p.rect_stroke(
+            track_rect,
+            cr,
+            Stroke::new(1.0, track_border),
+            StrokeKind::Inside,
+        );
+
+        let thumb_r = crate::motion::lerp_f32(SMOOTHING_THUMB_R, SMOOTHING_THUMB_HOVER_R, active_t);
+        if active_t > 0.01 {
+            p.circle_filled(
+                thumb_center,
+                thumb_r + 2.5 * active_t,
+                t.accent.gamma_multiply(0.18 * active_t),
+            );
+        }
+        p.circle(
+            thumb_center,
+            thumb_r,
+            t.field_bg,
+            Stroke::new(2.2, fill_color),
+        );
+    }
+
+    let label = smoothing_value_label(display_val);
+    let resp = resp.on_hover_cursor(if is_dragging {
+        egui::CursorIcon::Grabbing
+    } else {
+        egui::CursorIcon::PointingHand
+    });
+    if is_dragging {
+        paint_smoothing_slider_readout(ui.ctx(), drag_id.with("readout"), thumb_center, &label, t);
+    } else {
+        resp.on_hover_text(format!(
+            "Stroke smoothing ({label}) — drag or click to adjust"
+        ));
+    }
+    emission
+}
+
 pub(crate) fn show_smoothing_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
     if !app.view.smoothing_popover_open {
         return;
@@ -4798,12 +5098,7 @@ pub(crate) fn show_smoothing_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui)
     let sm = app.session.pen(kind).smoothing.clone();
     let eff_strength = sm.effective_strength();
     let is_off = sm.is_smoothing_disabled();
-    let value_label = crate::inspector::smoothing_value_label(eff_strength);
-    let style_label = if is_off {
-        "Direct 1:1"
-    } else {
-        sm.preset().label()
-    };
+    let value_label = smoothing_value_label(eff_strength);
 
     let viewport = ctx.content_rect();
     let pop_w = 264.0_f32;
@@ -4815,15 +5110,14 @@ pub(crate) fn show_smoothing_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui)
         .clamp(8.0, (viewport.right() - pop_w - 8.0).max(8.0));
     let pop_y = anchor
         .map_or(92.0, |r| r.bottom() + 6.0)
-        .clamp(8.0, (viewport.bottom() - 180.0).max(8.0));
+        .clamp(8.0, (viewport.bottom() - 144.0).max(8.0));
 
     let mut next_strength: Option<(f32, bool)> = None;
-    let mut open_settings = false;
 
     let area_resp = egui::Area::new(ui.make_persistent_id("papercraft_smoothing_popover"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::pos2(pop_x, pop_y))
-        .default_size(Vec2::new(pop_w, 170.0))
+        .default_size(Vec2::new(pop_w, 134.0))
         .constrain_to(viewport.shrink(6.0))
         .fade_in(false)
         .show(&ctx, |ui| {
@@ -4852,10 +5146,7 @@ pub(crate) fn show_smoothing_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui)
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             egui::Frame::new()
                                 .fill(if is_off { t.field_bg } else { t.accent_soft })
-                                .stroke(Stroke::new(
-                                    1.0,
-                                    if is_off { t.border } else { t.accent },
-                                ))
+                                .stroke(Stroke::new(1.0, if is_off { t.border } else { t.accent }))
                                 .corner_radius(CornerRadius::same(5))
                                 .inner_margin(egui::Margin::symmetric(7, 2))
                                 .show(ui, |ui| {
@@ -4871,7 +5162,7 @@ pub(crate) fn show_smoothing_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui)
                     });
 
                     ui.add_space(6.0);
-                    if let Some(val) = crate::inspector::draw_smoothing_quick_switch(
+                    if let Some(val) = draw_smoothing_quick_switch(
                         ui,
                         "toolbar_smoothing_quick_levels",
                         eff_strength,
@@ -4882,7 +5173,7 @@ pub(crate) fn show_smoothing_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui)
 
                     ui.add_space(4.0);
                     let slider_w = ui.available_width();
-                    if let Some((val, persist)) = crate::inspector::draw_smoothing_strength_slider(
+                    if let Some((val, persist)) = draw_smoothing_strength_slider(
                         ui,
                         ("toolbar_smoothing_strength_slider", kind),
                         eff_strength,
@@ -4903,43 +5194,11 @@ pub(crate) fn show_smoothing_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui)
                         )
                         .wrap(),
                     );
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("Style: {style_label}"))
-                                .size(10.8)
-                                .color(t.text_muted),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if compact_icon_button(
-                                ui,
-                                Icon::Settings,
-                                Some("All styles…"),
-                                false,
-                                true,
-                                &t,
-                            )
-                            .on_hover_text("Open Pen settings to switch smoothing algorithm and view the live preview")
-                            .clicked()
-                            {
-                                open_settings = true;
-                            }
-                        });
-                    });
                 });
         });
 
     if let Some((val, persist)) = next_strength {
-        crate::inspector::apply_smoothing_strength(app, kind, val, persist);
-    }
-    if open_settings {
-        app.view.inspector_open = true;
-        app.view.settings_tab = crate::SettingsTab::Pen;
-        app.view.smoothing_popover_open = false;
-        return;
+        apply_smoothing_strength(app, kind, val, persist);
     }
 
     let pressed_pos = ctx.input(|i| {
@@ -7309,13 +7568,38 @@ mod tests {
                 }
             };
 
+        let collect_all_texts = |shapes: &[egui::epaint::ClippedShape]| -> String {
+            let mut out = String::new();
+            fn visit(shape: &egui::Shape, buf: &mut String) {
+                match shape {
+                    egui::Shape::Text(t) => {
+                        buf.push_str(t.galley.text());
+                        buf.push('\n');
+                    }
+                    egui::Shape::Vec(items) => {
+                        for s in items {
+                            visit(s, buf);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for c in shapes {
+                visit(&c.shape, &mut out);
+            }
+            out
+        };
+
         let shapes = settle(&ctx, &mut app, &mut time);
         let pill_pos =
-            find_text(&shapes, "35%").expect("default 35% smoothing pill in context tray");
+            find_text(&shapes, "25%").expect("default 25% smoothing pill in context tray");
         click_at(&ctx, &mut app, &mut time, pill_pos);
         assert!(app.view.smoothing_popover_open);
 
         let pop_shapes = settle(&ctx, &mut app, &mut time);
+        let pop_texts = collect_all_texts(&pop_shapes);
+        assert!(!pop_texts.contains("Style:"));
+        assert!(!pop_texts.contains("All styles"));
         let off_pos = find_text(&pop_shapes, "Off").expect("Off level inside smoothing popover");
         click_at(&ctx, &mut app, &mut time, off_pos);
         assert!(
@@ -7341,6 +7625,50 @@ mod tests {
         );
         assert_eq!(
             app.session.prefs.pen_smoothings[PenKind::FountainPen.index()].strength_percent(),
+            80
+        );
+
+        // Switching to BallPen keeps its independent 25% smoothing setting.
+        time += 0.03;
+        let _ = step_editor_frame(
+            &ctx,
+            &mut app,
+            viewport,
+            time,
+            0.03,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!app.view.smoothing_popover_open);
+
+        app.session
+            .execute("tool.select", &json!({ "tool": "BallPen" }))
+            .unwrap();
+        let ball_shapes = settle(&ctx, &mut app, &mut time);
+        let ball_pill = find_text(&ball_shapes, "25%").expect("BallPen starts with default 25%");
+        click_at(&ctx, &mut app, &mut time, ball_pill);
+        assert!(app.view.smoothing_popover_open);
+
+        let ball_pop = settle(&ctx, &mut app, &mut time);
+        let med_pos = find_text(&ball_pop, "Med").expect("Med level inside BallPen popover");
+        click_at(&ctx, &mut app, &mut time, med_pos);
+        assert_eq!(
+            app.session
+                .pen(PenKind::BallPen)
+                .smoothing
+                .strength_percent(),
+            50
+        );
+        assert_eq!(
+            app.session
+                .pen(PenKind::FountainPen)
+                .smoothing
+                .strength_percent(),
             80
         );
 

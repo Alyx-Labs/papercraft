@@ -3503,7 +3503,7 @@ mod tests {
     fn notebook_settings_button_opens_notebook_settings_modal() {
         let mut app = PaperCraftApp::default();
         app.view.inspector_open = false;
-        app.view.settings_tab = crate::SettingsTab::Pen;
+        app.view.settings_tab = crate::SettingsTab::Appearance;
 
         let ctx = egui::Context::default();
         let mut btn_center = None;

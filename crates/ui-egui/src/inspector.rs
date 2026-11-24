@@ -1,22 +1,13 @@
-//! Dedicated minimalist Settings drawer: Pen input stabilization with live
-//! stroke preview, studio appearance, and live Telemetry.
+//! Dedicated minimalist Settings drawer: studio appearance and live Telemetry.
 
-use egui::{
-    CornerRadius, FontId, Frame, Margin, Rect, RichText, Sense, Stroke, StrokeKind, Vec2, pos2,
-};
-use papercraft_doc::{
-    PenKind, PenSettings, SmoothingConfig, StabilizationPreset, StrokeSample, StylusButtonAction,
-    StylusButtonConfig, UserStudioConfig,
-};
-use papercraft_geom::Affine2;
-use papercraft_paint::smooth_stroke_samples;
+use egui::{CornerRadius, Frame, Margin, Rect, RichText, Sense, Stroke, Vec2};
+use papercraft_doc::{StylusButtonAction, StylusButtonConfig, UserStudioConfig};
 use serde_json::json;
 
 use crate::icons::{
-    Icon, SwitchLayout, SwitchOption, compact_icon_button, icon_button, paint_icon,
-    section_card_header, segmented_switch,
+    Icon, SwitchLayout, SwitchOption, compact_icon_button, section_card_header, segmented_switch,
 };
-use crate::theme::{Tokens, to_color32};
+use crate::theme::Tokens;
 use crate::{PaperCraftApp, SettingsTab};
 
 pub(crate) fn card_frame(t: &Tokens) -> Frame {
@@ -25,681 +16,6 @@ pub(crate) fn card_frame(t: &Tokens) -> Frame {
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::same(10))
         .stroke(Stroke::new(1.0, t.border))
-}
-
-pub(crate) const SMOOTHING_QUICK_LEVELS: [(&str, f32, &str); 4] = [
-    (
-        "Off",
-        0.0,
-        "Disable smoothing (1:1 direct tracking, zero corner lag)",
-    ),
-    (
-        "Low",
-        0.25,
-        "Light smoothing for fast handwriting with crisp turns",
-    ),
-    ("Med", 0.50, "Balanced smoothing for everyday notes"),
-    (
-        "High",
-        0.80,
-        "Strong smoothing for deliberate curves and precision lines",
-    ),
-];
-
-const SMOOTHING_TRACK_H: f32 = 12.0;
-const SMOOTHING_THUMB_R: f32 = 7.2;
-const SMOOTHING_THUMB_HOVER_R: f32 = 8.2;
-
-#[derive(Clone, Copy, Default)]
-struct SmoothingSliderDragState {
-    active: bool,
-    needs_persist: bool,
-}
-
-pub(crate) fn smoothing_value_label(strength: f32) -> String {
-    let clean = if strength.is_finite() {
-        strength.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    if clean <= SmoothingConfig::SMOOTHING_OFF_EPSILON {
-        "Off".to_string()
-    } else {
-        let pct = (clean * 100.0).round().clamp(1.0, 100.0) as u8;
-        format!("{pct}%")
-    }
-}
-
-pub(crate) fn apply_smoothing_strength(
-    app: &mut PaperCraftApp,
-    kind: PenKind,
-    strength: f32,
-    persist: bool,
-) {
-    let clean = if strength.is_finite() {
-        strength.clamp(0.0, 1.0)
-    } else {
-        SmoothingConfig::DEFAULT_ADAPTIVE_STRENGTH
-    };
-    let _ = app.session.execute(
-        "pen.setSmoothing",
-        &json!({
-            "kind": kind,
-            "stabilizer_strength": clean,
-            "persist": persist,
-        }),
-    );
-}
-
-pub(crate) fn draw_smoothing_quick_switch(
-    ui: &mut egui::Ui,
-    id_salt: &str,
-    strength: f32,
-    t: &Tokens,
-) -> Option<f32> {
-    let s = if strength.is_finite() {
-        strength.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let active_idx = if s <= SmoothingConfig::SMOOTHING_OFF_EPSILON {
-        Some(0)
-    } else {
-        SMOOTHING_QUICK_LEVELS
-            .iter()
-            .enumerate()
-            .skip(1)
-            .find(|(_, (_, val, _))| (s - *val).abs() <= 0.04)
-            .map(|(idx, _)| idx)
-    };
-    let options: Vec<SwitchOption<'_>> = SMOOTHING_QUICK_LEVELS
-        .iter()
-        .map(|(label, _, tip)| SwitchOption::new(None, Some(*label), tip, true))
-        .collect();
-    let (clicked, _) = segmented_switch(
-        ui,
-        id_salt,
-        &options,
-        active_idx,
-        SwitchLayout::EqualWidth,
-        t,
-    );
-    clicked.and_then(|idx| SMOOTHING_QUICK_LEVELS.get(idx).map(|(_, val, _)| *val))
-}
-
-fn update_smoothing_slider_drag(
-    ui: &egui::Ui,
-    resp: &egui::Response,
-    drag_id: egui::Id,
-    clean_cur: f32,
-    travel_min_x: f32,
-    travel_w: f32,
-) -> Option<(f32, bool)> {
-    let pos_to_val = |pos: egui::Pos2| -> f32 {
-        let frac = ((pos.x - travel_min_x) / travel_w).clamp(0.0, 1.0);
-        ((frac * 100.0).round() / 100.0).clamp(0.0, 1.0)
-    };
-    let mut state = ui
-        .ctx()
-        .data(|d| d.get_temp::<SmoothingSliderDragState>(drag_id))
-        .unwrap_or_default();
-    let pointer_pos = resp
-        .interact_pointer_pos()
-        .or_else(|| ui.input(|i| i.pointer.interact_pos()));
-    let mut emission = None;
-
-    if resp.dragged_by(egui::PointerButton::Primary) {
-        state.active = true;
-        if let Some(pos) = pointer_pos {
-            let next = pos_to_val(pos);
-            if (next - clean_cur).abs() >= 0.005 {
-                state.needs_persist = true;
-                emission = Some((next, false));
-            }
-        }
-    } else if state.active {
-        let final_val = pointer_pos.map(pos_to_val).unwrap_or(clean_cur);
-        if state.needs_persist || (final_val - clean_cur).abs() >= 0.005 {
-            emission = Some((final_val, true));
-        }
-        state = SmoothingSliderDragState::default();
-    } else if resp.clicked_by(egui::PointerButton::Primary)
-        && let Some(pos) = pointer_pos
-    {
-        let next = pos_to_val(pos);
-        if (next - clean_cur).abs() >= 0.005 {
-            emission = Some((next, true));
-        }
-    }
-    ui.ctx().data_mut(|d| d.insert_temp(drag_id, state));
-    emission
-}
-
-fn paint_smoothing_slider_readout(
-    ctx: &egui::Context,
-    id: egui::Id,
-    thumb_center: egui::Pos2,
-    label: &str,
-    t: &Tokens,
-) {
-    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, id));
-    let galley = painter.layout_no_wrap(label.to_string(), FontId::proportional(11.0), t.text);
-    let pill_size = galley.size() + Vec2::new(12.0, 6.0);
-    let screen = ctx.content_rect().shrink(4.0);
-    let left = (thumb_center.x - pill_size.x * 0.5).clamp(
-        screen.left(),
-        (screen.right() - pill_size.x).max(screen.left()),
-    );
-    let top = (thumb_center.y + 14.0).clamp(
-        screen.top(),
-        (screen.bottom() - pill_size.y).max(screen.top()),
-    );
-    let pill_rect = Rect::from_min_size(pos2(left, top), pill_size);
-    painter.rect(
-        pill_rect,
-        CornerRadius::same(6),
-        t.field_bg,
-        Stroke::new(1.0, t.border),
-        StrokeKind::Inside,
-    );
-    painter.galley(
-        pos2(
-            pill_rect.center().x - galley.size().x * 0.5,
-            pill_rect.center().y - galley.size().y * 0.5,
-        ),
-        galley,
-        t.text,
-    );
-}
-
-pub(crate) fn draw_smoothing_strength_slider(
-    ui: &mut egui::Ui,
-    id_salt: impl egui::AsIdSalt,
-    current_strength: f32,
-    width: f32,
-    t: &Tokens,
-) -> Option<(f32, bool)> {
-    let clean_cur = if current_strength.is_finite() {
-        current_strength.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let (rect, resp) =
-        ui.allocate_exact_size(Vec2::new(width.max(80.0), 26.0), Sense::click_and_drag());
-    let track_rect = Rect::from_min_max(
-        pos2(rect.left() + 4.0, rect.center().y - SMOOTHING_TRACK_H * 0.5),
-        pos2(
-            rect.right() - 4.0,
-            rect.center().y + SMOOTHING_TRACK_H * 0.5,
-        ),
-    );
-    let cap_pad = SMOOTHING_TRACK_H * 0.5;
-    let travel_min_x = track_rect.left() + cap_pad;
-    let travel_max_x = (track_rect.right() - cap_pad).max(travel_min_x + 1.0);
-    let travel_w = (travel_max_x - travel_min_x).max(1.0);
-
-    let drag_id = ui.make_persistent_id(id_salt);
-    let emission =
-        update_smoothing_slider_drag(ui, &resp, drag_id, clean_cur, travel_min_x, travel_w);
-    let display_val = emission.map_or(clean_cur, |(v, _)| v);
-    let is_dragging = resp.dragged_by(egui::PointerButton::Primary);
-    let anim_frac = ui
-        .ctx()
-        .animate_value_with_time(
-            drag_id.with("frac"),
-            display_val,
-            if is_dragging {
-                0.0
-            } else {
-                crate::motion::MICRO_DURATION_S
-            },
-        )
-        .clamp(0.0, 1.0);
-    let hover_t = crate::motion::hover_factor(
-        ui.ctx(),
-        drag_id.with("hov"),
-        resp.hovered() && !is_dragging,
-    );
-    let drag_t = crate::motion::hover_factor(ui.ctx(), drag_id.with("act"), is_dragging);
-    let active_t = hover_t.max(drag_t);
-
-    let thumb_cx = travel_min_x + anim_frac * travel_w;
-    let thumb_center = pos2(thumb_cx, track_rect.center().y);
-    if ui.is_rect_visible(track_rect) {
-        let track_bg = if t.is_dark {
-            t.panel_bg
-        } else {
-            crate::motion::lerp_color(t.canvas_bg, t.border, 0.28)
-        };
-        let fill_color = if display_val <= SmoothingConfig::SMOOTHING_OFF_EPSILON {
-            t.text_muted
-        } else {
-            crate::motion::lerp_color(t.accent, t.accent_hover, active_t)
-        };
-        let track_border =
-            crate::motion::lerp_color(t.border, t.accent.gamma_multiply(0.65), active_t);
-        let p = ui.painter();
-        let cr = CornerRadius::same(6);
-        p.rect_filled(track_rect, cr, track_bg);
-        if display_val > SmoothingConfig::SMOOTHING_OFF_EPSILON {
-            let fill_right = (thumb_cx + cap_pad).clamp(
-                (track_rect.left() + SMOOTHING_TRACK_H).min(track_rect.right()),
-                track_rect.right(),
-            );
-            p.rect_filled(
-                Rect::from_min_max(track_rect.min, pos2(fill_right, track_rect.max.y)),
-                cr,
-                fill_color,
-            );
-        }
-        p.rect_stroke(
-            track_rect,
-            cr,
-            Stroke::new(1.0, track_border),
-            StrokeKind::Inside,
-        );
-
-        let thumb_r = crate::motion::lerp_f32(SMOOTHING_THUMB_R, SMOOTHING_THUMB_HOVER_R, active_t);
-        if active_t > 0.01 {
-            p.circle_filled(
-                thumb_center,
-                thumb_r + 2.5 * active_t,
-                t.accent.gamma_multiply(0.18 * active_t),
-            );
-        }
-        p.circle(
-            thumb_center,
-            thumb_r,
-            t.field_bg,
-            Stroke::new(2.2, fill_color),
-        );
-    }
-
-    let label = smoothing_value_label(display_val);
-    let resp = resp.on_hover_cursor(if is_dragging {
-        egui::CursorIcon::Grabbing
-    } else {
-        egui::CursorIcon::PointingHand
-    });
-    if is_dragging {
-        paint_smoothing_slider_readout(ui.ctx(), drag_id.with("readout"), thumb_center, &label, t);
-    } else {
-        resp.on_hover_text(format!(
-            "Stroke smoothing ({label}) — drag or click to adjust"
-        ));
-    }
-    emission
-}
-
-#[derive(Clone, PartialEq)]
-struct LivePreviewMeshCache {
-    pen: PenSettings,
-    width_bits: u32,
-    raw_guide: Vec<egui::Pos2>,
-    mesh: Option<std::sync::Arc<egui::Mesh>>,
-}
-
-fn build_live_preview_mesh(
-    pen: &PenSettings,
-    rect_width: f32,
-) -> (Vec<egui::Pos2>, Option<std::sync::Arc<egui::Mesh>>) {
-    let x0 = 16.0_f64;
-    let span = f64::from((rect_width - 32.0).max(40.0));
-    let dt_ms = 1000.0 / 60.0;
-    let mut raw: Vec<StrokeSample> = Vec::with_capacity(64);
-
-    // Left half: slow curved stroke with hand tremor to show jitter smoothing.
-    let curve_samples = 30usize;
-    for i in 0..curve_samples {
-        let t = i as f64 / (curve_samples - 1) as f64;
-        let u = t * 0.48;
-        let wave = (t * std::f64::consts::TAU).sin();
-        let tremor = ((i as f64) * 2.1).sin() * 2.2 * (1.0 - (2.0 * t - 1.0).powi(2));
-        let pressure = 0.30 + 0.62 * ((t * std::f64::consts::PI).sin() as f32);
-        raw.push(StrokeSample {
-            x: x0 + u * span,
-            y: -wave * 13.0 + tremor,
-            pressure,
-            tilt_x: (wave * 20.0) as f32,
-            tilt_y: -8.0,
-            rotation: 0.0,
-            time_ms: i as f64 * dt_ms,
-        });
-    }
-
-    // Right half: fast zig-zag with sharp turns at 60 Hz to show corner fidelity.
-    let peaks: [(f64, f64); 5] = [
-        (0.50, 0.0),
-        (0.62, -16.0),
-        (0.75, 16.0),
-        (0.88, -16.0),
-        (1.00, 0.0),
-    ];
-    let steps_per_leg = 6usize;
-    let mut idx = curve_samples;
-    for win in peaks.windows(2) {
-        let (u0, y0) = win[0];
-        let (u1, y1) = win[1];
-        for k in 1..=steps_per_leg {
-            let f = k as f64 / steps_per_leg as f64;
-            let u = u0 + (u1 - u0) * f;
-            let y = y0 + (y1 - y0) * f;
-            raw.push(StrokeSample {
-                x: x0 + u * span,
-                y,
-                pressure: 0.68,
-                tilt_x: 0.0,
-                tilt_y: -6.0,
-                rotation: 0.0,
-                time_ms: idx as f64 * dt_ms,
-            });
-            idx += 1;
-        }
-    }
-
-    let raw_guide: Vec<egui::Pos2> = raw.iter().map(|s| pos2(s.x as f32, s.y as f32)).collect();
-    let smoothed = smooth_stroke_samples(&raw, &pen.smoothing, 1.0);
-    let mesh = crate::canvas::build_live_ribbon_mesh(pen, &smoothed, Affine2::IDENTITY, 0.85)
-        .map(std::sync::Arc::new);
-    (raw_guide, mesh)
-}
-
-fn draw_live_stroke_preview(app: &PaperCraftApp, ui: &mut egui::Ui, kind: PenKind, t: &Tokens) {
-    let pen = app.session.pen(kind);
-    let theme = app.session.prefs.theme;
-    let auto_contrast = app.session.prefs.auto_contrast_with_theme;
-    let paper_colors = app
-        .session
-        .doc
-        .paper_color
-        .resolved_colors(theme, auto_contrast);
-    let paper_bg = to_color32(paper_colors.background);
-    let rule_c = to_color32(paper_colors.line);
-
-    let desired = Vec2::new(ui.available_width(), 64.0);
-    let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
-    let p = ui.painter_at(rect);
-
-    p.rect_filled(rect, CornerRadius::same(7), paper_bg);
-    p.line_segment(
-        [
-            pos2(rect.left() + 8.0, rect.center().y),
-            pos2(rect.right() - 8.0, rect.center().y),
-        ],
-        Stroke::new(1.0, rule_c),
-    );
-    p.rect_stroke(
-        rect,
-        CornerRadius::same(7),
-        Stroke::new(1.0, t.border),
-        StrokeKind::Inside,
-    );
-
-    let mut display_pen = pen.clone();
-    display_pen.color = app.session.doc.paper_color.resolve_ink_color(
-        theme,
-        auto_contrast,
-        pen.color,
-        matches!(pen.kind, PenKind::Highlighter),
-    );
-    let width_bits = rect.width().to_bits();
-    let cache_id = ui.make_persistent_id("papercraft_inspector_preview_cache");
-    let cached = ui
-        .ctx()
-        .data(|d| d.get_temp::<LivePreviewMeshCache>(cache_id));
-    let (raw_guide, mesh_opt) = match cached {
-        Some(entry) if entry.pen == display_pen && entry.width_bits == width_bits => {
-            (entry.raw_guide, entry.mesh)
-        }
-        _ => {
-            let (raw_guide, mesh) = build_live_preview_mesh(&display_pen, rect.width());
-            let entry = LivePreviewMeshCache {
-                pen: display_pen,
-                width_bits,
-                raw_guide: raw_guide.clone(),
-                mesh: mesh.clone(),
-            };
-            ui.ctx().data_mut(|d| d.insert_temp(cache_id, entry));
-            (raw_guide, mesh)
-        }
-    };
-    let offset = egui::vec2(rect.left(), rect.center().y);
-    if raw_guide.len() >= 2 {
-        let translated_guide: Vec<egui::Pos2> = raw_guide.iter().map(|pt| *pt + offset).collect();
-        p.add(egui::Shape::line(
-            translated_guide,
-            Stroke::new(1.0, t.text_muted.gamma_multiply(0.26)),
-        ));
-    }
-    if let Some(local_mesh) = mesh_opt {
-        let mut translated = (*local_mesh).clone();
-        translated.translate(offset);
-        p.add(egui::Shape::mesh(translated));
-    }
-
-    let stab_tag = pen.smoothing.stabilization_summary();
-    ui.add_space(3.0);
-    ui.label(
-        RichText::new(format!(
-            "Preview: {} — {:.1} pt · {}",
-            pen.kind.label(),
-            pen.size,
-            stab_tag
-        ))
-        .size(11.0)
-        .color(t.text_muted),
-    );
-}
-
-fn draw_smoothing_preset_card(
-    ui: &mut egui::Ui,
-    preset: StabilizationPreset,
-    selected: bool,
-    t: &Tokens,
-) -> bool {
-    let card_id = ui.make_persistent_id(("papercraft_stab_preset_card", preset));
-    let hover_mem_id = card_id.with("hov_mem");
-    let prev_hovered = ui
-        .ctx()
-        .data(|d| d.get_temp::<bool>(hover_mem_id))
-        .unwrap_or(false);
-    let select_t = crate::motion::hover_factor(ui.ctx(), card_id.with("sel"), selected);
-    let hover_t =
-        crate::motion::hover_factor(ui.ctx(), card_id.with("hov"), prev_hovered && !selected);
-
-    let rest_fill = crate::motion::lerp_color(t.panel_bg, t.border.gamma_multiply(0.30), hover_t);
-    let fill = crate::motion::lerp_color(rest_fill, t.accent_soft, select_t);
-    let rest_border =
-        crate::motion::lerp_color(t.border, t.text_muted.gamma_multiply(0.55), hover_t);
-    let border_c = crate::motion::lerp_color(rest_border, t.accent, select_t);
-    let stroke = Stroke::new(crate::motion::lerp_f32(1.0, 1.5, select_t), border_c);
-    let title_c = crate::motion::lerp_color(t.text, t.accent, select_t);
-
-    let badge_bg = if selected {
-        t.accent.gamma_multiply(0.16)
-    } else {
-        t.field_bg
-    };
-    let badge_border = if selected {
-        t.accent.gamma_multiply(0.45)
-    } else {
-        t.border
-    };
-    let badge_fg = if selected { t.accent } else { t.text_muted };
-
-    let frame_resp = Frame::new()
-        .fill(fill)
-        .stroke(stroke)
-        .corner_radius(CornerRadius::same(7))
-        .inner_margin(Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                if selected {
-                    let (icon_r, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
-                    paint_icon(ui.painter(), icon_r, Icon::Check, t.accent);
-                }
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(preset.label())
-                            .size(12.2)
-                            .strong()
-                            .color(title_c),
-                    )
-                    .selectable(false),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    Frame::new()
-                        .fill(badge_bg)
-                        .stroke(Stroke::new(1.0, badge_border))
-                        .corner_radius(CornerRadius::same(4))
-                        .inner_margin(Margin::symmetric(6, 2))
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(preset.badge()).size(9.8).color(badge_fg),
-                                )
-                                .selectable(false),
-                            );
-                        });
-                });
-            });
-            ui.add_space(3.0);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(preset.description())
-                        .size(11.0)
-                        .color(t.text_muted),
-                )
-                .selectable(false)
-                .wrap(),
-            );
-        });
-
-    let resp = frame_resp
-        .response
-        .interact(Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(preset.description());
-    ui.ctx()
-        .data_mut(|d| d.insert_temp(hover_mem_id, resp.hovered()));
-    resp.clicked()
-}
-
-fn draw_pen_smoothing_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, kind: PenKind, t: &Tokens) {
-    let sm = app.session.pen(kind).smoothing.clone();
-    let eff_strength = sm.effective_strength();
-    let is_off = sm.is_smoothing_disabled();
-    let active_preset = sm.preset();
-    let value_label = smoothing_value_label(eff_strength);
-    let mut chosen_preset = None;
-    let mut next_strength: Option<(f32, bool)> = None;
-
-    card_frame(t).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        section_card_header(
-            ui,
-            Icon::Stabilizer,
-            "Input stabilization",
-            "Balance crisp fast handwriting against silky precision lines, then pick your preferred feel.",
-            t,
-        );
-
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Smoothing strength")
-                    .size(12.0)
-                    .strong()
-                    .color(t.text),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                Frame::new()
-                    .fill(if is_off { t.panel_bg } else { t.accent_soft })
-                    .stroke(Stroke::new(
-                        1.0,
-                        if is_off { t.border } else { t.accent },
-                    ))
-                    .corner_radius(CornerRadius::same(5))
-                    .inner_margin(Margin::symmetric(7, 2))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(&value_label)
-                                .size(11.0)
-                                .strong()
-                                .monospace()
-                                .color(if is_off { t.text_muted } else { t.accent }),
-                        );
-                    });
-            });
-        });
-
-        ui.add_space(4.0);
-        let slider_w = ui.available_width();
-        if let Some((val, persist)) = draw_smoothing_strength_slider(
-            ui,
-            ("inspector_smoothing_strength_slider", kind),
-            eff_strength,
-            slider_w,
-            t,
-        ) {
-            next_strength = Some((val, persist));
-        }
-
-        ui.add_space(4.0);
-        if let Some(val) = draw_smoothing_quick_switch(
-            ui,
-            "inspector_smoothing_quick_levels",
-            eff_strength,
-            t,
-        ) {
-            next_strength = Some((val, true));
-        }
-
-        ui.add_space(4.0);
-        ui.add(
-            egui::Label::new(
-                RichText::new(SmoothingConfig::strength_guidance(eff_strength))
-                    .size(11.0)
-                    .color(t.text_muted),
-            )
-            .wrap(),
-        );
-
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new("Smoothing style")
-                .size(11.5)
-                .strong()
-                .color(t.text),
-        );
-        ui.add_space(4.0);
-
-        for (idx, &preset) in StabilizationPreset::UI_STYLES.iter().enumerate() {
-            if idx > 0 {
-                ui.add_space(6.0);
-            }
-            if draw_smoothing_preset_card(ui, preset, preset == active_preset && !is_off, t) {
-                chosen_preset = Some(preset);
-            }
-        }
-    });
-
-    if let Some((val, persist)) = next_strength {
-        apply_smoothing_strength(app, kind, val, persist);
-    } else if let Some(preset) = chosen_preset {
-        let _ = app.session.execute(
-            "pen.setSmoothing",
-            &json!({
-                "kind": kind,
-                "preset": preset,
-                "preserve_strength": true,
-                "persist": true,
-            }),
-        );
-    }
 }
 
 struct StylusButtonRowSpec<'a> {
@@ -1289,7 +605,7 @@ fn draw_live_telemetry_card(app: &PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) 
         ui.add(
             egui::Label::new(
                 RichText::new(
-                    "Tip: Inverting a supported stylus or holding its side buttons runs your configured shortcuts. Customize button actions in the Pen tab while a stylus is connected.",
+                    "Tip: Inverting a supported stylus or holding its side buttons runs your configured shortcuts. Customize button actions below while a stylus is connected.",
                 )
                 .size(11.0)
                 .color(t.text_muted),
@@ -1359,47 +675,21 @@ fn draw_shortcuts_card(ui: &mut egui::Ui, t: &Tokens) {
     });
 }
 
-fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, kind: PenKind, t: &Tokens) {
+fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     ui.horizontal(|ui| {
         ui.set_height(28.0);
         let (ir, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
-        paint_icon(ui.painter(), ir, Icon::Settings, t.accent);
+        crate::icons::paint_icon(ui.painter(), ir, Icon::Settings, t.accent);
         ui.label(RichText::new("Settings").size(17.0).strong().color(t.text));
-        if app.view.settings_tab == SettingsTab::Pen {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icon_button(ui, Icon::Reset, Some("Reset Tool"), false, true, t)
-                    .on_hover_text(
-                        "Restore factory default settings for the currently selected pen.",
-                    )
-                    .clicked()
-                {
-                    let mut defaults = PenSettings::for_kind(kind);
-                    if let Some(size) = UserStudioConfig::DEFAULT_PEN_SIZES.get(kind.index()) {
-                        defaults.size = *size;
-                    }
-                    defaults.color = app.session.pen(kind).color;
-                    let _ = app.session.execute(
-                        "pen.setSettings",
-                        &json!({ "kind": kind, "settings": defaults }),
-                    );
-                }
-            });
-        }
     });
     ui.label(
-        RichText::new("Input stabilization, studio appearance, and live telemetry.")
+        RichText::new("Studio appearance, app scale, and live telemetry.")
             .size(11.5)
             .color(t.text_muted),
     );
     ui.add_space(6.0);
 
     let tabs = [
-        (
-            SettingsTab::Pen,
-            Icon::FountainPen,
-            "Pen",
-            "Input stabilization settings and live stroke preview",
-        ),
         (
             SettingsTab::Appearance,
             Icon::Palette,
@@ -1507,8 +797,7 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
     )
     .show_collapsible(ui, &mut panel_open, |ui| {
         ui.multiply_opacity(content_opacity);
-        let kind = app.session.active_pen_kind();
-        draw_settings_header(app, ui, kind, &t);
+        draw_settings_header(app, ui, &t);
         ui.separator();
 
         let dt = ui.ctx().input(|i| i.stable_dt);
@@ -1526,15 +815,6 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
             ui.scope(|ui| {
                 ui.multiply_opacity(tab_opacity);
                 match app.view.settings_tab {
-                    SettingsTab::Pen => {
-                        draw_live_stroke_preview(app, ui, kind, &t);
-                        ui.add_space(8.0);
-                        draw_pen_smoothing_card(app, ui, kind, &t);
-                        if app.is_stylus_connected() {
-                            ui.add_space(8.0);
-                            draw_stylus_shortcuts_card(app, ui, &t);
-                        }
-                    }
                     SettingsTab::Appearance => {
                         draw_appearance_card(app, ui, &t);
                         ui.add_space(8.0);
@@ -1542,6 +822,10 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
                     }
                     SettingsTab::Telemetry => {
                         draw_live_telemetry_card(app, ui, &t);
+                        if app.is_stylus_connected() {
+                            ui.add_space(8.0);
+                            draw_stylus_shortcuts_card(app, ui, &t);
+                        }
                         ui.add_space(8.0);
                         draw_shortcuts_card(ui, &t);
                     }
@@ -1739,88 +1023,35 @@ mod auto_contrast_ui_tests {
     }
 
     #[test]
-    fn clicking_smoothing_preset_cards_updates_active_pen_and_preview() {
+    fn settings_two_way_tab_switch_cycles_between_appearance_and_telemetry() {
         let ctx = egui::Context::default();
         let mut app = PaperCraftApp::default();
         app.view.screen = AppScreen::Editor;
         app.view.motion.screen = motion::ScreenTransition::new(AppScreen::Editor);
         app.view.inspector_open = true;
-        app.view.settings_tab = SettingsTab::Pen;
-
-        let kind = app.session.active_pen_kind();
-        assert_eq!(app.session.pen(kind).smoothing.strength_percent(), 35);
-        assert_eq!(
-            app.session.pen(kind).smoothing.preset(),
-            StabilizationPreset::Adaptive
-        );
+        app.view.settings_tab = SettingsTab::Appearance;
 
         let mut time_s = 1.0_f64;
         let _ = run_editor_frame(&ctx, &mut app, base_input(), &mut time_s);
-        let mut shapes = run_editor_frame(&ctx, &mut app, base_input(), &mut time_s);
-
-        // Quick-level buttons adjust strength directly; Off disables and High raises to 80%.
-        let off_rect = find_text_rect_in_shapes(&shapes, "Off")
-            .expect("Off quick level button should be rendered");
-        shapes = click_at(&ctx, &mut app, off_rect.center(), &mut time_s);
-        assert!(app.session.pen(kind).smoothing.is_smoothing_disabled());
-        assert_eq!(app.session.pen(kind).smoothing.strength_percent(), 0);
-
-        let high_rect = find_text_rect_in_shapes(&shapes, "High")
-            .expect("High quick level button should be rendered");
-        shapes = click_at(&ctx, &mut app, high_rect.center(), &mut time_s);
-        assert!(!app.session.pen(kind).smoothing.is_smoothing_disabled());
-        assert_eq!(app.session.pen(kind).smoothing.strength_percent(), 80);
-
-        for &preset in &[
-            StabilizationPreset::ModeledSpring,
-            StabilizationPreset::CurvedBezier,
-            StabilizationPreset::ArithmeticBuffer10,
-            StabilizationPreset::Adaptive,
-        ] {
-            let rect = find_text_rect_in_shapes(&shapes, preset.label())
-                .expect("Preset card label should be rendered");
-            shapes = click_at(&ctx, &mut app, rect.center(), &mut time_s);
-            assert_eq!(app.session.pen(kind).smoothing.preset(), preset);
-            assert_eq!(
-                app.session.pen(kind).smoothing.strength_percent(),
-                80,
-                "switching style should preserve user's smoothing strength"
-            );
-        }
-    }
-
-    #[test]
-    fn settings_three_way_tab_switch_cycles_between_pen_appearance_and_telemetry() {
-        let ctx = egui::Context::default();
-        let mut app = PaperCraftApp::default();
-        app.view.screen = AppScreen::Editor;
-        app.view.motion.screen = motion::ScreenTransition::new(AppScreen::Editor);
-        app.view.inspector_open = true;
-        app.view.settings_tab = SettingsTab::Pen;
-
-        let mut time_s = 1.0_f64;
-        let _ = run_editor_frame(&ctx, &mut app, base_input(), &mut time_s);
-        let shapes_pen = run_editor_frame(&ctx, &mut app, base_input(), &mut time_s);
-
-        let appearance_tab = find_text_rect_in_shapes(&shapes_pen, "Appearance")
-            .expect("Appearance tab should be rendered in 3-way switch");
-        let shapes_app = click_at(&ctx, &mut app, appearance_tab.center(), &mut time_s);
-        assert_eq!(app.view.settings_tab, SettingsTab::Appearance);
+        let shapes_app = run_editor_frame(&ctx, &mut app, base_input(), &mut time_s);
         assert!(
             find_text_rect_in_shapes(&shapes_app, "Auto-adapt canvas colors to theme").is_some()
         );
+        assert!(find_text_rect_in_shapes(&shapes_app, "Input stabilization").is_none());
 
         let telemetry_tab = find_text_rect_in_shapes(&shapes_app, "Telemetry")
-            .expect("Telemetry tab should be rendered in 3-way switch");
+            .expect("Telemetry tab should be rendered in 2-way switch");
         let shapes_tel = click_at(&ctx, &mut app, telemetry_tab.center(), &mut time_s);
         assert_eq!(app.view.settings_tab, SettingsTab::Telemetry);
         assert!(find_text_rect_in_shapes(&shapes_tel, "Live Stylus Telemetry").is_some());
 
-        let pen_tab = find_text_rect_in_shapes(&shapes_tel, "Pen")
-            .expect("Pen tab should be rendered in 3-way switch");
-        let shapes_back = click_at(&ctx, &mut app, pen_tab.center(), &mut time_s);
-        assert_eq!(app.view.settings_tab, SettingsTab::Pen);
-        assert!(find_text_rect_in_shapes(&shapes_back, "Input stabilization").is_some());
+        let appearance_tab = find_text_rect_in_shapes(&shapes_tel, "Appearance")
+            .expect("Appearance tab should be rendered in 2-way switch");
+        let shapes_back = click_at(&ctx, &mut app, appearance_tab.center(), &mut time_s);
+        assert_eq!(app.view.settings_tab, SettingsTab::Appearance);
+        assert!(
+            find_text_rect_in_shapes(&shapes_back, "Auto-adapt canvas colors to theme").is_some()
+        );
     }
 }
 
@@ -1861,7 +1092,7 @@ mod tests {
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(1280.0, 800.0),
+                    egui::vec2(1280.0, 1200.0),
                 )),
                 ..Default::default()
             };
@@ -1879,63 +1110,14 @@ mod tests {
                 "tab {tab:?} inspector rect {panel_rect:?} overflowed or differed from default {DEFAULT_INSPECTOR_WIDTH}",
             );
         }
-        assert!(last_texts.lines().any(|line| line == "Pen"));
         assert!(last_texts.lines().any(|line| line == "Appearance"));
-        assert!(!last_texts.lines().any(|line| line == "Page"));
         assert!(last_texts.lines().any(|line| line == "Telemetry"));
+        assert!(!last_texts.lines().any(|line| line == "Pen"));
+        assert!(!last_texts.lines().any(|line| line == "Page"));
+        assert!(!last_texts.contains("Input stabilization"));
+        assert!(!last_texts.contains("Smoothing strength"));
+        assert!(!last_texts.contains("Smoothing style"));
         (panel_rect, last_texts)
-    }
-
-    #[test]
-    fn input_stabilization_renders_four_curated_presets_without_manual_controls() {
-        let mut app = PaperCraftApp::default();
-        for kind in PenKind::ALL {
-            assert_eq!(
-                app.session.pen(*kind).smoothing,
-                papercraft_doc::SmoothingConfig::default()
-            );
-            assert_eq!(
-                app.session.pen(*kind).smoothing.preset(),
-                StabilizationPreset::Adaptive
-            );
-            assert_eq!(app.session.pen(*kind).smoothing.strength_percent(), 35);
-        }
-
-        let (_, pen_texts) = render_inspector_tab(&mut app, SettingsTab::Pen);
-        assert!(pen_texts.contains("Input stabilization"));
-        assert!(pen_texts.contains("Smoothing strength"));
-        assert!(pen_texts.contains("35%"));
-        assert!(pen_texts.contains("Off"));
-        assert!(pen_texts.contains("Low"));
-        assert!(pen_texts.contains("Med"));
-        assert!(pen_texts.contains("High"));
-        assert!(pen_texts.contains("Smoothing style"));
-        for &preset in StabilizationPreset::UI_STYLES {
-            assert!(
-                pen_texts.contains(preset.label()),
-                "missing preset label {}",
-                preset.label()
-            );
-            assert!(
-                pen_texts.contains(preset.badge()),
-                "missing preset badge {}",
-                preset.badge()
-            );
-            assert!(
-                pen_texts.contains(preset.description()),
-                "missing preset description {}",
-                preset.description()
-            );
-        }
-
-        // Manual algorithm tuning parameters must not be exposed in the UI.
-        assert!(!pen_texts.contains("Averaging method"));
-        assert!(!pen_texts.contains("Buffer size"));
-        assert!(!pen_texts.contains("Preprocessor"));
-        assert!(!pen_texts.contains("Finalize the stroke"));
-        assert!(!pen_texts.contains("Deadzone radius"));
-        assert!(!pen_texts.lines().any(|line| line == "Drag"));
-        assert!(!pen_texts.lines().any(|line| line == "Mass"));
     }
 
     #[test]
@@ -2001,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_header_has_pen_appearance_and_telemetry_tabs_on_single_row() {
+    fn settings_header_has_appearance_and_telemetry_tabs_on_single_row() {
         let mut app = PaperCraftApp::default();
         app.view.inspector_open = true;
         let ctx = egui::Context::default();
@@ -2010,7 +1192,7 @@ mod tests {
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(1280.0, 800.0),
+                    egui::vec2(1280.0, 1200.0),
                 )),
                 ..Default::default()
             };
@@ -2021,57 +1203,13 @@ mod tests {
             shapes = out.shapes.clone();
             out.drop_without_applying_deltas();
         }
-        let pen_pos = find_text_center(&shapes, "Pen").unwrap();
         let app_pos = find_text_center(&shapes, "Appearance").unwrap();
         let tel_pos = find_text_center(&shapes, "Telemetry").unwrap();
-        assert!((pen_pos.y - app_pos.y).abs() <= 1.0);
-        assert!((pen_pos.y - tel_pos.y).abs() <= 1.0);
-        assert!(pen_pos.x < app_pos.x && app_pos.x < tel_pos.x);
+        assert!((app_pos.y - tel_pos.y).abs() <= 1.0);
+        assert!(app_pos.x < tel_pos.x);
+        assert!(find_text_center(&shapes, "Pen").is_none());
         assert!(find_text_center(&shapes, "Page").is_none());
-    }
-
-    #[test]
-    fn pen_tab_stabilization_settings_only_update_active_pen() {
-        let mut app = PaperCraftApp::default();
-        crate::open_notebook_in_editor(&mut app, 0);
-
-        app.session
-            .execute("tool.select", &json!({ "tool": "BallPen" }))
-            .unwrap();
-        let custom_color = papercraft_color::Color::from_hex("#1D4ED8").unwrap();
-        app.session
-            .execute(
-                "pen.setSettings",
-                &json!({ "kind": PenKind::BallPen, "size": 8.0, "color": custom_color }),
-            )
-            .unwrap();
-
-        let before = app.session.pen(PenKind::BallPen).clone();
-        app.session
-            .execute(
-                "pen.setSmoothing",
-                &json!({
-                    "kind": app.session.active_pen_kind(),
-                    "preset": StabilizationPreset::ModeledSpring,
-                }),
-            )
-            .unwrap();
-        let after = app.session.pen(PenKind::BallPen);
-
-        assert_eq!(after.smoothing.preset(), StabilizationPreset::ModeledSpring);
-        assert_eq!(
-            after.smoothing,
-            StabilizationPreset::ModeledSpring.to_smoothing_config()
-        );
-        assert!((after.size - before.size).abs() < 1e-4);
-        assert_eq!(after.color, before.color);
-        assert_eq!(after.nib_flatness, before.nib_flatness);
-        assert_eq!(after.pressure_enabled, before.pressure_enabled);
-        assert_eq!(after.pressure_curve, before.pressure_curve);
-        assert_eq!(
-            app.session.pen(PenKind::FountainPen).smoothing,
-            papercraft_doc::SmoothingConfig::default()
-        );
+        assert!(find_text_center(&shapes, "Reset Tool").is_none());
     }
 
     #[test]
@@ -2171,7 +1309,7 @@ mod tests {
         let mut app = PaperCraftApp::new(papercraft_engine::Session::default(), hooks);
         app.view.screen = crate::AppScreen::Editor;
         app.view.inspector_open = true;
-        app.view.settings_tab = SettingsTab::Pen;
+        app.view.settings_tab = SettingsTab::Telemetry;
 
         let render_step =
             |ctx: &egui::Context, app: &mut PaperCraftApp, t: f64, events: Vec<egui::Event>| {
@@ -2198,9 +1336,9 @@ mod tests {
                 (texts, shapes)
             };
 
-        // 1. Disconnected: Pen tab shows Input stabilization only and hides Stylus shortcuts.
+        // 1. Disconnected: Telemetry tab shows live metrics and hides Stylus shortcuts.
         let (texts_off, _) = render_step(&ctx, &mut app, 0.02, Vec::new());
-        assert!(texts_off.contains("Input stabilization"));
+        assert!(texts_off.contains("Live Stylus Telemetry"));
         assert!(!texts_off.contains("Stylus shortcuts"));
 
         // 2. Connect stylus and re-poll after interval: card appears with device name and 3 rows.

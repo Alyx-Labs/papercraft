@@ -30,7 +30,7 @@ pub use spline::{
     densify_linear, predict_live_tip, resample_adaptive_catmull_rom,
     resample_centripetal_catmull_rom,
 };
-pub use stabilizer::{StrokeStabilizer, apply_streamline};
+pub use stabilizer::{StrokeStabilizer, apply_corner_safe_streamline, apply_streamline};
 
 use papercraft_doc::{PenKind, PenSettings, SmoothingConfig, StabilizerMode, StrokeSample};
 use papercraft_geom::distance_to_segment;
@@ -50,7 +50,11 @@ pub fn finalize_smoothed_samples(
     {
         return densify_linear(stabilized, 3.5);
     }
-    let faired = apply_streamline(stabilized, cfg.streamline_amount);
+    let faired = if cfg.stabilizer_mode == StabilizerMode::OneEuro {
+        apply_corner_safe_streamline(stabilized, cfg.streamline_amount)
+    } else {
+        apply_streamline(stabilized, cfg.streamline_amount)
+    };
     if faired.len() < 2 {
         return faired;
     }

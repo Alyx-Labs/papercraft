@@ -563,7 +563,7 @@ pub struct TabFadeTransition {
 impl Default for TabFadeTransition {
     fn default() -> Self {
         Self {
-            last_tab: SettingsTab::Pen,
+            last_tab: SettingsTab::Appearance,
             progress: 1.0,
         }
     }

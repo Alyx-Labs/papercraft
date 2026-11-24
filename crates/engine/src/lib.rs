@@ -2279,7 +2279,7 @@ mod tests {
         assert_eq!(s.pen(PenKind::FountainPen).smoothing.strength_percent(), 15);
         assert_eq!(
             s.prefs.pen_smoothings[PenKind::FountainPen.index()].strength_percent(),
-            35
+            25
         );
 
         // Switching to SimpleDirect (Off) and persisting, then raising strength > 0 upgrades to Adaptive.
@@ -2351,7 +2351,7 @@ mod tests {
         );
         assert_eq!(
             restored.pen(PenKind::BallPen).smoothing.strength_percent(),
-            35
+            25
         );
     }
 }
