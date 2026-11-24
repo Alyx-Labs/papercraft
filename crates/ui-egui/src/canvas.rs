@@ -5980,7 +5980,11 @@ fn render_selected_object_outline(
     if app.view.text_editing {
         return;
     }
-    let marquee_active = match app.view.selection_drag.as_ref().map(|d| &d.mode) {
+    let selection_drag_keeps_active = matches!(
+        app.view.selection_drag.as_ref().map(|d| &d.mode),
+        Some(crate::SelectionDragMode::Marquee { .. } | crate::SelectionDragMode::Lasso { .. })
+    );
+    match app.view.selection_drag.as_ref().map(|d| &d.mode) {
         Some(crate::SelectionDragMode::Marquee { start, current, .. }) => {
             let rect = Rect::from_two_pos(pos2(start[0], start[1]), pos2(current[0], current[1]));
             painter.rect_filled(
@@ -5994,7 +5998,6 @@ fn render_selected_object_outline(
                 Stroke::new(1.2, t.accent),
                 StrokeKind::Inside,
             );
-            true
         }
         Some(crate::SelectionDragMode::Lasso {
             points, dragged, ..
@@ -6021,10 +6024,9 @@ fn render_selected_object_outline(
                 t.accent,
                 papercraft_doc::ShapeLineStyle::Solid,
             );
-            true
         }
-        _ => false,
-    };
+        _ => {}
+    }
     let pointer_pos = painter.ctx().input(|i| i.pointer.interact_pos());
     let halo = t.panel_bg.gamma_multiply(0.55);
     if let Some((index, item)) = selected_single_text(app) {
@@ -6065,8 +6067,12 @@ fn render_selected_object_outline(
         return;
     }
     let Some(bounds) = cached_selected_objects_bounds(app, painter, xf) else {
-        if !marquee_active {
+        if !selection_drag_keeps_active {
             app.view.clear_selection();
+        } else {
+            app.view.selected_text = None;
+            app.view.selected_object = None;
+            app.view.selected_objects.clear();
         }
         return;
     };
@@ -10147,6 +10153,210 @@ mod tests {
         let out = run_editor_frame_with_hooks(&ctx, &mut app, 0.25, events);
         out.drop_without_applying_deltas();
         assert_eq!(app.view.selected_objects, vec![SelectedObject::Shape(0)]);
+    }
+
+    #[test]
+    fn multiframe_mouse_and_stylus_lasso_with_empty_initial_selection_selects_strokes() {
+        let ctx = egui::Context::default();
+        let mut app = setup_editor_app(&ctx);
+        crate::activate_select_tool(&mut app);
+        app.view.freeform_lasso_mode = true;
+
+        let draw_stroke = |app: &mut PaperCraftApp, pts: &[(f64, f64)]| -> StrokeId {
+            let json_pts: Vec<_> = pts
+                .iter()
+                .enumerate()
+                .map(|(i, &(x, y))| {
+                    serde_json::json!({
+                        "x": x,
+                        "y": y,
+                        "pressure": 0.7,
+                        "time_ms": (i as f64) * 16.0,
+                    })
+                })
+                .collect();
+            let res = app
+                .session
+                .execute(
+                    "stroke.draw",
+                    &serde_json::json!({
+                        "kind": "FountainPen",
+                        "points": json_pts,
+                    }),
+                )
+                .unwrap();
+            StrokeId(res["strokeId"].as_u64().unwrap())
+        };
+
+        let inside_id = draw_stroke(&mut app, &[(180.0, 180.0), (210.0, 200.0), (235.0, 215.0)]);
+        let _outside_id = draw_stroke(&mut app, &[(520.0, 520.0), (570.0, 540.0), (610.0, 560.0)]);
+
+        let xf = page_affine(&app);
+        let to_scr = |x: f64, y: f64| {
+            let s = xf.to_screen(Point::new(x, y));
+            pos2(s.x as f32, s.y as f32)
+        };
+        let p0 = to_scr(130.0, 130.0);
+        let p_tiny = pos2(p0.x + 1.5, p0.y + 1.0);
+        let p1 = to_scr(280.0, 130.0);
+        let p2 = to_scr(280.0, 270.0);
+        let p3 = to_scr(130.0, 270.0);
+
+        // Frame 1: pointer down on empty selection must survive end-of-frame outline rendering.
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.016,
+            vec![
+                egui::Event::PointerMoved(p0),
+                egui::Event::PointerButton {
+                    pos: p0,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+        assert!(
+            matches!(
+                app.view.selection_drag.as_ref().map(|d| &d.mode),
+                Some(crate::SelectionDragMode::Lasso { dragged: false, .. })
+            ),
+            "initial lasso press with no prior selection must persist across frames"
+        );
+
+        // Frame 2: sub-threshold micro-move (<4px) must also keep lasso drag alive.
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.032,
+            vec![egui::Event::PointerMoved(p_tiny)],
+        )
+        .drop_without_applying_deltas();
+        assert!(matches!(
+            app.view.selection_drag.as_ref().map(|d| &d.mode),
+            Some(crate::SelectionDragMode::Lasso { .. })
+        ));
+
+        // Frames 3-5: sweep loop across multiple frames around `inside_id`.
+        for (idx, pos) in [p1, p2, p3].into_iter().enumerate() {
+            run_editor_frame_with_hooks(
+                &ctx,
+                &mut app,
+                0.048 + (idx as f64) * 0.016,
+                vec![egui::Event::PointerMoved(pos)],
+            )
+            .drop_without_applying_deltas();
+        }
+        assert!(matches!(
+            app.view.selection_drag.as_ref().map(|d| &d.mode),
+            Some(crate::SelectionDragMode::Lasso {
+                dragged: true,
+                points,
+                ..
+            }) if points.len() >= 4
+        ));
+
+        // Frame 6: release commits lasso selection of the enclosed stroke.
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.096,
+            vec![egui::Event::PointerButton {
+                pos: p3,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        )
+        .drop_without_applying_deltas();
+        assert!(app.view.selection_drag.is_none());
+        assert_eq!(
+            app.view.selected_objects,
+            vec![SelectedObject::Stroke(inside_id)]
+        );
+
+        // Now clear selection and verify multi-frame stylus Touch lasso works as well.
+        app.view.clear_selection();
+        let dev = egui::TouchDeviceId(1);
+        let pen_id = egui::TouchId(77);
+        let send_pen_frame = |app: &mut PaperCraftApp,
+                              t: f64,
+                              phase: egui::TouchPhase,
+                              pos: Pos2,
+                              force: Option<f32>,
+                              btn: Option<bool>| {
+            let mut evs = vec![
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: pen_id,
+                    phase,
+                    pos,
+                    force,
+                },
+                egui::Event::PointerMoved(pos),
+            ];
+            if let Some(pressed) = btn {
+                evs.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            run_editor_frame_with_hooks(&ctx, app, t, evs).drop_without_applying_deltas();
+        };
+
+        send_pen_frame(
+            &mut app,
+            0.200,
+            egui::TouchPhase::Start,
+            p0,
+            Some(0.35),
+            Some(true),
+        );
+        assert!(matches!(
+            app.view.selection_drag.as_ref().map(|d| (&d.mode, d.touch_id)),
+            Some((crate::SelectionDragMode::Lasso { .. }, Some(id))) if id == pen_id
+        ));
+        send_pen_frame(
+            &mut app,
+            0.216,
+            egui::TouchPhase::Move,
+            p1,
+            Some(0.55),
+            None,
+        );
+        send_pen_frame(
+            &mut app,
+            0.232,
+            egui::TouchPhase::Move,
+            p2,
+            Some(0.55),
+            None,
+        );
+        send_pen_frame(
+            &mut app,
+            0.248,
+            egui::TouchPhase::Move,
+            p3,
+            Some(0.50),
+            None,
+        );
+        send_pen_frame(
+            &mut app,
+            0.264,
+            egui::TouchPhase::End,
+            p3,
+            Some(0.0),
+            Some(false),
+        );
+        assert!(app.view.selection_drag.is_none());
+        assert_eq!(
+            app.view.selected_objects,
+            vec![SelectedObject::Stroke(inside_id)]
+        );
     }
 
     #[test]

@@ -2155,10 +2155,7 @@ mod tests {
     fn default_session_starts_with_blue_fountain_pen() {
         let s = Session::default();
         assert_eq!(s.active_tool, ToolKind::Pen(PenKind::FountainPen));
-        assert_eq!(
-            s.active_pen().color,
-            papercraft_color::INK_PALETTE[1].color
-        );
+        assert_eq!(s.active_pen().color, papercraft_color::INK_PALETTE[1].color);
         assert_eq!(s.active_pen().color.to_hex(), "#0052FF");
     }
 }
