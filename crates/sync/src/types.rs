@@ -50,6 +50,24 @@ pub struct LocalProfile {
     pub created_at_ms: i64,
     #[serde(default)]
     pub last_used_at_ms: i64,
+    /// Cloud `user_id` that owns this local profile when created inside a signed-in account.
+    ///
+    /// Unlinked offline profiles (`None`) may be offered for migration when a cloud account signs
+    /// in, whereas profiles bound to a specific cloud account (`Some(uid)`) are never offered to
+    /// other accounts.
+    #[serde(default)]
+    pub owner_cloud_user_id: Option<String>,
+}
+
+impl LocalProfile {
+    /// Returns `true` when this local profile is unlinked or owned by `cloud_user_id`.
+    pub fn is_accessible_to_cloud_user(&self, cloud_user_id: Option<&str>) -> bool {
+        match (&self.owner_cloud_user_id, cloud_user_id) {
+            (None, _) => true,
+            (Some(owner), Some(current)) => owner == current,
+            (Some(_), None) => false,
+        }
+    }
 }
 
 /// Explicit per-entity synchronization state tracked locally and surfaced in UI badges.
@@ -107,11 +125,31 @@ impl GlobalSyncState {
         }
     }
 
-    pub fn active_local_profile(&self) -> Option<&LocalProfile> {
+    pub fn active_cloud_user_id(&self) -> Option<&str> {
+        self.session.as_ref().map(|s| s.user.user_id.as_str())
+    }
+
+    pub fn accessible_local_profiles(&self) -> Vec<&LocalProfile> {
+        let uid = self.active_cloud_user_id();
         self.local_profiles
             .iter()
-            .find(|p| p.local_profile_id == self.active_local_profile_id)
-            .or_else(|| self.local_profiles.first())
+            .filter(|p| p.is_accessible_to_cloud_user(uid))
+            .collect()
+    }
+
+    pub fn active_local_profile(&self) -> Option<&LocalProfile> {
+        let uid = self.active_cloud_user_id();
+        self.local_profiles
+            .iter()
+            .find(|p| {
+                p.local_profile_id == self.active_local_profile_id
+                    && p.is_accessible_to_cloud_user(uid)
+            })
+            .or_else(|| {
+                self.local_profiles
+                    .iter()
+                    .find(|p| p.is_accessible_to_cloud_user(uid))
+            })
     }
 
     pub fn is_viewing_cloud(&self) -> bool {

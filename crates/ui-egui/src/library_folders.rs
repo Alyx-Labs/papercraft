@@ -37,6 +37,7 @@ pub(crate) const MAX_FOLDER_NAME_CHARS: usize = 48;
 const ROW_HEIGHT: f32 = 30.0;
 const INDENT: f32 = 14.0;
 const TILE_HEIGHT: f32 = 64.0;
+const SIDEBAR_FOOTER_HEIGHT: f32 = 28.0;
 
 // ---------------------------------------------------------------------------
 // Folder paths
@@ -1331,10 +1332,15 @@ pub(crate) fn draw_library_nav(
 ) {
     let snapshot = NavSnapshot::capture(app);
     let mut actions = Vec::new();
+    let show_footer = mode == NavMode::Sidebar;
+    let item_gap = ui.spacing().item_spacing.y;
     let scroll = egui::ScrollArea::vertical()
         .id_salt(("papercraft_library_nav_scroll", mode == NavMode::Popup));
     let scroll = match mode {
-        NavMode::Sidebar => scroll.auto_shrink([false, false]),
+        NavMode::Sidebar => {
+            let max_h = (ui.available_height() - SIDEBAR_FOOTER_HEIGHT - item_gap).max(60.0);
+            scroll.auto_shrink([false, false]).max_height(max_h)
+        }
         NavMode::Popup => scroll.auto_shrink([false, true]).max_height(440.0),
     };
     scroll.show(ui, |ui| {
@@ -1351,6 +1357,84 @@ pub(crate) fn draw_library_nav(
     for action in actions {
         apply_library_action(app, action);
     }
+    if show_footer && draw_sidebar_footer(ui, t) {
+        crate::open_external_url(app, ui.ctx(), crate::GITHUB_REPO_URL);
+    }
+}
+
+fn draw_sidebar_footer(ui: &mut egui::Ui, t: &Tokens) -> bool {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), SIDEBAR_FOOTER_HEIGHT),
+        Sense::hover(),
+    );
+    let row_rect = Rect::from_min_max(pos2(rect.left(), rect.top() + 6.0), rect.right_bottom());
+    let version_text = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let version_color = t.text_muted.gamma_multiply(0.75);
+    let version_galley =
+        ui.painter()
+            .layout_no_wrap(version_text, FontId::proportional(10.5), version_color);
+    let version_pos = pos2(
+        row_rect.right() - version_galley.size().x,
+        row_rect.center().y - version_galley.size().y * 0.5,
+    );
+
+    let icon_dim = 12.5_f32;
+    let icon_gap = 5.0_f32;
+    let label_galley = ui.painter().layout_no_wrap(
+        "GitHub".to_string(),
+        FontId::proportional(11.0),
+        t.text_muted,
+    );
+    let max_link_right = (version_pos.x - 8.0).max(row_rect.left() + icon_dim);
+    let link_w = (icon_dim + icon_gap + label_galley.size().x)
+        .min((max_link_right - row_rect.left()).max(icon_dim));
+    let link_rect = Rect::from_min_size(row_rect.left_top(), Vec2::new(link_w, row_rect.height()));
+    let link_resp = ui
+        .interact(
+            link_rect,
+            ui.make_persistent_id("papercraft_home_sidebar_github_link"),
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!(
+            "Open GitHub repository\n{}",
+            crate::GITHUB_REPO_URL
+        ));
+
+    if ui.is_rect_visible(rect) {
+        let hover_t =
+            crate::motion::hover_factor(ui.ctx(), link_resp.id.with("hov"), link_resp.hovered());
+        let fg = crate::motion::lerp_color(t.text_muted.gamma_multiply(0.82), t.text, hover_t);
+        let p = ui.painter();
+        p.hline(
+            rect.x_range(),
+            rect.top() + 0.5,
+            Stroke::new(1.0, t.border.gamma_multiply(0.5)),
+        );
+        p.galley(version_pos, version_galley, version_color);
+
+        let icon_rect = Rect::from_center_size(
+            pos2(link_rect.left() + icon_dim * 0.5, row_rect.center().y),
+            Vec2::splat(icon_dim),
+        );
+        paint_icon(p, icon_rect, Icon::GitHub, fg);
+        let text_x = icon_rect.right() + icon_gap;
+        let text_y = row_rect.center().y - label_galley.size().y * 0.5;
+        let label_w = label_galley.size().x;
+        let label_h = label_galley.size().y;
+        if text_x + label_w <= link_rect.right() + 0.5 {
+            p.galley_with_override_text_color(pos2(text_x, text_y), label_galley, fg);
+            if hover_t > 0.05 {
+                p.hline(
+                    text_x..=(text_x + label_w),
+                    text_y + label_h - 1.0,
+                    Stroke::new(1.0, fg.gamma_multiply(hover_t * 0.85)),
+                );
+            }
+        }
+    }
+
+    link_resp.clicked()
 }
 
 fn draw_library_views(
@@ -2314,5 +2398,187 @@ mod tests {
         assert_eq!(app.view.active_modal, Some(ActiveModal::TagColor));
         assert_eq!(app.view.tag_dialog_target, "example");
         assert!(!egui::Popup::is_any_open(&ctx));
+    }
+
+    #[test]
+    fn home_sidebar_footer_shows_github_link_and_version_only_in_sidebar_mode() {
+        let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let opened_hook = std::sync::Arc::clone(&opened);
+        let hooks = crate::PlatformHooks {
+            open_url: Some(Box::new(move |url| {
+                opened_hook.lock().unwrap().push(url.to_string());
+            })),
+            ..crate::PlatformHooks::default()
+        };
+        let mut app = PaperCraftApp::new(papercraft_engine::Session::default(), hooks);
+        let ctx = egui::Context::default();
+        let viewport = Vec2::new(1280.0, 800.0);
+        let expected_version = format!("v{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(expected_version, "v0.2.0");
+
+        let mut sidebar_rect = Rect::NOTHING;
+        let mut github_rect = None;
+        let mut version_rect = None;
+        for _ in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                sidebar_rect = crate::home::show_inner(&mut app, ui)
+                    .sidebar_rect
+                    .expect("Home sidebar visible at 1280px");
+            });
+            fn find_texts(
+                shape: &egui::Shape,
+                github_rect: &mut Option<Rect>,
+                version_rect: &mut Option<Rect>,
+                expected_version: &str,
+            ) {
+                match shape {
+                    egui::Shape::Text(text) => {
+                        let s = text.galley.text();
+                        if s == "GitHub" {
+                            *github_rect = Some(text.visual_bounding_rect());
+                        } else if s == expected_version {
+                            *version_rect = Some(text.visual_bounding_rect());
+                        }
+                    }
+                    egui::Shape::Vec(items) => {
+                        for item in items {
+                            find_texts(item, github_rect, version_rect, expected_version);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            github_rect = None;
+            version_rect = None;
+            for clipped in &out.shapes {
+                find_texts(
+                    &clipped.shape,
+                    &mut github_rect,
+                    &mut version_rect,
+                    &expected_version,
+                );
+            }
+            out.drop_without_applying_deltas();
+        }
+
+        let gh_r = github_rect.expect("expected GitHub link in Home sidebar footer");
+        let ver_r = version_rect.expect("expected version label in Home sidebar footer");
+        assert!(sidebar_rect.contains(gh_r.center()));
+        assert!(sidebar_rect.contains(ver_r.center()));
+        assert!(gh_r.right() < ver_r.left());
+        assert!((gh_r.center().y - ver_r.center().y).abs() <= 2.0);
+        assert!(sidebar_rect.bottom() - gh_r.bottom() <= 24.0);
+
+        let click_pos = gh_r.center();
+        for (pressed, time) in [(true, 0.05), (false, 0.10)] {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                time: Some(time),
+                events: vec![
+                    egui::Event::PointerMoved(click_pos),
+                    egui::Event::PointerButton {
+                        pos: click_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                let _ = crate::home::show_inner(&mut app, ui);
+            });
+            out.drop_without_applying_deltas();
+        }
+        assert_eq!(
+            *opened.lock().unwrap(),
+            vec![crate::GITHUB_REPO_URL.to_string()]
+        );
+
+        // Popup mode (narrow Browse menu) and Editor screen must not show the Home sidebar footer.
+        let t = Tokens::light();
+        let popup_out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(320.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                draw_library_nav(&mut app, ui, &t, NavMode::Popup);
+            },
+        );
+        let mut popup_gh = None;
+        let mut popup_ver = None;
+        fn find_popup(
+            shape: &egui::Shape,
+            gh: &mut Option<Rect>,
+            ver: &mut Option<Rect>,
+            expected_version: &str,
+        ) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let s = text.galley.text();
+                    if s == "GitHub" {
+                        *gh = Some(text.visual_bounding_rect());
+                    } else if s == expected_version {
+                        *ver = Some(text.visual_bounding_rect());
+                    }
+                }
+                egui::Shape::Vec(items) => {
+                    for item in items {
+                        find_popup(item, gh, ver, expected_version);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for clipped in &popup_out.shapes {
+            find_popup(
+                &clipped.shape,
+                &mut popup_gh,
+                &mut popup_ver,
+                &expected_version,
+            );
+        }
+        popup_out.drop_without_applying_deltas();
+        assert!(popup_gh.is_none(), "Browse popup must omit GitHub footer");
+        assert!(popup_ver.is_none(), "Browse popup must omit version footer");
+
+        crate::open_notebook_in_editor(&mut app, 0);
+        app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
+        let mut editor_gh = None;
+        let mut editor_ver = None;
+        for _ in 0..2 {
+            let editor_out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                    ..Default::default()
+                },
+                |ui| {
+                    app.show_ui(ui);
+                },
+            );
+            editor_gh = None;
+            editor_ver = None;
+            for clipped in &editor_out.shapes {
+                find_popup(
+                    &clipped.shape,
+                    &mut editor_gh,
+                    &mut editor_ver,
+                    &expected_version,
+                );
+            }
+            editor_out.drop_without_applying_deltas();
+        }
+        assert!(editor_gh.is_none(), "Editor must omit Home GitHub footer");
+        assert!(editor_ver.is_none(), "Editor must omit Home version footer");
     }
 }

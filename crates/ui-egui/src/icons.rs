@@ -103,6 +103,7 @@ pub enum Icon {
     LaserPointer,
     GripHorizontal,
     Text,
+    GitHub,
 }
 
 /// Load the local outline SVG assigned to a semantic icon.
@@ -200,6 +201,7 @@ fn icon_svg(icon: Icon) -> &'static str {
         Icon::LaserPointer => include_str!("../assets/icons/lucide/laser.svg"),
         Icon::GripHorizontal => include_str!("../assets/icons/lucide/grip-horizontal.svg"),
         Icon::Text => include_str!("../assets/icons/lucide/type.svg"),
+        Icon::GitHub => include_str!("../assets/icons/lucide/github.svg"),
     }
 }
 
@@ -917,6 +919,7 @@ mod tests {
             (Icon::LaserPointer, "LaserPointer"),
             (Icon::GripHorizontal, "GripHorizontal"),
             (Icon::Text, "Text"),
+            (Icon::GitHub, "GitHub"),
         ]
     }
 

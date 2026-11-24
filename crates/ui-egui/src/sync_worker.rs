@@ -376,7 +376,7 @@ pub(crate) fn maybe_report_local_discovery(
     let state_key = (
         app.session.revision,
         app.session.is_viewing_cloud(),
-        app.session.local_profiles().len(),
+        app.session.accessible_local_profiles().len(),
     );
     let periodic_due = app
         .sync_worker

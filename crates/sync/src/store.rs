@@ -155,6 +155,11 @@ pub fn load_global_state(root_dir: &Path) -> GlobalSyncState {
     for profile in &mut parsed.local_profiles {
         profile.local_profile_id = sanitize_account_dir_segment(&profile.local_profile_id);
         profile.nickname = sanitize_profile_nickname(&profile.nickname);
+        profile.owner_cloud_user_id = profile
+            .owner_cloud_user_id
+            .take()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
     }
     parsed.client_id = sanitize_client_id(&parsed.client_id);
     parsed
@@ -225,9 +230,10 @@ pub fn inspect_local_accounts_in_library(
     if global.needs_initial_nickname {
         return Some((client_id, LocalDiscoverySummary::default()));
     }
-    let unsynced_local_accounts = global.local_profiles.len();
+    let accessible = global.accessible_local_profiles();
+    let unsynced_local_accounts = accessible.len();
     let mut total_local_notebooks = 0usize;
-    for profile in &global.local_profiles {
+    for profile in accessible {
         let dir = profile_library_dir(root_dir, &profile.local_profile_id);
         total_local_notebooks =
             total_local_notebooks.saturating_add(count_active_notebook_files(&dir));

@@ -131,6 +131,9 @@ pub struct AccountDraftState {
     pub renaming_profile_id: Option<String>,
     pub rename_profile_draft: String,
     pub import_local_open: bool,
+    pub pending_migration_profile_id: Option<String>,
+    pub migration_confirm_input: String,
+    pub migration_confirm_scroll_pending: bool,
     pub edit_display_name: String,
     pub edit_username: String,
     pub profile_save_busy: bool,
@@ -173,6 +176,9 @@ impl Default for AccountDraftState {
             renaming_profile_id: None,
             rename_profile_draft: String::new(),
             import_local_open: false,
+            pending_migration_profile_id: None,
+            migration_confirm_input: String::new(),
+            migration_confirm_scroll_pending: false,
             edit_display_name: String::new(),
             edit_username: String::new(),
             profile_save_busy: false,
@@ -255,6 +261,9 @@ impl AccountDraftState {
         self.conflict_resolving = false;
         self.logout_confirm_open = false;
         self.sign_out_after_sync = false;
+        self.pending_migration_profile_id = None;
+        self.migration_confirm_input.clear();
+        self.migration_confirm_scroll_pending = false;
         self.profile_save_busy = false;
         self.change_password_busy = false;
         self.current_password_draft.clear();
@@ -384,6 +393,9 @@ impl AccountDraftState {
         self.conflict_resolving = false;
         self.logout_confirm_open = false;
         self.sign_out_after_sync = false;
+        self.pending_migration_profile_id = None;
+        self.migration_confirm_input.clear();
+        self.migration_confirm_scroll_pending = false;
         self.password_reset = PasswordResetFlowState::default();
         self.signup_username.clear();
         self.edit_display_name.clear();
@@ -413,6 +425,9 @@ pub(crate) fn sync_draft_from_session(app: &mut PaperCraftApp) {
     app.view.account.status_message = None;
     app.view.account.logout_confirm_open = false;
     app.view.account.sign_out_after_sync = false;
+    app.view.account.pending_migration_profile_id = None;
+    app.view.account.migration_confirm_input.clear();
+    app.view.account.migration_confirm_scroll_pending = false;
     app.view.account.profile_save_busy = false;
     app.view.account.change_email_open = false;
     app.view.account.change_email_password.clear();
@@ -1095,7 +1110,7 @@ fn render_signed_out_local_workspace_card(app: &mut PaperCraftApp, ui: &mut egui
         .active_local_profile()
         .map_or_else(|| "Personal".to_string(), |p| p.nickname.clone());
     let nb_count = app.session.notebooks.len();
-    let profile_count = app.session.local_profiles().len();
+    let profile_count = app.session.accessible_local_profiles().len();
 
     ui.horizontal(|ui| {
         let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
@@ -1623,7 +1638,7 @@ fn render_signed_in_body(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens)
         render_signed_in_account_card(app, ui, &summary, cloud_pending, t);
     });
 
-    if !app.session.local_profiles().is_empty() {
+    if !app.session.accessible_local_profiles().is_empty() {
         ui.add_space(10.0);
         draw_section_card(ui, t, |ui| {
             render_detected_local_accounts_migration_card(app, ui, &summary, t);
@@ -2191,20 +2206,286 @@ pub(crate) fn render_session_sign_out_card(
     });
 }
 
+fn migration_cloud_target_label(summary: &SyncStatusSummary) -> String {
+    summary
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            summary
+                .username
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            summary
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "Cloud".to_string())
+}
+
+/// Builds the exact English sentence the user must type before moving a local account into Cloud
+/// and permanently deleting that local user.
+pub(crate) fn migration_confirmation_phrase(local_nickname: &str, cloud_account: &str) -> String {
+    format!(
+        "I agree to move all notebooks from {local_nickname} to {cloud_account} and delete the local user"
+    )
+}
+
+fn normalize_confirmation_words(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn migration_confirmation_matches(input: &str, expected: &str) -> bool {
+    normalize_confirmation_words(input)
+        .eq_ignore_ascii_case(&normalize_confirmation_words(expected))
+}
+
+fn render_migration_typed_confirmation(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    prof: &papercraft_sync::LocalProfile,
+    cloud_target: &str,
+    t: &Tokens,
+) -> bool {
+    let expected = migration_confirmation_phrase(&prof.nickname, cloud_target);
+    let mut confirmed = false;
+    let mut cancel = false;
+
+    let confirm_resp = egui::Frame::new()
+        .fill(t.field_bg)
+        .stroke(Stroke::new(1.0, t.danger_border))
+        .corner_radius(CornerRadius::same(7))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (ir, _) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::hover());
+                paint_icon(ui.painter(), ir, Icon::AlertCircle, t.danger_fg);
+                ui.label(
+                    egui::RichText::new("Confirm Move & Permanent Local User Deletion")
+                        .size(12.0)
+                        .strong()
+                        .color(t.danger_fg),
+                );
+            });
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "This moves all notebooks from local account '{}' to '{}' and permanently deletes local user '{}'. Type the exact English sentence below to proceed:",
+                        prof.nickname, cloud_target, prof.nickname
+                    ))
+                    .size(11.0)
+                    .color(t.text_muted),
+                )
+                .wrap(),
+            );
+            ui.add_space(6.0);
+            egui::Frame::new()
+                .fill(t.toolbar_bg)
+                .stroke(Stroke::new(1.0, t.border))
+                .corner_radius(CornerRadius::same(5))
+                .inner_margin(Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&expected)
+                                .size(11.0)
+                                .strong()
+                                .color(t.text),
+                        )
+                        .wrap(),
+                    );
+                });
+            ui.add_space(6.0);
+            let matched =
+                migration_confirmation_matches(&app.view.account.migration_confirm_input, &expected);
+            let hint = if app.view.account.migration_confirm_input.trim().is_empty() {
+                FieldHint::Muted("Type the confirmation sentence")
+            } else if matched {
+                FieldHint::Success("Confirmation matched")
+            } else {
+                FieldHint::Warning("Must match the exact English sentence".to_string())
+            };
+            draw_field_label_row(ui, "Confirmation Sentence", hint, t);
+            ui.add_space(3.0);
+            let input_resp = draw_text_input(
+                ui,
+                InputFieldSpec {
+                    id_salt: "acct_migration_confirm_input",
+                    width: ui.available_width(),
+                    hint: "I agree to move all notebooks from ...",
+                    border_color: Some(if matched {
+                        t.success_border
+                    } else {
+                        t.danger_border
+                    }),
+                    trailing: if matched {
+                        InputTrailing::GreenCheck("Confirmation sentence matches")
+                    } else {
+                        InputTrailing::None
+                    },
+                },
+                &mut app.view.account.migration_confirm_input,
+                t,
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if secondary_action_button(ui, "Cancel", true, t).clicked() {
+                    cancel = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if danger_action_button(ui, "Confirm Move & Delete", matched, t).clicked()
+                        || (input_resp.enter_pressed && matched)
+                    {
+                        confirmed = true;
+                    }
+                });
+            });
+        });
+
+    if std::mem::take(&mut app.view.account.migration_confirm_scroll_pending) {
+        ui.scroll_to_rect(confirm_resp.response.rect, Some(egui::Align::Center));
+        ui.memory_mut(|m| m.request_focus(ui.make_persistent_id("acct_migration_confirm_input")));
+    }
+
+    if cancel {
+        app.view.account.pending_migration_profile_id = None;
+        app.view.account.migration_confirm_input.clear();
+        app.view.account.migration_confirm_scroll_pending = false;
+    }
+    confirmed
+}
+
+fn render_local_account_migration_row(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    prof: &papercraft_sync::LocalProfile,
+    nb_count: usize,
+    cloud_target: &str,
+    t: &Tokens,
+) -> Option<String> {
+    let mut execute_profile = None;
+    let is_confirming =
+        app.view.account.pending_migration_profile_id.as_deref() == Some(&prof.local_profile_id);
+
+    ui.add_space(4.0);
+    egui::Frame::new()
+        .fill(t.toolbar_bg)
+        .stroke(Stroke::new(1.0, t.border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "A local account '{}' was found ({} notebook(s)). Do you want to move its notebooks into '{}'?",
+                        prof.nickname, nb_count, cloud_target
+                    ))
+                    .size(12.0)
+                    .strong()
+                    .color(t.text),
+                )
+                .wrap(),
+            );
+            ui.add_space(3.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "Moving transfers all data into '{}', renames each notebook with ' - {}', and permanently deletes the local user '{}'.",
+                        cloud_target, prof.nickname, prof.nickname
+                    ))
+                    .size(11.0)
+                    .color(t.text_muted),
+                )
+                .wrap(),
+            );
+            ui.add_space(6.0);
+            if is_confirming {
+                if render_migration_typed_confirmation(app, ui, prof, cloud_target, t) {
+                    execute_profile = Some(prof.local_profile_id.clone());
+                }
+            } else if primary_action_button(
+                ui,
+                &format!("Move '{}' into '{}'...", prof.nickname, cloud_target),
+                true,
+                t,
+            )
+            .clicked()
+            {
+                app.view.account.pending_migration_profile_id = Some(prof.local_profile_id.clone());
+                app.view.account.migration_confirm_input.clear();
+                app.view.account.migration_confirm_scroll_pending = true;
+                app.view.account.error_message = None;
+            }
+        });
+    execute_profile
+}
+
+fn execute_local_account_migration(
+    app: &mut PaperCraftApp,
+    ctx: &egui::Context,
+    profile_id: &str,
+    cloud_target: &str,
+) {
+    match app.session.execute(
+        "sync.migrateLocalAccount",
+        &json!({ "profile_id": profile_id }),
+    ) {
+        Ok(val) => {
+            let src_nick = val["sourceNickname"]
+                .as_str()
+                .unwrap_or("Local account")
+                .to_string();
+            let moved = val["movedNotebooks"].as_u64().unwrap_or(0);
+            app.view.account.pending_migration_profile_id = None;
+            app.view.account.migration_confirm_input.clear();
+            app.view.account.migration_confirm_scroll_pending = false;
+            app.view.account.error_message = None;
+            app.view.account.status_message = Some(format!(
+                "Moved {moved} notebook(s) from '{src_nick}' into '{cloud_target}' and deleted local user '{src_nick}'."
+            ));
+            crate::sync_view_to_active_notebook(app);
+            crate::sync_worker::maybe_report_local_discovery(
+                app,
+                ctx,
+                ctx.input(|i| i.time * 1000.0),
+            );
+            trigger_manual_sync(app, ctx);
+        }
+        Err(err) => {
+            app.view.account.status_message = None;
+            app.view.account.error_message = Some(err.to_string());
+        }
+    }
+}
+
 pub(crate) fn render_detected_local_accounts_migration_card(
     app: &mut PaperCraftApp,
     ui: &mut egui::Ui,
     summary: &SyncStatusSummary,
     t: &Tokens,
 ) {
-    let profiles = app.session.local_profiles().to_vec();
-    let acct_name = summary
-        .display_name
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .or(summary.username.as_deref())
-        .unwrap_or("Cloud")
-        .to_string();
+    let profiles = app.session.accessible_local_profiles();
+    if let Some(ref pending_id) = app.view.account.pending_migration_profile_id
+        && !profiles.iter().any(|p| p.local_profile_id == *pending_id)
+    {
+        app.view.account.pending_migration_profile_id = None;
+        app.view.account.migration_confirm_input.clear();
+        app.view.account.migration_confirm_scroll_pending = false;
+    }
+    let cloud_target = migration_cloud_target_label(summary);
 
     ui.horizontal(|ui| {
         let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
@@ -2224,80 +2505,15 @@ pub(crate) fn render_detected_local_accounts_migration_card(
             .session
             .list_local_profile_notebooks(&prof.local_profile_id)
             .len();
-        ui.add_space(4.0);
-        egui::Frame::new()
-            .fill(t.toolbar_bg)
-            .stroke(Stroke::new(1.0, t.border))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(format!(
-                            "A local account '{}' was found ({} notebook(s)). Do you want to sync it with your '{}' account?",
-                            prof.nickname, nb_count, acct_name
-                        ))
-                        .size(12.0)
-                        .strong()
-                        .color(t.text),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(3.0);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(format!(
-                            "Confirming moves all data into your '{}' account, renames each notebook with ' - {}', and permanently deletes the old local account.",
-                            acct_name, prof.nickname
-                        ))
-                        .size(11.0)
-                        .color(t.text_muted),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(6.0);
-                if primary_action_button(
-                    ui,
-                    &format!("Sync '{}' into '{}'", prof.nickname, acct_name),
-                    true,
-                    t,
-                )
-                .clicked()
-                {
-                    migrate_target = Some(prof.local_profile_id);
-                }
-            });
+        if let Some(pid) =
+            render_local_account_migration_row(app, ui, &prof, nb_count, &cloud_target, t)
+        {
+            migrate_target = Some(pid);
+        }
     }
 
     if let Some(profile_id) = migrate_target {
-        match app.session.execute(
-            "sync.migrateLocalAccount",
-            &json!({ "profile_id": profile_id }),
-        ) {
-            Ok(val) => {
-                let src_nick = val["sourceNickname"]
-                    .as_str()
-                    .unwrap_or("Local account")
-                    .to_string();
-                let moved = val["movedNotebooks"].as_u64().unwrap_or(0);
-                app.view.account.error_message = None;
-                app.view.account.status_message = Some(format!(
-                    "Migrated {moved} notebook(s) from '{src_nick}' into '{acct_name}' and deleted the old local account."
-                ));
-                crate::sync_view_to_active_notebook(app);
-                crate::sync_worker::maybe_report_local_discovery(
-                    app,
-                    ui.ctx(),
-                    ui.ctx().input(|i| i.time * 1000.0),
-                );
-                trigger_manual_sync(app, ui.ctx());
-            }
-            Err(err) => {
-                app.view.account.status_message = None;
-                app.view.account.error_message = Some(err.to_string());
-            }
-        }
+        execute_local_account_migration(app, ui.ctx(), &profile_id, &cloud_target);
     }
 }
 
@@ -2307,7 +2523,7 @@ fn render_workspaces_and_transfer_card(
     summary: &SyncStatusSummary,
     t: &Tokens,
 ) {
-    let profile_count = app.session.local_profiles().len();
+    let profile_count = app.session.accessible_local_profiles().len();
     ui.horizontal(|ui| {
         let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
         paint_icon(ui.painter(), ir, Icon::Inbox, t.accent);
@@ -2399,7 +2615,7 @@ pub(crate) fn render_local_profiles_manager(
     ui: &mut egui::Ui,
     t: &Tokens,
 ) {
-    let profiles = app.session.local_profiles().to_vec();
+    let profiles = app.session.accessible_local_profiles();
     let active_local_id = app
         .session
         .active_local_profile()
@@ -2567,7 +2783,7 @@ pub(crate) fn render_signed_in_transfer_section(
     ui: &mut egui::Ui,
     t: &Tokens,
 ) {
-    let profiles = app.session.local_profiles().to_vec();
+    let profiles = app.session.accessible_local_profiles();
     let mut entries: Vec<(String, String, papercraft_engine::LocalNotebookEntry)> = Vec::new();
     for prof in &profiles {
         for nb in app
@@ -3664,7 +3880,7 @@ fn format_last_sync(last_ms: Option<i64>) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{AuthTab, ServerProbeState};
+    use super::{AuthTab, ServerProbeState, migration_confirmation_phrase};
     use crate::PaperCraftApp;
     use crate::modal;
     use egui::{Shape, epaint::ClippedShape};
@@ -4050,5 +4266,203 @@ mod tests {
             )
             .unwrap();
         assert_eq!(app.session.local_profiles().len(), 1);
+    }
+
+    #[test]
+    fn migration_requires_typed_english_confirmation_and_hides_other_accounts_local_profiles() {
+        fn find_text_center(shapes: &[ClippedShape], target: &str) -> Option<egui::Pos2> {
+            fn visit(shape: &Shape, target: &str) -> Option<egui::Pos2> {
+                match shape {
+                    Shape::Text(text) if text.galley.text() == target => {
+                        Some(text.visual_bounding_rect().center())
+                    }
+                    Shape::Vec(items) => items.iter().find_map(|s| visit(s, target)),
+                    _ => None,
+                }
+            }
+            shapes
+                .iter()
+                .find_map(|c| visit(&c.shape, target).filter(|p| c.clip_rect.contains(*p)))
+        }
+
+        fn click_pos(ctx: &egui::Context, app: &mut PaperCraftApp, pos: egui::Pos2, t0: &mut f64) {
+            for pressed in [true, false] {
+                *t0 += 0.05;
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 800.0),
+                    )),
+                    time: Some(*t0),
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(raw, |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    modal::show(app, ui);
+                });
+                out.drop_without_applying_deltas();
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = PaperCraftApp::default();
+        app.session.prefs.theme = papercraft_doc::UiTheme::Light;
+
+        // Create a local profile while signed into User A (bound to u-other) and an unlinked local
+        // profile 'Bruno' created offline before signing in.
+        app.session.switch_to_authenticated_library(
+            test_account("u-other", "other@example.com"),
+            AuthWorkspaceMode::SwitchOnly,
+        );
+        let other_local = app
+            .session
+            .create_local_profile("OtherPrivate", false)
+            .unwrap();
+        app.session.sign_out_to_local_library();
+        let bruno = app.session.create_local_profile("Bruno", true).unwrap();
+        app.session
+            .execute(
+                "notebook.create",
+                &serde_json::json!({ "title": "Physics" }),
+            )
+            .unwrap();
+
+        // Sign in as Alex -> must NEVER see OtherPrivate, only Bruno (plus unlinked Personal).
+        app.session.switch_to_authenticated_library(
+            test_account("u-alex", "alex@example.com"),
+            AuthWorkspaceMode::SwitchOnly,
+        );
+        modal::open(&mut app, modal::ActiveModal::AccountSync);
+        let mut t = 0.0_f64;
+        let mut shapes = Vec::new();
+        let mut text = String::new();
+        for _ in 0..4 {
+            t += 0.05;
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(t),
+                predicted_dt: 0.05,
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                crate::theme::apply_light_visuals(ui.ctx());
+                modal::show(&mut app, ui);
+            });
+            text = collect_text(&out.shapes);
+            shapes = out.shapes.clone();
+            out.drop_without_applying_deltas();
+        }
+        assert!(
+            !text.contains("OtherPrivate"),
+            "other cloud account's local profile leaked into UI:\n{text}"
+        );
+        assert!(text.contains("Bruno"));
+
+        // Clicking Move opens typed confirmation without immediately deleting Bruno.
+        let move_btn = find_text_center(&shapes, "Move 'Bruno' into 'alex@example.com'...")
+            .expect("Move button for Bruno");
+        click_pos(&ctx, &mut app, move_btn, &mut t);
+        assert_eq!(
+            app.view.account.pending_migration_profile_id.as_deref(),
+            Some(bruno.local_profile_id.as_str())
+        );
+        assert!(
+            app.session
+                .accessible_local_profiles()
+                .iter()
+                .any(|p| p.local_profile_id == bruno.local_profile_id),
+            "Bruno must not be deleted before typed confirmation"
+        );
+
+        // Wrong confirmation phrase keeps Confirm button disabled and does not migrate.
+        app.view.account.migration_confirm_input = "yes move Bruno".to_string();
+        let mut confirm_shapes = Vec::new();
+        for _ in 0..3 {
+            t += 0.05;
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(t),
+                predicted_dt: 0.05,
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                crate::theme::apply_light_visuals(ui.ctx());
+                modal::show(&mut app, ui);
+            });
+            confirm_shapes = out.shapes.clone();
+            out.drop_without_applying_deltas();
+        }
+        let confirm_btn = find_text_center(&confirm_shapes, "Confirm Move & Delete")
+            .expect("Confirm Move & Delete button");
+        click_pos(&ctx, &mut app, confirm_btn, &mut t);
+        assert!(
+            app.session
+                .accessible_local_profiles()
+                .iter()
+                .any(|p| p.local_profile_id == bruno.local_profile_id),
+            "mismatched phrase must not trigger migration"
+        );
+
+        // Typing the clear English confirmation sentence enables migration and deletes Bruno.
+        app.view.account.migration_confirm_input =
+            migration_confirmation_phrase("Bruno", "alex@example.com");
+        for _ in 0..2 {
+            t += 0.05;
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(t),
+                predicted_dt: 0.05,
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                crate::theme::apply_light_visuals(ui.ctx());
+                modal::show(&mut app, ui);
+            });
+            confirm_shapes = out.shapes.clone();
+            out.drop_without_applying_deltas();
+        }
+        let confirm_btn = find_text_center(&confirm_shapes, "Confirm Move & Delete")
+            .expect("enabled Confirm Move & Delete button");
+        click_pos(&ctx, &mut app, confirm_btn, &mut t);
+
+        assert!(
+            !app.session
+                .accessible_local_profiles()
+                .iter()
+                .any(|p| p.local_profile_id == bruno.local_profile_id),
+            "Bruno must be deleted after confirmed migration"
+        );
+        assert!(
+            app.session
+                .notebooks
+                .iter()
+                .any(|n| n.title == "Physics - Bruno"),
+            "Bruno's notebook must be moved into Alex's cloud library"
+        );
+        assert!(
+            app.session
+                .local_profiles()
+                .iter()
+                .any(|p| p.local_profile_id == other_local.local_profile_id),
+            "OtherPrivate belonging to u-other must remain completely untouched"
+        );
     }
 }

@@ -1119,6 +1119,7 @@ mod tests {
             nickname: "BrunoPrivateNickname".to_string(),
             created_at_ms: 1,
             last_used_at_ms: 1,
+            owner_cloud_user_id: None,
         }];
         save_global_state(&client_lib, &global).unwrap();
         let prof_dir = profile_library_dir(&client_lib, "loc-bruno");

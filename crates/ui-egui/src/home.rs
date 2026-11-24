@@ -485,13 +485,6 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
                         let _ = app.trigger_import_package_dialog();
                     }
 
-                    if icon_button(ui, Icon::AddPage, Some("Import PDF"), false, true, t)
-                        .on_hover_text("Import a PDF file as a new annotated notebook")
-                        .clicked()
-                    {
-                        app.trigger_import_pdf_dialog(crate::PdfImportTarget::NewNotebook);
-                    }
-
                     if icon_button(ui, Icon::Export, Some("Open .pcraft"), false, true, t)
                         .on_hover_text("Open a .pcraft notebook file from disk (Ctrl+O)")
                         .clicked()
@@ -841,11 +834,19 @@ fn scope_badge_text(app: &PaperCraftApp, info: &SectionHeaderInfo<'_>) -> String
 #[derive(Clone, Debug)]
 enum SectionHeaderButton {
     NewNotebook { tip: &'static str, can_create: bool },
+    ImportPdf { can_create: bool },
     Subfolder { path: String, can_nest: bool },
     RenameFolder(String),
     ColorFolder(String),
     ColorTag(String),
     DeleteFolder(String),
+}
+
+#[derive(Default)]
+struct SectionHeaderClicks {
+    actions: Vec<LibraryAction>,
+    open_new_notebook: bool,
+    import_pdf: bool,
 }
 
 fn section_header_buttons(
@@ -854,12 +855,14 @@ fn section_header_buttons(
 ) -> Vec<SectionHeaderButton> {
     let can_create = app.session.notebooks.len() < papercraft_engine::MAX_NOTEBOOKS;
     let new_notebook = |tip: &'static str| SectionHeaderButton::NewNotebook { tip, can_create };
+    let import_pdf = SectionHeaderButton::ImportPdf { can_create };
     match info.scope {
         LibraryScope::Folder(path) => {
             let can_nest =
                 folder_depth(path) < MAX_FOLDER_DEPTH && info.tree.len() < MAX_LIBRARY_FOLDERS;
             vec![
                 new_notebook("Create a new notebook inside this folder"),
+                import_pdf,
                 SectionHeaderButton::Subfolder {
                     path: path.clone(),
                     can_nest,
@@ -871,13 +874,15 @@ fn section_header_buttons(
         }
         LibraryScope::Tag(tag) => vec![
             new_notebook("Create a new notebook that already carries this tag"),
+            import_pdf,
             SectionHeaderButton::ColorTag(tag.clone()),
         ],
-        LibraryScope::Unfiled => vec![new_notebook("Create a new unfiled notebook")],
-        LibraryScope::All => vec![new_notebook("Create a new notebook")],
-        LibraryScope::Favorites => vec![new_notebook(
-            "Create a new notebook that is already marked as a favorite",
-        )],
+        LibraryScope::Unfiled => vec![new_notebook("Create a new unfiled notebook"), import_pdf],
+        LibraryScope::All => vec![new_notebook("Create a new notebook"), import_pdf],
+        LibraryScope::Favorites => vec![
+            new_notebook("Create a new notebook that is already marked as a favorite"),
+            import_pdf,
+        ],
         LibraryScope::Trash => Vec::new(),
     }
 }
@@ -886,8 +891,7 @@ fn draw_section_header_button(
     ui: &mut egui::Ui,
     button: &SectionHeaderButton,
     t: &Tokens,
-    actions: &mut Vec<LibraryAction>,
-    open_new_notebook: &mut bool,
+    clicks: &mut SectionHeaderClicks,
 ) {
     match button {
         SectionHeaderButton::NewNotebook { tip, can_create } => {
@@ -900,7 +904,20 @@ fn draw_section_header_button(
                 .on_hover_text(tip)
                 .clicked()
             {
-                *open_new_notebook = true;
+                clicks.open_new_notebook = true;
+            }
+        }
+        SectionHeaderButton::ImportPdf { can_create } => {
+            let tip = if *can_create {
+                "Import a PDF file as a new annotated notebook"
+            } else {
+                "Maximum number of notebooks reached"
+            };
+            if compact_icon_button(ui, Icon::AddPage, Some("Import PDF"), false, *can_create, t)
+                .on_hover_text(tip)
+                .clicked()
+            {
+                clicks.import_pdf = true;
             }
         }
         SectionHeaderButton::Subfolder { path, can_nest } => {
@@ -912,7 +929,7 @@ fn draw_section_header_button(
                 })
                 .clicked()
             {
-                actions.push(LibraryAction::NewFolder {
+                clicks.actions.push(LibraryAction::NewFolder {
                     parent: path.clone(),
                     move_notebook: None,
                 });
@@ -923,7 +940,9 @@ fn draw_section_header_button(
                 .on_hover_text("Rename or move this folder")
                 .clicked()
             {
-                actions.push(LibraryAction::RenameFolder(path.clone()));
+                clicks
+                    .actions
+                    .push(LibraryAction::RenameFolder(path.clone()));
             }
         }
         SectionHeaderButton::ColorFolder(path) => {
@@ -931,7 +950,9 @@ fn draw_section_header_button(
                 .on_hover_text("Choose a color for this folder")
                 .clicked()
             {
-                actions.push(LibraryAction::OpenFolderColor(path.clone()));
+                clicks
+                    .actions
+                    .push(LibraryAction::OpenFolderColor(path.clone()));
             }
         }
         SectionHeaderButton::ColorTag(tag) => {
@@ -939,7 +960,9 @@ fn draw_section_header_button(
                 .on_hover_text("Choose a color for this tag")
                 .clicked()
             {
-                actions.push(LibraryAction::OpenTagColor(tag.clone()));
+                clicks
+                    .actions
+                    .push(LibraryAction::OpenTagColor(tag.clone()));
             }
         }
         SectionHeaderButton::DeleteFolder(path) => {
@@ -947,7 +970,9 @@ fn draw_section_header_button(
                 .on_hover_text("Delete folder (notebooks inside stay safe)")
                 .clicked()
             {
-                actions.push(LibraryAction::DeleteFolder(path.clone()));
+                clicks
+                    .actions
+                    .push(LibraryAction::DeleteFolder(path.clone()));
             }
         }
     }
@@ -993,11 +1018,10 @@ fn draw_library_section_header(
     info: &SectionHeaderInfo<'_>,
     t: &Tokens,
 ) {
-    let mut actions = Vec::new();
-    let mut open_new_notebook = false;
+    let mut clicks = SectionHeaderClicks::default();
     let scope_color = match info.scope {
         LibraryScope::Folder(path) => {
-            draw_breadcrumb(ui, path, t, &mut actions);
+            draw_breadcrumb(ui, path, t, &mut clicks.actions);
             ui.add_space(4.0);
             app.session.prefs.folder_color(path)
         }
@@ -1007,7 +1031,8 @@ fn draw_library_section_header(
 
     let badge_text = scope_badge_text(app, info);
     let buttons = section_header_buttons(app, info);
-    let wide_row = ui.available_width() >= 620.0;
+    let min_wide_w = if buttons.len() > 3 { 740.0 } else { 620.0 };
+    let wide_row = ui.available_width() >= min_wide_w;
 
     if wide_row || buttons.is_empty() {
         ui.horizontal(|ui| {
@@ -1017,13 +1042,7 @@ fn draw_library_section_header(
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     for button in buttons.iter().rev() {
-                        draw_section_header_button(
-                            ui,
-                            button,
-                            t,
-                            &mut actions,
-                            &mut open_new_notebook,
-                        );
+                        draw_section_header_button(ui, button, t, &mut clicks);
                     }
                 });
             }
@@ -1035,7 +1054,7 @@ fn draw_library_section_header(
         ui.add_space(6.0);
         crate::theme::studio_wrapped_row(ui, Vec2::new(6.0, 4.0), 28.0, |ui| {
             for button in &buttons {
-                draw_section_header_button(ui, button, t, &mut actions, &mut open_new_notebook);
+                draw_section_header_button(ui, button, t, &mut clicks);
             }
         });
     }
@@ -1050,10 +1069,13 @@ fn draw_library_section_header(
         .wrap(),
     );
 
-    if open_new_notebook {
+    if clicks.open_new_notebook {
         modal::open(app, ActiveModal::NewNotebook);
     }
-    for action in actions {
+    if clicks.import_pdf {
+        app.trigger_import_pdf_dialog(crate::PdfImportTarget::NewNotebook);
+    }
+    for action in clicks.actions {
         apply_library_action(app, action);
     }
 }
@@ -3177,7 +3199,7 @@ mod tests {
             .find(|(txt, _)| txt == "Subfolder")
             .expect("expected Subfolder header button")
             .1;
-        for label in ["New Notebook", "Subfolder", "Rename"] {
+        for label in ["New Notebook", "Import PDF", "Subfolder", "Rename"] {
             let header_matches: Vec<Rect> = content_texts
                 .iter()
                 .filter(|(txt, r)| txt == label && !create_rect.contains(r.center()))
@@ -3262,9 +3284,14 @@ mod tests {
             !search_texts
                 .iter()
                 .any(|(_, r)| r.top() >= no_match_y + 24.0
-                    && ["Clear Search", "Show All Notebooks", "New Notebook"]
-                        .iter()
-                        .any(|b| search_texts.iter().any(|(t, tr)| t == b && *tr == *r))),
+                    && [
+                        "Clear Search",
+                        "Show All Notebooks",
+                        "New Notebook",
+                        "Import PDF"
+                    ]
+                    .iter()
+                    .any(|b| search_texts.iter().any(|(t, tr)| t == b && *tr == *r))),
             "empty search state should contain no buttons"
         );
         out.drop_without_applying_deltas();
@@ -3306,26 +3333,37 @@ mod tests {
     }
 
     #[test]
-    fn new_notebook_header_button_appears_in_every_scope_except_trash() {
-        fn header_new_notebook_pos(
+    fn new_notebook_and_import_pdf_header_buttons_appear_together_except_in_trash() {
+        fn header_button_rect(
             shapes: &[egui::epaint::ClippedShape],
             m: &HomeMetrics,
-        ) -> Option<Pos2> {
-            fn visit(shape: &egui::Shape, m: &HomeMetrics) -> Option<Pos2> {
+            label: &str,
+        ) -> Option<Rect> {
+            fn visit(shape: &egui::Shape, m: &HomeMetrics, label: &str) -> Option<Rect> {
                 match shape {
-                    egui::Shape::Text(text) if text.galley.text() == "New Notebook" => {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
                         let r = text.visual_bounding_rect();
                         let in_card = m.create_card_rect.is_some_and(|c| c.contains(r.center()));
-                        (!in_card && r.top() >= m.header_rect.bottom() - 1.0).then(|| r.center())
+                        (!in_card && r.top() >= m.header_rect.bottom() - 1.0).then_some(r)
                     }
-                    egui::Shape::Vec(items) => items.iter().find_map(|item| visit(item, m)),
+                    egui::Shape::Vec(items) => items.iter().find_map(|item| visit(item, m, label)),
                     _ => None,
                 }
             }
-            shapes.iter().find_map(|c| visit(&c.shape, m))
+            shapes.iter().find_map(|c| visit(&c.shape, m, label))
         }
 
-        let mut app = PaperCraftApp::default();
+        let pdf_pick_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pdf_pick_count_hook = std::sync::Arc::clone(&pdf_pick_count);
+        let hooks = crate::PlatformHooks {
+            pick_open_file: Some(Box::new(move |kind| {
+                assert_eq!(kind, crate::FileDialogKind::Pdf);
+                pdf_pick_count_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            })),
+            ..crate::PlatformHooks::default()
+        };
+        let mut app = PaperCraftApp::new(papercraft_engine::Session::default(), hooks);
         let ctx = egui::Context::default();
         let viewport = Vec2::new(1280.0, 800.0);
         let scopes = [
@@ -3337,7 +3375,8 @@ mod tests {
         ];
         for scope in scopes {
             crate::library_folders::set_scope(&mut app, scope.clone());
-            let mut pos = None;
+            let mut new_rect = None;
+            let mut import_rect = None;
             let mut time = ctx.input(|i| i.time);
             for _ in 0..3 {
                 time += 0.05;
@@ -3351,17 +3390,34 @@ mod tests {
                     crate::theme::apply_light_visuals(ui.ctx());
                     metrics = Some(show_inner(&mut app, ui));
                 });
-                pos = metrics
+                new_rect = metrics
                     .as_ref()
-                    .and_then(|m| header_new_notebook_pos(&out.shapes, m));
+                    .and_then(|m| header_button_rect(&out.shapes, m, "New Notebook"));
+                import_rect = metrics
+                    .as_ref()
+                    .and_then(|m| header_button_rect(&out.shapes, m, "Import PDF"));
                 out.drop_without_applying_deltas();
             }
 
             if scope == LibraryScope::Trash {
-                assert!(pos.is_none(), "Trash must not offer New Notebook");
+                assert!(new_rect.is_none(), "Trash must not offer New Notebook");
+                assert!(import_rect.is_none(), "Trash must not offer Import PDF");
                 continue;
             }
-            let pos = pos.unwrap_or_else(|| panic!("missing New Notebook button in {scope:?}"));
+            let new_r =
+                new_rect.unwrap_or_else(|| panic!("missing New Notebook button in {scope:?}"));
+            let import_r =
+                import_rect.unwrap_or_else(|| panic!("missing Import PDF button in {scope:?}"));
+            assert!(
+                import_r.left() > new_r.right(),
+                "expected Import PDF ({import_r:?}) directly to the right of New Notebook ({new_r:?}) in {scope:?}"
+            );
+            assert!(
+                (import_r.center().y - new_r.center().y).abs() <= 2.0,
+                "expected Import PDF ({import_r:?}) aligned with New Notebook ({new_r:?}) in {scope:?}"
+            );
+
+            let pos = new_r.center();
             for (pressed, dt) in [(true, 0.05), (false, 0.10)] {
                 let raw = egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, viewport)),
@@ -3394,6 +3450,7 @@ mod tests {
             };
             assert_eq!(app.view.new_notebook_tags, expected_tags);
             modal::close(&mut app);
+            time += 0.10;
             for _ in 0..8 {
                 time += 0.1;
                 let out = ctx.run_ui(
@@ -3409,6 +3466,39 @@ mod tests {
                 );
                 out.drop_without_applying_deltas();
             }
+
+            let before_picks = pdf_pick_count.load(std::sync::atomic::Ordering::Relaxed);
+            let import_pos = import_r.center();
+            for (pressed, dt) in [(true, 0.05), (false, 0.10)] {
+                let raw = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, viewport)),
+                    time: Some(time + dt),
+                    events: vec![
+                        egui::Event::PointerMoved(import_pos),
+                        egui::Event::PointerButton {
+                            pos: import_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(raw, |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    let _ = show_inner(&mut app, ui);
+                });
+                out.drop_without_applying_deltas();
+            }
+            assert_eq!(
+                pdf_pick_count.load(std::sync::atomic::Ordering::Relaxed),
+                before_picks + 1,
+                "clicking Import PDF in {scope:?} should open the PDF file picker"
+            );
+            assert_eq!(
+                app.view.pdf_import_target,
+                crate::PdfImportTarget::NewNotebook
+            );
         }
     }
 
@@ -3548,8 +3638,8 @@ mod tests {
         assert!(
             !header_texts
                 .iter()
-                .any(|(label, _)| label == "New Notebook"),
-            "home header must not contain 'New Notebook' button, got {header_texts:?}"
+                .any(|(label, _)| label == "New Notebook" || label == "Import PDF"),
+            "home header must not contain 'New Notebook' or 'Import PDF' buttons, got {header_texts:?}"
         );
         assert!(
             !header_texts.iter().any(|(label, _)| label == "Theme"),

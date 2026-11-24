@@ -14,7 +14,7 @@ PaperCraft is a cross-platform note-taking and handwriting application written i
 - **L1 Document**: `papercraft-doc` (pure serializable data; large point buffers `Arc`-shared)
 - **L2 Operations, Paint & Sync Protocol**: `papercraft-ops`, `papercraft-paint`, `papercraft-sync-protocol`
 - **L3 Compositor & Format**: `papercraft-compose` (CPU oracle), `papercraft-format` (`.pcraft` JSON/binary format)
-- **L4 Sync Client**: `papercraft-sync`
+- **L4 Sync Client & Updater**: `papercraft-sync`, `papercraft-updater`
 - **L5 Engine**: `papercraft-engine` (headless `Session` + command registry; every action is a command)
 - **L6 UI Shell**: `papercraft-ui-egui` (thin `egui`/`eframe` shell; no UI crates permitted below L6)
 - **Apps**: `papercraft` (desktop), `papercraft-server` (system-tray sync server control app), `papercraft-server-cli` (self-hosted CLI sync server), `papercraft-web` (WebAssembly), `papercraft-cli` (headless CLI), `xtask`
@@ -27,6 +27,7 @@ PaperCraft is a cross-platform note-taking and handwriting application written i
 - **Build web release bundle (`dist/`)**: `cargo xtask web-build` (or `cd apps/papercraft-web && trunk build --release`)
 - **Run sync server**: `cargo run -p papercraft-server-cli -- serve --bind 127.0.0.1:8787`
 - **Run CLI**: `cargo run -p papercraft-cli -- commands`
+- **Local auto-update test server**: `cargo xtask update-dev-server --version 0.2.0` (serves local binaries and `latest.json` on `http://127.0.0.1:8799/latest.json` for safe testing via `PAPERCRAFT_UPDATE_MANIFEST_URL` and `PAPERCRAFT_UPDATE_CURRENT_VERSION`)
 - **Verify layers & CI**: `cargo xtask layers` / `cargo xtask ci`
 
 ## Golden Rules
@@ -46,3 +47,17 @@ PaperCraft is a cross-platform note-taking and handwriting application written i
 5. **Plain-English Inline Explanations**: Every setting card, preset, and control must include an inline, non-jargon subtitle explaining *what it adjusts* and *how it changes the feel of writing*.
 6. **Clean Light & Dark Studio Themes**: Follow `crates/ui-egui/src/theme.rs` tokens (`UiTheme`, `Tokens::light()`, `Tokens::dark()`, `Tokens::for_theme`, `canvas_bg`, `toolbar_bg`, `panel_bg`, `field_bg`, `border`, `accent`, `accent_hover`, `accent_soft`, `text`, `text_muted`, `danger_fg`/`danger_border`/`danger_bg`) with rounded card containers (`section_card_header`, `card_frame`), generous spacing, and user-selectable Light/Dark switching via `theme.set` persisted in `studio_prefs.json`.
 7. **Minimalist Canvas Controls & Percentage-Only Per-Pen Smoothing**: In the floating pen context tray, expose only quick 1-click thickness dots/slider and a compact per-pen smoothing pill (`Off` or `%` opening an `Off / Low / Med / High` + `0%–100%` slider popover backed by the arithmetic circular buffer up to window `20`, default `50%` = `10`) persisted independently per pen in `UserStudioConfig` (`studio_prefs.json` / Web `localStorage` / Sync), with NO preset dropdown, NO style selector, NO smoothing controls in the Settings sidebar, and NO raw algorithm parameter or buffer-size controls.
+
+## Release & Auto-Update Protocol
+
+1. **Always interview the user before releasing**: Whenever the user asks to release, publish, deploy, or bump a version—or before pushing `main` or creating/pushing any `v*` tag—ALWAYS ask the user first how they want to proceed, covering:
+   - **Release channel**:
+     - `dev` only (save work in progress; no Web deploy, no GitHub Release, and no Desktop/Server auto-update);
+     - `main` only without a tag (triggers `.github/workflows/pages.yml` to update the Web app at `web.papercraft.ink`, without triggering Desktop/Server auto-update);
+     - **Pre-release tag** (`vX.Y.Z-rc.1` or any `v*` tag containing `-`): triggers `.github/workflows/release.yml` to build real binaries marked as a GitHub **Pre-release**, without changing `/releases/latest/download/latest.json` or notifying stable users;
+     - **Public production release** (stable `vX.Y.Z` tag): fast-forwards `main` from `dev`, pushes `main`, and pushes tag `vX.Y.Z`, triggering `.github/workflows/release.yml` to publish binaries, `SHA256SUMS.txt`, and `latest.json` (automatically notifies installed Desktop and Server users).
+   - **Target version number** (patch, minor, or pre-release suffix).
+   - **Execution preference**: whether the agent should run the git commit/merge/tag/push commands or only prepare and verify the files locally.
+2. **Never push `main` or tags without explicit confirmation**: Never push to `main` or create/push a `v*` tag unless the user has explicitly selected that channel and confirmed.
+3. **Keep version strings in sync with the tag**: Before creating any `vX.Y.Z` (or `vX.Y.Z-rc.N`) tag, update `[workspace.package] version` in `Cargo.toml` to match the tag version (preventing an infinite update loop where the newly downloaded binary still reports the old version), refresh `Cargo.lock`, update the macOS fallback `APP_VER` in `.github/workflows/release.yml`, and (for stable releases) update the version references in `README.md`. Never modify external dependency versions such as `winres = "0.1.12"`.
+4. **Pre-release verification**: Before pushing `main` or any release tag, run `cargo xtask ci`, `cargo check --target wasm32-unknown-unknown -p papercraft-web --all-targets`, and `cargo clippy --target wasm32-unknown-unknown -p papercraft-web --all-targets --no-deps -- -D warnings`.

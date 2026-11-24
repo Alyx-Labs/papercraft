@@ -348,6 +348,17 @@ impl Session {
         &self.sync.global.local_profiles
     }
 
+    /// Returns local profiles accessible to the active workspace session (unlinked or owned by the
+    /// currently signed-in cloud user). Profiles linked to a different cloud account are excluded.
+    pub fn accessible_local_profiles(&self) -> Vec<LocalProfile> {
+        self.sync
+            .global
+            .accessible_local_profiles()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
     pub fn active_local_profile(&self) -> Option<&LocalProfile> {
         self.sync.global.active_local_profile()
     }
@@ -399,11 +410,9 @@ impl Session {
                 total_local_notebooks: 0,
             };
         }
-        let unsynced_local_accounts = self.sync.global.local_profiles.len();
-        let total_local_notebooks = self
-            .sync
-            .global
-            .local_profiles
+        let accessible = self.sync.global.accessible_local_profiles();
+        let unsynced_local_accounts = accessible.len();
+        let total_local_notebooks = accessible
             .iter()
             .map(|p| self.count_local_profile_notebooks(&p.local_profile_id))
             .sum();
@@ -596,6 +605,9 @@ impl Session {
     }
 
     /// Creates a new isolated local profile on this device.
+    ///
+    /// When created while signed in to a cloud account, the local profile stays linked to that
+    /// account (`owner_cloud_user_id`) so other cloud accounts on the same device never see it.
     pub fn create_local_profile(
         &mut self,
         nickname_raw: &str,
@@ -608,6 +620,7 @@ impl Session {
             nickname,
             created_at_ms: now,
             last_used_at_ms: now,
+            owner_cloud_user_id: self.sync.global.active_cloud_user_id().map(str::to_string),
         };
         self.sync.global.local_profiles.push(profile.clone());
         self.sync_persist_global_state();
@@ -623,13 +636,10 @@ impl Session {
         profile_id: &str,
         nickname_raw: &str,
     ) -> Result<(), String> {
-        let Some(prof) = self
-            .sync
-            .global
-            .local_profiles
-            .iter_mut()
-            .find(|p| p.local_profile_id == profile_id)
-        else {
+        let uid = self.sync.global.active_cloud_user_id().map(str::to_string);
+        let Some(prof) = self.sync.global.local_profiles.iter_mut().find(|p| {
+            p.local_profile_id == profile_id && p.is_accessible_to_cloud_user(uid.as_deref())
+        }) else {
             return Err("local profile not found".to_string());
         };
         prof.nickname = sanitize_profile_nickname(nickname_raw);
@@ -638,27 +648,30 @@ impl Session {
         Ok(())
     }
 
-    /// Deletes a local profile when more than one exists on this device.
+    /// Deletes a local profile when more than one accessible local profile exists on this device.
     pub fn delete_local_profile(&mut self, profile_id: &str) -> Result<(), String> {
-        if self.sync.global.local_profiles.len() <= 1 {
+        if self.sync.global.accessible_local_profiles().len() <= 1 {
             return Err("at least one local profile must stay on this device".to_string());
         }
-        let Some(pos) = self
-            .sync
-            .global
-            .local_profiles
-            .iter()
-            .position(|p| p.local_profile_id == profile_id)
+        let uid = self.sync.global.active_cloud_user_id();
+        let Some(pos) =
+            self.sync.global.local_profiles.iter().position(|p| {
+                p.local_profile_id == profile_id && p.is_accessible_to_cloud_user(uid)
+            })
         else {
             return Err("local profile not found".to_string());
         };
         let was_active_local =
             !self.is_viewing_cloud() && self.sync.global.active_local_profile_id == profile_id;
         self.sync.global.local_profiles.remove(pos);
-        if self.sync.global.active_local_profile_id == profile_id
-            && let Some(first) = self.sync.global.local_profiles.first()
-        {
-            self.sync.global.active_local_profile_id = first.local_profile_id.clone();
+        if self.sync.global.active_local_profile_id == profile_id {
+            self.sync.global.active_local_profile_id = self
+                .sync
+                .global
+                .accessible_local_profiles()
+                .first()
+                .map(|p| p.local_profile_id.clone())
+                .unwrap_or_default();
         }
         self.sync.web_local_bundles.remove(profile_id);
         if let Some(ref root) = self.sync.desktop_root {
@@ -669,7 +682,7 @@ impl Session {
         }
         self.sync_persist_global_state();
         if was_active_local {
-            let fallback_id = self.sync.global.active_local_profile_id.clone();
+            let fallback_id = ensure_default_profile_in_global(&mut self.sync.global);
             self.load_local_profile_workspace(&fallback_id);
         } else {
             self.bump_revision();
@@ -679,12 +692,13 @@ impl Session {
 
     /// Switches the active view to a local profile while keeping any connected cloud session intact.
     pub fn switch_to_local_profile(&mut self, profile_id: &str) -> Result<(), String> {
+        let uid = self.sync.global.active_cloud_user_id();
         if !self
             .sync
             .global
             .local_profiles
             .iter()
-            .any(|p| p.local_profile_id == profile_id)
+            .any(|p| p.local_profile_id == profile_id && p.is_accessible_to_cloud_user(uid))
         {
             return Err("local profile not found".to_string());
         }
@@ -730,7 +744,7 @@ impl Session {
             AuthWorkspaceMode::SwitchOnly => None,
             AuthWorkspaceMode::PromoteLocalProfile { source_profile_id }
             | AuthWorkspaceMode::MergeLocalProfile { source_profile_id } => {
-                self.take_local_profile_payload(source_profile_id)
+                self.take_local_profile_payload(source_profile_id, &auth.user.user_id)
             }
         };
 
@@ -803,11 +817,11 @@ impl Session {
         self.bump_revision();
     }
 
-    /// Flushes account data safely and signs out back into the active local profile.
+    /// Flushes account data safely and signs out back into an accessible local profile.
     pub fn sign_out_to_local_library(&mut self) {
         self.flush_active_workspace_to_storage();
         self.sync.global.session = None;
-        if self.sync.global.local_profiles.is_empty() {
+        if self.sync.global.accessible_local_profiles().is_empty() {
             self.sync.global.needs_initial_nickname = true;
         }
         let target_id = ensure_default_profile_in_global(&mut self.sync.global);
@@ -841,6 +855,9 @@ impl Session {
         else {
             return Err("Local account not found on this device.".to_string());
         };
+        if !profile.is_accessible_to_cloud_user(Some(&acct.user.user_id)) {
+            return Err("This local account belongs to a different cloud account.".to_string());
+        }
 
         self.flush_active_workspace_to_storage();
         let captured = self.read_local_profile_payload(source_profile_id);
@@ -958,8 +975,18 @@ impl Session {
         0
     }
 
-    /// Lists notebooks inside a local profile on this device (for manual Cloud import/transfer).
+    /// Lists notebooks inside an accessible local profile on this device (for manual Cloud import/transfer).
     pub fn list_local_profile_notebooks(&self, profile_id: &str) -> Vec<LocalNotebookEntry> {
+        let uid = self.sync.global.active_cloud_user_id();
+        if !self
+            .sync
+            .global
+            .local_profiles
+            .iter()
+            .any(|p| p.local_profile_id == profile_id && p.is_accessible_to_cloud_user(uid))
+        {
+            return Vec::new();
+        }
         if !self.is_viewing_cloud()
             && self
                 .active_local_profile()
@@ -1045,6 +1072,18 @@ impl Session {
         let Some(acct) = self.sync.global.session.clone() else {
             return Err("sign in to a cloud account first".to_string());
         };
+        let Some(profile) = self
+            .sync
+            .global
+            .local_profiles
+            .iter()
+            .find(|p| p.local_profile_id == source_profile_id)
+        else {
+            return Err("local profile not found".to_string());
+        };
+        if !profile.is_accessible_to_cloud_user(Some(&acct.user.user_id)) {
+            return Err("this local profile belongs to a different cloud account".to_string());
+        }
         self.flush_active_workspace_to_storage();
         let viewing_cloud = self.is_viewing_cloud();
         let viewing_source = !viewing_cloud
@@ -1204,14 +1243,13 @@ impl Session {
     fn take_local_profile_payload(
         &mut self,
         source_profile_id: &str,
+        target_cloud_user_id: &str,
     ) -> Option<CapturedProfileData> {
-        let exists = self
-            .sync
-            .global
-            .local_profiles
-            .iter()
-            .any(|p| p.local_profile_id == source_profile_id);
-        if !exists {
+        let accessible = self.sync.global.local_profiles.iter().any(|p| {
+            p.local_profile_id == source_profile_id
+                && p.is_accessible_to_cloud_user(Some(target_cloud_user_id))
+        });
+        if !accessible {
             return None;
         }
         let payload = self.read_local_profile_payload(source_profile_id);
@@ -2574,11 +2612,13 @@ fn ensure_default_profile_in_global(global: &mut GlobalSyncState) -> String {
     }
     let now = now_unix_ms();
     let id = Uuid::new_v4().to_string();
+    let owner_cloud_user_id = global.active_cloud_user_id().map(str::to_string);
     global.local_profiles.push(LocalProfile {
         local_profile_id: id.clone(),
         nickname: "Personal".to_string(),
         created_at_ms: now,
         last_used_at_ms: now,
+        owner_cloud_user_id,
     });
     global.active_local_profile_id = id.clone();
     id
@@ -2629,6 +2669,7 @@ fn recover_existing_desktop_profiles(root_dir: &Path, global: &mut GlobalSyncSta
             },
             created_at_ms: now,
             last_used_at_ms: now,
+            owner_cloud_user_id: None,
         })
         .collect();
     if let Some(first) = global.local_profiles.first() {
@@ -2639,12 +2680,12 @@ fn recover_existing_desktop_profiles(root_dir: &Path, global: &mut GlobalSyncSta
 }
 
 fn ensure_desktop_default_profile(root_dir: &Path, global: &mut GlobalSyncState) -> bool {
-    if !global.local_profiles.is_empty() {
+    if !global.accessible_local_profiles().is_empty() {
         let before = global.active_local_profile_id.clone();
         let resolved = ensure_default_profile_in_global(global);
         return resolved != before;
     }
-    if recover_existing_desktop_profiles(root_dir, global) {
+    if global.local_profiles.is_empty() && recover_existing_desktop_profiles(root_dir, global) {
         return true;
     }
     let pid = ensure_default_profile_in_global(global);
@@ -3780,6 +3821,100 @@ mod tests {
         assert_eq!(
             target.pen_smoothings[papercraft_doc::PenKind::FountainPen.index()].strength_percent(),
             75
+        );
+    }
+
+    #[test]
+    fn cloud_bound_local_profile_is_isolated_from_other_accounts_and_signed_out_sessions() {
+        let dir = temp_dir("cloud_bound_local_isolation");
+        let mut session = Session::open_desktop_library(dir.0.clone());
+        session
+            .execute(
+                "profile.completeFirstAccess",
+                &json!({ "nickname": "SharedOffline" }),
+            )
+            .unwrap();
+        let shared_id = session
+            .active_local_profile()
+            .unwrap()
+            .local_profile_id
+            .clone();
+
+        // User A signs in and creates a local profile inside Account A -> linked to user-a.
+        let acct_a = fake_account("user-a", "alyx@example.com", "alyx");
+        session.switch_to_authenticated_library(acct_a, AuthWorkspaceMode::SwitchOnly);
+        let a_local = session.create_local_profile("AlyxOffline", true).unwrap();
+        assert_eq!(a_local.owner_cloud_user_id.as_deref(), Some("user-a"));
+        session
+            .execute("notebook.create", &json!({ "title": "Alyx Private Local" }))
+            .unwrap();
+        let a_nb_id = session.doc.id.clone();
+
+        assert!(
+            session
+                .accessible_local_profiles()
+                .iter()
+                .any(|p| p.local_profile_id == a_local.local_profile_id)
+        );
+
+        // User A signs out -> signed-out session only sees unlinked local profiles, never AlyxOffline.
+        session.sign_out_to_local_library();
+        assert!(
+            !session
+                .accessible_local_profiles()
+                .iter()
+                .any(|p| p.local_profile_id == a_local.local_profile_id)
+        );
+        assert_eq!(
+            session.active_local_profile().unwrap().local_profile_id,
+            shared_id
+        );
+
+        // User B signs in -> only sees unlinked profiles; User A's linked profile is completely hidden & blocked.
+        let acct_b = fake_account("user-b", "bob@example.com", "bob");
+        session.switch_to_authenticated_library(acct_b, AuthWorkspaceMode::SwitchOnly);
+        assert!(
+            !session
+                .accessible_local_profiles()
+                .iter()
+                .any(|p| p.local_profile_id == a_local.local_profile_id)
+        );
+        assert!(
+            session
+                .list_local_profile_notebooks(&a_local.local_profile_id)
+                .is_empty()
+        );
+        assert!(
+            session
+                .migrate_local_account_to_cloud(&a_local.local_profile_id)
+                .is_err()
+        );
+        assert!(
+            session
+                .transfer_local_notebook_to_cloud(&a_local.local_profile_id, &a_nb_id, true)
+                .is_err()
+        );
+        assert!(
+            session
+                .switch_to_local_profile(&a_local.local_profile_id)
+                .is_err()
+        );
+        assert_eq!(session.local_discovery_report().unsynced_local_accounts, 1);
+
+        // User A signs back in -> AlyxOffline is accessible again with its notebook intact.
+        let acct_a2 = fake_account("user-a", "alyx@example.com", "alyx");
+        session.switch_to_authenticated_library(acct_a2, AuthWorkspaceMode::SwitchOnly);
+        assert!(
+            session
+                .accessible_local_profiles()
+                .iter()
+                .any(|p| p.local_profile_id == a_local.local_profile_id)
+        );
+        assert!(
+            session
+                .list_local_profile_notebooks(&a_local.local_profile_id)
+                .iter()
+                .any(|n| n.notebook_id == a_nb_id)
         );
     }
 }

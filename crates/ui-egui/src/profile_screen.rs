@@ -26,7 +26,6 @@ const HEADER_ROW_HEIGHT: f32 = 28.0;
 const MAX_CONTENT_WIDTH: f32 = 940.0;
 const RAIL_WIDTH: f32 = 228.0;
 const COMPACT_BREAKPOINT: f32 = 760.0;
-const GITHUB_REPO_URL: &str = "https://github.com/alyxhard/papercraft";
 
 /// Renders the dedicated Profile & Cloud Sync screen.
 pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
@@ -591,7 +590,7 @@ fn draw_active_section_content(
                 draw_section_card(ui, t, |ui| {
                     render_signed_in_account_card(app, ui, summary, cloud_pending, t);
                 });
-                if !app.session.local_profiles().is_empty() {
+                if !app.session.accessible_local_profiles().is_empty() {
                     ui.add_space(10.0);
                     draw_section_card(ui, t, |ui| {
                         render_detected_local_accounts_migration_card(app, ui, summary, t);
@@ -767,7 +766,7 @@ fn draw_self_hosted_download_disclaimer(app: &mut PaperCraftApp, ui: &mut egui::
     }
 
     if open_github {
-        let _ = crate::open_external_url(app, ui.ctx(), GITHUB_REPO_URL);
+        let _ = crate::open_external_url(app, ui.ctx(), crate::GITHUB_REPO_URL);
     }
 }
 
@@ -835,6 +834,13 @@ fn draw_signed_in_workspaces_section(
         ui.add_space(10.0);
         render_local_profiles_manager(app, ui, t);
     });
+
+    if !app.session.accessible_local_profiles().is_empty() {
+        ui.add_space(10.0);
+        draw_section_card(ui, t, |ui| {
+            render_detected_local_accounts_migration_card(app, ui, summary, t);
+        });
+    }
 
     ui.add_space(10.0);
     draw_section_card(ui, t, |ui| {

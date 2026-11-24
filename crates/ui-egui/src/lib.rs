@@ -48,6 +48,9 @@ use papercraft_engine::Session;
 use papercraft_paint::RibbonMesh;
 use serde_json::json;
 
+/// Public source repository URL displayed in Home and Profile links.
+pub(crate) const GITHUB_REPO_URL: &str = "https://github.com/alyxhard/papercraft";
+
 /// Top-level workspace screen mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AppScreen {
@@ -1605,7 +1608,7 @@ impl PaperCraftApp {
             trashed_count: self.session.trashed_notebooks.len(),
             signed_in: self.session.is_signed_in(),
             viewing_cloud: self.session.is_viewing_cloud(),
-            local_profile_count: self.session.local_profiles().len(),
+            local_profile_count: self.session.accessible_local_profiles().len(),
             last_sync_at_ms: self.session.sync_status_summary().last_sync_at_ms,
             active_notebook: self.session.active_notebook,
         };

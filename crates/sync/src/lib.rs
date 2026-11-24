@@ -147,12 +147,21 @@ mod tests {
                 nickname: "BrunoSecret".to_string(),
                 created_at_ms: 1,
                 last_used_at_ms: 1,
+                owner_cloud_user_id: None,
             },
             LocalProfile {
                 local_profile_id: "p2".to_string(),
                 nickname: "SecondSecret".to_string(),
                 created_at_ms: 2,
                 last_used_at_ms: 2,
+                owner_cloud_user_id: None,
+            },
+            LocalProfile {
+                local_profile_id: "p3-other".to_string(),
+                nickname: "OtherCloudLocal".to_string(),
+                created_at_ms: 3,
+                last_used_at_ms: 3,
+                owner_cloud_user_id: Some("other-cloud-user".to_string()),
             },
         ];
         save_global_state(&dir.0, &global).unwrap();
@@ -167,6 +176,10 @@ mod tests {
         let p2_dir = profile_library_dir(&dir.0, "p2");
         std::fs::create_dir_all(&p2_dir).unwrap();
         std::fs::write(p2_dir.join("c.pcraft"), b"dummy").unwrap();
+
+        let p3_dir = profile_library_dir(&dir.0, "p3-other");
+        std::fs::create_dir_all(&p3_dir).unwrap();
+        std::fs::write(p3_dir.join("d.pcraft"), b"dummy").unwrap();
 
         let (cid, summary) = inspect_local_accounts_in_library(&dir.0).unwrap();
         assert_eq!(cid, "client-a");
