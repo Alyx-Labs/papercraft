@@ -26,7 +26,8 @@ use uuid::Uuid;
 
 use crate::library::{
     LIBRARY_MARKER_FILE, LibraryInitMode, STUDIO_PREFS_FILE, TrashedNotebook,
-    count_ncraft_files_in_dir, starter_documents, write_document_snapshot,
+    count_ncraft_files_in_dir, seed_starter_library_prefs, starter_documents,
+    write_document_snapshot,
 };
 use crate::{MAX_NOTEBOOKS, Session};
 
@@ -206,6 +207,7 @@ impl Session {
 
         let mut session = Self::default();
         session.replace_notebooks_for_library(starter_documents(), None);
+        seed_starter_library_prefs(&mut session.prefs);
         session.sync.global = GlobalSyncState::with_defaults("Web Browser".to_string());
         session.sync.global.needs_initial_nickname = true;
         let pid = ensure_default_profile_in_global(&mut session.sync.global);
@@ -2783,8 +2785,11 @@ fn starter_web_bundle() -> CachedLibraryBundle {
             d
         })
         .collect();
+    let mut prefs = UserStudioConfig::default();
+    seed_starter_library_prefs(&mut prefs);
     CachedLibraryBundle {
         notebooks,
+        prefs,
         ..Default::default()
     }
 }

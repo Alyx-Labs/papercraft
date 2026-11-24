@@ -5,7 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use papercraft_doc::{Document, NotebookPreset, UserStudioConfig, sanitize_notebook_title};
+use papercraft_color::Color;
+use papercraft_doc::{
+    Document, NotebookCover, NotebookPreset, UserStudioConfig, sanitize_library_folder_colors,
+    sanitize_library_folders, sanitize_library_tag_colors, sanitize_notebook_tags,
+    sanitize_notebook_title,
+};
 use papercraft_format::{load_document_bytes, save_document_bytes};
 use uuid::Uuid;
 
@@ -155,36 +160,144 @@ fn library_dir_for_exe(exe_path: &Path) -> Option<PathBuf> {
     Some(exe_dir.join("library"))
 }
 
-const STARTER_DAILY_NOTEBOOK_BYTES: &[u8] =
-    include_bytes!("../assets/starter_daily_notebook.pcraft");
+struct StarterNotebookSpec {
+    title: &'static str,
+    preset: NotebookPreset,
+    cover: NotebookCover,
+    folder_path: &'static str,
+    favorite: bool,
+    tags: &'static [&'static str],
+}
+
+const STARTER_FOLDERS: &[(&str, &str)] = &[
+    ("Computer Science", "#2563EB"),
+    ("Computer Science/Algorithms", "#7C3AED"),
+    ("Mathematics", "#0D9488"),
+    ("Mathematics/Calculus", "#16A34A"),
+    ("Natural Sciences", "#D97706"),
+    ("Humanities", "#DB2777"),
+];
+
+const STARTER_TAG_COLORS: &[(&str, &str)] = &[
+    ("exam", "#DC2626"),
+    ("lecture", "#2563EB"),
+    ("homework", "#EA580C"),
+    ("lab", "#16A34A"),
+    ("core", "#7C3AED"),
+    ("math", "#0D9488"),
+    ("reading", "#D97706"),
+    ("review", "#DB2777"),
+];
+
+const STARTER_NOTEBOOK_SPECS: &[StarterNotebookSpec] = &[
+    StarterNotebookSpec {
+        title: "Data Structures & Algorithms",
+        preset: NotebookPreset::EngineeringGrid,
+        cover: NotebookCover::ClassicNavy,
+        folder_path: "Computer Science/Algorithms",
+        favorite: true,
+        tags: &["exam", "core"],
+    },
+    StarterNotebookSpec {
+        title: "Linear Algebra",
+        preset: NotebookPreset::EngineeringGrid,
+        cover: NotebookCover::SlateGraphite,
+        folder_path: "Mathematics",
+        favorite: false,
+        tags: &["exam", "homework"],
+    },
+    StarterNotebookSpec {
+        title: "Differential Calculus",
+        preset: NotebookPreset::LectureCornell,
+        cover: NotebookCover::PlumStudio,
+        folder_path: "Mathematics/Calculus",
+        favorite: true,
+        tags: &["lecture", "math"],
+    },
+    StarterNotebookSpec {
+        title: "Organic Chemistry",
+        preset: NotebookPreset::BulletDotted,
+        cover: NotebookCover::SageGreen,
+        folder_path: "Natural Sciences",
+        favorite: false,
+        tags: &["lab", "review"],
+    },
+    StarterNotebookSpec {
+        title: "Modern World History",
+        preset: NotebookPreset::EverydayLined,
+        cover: NotebookCover::Terracotta,
+        folder_path: "Humanities",
+        favorite: false,
+        tags: &["lecture", "reading"],
+    },
+    StarterNotebookSpec {
+        title: "Physics Mechanics",
+        preset: NotebookPreset::SketchBlank,
+        cover: NotebookCover::WarmSand,
+        folder_path: "",
+        favorite: false,
+        tags: &["homework", "lab"],
+    },
+];
 
 pub(crate) fn starter_documents() -> Vec<Document> {
     let now = unix_now_ms();
-    let mut daily = load_document_bytes(STARTER_DAILY_NOTEBOOK_BYTES)
-        .unwrap_or_else(|_| NotebookPreset::EverydayLined.create_document());
-    daily.paper_color = papercraft_doc::PaperColor::PureWhite;
-    daily.sync_active_to_pages();
-    for page in &mut daily.pages {
-        page.paper_color = papercraft_doc::PaperColor::PureWhite;
-    }
-    daily.load_active_from_pages();
+    STARTER_NOTEBOOK_SPECS
+        .iter()
+        .map(|spec| {
+            let mut doc = spec.preset.create_document();
+            doc.id = Uuid::new_v4().to_string();
+            doc.title = spec.title.to_string();
+            doc.cover = spec.cover;
+            doc.folder_path = spec.folder_path.to_string();
+            doc.favorite = spec.favorite;
+            doc.tags = sanitize_notebook_tags(
+                &spec
+                    .tags
+                    .iter()
+                    .map(|tag| (*tag).to_string())
+                    .collect::<Vec<_>>(),
+            );
+            doc.paper_color = papercraft_doc::PaperColor::PureWhite;
+            doc.created_at_ms = now;
+            doc.updated_at_ms = now;
+            doc.meta_updated_at_ms = now;
+            doc.sync_active_to_pages();
+            for page in &mut doc.pages {
+                page.paper_color = papercraft_doc::PaperColor::PureWhite;
+            }
+            doc.load_active_from_pages();
+            doc
+        })
+        .collect()
+}
 
-    let mut docs = vec![daily];
-    let presets = [
-        NotebookPreset::LectureCornell,
-        NotebookPreset::EngineeringGrid,
-        NotebookPreset::SketchBlank,
-    ];
-    for preset in presets {
-        docs.push(preset.create_document());
+pub(crate) fn seed_starter_library_prefs(prefs: &mut UserStudioConfig) {
+    let mut folders = prefs.library_folders.clone();
+    for (folder_path, _) in STARTER_FOLDERS {
+        folders.push((*folder_path).to_string());
     }
-    for doc in &mut docs {
-        doc.id = Uuid::new_v4().to_string();
-        doc.created_at_ms = now;
-        doc.updated_at_ms = now;
-        doc.meta_updated_at_ms = now;
+    prefs.library_folders = sanitize_library_folders(&folders);
+
+    let mut folder_colors = prefs.library_folder_colors.clone();
+    for (folder_path, hex) in STARTER_FOLDERS {
+        if let Some(color) = Color::from_hex(hex) {
+            folder_colors
+                .entry((*folder_path).to_ascii_lowercase())
+                .or_insert(color);
+        }
     }
-    docs
+    prefs.library_folder_colors = sanitize_library_folder_colors(&folder_colors);
+
+    let mut tag_colors = prefs.library_tag_colors.clone();
+    for (tag, hex) in STARTER_TAG_COLORS {
+        if let Some(color) = Color::from_hex(hex) {
+            tag_colors
+                .entry((*tag).to_ascii_lowercase())
+                .or_insert(color);
+        }
+    }
+    prefs.library_tag_colors = sanitize_library_tag_colors(&tag_colors);
 }
 
 fn system_time_ms(t: SystemTime) -> i64 {
@@ -413,11 +526,16 @@ impl Session {
                 session.trashed_notebooks = read_trash_entries(&dir);
                 return (session, true);
             }
-            let docs = if marker_exists {
-                Vec::new()
-            } else {
+            let fresh_seed = !marker_exists;
+            let docs = if fresh_seed {
                 starter_documents()
+            } else {
+                Vec::new()
             };
+            let mut prefs = prefs;
+            if fresh_seed {
+                seed_starter_library_prefs(&mut prefs);
+            }
             let mut session = Self {
                 prefs,
                 ..Default::default()
@@ -428,6 +546,9 @@ impl Session {
                 session.trashed_notebooks = read_trash_entries(library_dir);
             }
             let _ = session.save_library();
+            if fresh_seed {
+                let _ = session.save_prefs();
+            }
             let _ = fs::write(&marker, b"1");
             return (session, false);
         }
@@ -465,6 +586,7 @@ impl Session {
     fn with_starter_library(dir: Option<PathBuf>) -> Self {
         let mut session = Self::default();
         let docs = starter_documents();
+        seed_starter_library_prefs(&mut session.prefs);
         session.replace_notebooks_for_library(docs, dir);
         session
     }
@@ -852,7 +974,7 @@ mod tests {
 
         {
             let mut session = Session::open_library(dir.clone());
-            assert_eq!(session.notebooks.len(), 4);
+            assert_eq!(session.notebooks.len(), 6);
             assert!(!session.has_dirty_notebooks());
 
             // Select second notebook, rename it, draw a stroke, and create a new one.
@@ -881,18 +1003,18 @@ mod tests {
                     &json!({ "preset": "MidnightSlate", "title": "Night Calculus" }),
                 )
                 .unwrap();
-            assert_eq!(session.notebooks.len(), 5);
+            assert_eq!(session.notebooks.len(), 7);
 
             // Delete the first notebook and ensure deletion persists on disk too.
             session
                 .execute("notebook.delete", &json!({ "index": 0 }))
                 .unwrap();
-            assert_eq!(session.notebooks.len(), 4);
+            assert_eq!(session.notebooks.len(), 6);
         }
 
         // Reopen from the same directory: deleted starter stays deleted, edits & created book survive.
         let reopened = Session::open_library(dir);
-        assert_eq!(reopened.notebooks.len(), 4);
+        assert_eq!(reopened.notebooks.len(), 6);
         let titles: Vec<&str> = reopened
             .notebooks
             .iter()
@@ -1307,13 +1429,16 @@ mod tests {
                 &json!({ "path": "University/Semester1/Calculus" }),
             )
             .unwrap();
-            assert_eq!(
-                s.prefs.library_folders,
-                vec![
-                    "University",
-                    "University/Semester1",
-                    "University/Semester1/Calculus"
-                ]
+            assert!(
+                s.prefs
+                    .library_folders
+                    .contains(&"University/Semester1/Calculus".to_string())
+            );
+            assert!(s.prefs.library_folders.contains(&"University".to_string()));
+            assert!(
+                s.prefs
+                    .library_folders
+                    .contains(&"University/Semester1".to_string())
             );
             s.execute(
                 "notebook.setMetadata",
@@ -1375,11 +1500,23 @@ mod tests {
         );
         assert!(reopened.prefs.library_sort_ascending);
         assert_eq!(reopened.prefs.custom_templates.len(), 1);
-        assert_eq!(reopened.prefs.library_folders, vec!["College"]);
+        assert!(
+            reopened
+                .prefs
+                .library_folders
+                .contains(&"College".to_string())
+        );
+        assert!(
+            !reopened
+                .prefs
+                .library_folders
+                .iter()
+                .any(|f| f.starts_with("University"))
+        );
         let moved = reopened
             .notebooks
             .iter()
-            .find(|d| d.favorite)
+            .find(|d| d.favorite && d.tags.iter().any(|t| t == "midterm"))
             .expect("favorited notebook survives");
         assert_eq!(moved.folder_path, "College");
         assert_eq!(moved.tags, vec!["midterm", "math"]);
@@ -1642,24 +1779,67 @@ mod tests {
         assert_eq!(empty_reopen.doc.page_count(), 1);
     }
 
+    fn assert_starter_prefs_seeded(session: &Session) {
+        assert_eq!(session.notebooks.len(), 6);
+        for (folder, _) in STARTER_FOLDERS {
+            assert!(
+                session.prefs.library_folders.iter().any(|f| f == folder),
+                "missing starter folder {folder}"
+            );
+            assert!(
+                session.prefs.folder_color(folder).is_some(),
+                "missing starter folder color for {folder}"
+            );
+        }
+        for (tag, _) in STARTER_TAG_COLORS {
+            assert!(
+                session.prefs.tag_color(tag).is_some(),
+                "missing starter tag color for {tag}"
+            );
+        }
+    }
+
     #[test]
-    fn starter_documents_use_pure_white_paper_and_embedded_daily_notebook() {
+    fn starter_documents_use_pure_white_paper_and_empty_subject_notebooks() {
         let starters = starter_documents();
-        assert_eq!(starters.len(), 4);
-        assert_eq!(starters[0].title, "Daily Notebook");
-        assert_eq!(starters[0].page_count(), 2);
-        let total_strokes: usize = starters[0]
-            .resolved_pages()
-            .iter()
-            .map(|p| p.strokes.len())
-            .sum();
-        assert!(total_strokes >= 30);
+        let titles: Vec<&str> = starters.iter().map(|d| d.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "Data Structures & Algorithms",
+                "Linear Algebra",
+                "Differential Calculus",
+                "Organic Chemistry",
+                "Modern World History",
+                "Physics Mechanics",
+            ]
+        );
         for doc in &starters {
+            let empty_content = doc.strokes.is_empty()
+                && doc.shapes.is_empty()
+                && doc.texts.is_empty()
+                && doc.images.is_empty()
+                && doc.pdf_documents.is_empty();
+            assert!(empty_content);
+            assert_eq!(doc.page_count(), 1);
+            assert!(!doc.tags.is_empty());
             assert_eq!(doc.paper_color, papercraft_doc::PaperColor::PureWhite);
             for page in doc.resolved_pages() {
+                let page_empty = page.strokes.is_empty()
+                    && page.shapes.is_empty()
+                    && page.texts.is_empty()
+                    && page.images.is_empty();
+                assert!(page_empty);
                 assert_eq!(page.paper_color, papercraft_doc::PaperColor::PureWhite);
             }
         }
+
+        let guard = temp_lib_dir("starter_demo_prefs");
+        let reopened = Session::open_library(guard.0.clone());
+        assert_starter_prefs_seeded(&reopened);
+
+        let web_session = Session::open_web_cache(None);
+        assert_starter_prefs_seeded(&web_session);
     }
 
     #[test]
