@@ -1,11 +1,14 @@
-//! Dedicated minimalist Settings drawer: studio appearance and live Telemetry.
+//! Dedicated minimalist Settings drawer: Pen stylus shortcuts, studio appearance, and live Telemetry.
 
 use egui::{CornerRadius, Frame, Margin, Rect, RichText, Sense, Stroke, Vec2};
-use papercraft_doc::{StylusButtonAction, StylusButtonConfig, UserStudioConfig};
+use papercraft_doc::{
+    PenKind, PenSettings, StylusButtonAction, StylusButtonConfig, UserStudioConfig,
+};
 use serde_json::json;
 
 use crate::icons::{
-    Icon, SwitchLayout, SwitchOption, compact_icon_button, section_card_header, segmented_switch,
+    Icon, SwitchLayout, SwitchOption, compact_icon_button, icon_button, paint_icon,
+    section_card_header, segmented_switch,
 };
 use crate::theme::Tokens;
 use crate::{PaperCraftApp, SettingsTab};
@@ -118,6 +121,51 @@ fn draw_stylus_button_row(
         });
 
     chosen.filter(|&next| next != spec.current)
+}
+
+fn draw_stylus_disconnected_card(ui: &mut egui::Ui, t: &Tokens) {
+    card_frame(t).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_card_header(
+            ui,
+            Icon::BallPen,
+            "Stylus detection",
+            "Connect a supported stylus or pen display to configure hardware button shortcuts.",
+            t,
+        );
+
+        Frame::new()
+            .fill(t.panel_bg)
+            .stroke(Stroke::new(1.0, t.border))
+            .corner_radius(CornerRadius::same(7))
+            .inner_margin(Margin::symmetric(9, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                    ui.painter()
+                        .circle_filled(dot_rect.center(), 4.0, t.text_muted);
+                    ui.label(
+                        RichText::new("No stylus detected")
+                            .size(11.5)
+                            .strong()
+                            .color(t.text_muted),
+                    );
+                });
+            });
+
+        ui.add_space(8.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Bring your stylus near the screen or connect a pen tablet to detect it automatically and customize Side Button 1, Side Button 2, and Eraser End shortcuts.",
+                )
+                .size(11.0)
+                .color(t.text_muted),
+            )
+            .wrap(),
+        );
+    });
 }
 
 fn draw_stylus_shortcuts_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
@@ -605,7 +653,7 @@ fn draw_live_telemetry_card(app: &PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) 
         ui.add(
             egui::Label::new(
                 RichText::new(
-                    "Tip: Inverting a supported stylus or holding its side buttons runs your configured shortcuts. Customize button actions below while a stylus is connected.",
+                    "Tip: Inverting a supported stylus or holding its side buttons runs your configured shortcuts. Customize button actions in the Pen tab while a stylus is connected.",
                 )
                 .size(11.0)
                 .color(t.text_muted),
@@ -675,21 +723,47 @@ fn draw_shortcuts_card(ui: &mut egui::Ui, t: &Tokens) {
     });
 }
 
-fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, kind: PenKind, t: &Tokens) {
     ui.horizontal(|ui| {
         ui.set_height(28.0);
         let (ir, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
-        crate::icons::paint_icon(ui.painter(), ir, Icon::Settings, t.accent);
+        paint_icon(ui.painter(), ir, Icon::Settings, t.accent);
         ui.label(RichText::new("Settings").size(17.0).strong().color(t.text));
+        if app.view.settings_tab == SettingsTab::Pen {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, Icon::Reset, Some("Reset Tool"), false, true, t)
+                    .on_hover_text(
+                        "Restore factory default settings for the currently selected pen.",
+                    )
+                    .clicked()
+                {
+                    let mut defaults = PenSettings::for_kind(kind);
+                    if let Some(size) = UserStudioConfig::DEFAULT_PEN_SIZES.get(kind.index()) {
+                        defaults.size = *size;
+                    }
+                    defaults.color = app.session.pen(kind).color;
+                    let _ = app.session.execute(
+                        "pen.setSettings",
+                        &json!({ "kind": kind, "settings": defaults }),
+                    );
+                }
+            });
+        }
     });
     ui.label(
-        RichText::new("Studio appearance, app scale, and live telemetry.")
+        RichText::new("Hardware stylus shortcuts, studio appearance, and live telemetry.")
             .size(11.5)
             .color(t.text_muted),
     );
     ui.add_space(6.0);
 
     let tabs = [
+        (
+            SettingsTab::Pen,
+            Icon::FountainPen,
+            "Pen",
+            "Stylus detection, hardware button shortcuts, and active pen reset",
+        ),
         (
             SettingsTab::Appearance,
             Icon::Palette,
@@ -797,7 +871,8 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
     )
     .show_collapsible(ui, &mut panel_open, |ui| {
         ui.multiply_opacity(content_opacity);
-        draw_settings_header(app, ui, &t);
+        let kind = app.session.active_pen_kind();
+        draw_settings_header(app, ui, kind, &t);
         ui.separator();
 
         let dt = ui.ctx().input(|i| i.stable_dt);
@@ -815,6 +890,13 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
             ui.scope(|ui| {
                 ui.multiply_opacity(tab_opacity);
                 match app.view.settings_tab {
+                    SettingsTab::Pen => {
+                        if app.is_stylus_connected() {
+                            draw_stylus_shortcuts_card(app, ui, &t);
+                        } else {
+                            draw_stylus_disconnected_card(ui, &t);
+                        }
+                    }
                     SettingsTab::Appearance => {
                         draw_appearance_card(app, ui, &t);
                         ui.add_space(8.0);
@@ -822,10 +904,6 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
                     }
                     SettingsTab::Telemetry => {
                         draw_live_telemetry_card(app, ui, &t);
-                        if app.is_stylus_connected() {
-                            ui.add_space(8.0);
-                            draw_stylus_shortcuts_card(app, ui, &t);
-                        }
                         ui.add_space(8.0);
                         draw_shortcuts_card(ui, &t);
                     }
@@ -1023,35 +1101,39 @@ mod auto_contrast_ui_tests {
     }
 
     #[test]
-    fn settings_two_way_tab_switch_cycles_between_appearance_and_telemetry() {
+    fn settings_three_way_tab_switch_cycles_between_pen_appearance_and_telemetry() {
         let ctx = egui::Context::default();
         let mut app = PaperCraftApp::default();
         app.view.screen = AppScreen::Editor;
         app.view.motion.screen = motion::ScreenTransition::new(AppScreen::Editor);
         app.view.inspector_open = true;
-        app.view.settings_tab = SettingsTab::Appearance;
+        app.view.settings_tab = SettingsTab::Pen;
 
         let mut time_s = 1.0_f64;
         let _ = run_editor_frame(&ctx, &mut app, base_input(), &mut time_s);
-        let shapes_app = run_editor_frame(&ctx, &mut app, base_input(), &mut time_s);
+        let shapes_pen = run_editor_frame(&ctx, &mut app, base_input(), &mut time_s);
+        assert!(find_text_rect_in_shapes(&shapes_pen, "Stylus detection").is_some());
+        assert!(find_text_rect_in_shapes(&shapes_pen, "Input stabilization").is_none());
+
+        let appearance_tab = find_text_rect_in_shapes(&shapes_pen, "Appearance")
+            .expect("Appearance tab should be rendered in 3-way switch");
+        let shapes_app = click_at(&ctx, &mut app, appearance_tab.center(), &mut time_s);
+        assert_eq!(app.view.settings_tab, SettingsTab::Appearance);
         assert!(
             find_text_rect_in_shapes(&shapes_app, "Auto-adapt canvas colors to theme").is_some()
         );
-        assert!(find_text_rect_in_shapes(&shapes_app, "Input stabilization").is_none());
 
         let telemetry_tab = find_text_rect_in_shapes(&shapes_app, "Telemetry")
-            .expect("Telemetry tab should be rendered in 2-way switch");
+            .expect("Telemetry tab should be rendered in 3-way switch");
         let shapes_tel = click_at(&ctx, &mut app, telemetry_tab.center(), &mut time_s);
         assert_eq!(app.view.settings_tab, SettingsTab::Telemetry);
         assert!(find_text_rect_in_shapes(&shapes_tel, "Live Stylus Telemetry").is_some());
 
-        let appearance_tab = find_text_rect_in_shapes(&shapes_tel, "Appearance")
-            .expect("Appearance tab should be rendered in 2-way switch");
-        let shapes_back = click_at(&ctx, &mut app, appearance_tab.center(), &mut time_s);
-        assert_eq!(app.view.settings_tab, SettingsTab::Appearance);
-        assert!(
-            find_text_rect_in_shapes(&shapes_back, "Auto-adapt canvas colors to theme").is_some()
-        );
+        let pen_tab = find_text_rect_in_shapes(&shapes_tel, "Pen")
+            .expect("Pen tab should be rendered in 3-way switch");
+        let shapes_back = click_at(&ctx, &mut app, pen_tab.center(), &mut time_s);
+        assert_eq!(app.view.settings_tab, SettingsTab::Pen);
+        assert!(find_text_rect_in_shapes(&shapes_back, "Stylus detection").is_some());
     }
 }
 
@@ -1092,7 +1174,7 @@ mod tests {
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(1280.0, 1200.0),
+                    egui::vec2(1280.0, 800.0),
                 )),
                 ..Default::default()
             };
@@ -1110,9 +1192,9 @@ mod tests {
                 "tab {tab:?} inspector rect {panel_rect:?} overflowed or differed from default {DEFAULT_INSPECTOR_WIDTH}",
             );
         }
+        assert!(last_texts.lines().any(|line| line == "Pen"));
         assert!(last_texts.lines().any(|line| line == "Appearance"));
         assert!(last_texts.lines().any(|line| line == "Telemetry"));
-        assert!(!last_texts.lines().any(|line| line == "Pen"));
         assert!(!last_texts.lines().any(|line| line == "Page"));
         assert!(!last_texts.contains("Input stabilization"));
         assert!(!last_texts.contains("Smoothing strength"));
@@ -1183,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_header_has_appearance_and_telemetry_tabs_on_single_row() {
+    fn settings_header_has_pen_appearance_and_telemetry_tabs_on_single_row() {
         let mut app = PaperCraftApp::default();
         app.view.inspector_open = true;
         let ctx = egui::Context::default();
@@ -1192,7 +1274,7 @@ mod tests {
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(1280.0, 1200.0),
+                    egui::vec2(1280.0, 800.0),
                 )),
                 ..Default::default()
             };
@@ -1203,13 +1285,14 @@ mod tests {
             shapes = out.shapes.clone();
             out.drop_without_applying_deltas();
         }
+        let pen_pos = find_text_center(&shapes, "Pen").unwrap();
         let app_pos = find_text_center(&shapes, "Appearance").unwrap();
         let tel_pos = find_text_center(&shapes, "Telemetry").unwrap();
-        assert!((app_pos.y - tel_pos.y).abs() <= 1.0);
-        assert!(app_pos.x < tel_pos.x);
-        assert!(find_text_center(&shapes, "Pen").is_none());
+        assert!((pen_pos.y - app_pos.y).abs() <= 1.0);
+        assert!((pen_pos.y - tel_pos.y).abs() <= 1.0);
+        assert!(pen_pos.x < app_pos.x && app_pos.x < tel_pos.x);
+        assert!(find_text_center(&shapes, "Reset Tool").is_some());
         assert!(find_text_center(&shapes, "Page").is_none());
-        assert!(find_text_center(&shapes, "Reset Tool").is_none());
     }
 
     #[test]
@@ -1309,7 +1392,7 @@ mod tests {
         let mut app = PaperCraftApp::new(papercraft_engine::Session::default(), hooks);
         app.view.screen = crate::AppScreen::Editor;
         app.view.inspector_open = true;
-        app.view.settings_tab = SettingsTab::Telemetry;
+        app.view.settings_tab = SettingsTab::Pen;
 
         let render_step =
             |ctx: &egui::Context, app: &mut PaperCraftApp, t: f64, events: Vec<egui::Event>| {
@@ -1336,10 +1419,12 @@ mod tests {
                 (texts, shapes)
             };
 
-        // 1. Disconnected: Telemetry tab shows live metrics and hides Stylus shortcuts.
+        // 1. Disconnected: Pen tab shows Stylus detection status and hides Stylus shortcuts.
         let (texts_off, _) = render_step(&ctx, &mut app, 0.02, Vec::new());
-        assert!(texts_off.contains("Live Stylus Telemetry"));
+        assert!(texts_off.contains("Stylus detection"));
+        assert!(texts_off.contains("No stylus detected"));
         assert!(!texts_off.contains("Stylus shortcuts"));
+        assert!(!texts_off.contains("Input stabilization"));
 
         // 2. Connect stylus and re-poll after interval: card appears with device name and 3 rows.
         connected.store(true, Ordering::Relaxed);
@@ -1421,9 +1506,10 @@ mod tests {
             StylusButtonConfig::default()
         );
 
-        // 5. Hot-unplugging hides Stylus shortcuts again.
+        // 5. Hot-unplugging hides Stylus shortcuts and restores detection prompt.
         connected.store(false, Ordering::Relaxed);
         let (texts_unplugged, _) = render_step(&ctx, &mut app, 4.5, Vec::new());
         assert!(!texts_unplugged.contains("Stylus shortcuts"));
+        assert!(texts_unplugged.contains("No stylus detected"));
     }
 }
