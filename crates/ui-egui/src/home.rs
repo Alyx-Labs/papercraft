@@ -443,6 +443,9 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
                         app.view.inspector_open = !app.view.inspector_open;
                     }
 
+                    #[cfg(not(target_arch = "wasm32"))]
+                    draw_home_update_pill(app, ui, t);
+
                     let pkg_resp =
                         icon_button(ui, Icon::Library, Some("Package"), false, true, t)
                             .on_hover_text(
@@ -513,6 +516,25 @@ fn truncate_label(raw: &str, max_chars: usize) -> String {
         format!("{collected}…")
     } else {
         collected
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn draw_home_update_pill(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    use papercraft_updater::UpdateStatus;
+
+    let label = match app.updater.status() {
+        UpdateStatus::Available(u) => format!("Update v{}", u.version),
+        UpdateStatus::Downloading { .. } => "Updating...".to_string(),
+        UpdateStatus::ReadyToInstall { .. } => "Restart to Update".to_string(),
+        _ => return,
+    };
+    let modal_open = app.view.active_modal == Some(ActiveModal::AppUpdate);
+    if compact_icon_button(ui, Icon::MoveDown, Some(&label), modal_open, true, t)
+        .on_hover_text("A newer PaperCraft release is available. Click to review and install.")
+        .clicked()
+    {
+        modal::open(app, ActiveModal::AppUpdate);
     }
 }
 

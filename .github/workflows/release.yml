@@ -32,6 +32,8 @@ jobs:
             target: aarch64-apple-darwin
             artifact: papercraft-macos-arm64.dmg
             server_artifact: papercraft-server-macos-arm64.dmg
+            tar_artifact: papercraft-macos-arm64.tar.gz
+            server_tar_artifact: papercraft-server-macos-arm64.tar.gz
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -120,7 +122,7 @@ jobs:
           if [[ "${RAW_VER}" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
             APP_VER="${RAW_VER}"
           else
-            APP_VER="0.1.1"
+            APP_VER="0.1.2"
           fi
 
           build_macos_dmg() {
@@ -129,10 +131,11 @@ jobs:
             local app_name="$3"
             local bundle_id="$4"
             local out_dmg="$5"
+            local out_tar="$6"
             local stage="dmg-stage-${bin_name}"
             local app_bundle="${stage}/${app_name}.app"
 
-            rm -rf "${stage}" "${out_dmg}"
+            rm -rf "${stage}" "${out_dmg}" "${out_tar}"
             mkdir -p "${app_bundle}/Contents/MacOS" "${app_bundle}/Contents/Resources"
             cp "${bin_src}" "${app_bundle}/Contents/MacOS/${bin_name}"
             chmod +x "${app_bundle}/Contents/MacOS/${bin_name}"
@@ -173,6 +176,7 @@ jobs:
           EOF
 
             codesign --force --deep --sign - "${app_bundle}"
+            tar -czf "${out_tar}" -C "${stage}" "${app_name}.app"
             ln -s /Applications "${stage}/Applications"
             hdiutil create -volname "${app_name}" -srcfolder "${stage}" -ov -format UDZO "${out_dmg}"
             rm -rf "${stage}"
@@ -183,14 +187,16 @@ jobs:
             "papercraft" \
             "PaperCraft" \
             "io.papercraft.app" \
-            "${{ matrix.artifact }}"
+            "${{ matrix.artifact }}" \
+            "${{ matrix.tar_artifact }}"
 
           build_macos_dmg \
             "target/${{ matrix.target }}/release/papercraft-server" \
             "papercraft-server" \
             "PaperCraft Server" \
             "io.papercraft.server" \
-            "${{ matrix.server_artifact }}"
+            "${{ matrix.server_artifact }}" \
+            "${{ matrix.server_tar_artifact }}"
       - uses: actions/upload-artifact@v4
         with:
           name: app-${{ matrix.target }}
@@ -199,6 +205,16 @@ jobs:
         with:
           name: server-${{ matrix.target }}
           path: ${{ matrix.server_artifact }}
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: app-tar-${{ matrix.target }}
+          path: ${{ matrix.tar_artifact }}
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: server-tar-${{ matrix.target }}
+          path: ${{ matrix.server_tar_artifact }}
 
   web:
     name: Build WebAssembly Bundle
@@ -230,6 +246,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
@@ -237,7 +256,95 @@ jobs:
       - name: Generate SHA256SUMS.txt
         working-directory: release-assets
         run: sha256sum * > SHA256SUMS.txt
+      - name: Generate latest.json update manifest
+        shell: python3 {0}
+        run: |
+          import datetime
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          assets_dir = pathlib.Path("release-assets")
+          sums = {}
+          for line in (assets_dir / "SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
+              parts = line.strip().split(maxsplit=1)
+              if len(parts) == 2:
+                  digest, fname = parts[0].strip(), parts[1].strip().lstrip("*")
+                  sums[fname] = digest
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = tag[1:] if tag.startswith(("v", "V")) else tag
+          repo = os.environ["GITHUB_REPOSITORY"]
+          release_url = f"https://github.com/{repo}/releases/tag/{tag}"
+
+          prev_tag = ""
+          try:
+              prev_tag = subprocess.check_output(
+                  ["git", "describe", "--tags", "--abbrev=0", "--match", "v*", f"{tag}^"],
+                  stderr=subprocess.DEVNULL,
+                  text=True,
+              ).strip()
+          except Exception:
+              prev_tag = ""
+
+          try:
+              cmd = ["git", "log", "--pretty=format:- %s"] + (
+                  [f"{prev_tag}..{tag}"] if prev_tag else ["-n", "15", tag]
+              )
+              notes = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True).strip()
+          except Exception:
+              notes = ""
+          if not notes:
+              notes = f"PaperCraft {tag} release."
+          elif len(notes) > 4000:
+              notes = notes[:3997] + "..."
+
+          spec = {
+              "papercraft": {
+                  "windows-x86_64": ("papercraft-windows-x86_64.exe", "exe"),
+                  "linux-x86_64": ("papercraft-linux-x86_64.AppImage", "appimage"),
+                  "macos-aarch64": ("papercraft-macos-arm64.tar.gz", "macos-app-tar-gz"),
+              },
+              "papercraft-server": {
+                  "windows-x86_64": ("papercraft-server-windows-x86_64.exe", "exe"),
+                  "linux-x86_64": ("papercraft-server-linux-x86_64.AppImage", "appimage"),
+                  "macos-aarch64": ("papercraft-server-macos-arm64.tar.gz", "macos-app-tar-gz"),
+              },
+          }
+
+          manifest_assets = {}
+          for app_key, platforms in spec.items():
+              manifest_assets[app_key] = {}
+              for plat_key, (fname, fmt) in platforms.items():
+                  fpath = assets_dir / fname
+                  if not fpath.is_file():
+                      raise SystemExit(f"Missing release artifact `{fname}` for {app_key}/{plat_key}")
+                  digest = sums.get(fname, "").lower()
+                  if len(digest) != 64:
+                      raise SystemExit(f"Invalid SHA-256 digest for `{fname}`: {digest!r}")
+                  manifest_assets[app_key][plat_key] = {
+                      "file_name": fname,
+                      "url": f"https://github.com/{repo}/releases/download/{tag}/{fname}",
+                      "sha256": digest,
+                      "size_bytes": fpath.stat().st_size,
+                      "format": fmt,
+                  }
+
+          manifest = {
+              "schema_version": 1,
+              "version": version,
+              "tag": tag,
+              "release_url": release_url,
+              "published_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "notes": notes,
+              "assets": manifest_assets,
+          }
+          out_path = assets_dir / "latest.json"
+          out_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+          print(f"Wrote {out_path} for {tag}")
       - uses: softprops/action-gh-release@v2
         with:
           files: release-assets/*
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

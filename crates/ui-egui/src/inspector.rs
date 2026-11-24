@@ -494,6 +494,170 @@ fn draw_app_scale_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn draw_app_updates_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    use papercraft_updater::{UpdateStatus, format_bytes};
+
+    let current_ver = app.updater.config().map_or_else(
+        || env!("CARGO_PKG_VERSION").to_string(),
+        |cfg| cfg.current_version.to_string(),
+    );
+    let is_custom_feed = app.updater.config().is_some_and(|cfg| cfg.is_custom_feed);
+    let status = app.updater.status().clone();
+    let is_busy = app.updater.is_busy();
+
+    card_frame(t).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_card_header(
+            ui,
+            Icon::MoveDown,
+            "App Updates",
+            "Check for new official PaperCraft releases and install updates in place.",
+            t,
+        );
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Installed version").size(12.0).color(t.text));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                Frame::new()
+                    .fill(t.panel_bg)
+                    .stroke(Stroke::new(1.0, t.border))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(8, 3))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!("v{current_ver}"))
+                                .size(11.5)
+                                .strong()
+                                .monospace()
+                                .color(t.text),
+                        );
+                    });
+                if is_custom_feed {
+                    Frame::new()
+                        .fill(t.accent_soft)
+                        .stroke(Stroke::new(1.0, t.accent))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(7, 3))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("Dev feed")
+                                    .size(10.5)
+                                    .strong()
+                                    .color(t.accent),
+                            );
+                        });
+                }
+            });
+        });
+
+        ui.add_space(8.0);
+        let mut auto_check = app.session.prefs.auto_check_updates;
+        let toggle_resp = ui
+            .checkbox(&mut auto_check, "Check for updates automatically on startup")
+            .on_hover_text(
+                "Quietly check GitHub Releases for new versions when PaperCraft opens.",
+            );
+        if toggle_resp.changed() {
+            let _ = app
+                .session
+                .execute("updates.setAutoCheck", &json!({ "enabled": auto_check }));
+        }
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Checks GitHub Releases quietly when PaperCraft starts. Turn off for completely offline use.",
+                )
+                .size(11.0)
+                .color(t.text_muted),
+            )
+            .wrap(),
+        );
+
+        ui.add_space(8.0);
+        let (status_line, status_color) = match &status {
+            UpdateStatus::Idle => ("Ready to check for updates.".to_string(), t.text_muted),
+            UpdateStatus::Checking { .. } => {
+                ("Checking for new releases...".to_string(), t.accent)
+            }
+            UpdateStatus::UpToDate { latest_version } => (
+                format!("Up to date (latest: v{latest_version})."),
+                t.success_fg,
+            ),
+            UpdateStatus::Available(u) => (
+                format!("Update available: v{}", u.version),
+                t.accent,
+            ),
+            UpdateStatus::Downloading {
+                downloaded_bytes,
+                total_bytes,
+                ..
+            } => {
+                if *total_bytes > 0 {
+                    (
+                        format!(
+                            "Downloading: {} / {}",
+                            format_bytes(*downloaded_bytes),
+                            format_bytes(*total_bytes)
+                        ),
+                        t.accent,
+                    )
+                } else {
+                    (
+                        format!("Downloading: {}", format_bytes(*downloaded_bytes)),
+                        t.accent,
+                    )
+                }
+            }
+            UpdateStatus::ReadyToInstall { update, .. } => (
+                format!("v{} verified and ready to install.", update.version),
+                t.success_fg,
+            ),
+            UpdateStatus::NoPlatformAsset { latest_version, .. } => (
+                format!("Release v{latest_version} requires manual download."),
+                t.warning_fg,
+            ),
+            UpdateStatus::Error { message, .. } => (message.clone(), t.danger_fg),
+        };
+        ui.add(egui::Label::new(RichText::new(status_line).size(11.5).color(status_color)).wrap());
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let check_lbl = if matches!(status, UpdateStatus::Checking { .. }) {
+                "Checking..."
+            } else {
+                "Check for Updates"
+            };
+            if compact_icon_button(ui, Icon::RotateCw, Some(check_lbl), false, !is_busy, t)
+                .on_hover_text("Check GitHub Releases for a newer PaperCraft version now")
+                .clicked()
+            {
+                app.trigger_update_check(false, ui.ctx());
+            }
+
+            let details_lbl = match &status {
+                UpdateStatus::ReadyToInstall { .. } => Some("Install & Restart"),
+                UpdateStatus::Available(_) | UpdateStatus::Downloading { .. } => {
+                    Some("View Update")
+                }
+                UpdateStatus::Error { .. } | UpdateStatus::NoPlatformAsset { .. } => {
+                    Some("Details")
+                }
+                _ => None,
+            };
+            if let Some(lbl) = details_lbl
+                && compact_icon_button(ui, Icon::MoveDown, Some(lbl), true, true, t)
+                    .on_hover_text("Open the Software Update window")
+                    .clicked()
+            {
+                crate::modal::open(app, crate::modal::ActiveModal::AppUpdate);
+            }
+        });
+    });
+}
+
 fn sanitize_metric(val: f32, lo: f32, hi: f32) -> f32 {
     if val.is_finite() {
         val.clamp(lo, hi)
@@ -901,6 +1065,11 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
                         draw_appearance_card(app, ui, &t);
                         ui.add_space(8.0);
                         draw_app_scale_card(app, ui, &t);
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            ui.add_space(8.0);
+                            draw_app_updates_card(app, ui, &t);
+                        }
                     }
                     SettingsTab::Telemetry => {
                         draw_live_telemetry_card(app, ui, &t);
@@ -928,7 +1097,7 @@ mod auto_contrast_ui_tests {
     use papercraft_doc::{PaperColor, UiTheme};
     use serde_json::json;
 
-    fn find_text_rect_in_shapes(
+    pub(super) fn find_text_rect_in_shapes(
         shapes: &[egui::epaint::ClippedShape],
         needle: &str,
     ) -> Option<Rect> {
@@ -944,7 +1113,7 @@ mod auto_contrast_ui_tests {
         shapes.iter().find_map(|cs| visit(&cs.shape, needle))
     }
 
-    fn run_editor_frame(
+    pub(super) fn run_editor_frame(
         ctx: &egui::Context,
         app: &mut PaperCraftApp,
         mut input: RawInput,
@@ -958,14 +1127,14 @@ mod auto_contrast_ui_tests {
         shapes
     }
 
-    fn base_input() -> RawInput {
+    pub(super) fn base_input() -> RawInput {
         RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 820.0))),
             ..Default::default()
         }
     }
 
-    fn click_at(
+    pub(super) fn click_at(
         ctx: &egui::Context,
         app: &mut PaperCraftApp,
         pos: Pos2,
@@ -1247,8 +1416,46 @@ mod tests {
         assert!(app_texts.contains("125%"));
         assert!(app_texts.contains("150%"));
         assert!(app_texts.contains("175%"));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            assert!(app_texts.contains("App Updates"));
+            assert!(app_texts.contains("Check for updates automatically on startup"));
+        }
         assert!(!app_texts.contains("Live Stylus Telemetry"));
         assert!(!app_texts.contains("Keyboard & Canvas Shortcuts"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn app_updates_checkbox_persists_auto_check_preference() {
+        let ctx = egui::Context::default();
+        let mut app = PaperCraftApp::default();
+        app.view.screen = crate::AppScreen::Editor;
+        app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
+        app.view.inspector_open = true;
+        app.view.settings_tab = SettingsTab::Appearance;
+        assert!(app.session.prefs.auto_check_updates);
+
+        let mut time_s = 1.0_f64;
+        let _ = auto_contrast_ui_tests::run_editor_frame(
+            &ctx,
+            &mut app,
+            auto_contrast_ui_tests::base_input(),
+            &mut time_s,
+        );
+        let shapes = auto_contrast_ui_tests::run_editor_frame(
+            &ctx,
+            &mut app,
+            auto_contrast_ui_tests::base_input(),
+            &mut time_s,
+        );
+        let check_rect = auto_contrast_ui_tests::find_text_rect_in_shapes(
+            &shapes,
+            "Check for updates automatically on startup",
+        )
+        .expect("Auto-check updates checkbox should render");
+        let _ = auto_contrast_ui_tests::click_at(&ctx, &mut app, check_rect.center(), &mut time_s);
+        assert!(!app.session.prefs.auto_check_updates);
     }
 
     fn find_text_center(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Pos2> {

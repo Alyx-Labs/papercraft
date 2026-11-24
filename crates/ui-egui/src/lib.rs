@@ -31,6 +31,8 @@ pub mod stylus;
 pub mod sync_worker;
 pub mod theme;
 pub mod toolbar;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod update_modal;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -717,6 +719,7 @@ pub struct PlatformHooks {
     pub set_clipboard_text: Option<SetClipboardTextFn>,
     pub open_url: Option<OpenUrlFn>,
     pub paste_poll: Option<PastePollFn>,
+    pub enable_auto_update_check: bool,
 }
 
 type AutosaveJob = (usize, PathBuf, Arc<Document>);
@@ -836,6 +839,10 @@ pub struct PaperCraftApp {
     autosave: Option<BackgroundAutosave>,
     pub(crate) sync_worker: sync_worker::BackgroundSyncWorker,
     #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) updater: papercraft_updater::UpdateWorker,
+    #[cfg(not(target_arch = "wasm32"))]
+    startup_update_checked: bool,
+    #[cfg(not(target_arch = "wasm32"))]
     pdf_import_job: Option<PendingPdfImportState>,
     last_ctx: Option<egui::Context>,
     frame_counter: u64,
@@ -897,6 +904,13 @@ impl PaperCraftApp {
             canvas_cache: canvas::CanvasRenderCache::default(),
             autosave: None,
             sync_worker: sync_worker::BackgroundSyncWorker::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            updater: papercraft_updater::UpdateWorker::new(
+                papercraft_updater::AppId::PaperCraft,
+                env!("CARGO_PKG_VERSION"),
+            ),
+            #[cfg(not(target_arch = "wasm32"))]
+            startup_update_checked: false,
             #[cfg(not(target_arch = "wasm32"))]
             pdf_import_job: None,
             last_ctx: None,
@@ -2054,6 +2068,8 @@ impl PaperCraftApp {
         pdf_view::pump_completed_renders(&ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.poll_async_pdf_import(&ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.pump_updater(&ctx);
         let (events, now_s, raw_dt) = ctx.input(|i| (i.events.clone(), i.time, i.stable_dt));
         let dt = motion::sanitize_dt(raw_dt);
         let now_ms = now_s * 1000.0;
@@ -2293,6 +2309,65 @@ impl PaperCraftApp {
         }
         if changed {
             ctx.request_repaint();
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pump_updater(&mut self, ctx: &egui::Context) {
+        if self.updater.poll() {
+            ctx.request_repaint();
+        }
+        if !self.startup_update_checked && self.hooks.enable_auto_update_check {
+            self.startup_update_checked = true;
+            if self.session.prefs.auto_check_updates {
+                self.trigger_update_check(true, ctx);
+            }
+        }
+        if self.updater.is_busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn trigger_update_check(&mut self, silent: bool, ctx: &egui::Context) {
+        let repaint_ctx = ctx.clone();
+        self.updater
+            .check_now(silent, Arc::new(move || repaint_ctx.request_repaint()));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn start_update_download(&mut self, ctx: &egui::Context) {
+        let repaint_ctx = ctx.clone();
+        self.updater
+            .start_download(Arc::new(move || repaint_ctx.request_repaint()));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn cancel_update_download(&mut self) {
+        self.updater.cancel_download();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn apply_ready_update_and_restart(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        canvas::commit_pending_text(self);
+        self.session.cancel_live_stroke();
+        self.session.cancel_live_eraser();
+        self.flush_pending_autosaves();
+        self.sync_worker.shutdown();
+        self.updater.apply_ready_update_and_relaunch()?;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn open_external_url(&mut self, url: &str) {
+        if let Some(clean) = sanitize_link_url(url)
+            && let Some(open) = self.hooks.open_url.as_mut()
+        {
+            open(&clean);
         }
     }
 }

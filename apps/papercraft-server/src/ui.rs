@@ -24,6 +24,7 @@ const INPUT_HEIGHT: f32 = 30.0;
 pub struct UiActions {
     pub hide_to_tray: bool,
     pub quit_app: bool,
+    pub install_update: bool,
 }
 
 /// Renders the entire PaperCraft Server control window and returns requested window actions.
@@ -70,9 +71,11 @@ pub fn render_window(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Tokens)
                     match ctrl.active_tab {
                         ControlTab::Server => {
                             render_status_card(ctrl, ui, t);
+                            render_update_banner(ctrl, ui, t, &mut actions);
                             render_banners(ctrl, ui, t);
                             render_essential_settings_card(ctrl, &ctx, ui, t);
                             render_advanced_card(ctrl, ui, t);
+                            render_updates_card(ctrl, ui, t);
                         }
                         ControlTab::Users => {
                             render_users_view(ctrl, ui, t);
@@ -458,6 +461,390 @@ fn render_banners(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Tokens) {
     {
         ctrl.notice_banner = None;
     }
+}
+
+fn render_update_banner(
+    ctrl: &mut ServerController,
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    actions: &mut UiActions,
+) {
+    use papercraft_updater::{InstallCapability, UpdateStatus, format_bytes as upd_format_bytes};
+
+    let status = ctrl.updater.status().clone();
+    match status {
+        UpdateStatus::Available(update) => {
+            egui::Frame::new()
+                .fill(t.accent_soft)
+                .stroke(Stroke::new(1.0, t.accent))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                        paint_icon(ui.painter(), ir, Icon::MoveDown, t.accent);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Update available: v{} (current: v{})",
+                                update.version, update.current_version
+                            ))
+                            .size(12.5)
+                            .strong()
+                            .color(t.text),
+                        );
+                        if update.is_custom_feed {
+                            draw_compact_pill(ui, None, "Dev feed", t.field_bg, t.accent, t.accent);
+                        }
+                    });
+                    if !update.notes.trim().is_empty() {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(update.notes.trim())
+                                    .size(11.0)
+                                    .color(t.text_muted),
+                            )
+                            .wrap(),
+                        );
+                    }
+                    match &update.capability {
+                        InstallCapability::Supported { .. } => {
+                            let size_info = if update.asset.size_bytes > 0 {
+                                format!(
+                                    "Download size: {}",
+                                    upd_format_bytes(update.asset.size_bytes)
+                                )
+                            } else {
+                                "Verified HTTPS + SHA-256 update".to_string()
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(size_info)
+                                        .size(11.0)
+                                        .color(t.text_muted),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if primary_button(
+                                            ui,
+                                            Icon::MoveDown,
+                                            "Download Update",
+                                            true,
+                                            t,
+                                        )
+                                        .clicked()
+                                        {
+                                            ctrl.start_update_download();
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                        InstallCapability::ReadOnly { reason, .. }
+                        | InstallCapability::UnsupportedLayout { reason } => {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(reason).size(11.0).color(t.warning_fg),
+                                )
+                                .wrap(),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if icon_button(
+                                            ui,
+                                            Icon::ExternalLink,
+                                            Some("Open Release Page"),
+                                            false,
+                                            true,
+                                            t,
+                                        )
+                                        .clicked()
+                                        {
+                                            ctrl.open_update_release_page();
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                    }
+                });
+        }
+        UpdateStatus::Downloading {
+            update,
+            downloaded_bytes,
+            total_bytes,
+        } => {
+            let is_verifying = total_bytes > 0 && downloaded_bytes >= total_bytes;
+            let title = if is_verifying {
+                format!("Verifying v{} (SHA-256)...", update.version)
+            } else {
+                format!("Downloading v{}...", update.version)
+            };
+            let readout = if total_bytes > 0 {
+                let frac = (downloaded_bytes as f32 / total_bytes as f32).clamp(0.0, 1.0);
+                let pct = (frac * 100.0).round() as u32;
+                format!(
+                    "{} / {} · {pct}%",
+                    upd_format_bytes(downloaded_bytes),
+                    upd_format_bytes(total_bytes)
+                )
+            } else {
+                upd_format_bytes(downloaded_bytes)
+            };
+            egui::Frame::new()
+                .fill(t.accent_soft)
+                .stroke(Stroke::new(1.0, t.accent))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(egui::RichText::new(title).size(12.0).strong().color(t.text));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if secondary_button(ui, "Cancel", true, t).clicked() {
+                                ctrl.cancel_update_download();
+                            }
+                            ui.label(
+                                egui::RichText::new(readout)
+                                    .size(11.5)
+                                    .monospace()
+                                    .strong()
+                                    .color(t.accent),
+                            );
+                        });
+                    });
+                    draw_update_progress_bar(ui, downloaded_bytes, total_bytes, t);
+                });
+        }
+        UpdateStatus::ReadyToInstall { update, .. } => {
+            egui::Frame::new()
+                .fill(t.success_bg)
+                .stroke(Stroke::new(1.0, t.success_border))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                        paint_icon(ui.painter(), ir, Icon::CheckCircle, t.success_fg);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Update v{} verified and ready to install",
+                                update.version
+                            ))
+                            .size(12.0)
+                            .strong()
+                            .color(t.success_fg),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Stops sync server safely, swaps the binary, and relaunches.",
+                            )
+                            .size(11.0)
+                            .color(t.text_muted),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if primary_button(
+                                ui,
+                                Icon::RotateCw,
+                                "Stop Server, Install & Restart",
+                                true,
+                                t,
+                            )
+                            .clicked()
+                            {
+                                actions.install_update = true;
+                            }
+                        });
+                    });
+                });
+        }
+        _ => {}
+    }
+}
+
+fn draw_update_progress_bar(
+    ui: &mut egui::Ui,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+    t: &Tokens,
+) {
+    let track_h = 10.0_f32;
+    let radius = 5_u8;
+    let (bar_rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), track_h), Sense::hover());
+    if !ui.is_rect_visible(bar_rect) {
+        return;
+    }
+
+    let p = ui.painter();
+    p.rect_filled(bar_rect, CornerRadius::same(radius), t.field_bg);
+    p.rect_stroke(
+        bar_rect,
+        CornerRadius::same(radius),
+        Stroke::new(1.0, t.border),
+        egui::StrokeKind::Inside,
+    );
+
+    if total_bytes > 0 {
+        let target_frac = (downloaded_bytes as f32 / total_bytes as f32).clamp(0.0, 1.0);
+        let anim_frac = ui
+            .ctx()
+            .animate_value_with_time(
+                ui.make_persistent_id("papercraft_srv_update_progress"),
+                target_frac,
+                0.08,
+            )
+            .clamp(0.0, 1.0);
+        let fill_w = bar_rect.width() * anim_frac;
+        if fill_w > 0.5 {
+            let fill_rect =
+                egui::Rect::from_min_size(bar_rect.min, Vec2::new(fill_w, bar_rect.height()));
+            let fill_radius = (fill_w * 0.5).min(f32::from(radius)).round() as u8;
+            p.rect_filled(fill_rect, CornerRadius::same(fill_radius), t.accent);
+        }
+    } else {
+        let time_s = ui.ctx().input(|i| i.time);
+        let seg_w = (bar_rect.width() * 0.30).max(24.0).min(bar_rect.width());
+        let travel = bar_rect.width() + seg_w;
+        let phase = ((time_s * 0.85) % 1.0) as f32;
+        let left = bar_rect.left() - seg_w + travel * phase;
+        let seg_rect =
+            egui::Rect::from_min_size(egui::pos2(left, bar_rect.top()), Vec2::new(seg_w, track_h));
+        p.with_clip_rect(bar_rect)
+            .rect_filled(seg_rect, CornerRadius::same(radius), t.accent);
+        ui.ctx().request_repaint();
+    }
+}
+
+fn render_updates_card(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Tokens) {
+    use papercraft_updater::UpdateStatus;
+
+    let current_ver = ctrl.updater.config().map_or_else(
+        || env!("CARGO_PKG_VERSION").to_string(),
+        |cfg| cfg.current_version.to_string(),
+    );
+    let is_custom_feed = ctrl.updater.config().is_some_and(|cfg| cfg.is_custom_feed);
+    let busy = ctrl.updater.is_busy();
+    let status = ctrl.updater.status().clone();
+
+    draw_card(ui, t, |ui| {
+        draw_section_header(
+            ui,
+            Icon::MoveDown,
+            "App Updates",
+            "Check GitHub Releases for new PaperCraft Server versions and install in place.",
+            t,
+        );
+        ui.add_space(10.0);
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(
+                egui::RichText::new(format!("Installed version: v{current_ver}"))
+                    .size(12.0)
+                    .strong()
+                    .color(t.text),
+            );
+            if is_custom_feed {
+                draw_compact_pill(ui, None, "Dev feed", t.accent_soft, t.accent, t.accent);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let btn_lbl = if matches!(status, UpdateStatus::Checking { .. }) {
+                    "Checking..."
+                } else {
+                    "Check for Updates"
+                };
+                if icon_button(ui, Icon::RotateCw, Some(btn_lbl), false, !busy, t)
+                    .on_hover_text("Check GitHub Releases for a newer PaperCraft Server version")
+                    .clicked()
+                {
+                    ctrl.check_for_updates();
+                }
+            });
+        });
+
+        match &status {
+            UpdateStatus::UpToDate { latest_version } => {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "PaperCraft Server is up to date (latest: v{latest_version})."
+                    ))
+                    .size(11.0)
+                    .color(t.success_fg),
+                );
+            }
+            UpdateStatus::NoPlatformAsset { latest_version, .. } => {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Release v{latest_version} requires manual download for this platform."
+                        ))
+                        .size(11.0)
+                        .color(t.warning_fg),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icon_button(
+                            ui,
+                            Icon::ExternalLink,
+                            Some("Open Release Page"),
+                            false,
+                            true,
+                            t,
+                        )
+                        .clicked()
+                        {
+                            ctrl.open_update_release_page();
+                        }
+                    });
+                });
+            }
+            UpdateStatus::Error {
+                message,
+                was_silent: false,
+                ..
+            } => {
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(egui::RichText::new(message).size(11.0).color(t.danger_fg))
+                        .wrap(),
+                );
+            }
+            _ => {}
+        }
+
+        ui.add_space(10.0);
+        draw_hairline(ui, t);
+        ui.add_space(8.0);
+
+        ui.checkbox(
+            &mut ctrl.draft_settings.auto_check_updates,
+            egui::RichText::new("Check for updates automatically on startup")
+                .size(12.0)
+                .color(t.text),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Checks GitHub Releases quietly when PaperCraft Server starts. Turn off for completely offline use.",
+            )
+            .size(11.0)
+            .color(t.text_muted),
+        );
+    });
 }
 
 fn render_essential_settings_card(
@@ -1895,6 +2282,21 @@ mod tests {
         assert!(text2.contains("Stay signed in (days)"));
         assert!(text2.contains("Users (0)"));
         ctrl.stop_server();
+
+        // 3. Tall viewport shows the App Updates card below Advanced settings
+        ctrl.advanced_open = false;
+        let raw_full = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(560.0, 1400.0))),
+            ..Default::default()
+        };
+        let out3 = ctx.run_ui(raw_full, |ui| {
+            render_window(&mut ctrl, ui, &dark_tokens);
+        });
+        let text3 = collect_text(&out3.shapes);
+        out3.drop_without_applying_deltas();
+        assert!(text3.contains("App Updates"));
+        assert!(text3.contains("Check for updates automatically on startup"));
+        assert!(text3.contains("Check for Updates"));
     }
 
     #[test]
@@ -1986,5 +2388,24 @@ mod tests {
         assert_eq!(format_utc_date(0), "unknown date");
         assert_eq!(format_utc_date(1_000), "1970-01-01");
         assert_eq!(format_utc_date(1_763_424_000_000), "2025-11-18");
+    }
+
+    #[test]
+    fn server_update_progress_bar_renders_determinate_and_indeterminate_cleanly() {
+        let ctx = egui::Context::default();
+        for theme in [UiTheme::Light, UiTheme::Dark] {
+            let tokens = Tokens::for_theme(theme);
+            for (done, total) in [(0, 1000), (500, 1000), (1000, 1000), (2048, 0)] {
+                let raw = RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 80.0))),
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(raw, |ui| {
+                    draw_update_progress_bar(ui, done, total, &tokens);
+                });
+                assert!(!out.shapes.is_empty());
+                out.drop_without_applying_deltas();
+            }
+        }
     }
 }

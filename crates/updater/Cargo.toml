@@ -1,0 +1,19 @@
+[package]
+name = "papercraft-updater"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Pure-Rust GitHub Releases update checker, verifier, and self-updater for PaperCraft"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+log.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq.workspace = true
+
+[lints]
+workspace = true

@@ -159,3 +159,39 @@ fn pipe_to_clipboard_command(program: &str, args: &[&str], text: &str) -> bool {
     }
     child.wait().is_ok_and(|s| s.success())
 }
+
+/// Validates an HTTP(S) release URL and opens it in the system's default browser.
+pub fn open_url_in_browser(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    let safe = !trimmed.is_empty()
+        && trimmed.len() <= 2048
+        && !trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+        && (trimmed.starts_with("https://")
+            || papercraft_updater::manifest::is_loopback_http_url(trimmed));
+    if !safe {
+        return Err("Refused to open an unsafe external URL.".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", trimmed])
+            .spawn()
+            .map_err(|err| format!("Could not open web browser: {err}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|err| format!("Could not open web browser: {err}"))?;
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|err| format!("Could not open web browser: {err}"))?;
+    }
+    Ok(())
+}

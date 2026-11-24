@@ -256,6 +256,7 @@ fn install_platform_hooks() -> (Option<papercraft_tablet::windows::Monitor>, Pla
             }
         })),
         paste_poll: Some(Box::new(papercraft_tablet::windows::take_paste_requested)),
+        enable_auto_update_check: true,
         ..PlatformHooks::default()
     };
 
@@ -268,6 +269,7 @@ fn install_platform_hooks() -> (Option<()>, PlatformHooks) {
 }
 
 fn main() -> eframe::Result {
+    papercraft_updater::cleanup_stale_files(papercraft_updater::AppId::PaperCraft);
     let library_dir = papercraft_engine::default_library_dir();
     install_panic_logger(library_dir.clone());
 

@@ -9,6 +9,7 @@ description = "System-tray control center and standalone runner for the PaperCra
 [dependencies]
 papercraft-server-cli.workspace = true
 papercraft-doc.workspace = true
+papercraft-updater.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true

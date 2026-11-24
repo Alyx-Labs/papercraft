@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A native notebook and handwriting studio, built in pure Rust."
 readme = "README.md"
@@ -26,6 +26,7 @@ papercraft-engine = { path = "crates/engine" }
 papercraft-ui-egui = { path = "crates/ui-egui" }
 papercraft-sync-protocol = { path = "crates/sync-protocol" }
 papercraft-sync = { path = "crates/sync" }
+papercraft-updater = { path = "crates/updater" }
 papercraft-server-cli = { path = "apps/papercraft-server-cli" }
 
 # external (pure Rust)

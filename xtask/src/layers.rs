@@ -123,7 +123,7 @@ fn layer_of(name: &str) -> Option<u8> {
         "papercraft-doc" => Some(1),
         "papercraft-ops" | "papercraft-paint" | "papercraft-sync-protocol" => Some(2),
         "papercraft-compose" | "papercraft-format" => Some(3),
-        "papercraft-sync" => Some(4),
+        "papercraft-sync" | "papercraft-updater" => Some(4),
         "papercraft-engine" => Some(5),
         "papercraft-ui-egui" => Some(6),
         _ => None,
@@ -375,6 +375,7 @@ mod tests {
                 "papercraft-format",
                 &[("papercraft-doc", DepKind::Normal, true)],
             ),
+            c("papercraft-updater", &[]),
             c(
                 "papercraft-engine",
                 &[

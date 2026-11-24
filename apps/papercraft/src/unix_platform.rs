@@ -80,6 +80,7 @@ pub fn install_platform_hooks() -> (Option<()>, PlatformHooks) {
                 let _ = Command::new("xdg-open").arg(trimmed).spawn();
             }
         })),
+        enable_auto_update_check: true,
         ..PlatformHooks::default()
     };
 

@@ -52,6 +52,8 @@ fn panic_hunt_all_commands_resist_adversarial_inputs() {
         json!({ "reset": true }),
         json!({ "barrel_button": "Undo", "secondary_barrel_button": "PanCanvasHold", "eraser_end": "EraserHold" }),
         json!({ "eraser_end": "Undo" }),
+        json!({ "enabled": false }),
+        json!({ "enabled": "invalid" }),
     ];
 
     for spec in commands::specs() {

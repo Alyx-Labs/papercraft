@@ -24,6 +24,7 @@ log.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 winit.workspace = true
+papercraft-updater.workspace = true
 
 [lints]
 workspace = true

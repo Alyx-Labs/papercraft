@@ -79,6 +79,12 @@ pub struct ServerControlSettings {
     pub auto_start_server: bool,
     pub start_in_tray: bool,
     pub theme: UiTheme,
+    #[serde(default = "default_auto_check_updates")]
+    pub auto_check_updates: bool,
+}
+
+fn default_auto_check_updates() -> bool {
+    true
 }
 
 impl Default for ServerControlSettings {
@@ -95,6 +101,7 @@ impl Default for ServerControlSettings {
             auto_start_server: true,
             start_in_tray: false,
             theme: UiTheme::Dark,
+            auto_check_updates: default_auto_check_updates(),
         }
     }
 }
@@ -585,6 +592,7 @@ mod tests {
             auto_start_server: false,
             start_in_tray: true,
             theme: UiTheme::Dark,
+            auto_check_updates: false,
         };
 
         original.save_atomic(&cfg_path).unwrap();

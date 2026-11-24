@@ -7326,6 +7326,10 @@ fn default_ui_scale() -> f32 {
     UserStudioConfig::DEFAULT_UI_SCALE
 }
 
+fn default_auto_check_updates() -> bool {
+    true
+}
+
 fn default_pen_sizes() -> [f32; 5] {
     UserStudioConfig::DEFAULT_PEN_SIZES
 }
@@ -7569,6 +7573,8 @@ pub struct UserStudioConfig {
     pub saved_elements: Vec<SavedElement>,
     #[serde(default)]
     pub stylus_buttons: StylusButtonConfig,
+    #[serde(default = "default_auto_check_updates")]
+    pub auto_check_updates: bool,
 }
 
 impl Default for UserStudioConfig {
@@ -7596,6 +7602,7 @@ impl Default for UserStudioConfig {
             style_favorites: Vec::new(),
             saved_elements: Vec::new(),
             stylus_buttons: StylusButtonConfig::default(),
+            auto_check_updates: default_auto_check_updates(),
         }
     }
 }
@@ -8029,6 +8036,7 @@ impl UserStudioConfig {
             style_favorites,
             saved_elements,
             stylus_buttons: self.stylus_buttons.sanitized(),
+            auto_check_updates: self.auto_check_updates,
         }
     }
 }

@@ -10,6 +10,7 @@ publish = false
 papercraft-tablet.workspace = true
 papercraft-engine.workspace = true
 papercraft-ui-egui.workspace = true
+papercraft-updater.workspace = true
 eframe.workspace = true
 egui.workspace = true
 log.workspace = true

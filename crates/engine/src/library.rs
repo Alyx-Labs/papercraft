@@ -1661,4 +1661,27 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn auto_check_updates_preference_persists_and_validates() {
+        let legacy: UserStudioConfig = serde_json::from_str(r#"{"theme":"Dark"}"#).unwrap();
+        assert!(legacy.auto_check_updates);
+
+        let guard = temp_lib_dir("auto_check_updates");
+        let dir = guard.0.clone();
+
+        {
+            let mut session = Session::open_library(dir.clone());
+            assert!(session.prefs.auto_check_updates);
+            let res = session
+                .execute("updates.setAutoCheck", &json!({ "enabled": false }))
+                .unwrap();
+            assert_eq!(res["auto_check_updates"], false);
+            assert!(!session.prefs.auto_check_updates);
+            assert!(session.execute("updates.setAutoCheck", &json!({})).is_err());
+        }
+
+        let reopened = Session::open_library(dir);
+        assert!(!reopened.prefs.auto_check_updates);
+    }
 }

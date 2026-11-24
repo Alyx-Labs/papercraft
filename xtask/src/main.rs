@@ -10,6 +10,7 @@
 
 mod branding;
 mod layers;
+mod update_dev_server;
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -158,14 +159,21 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("update-dev-server") => match update_dev_server::run(&rest) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        },
         Some(other) => {
             eprintln!(
-                "unknown xtask command `{other}` (expected: layers, branding, ci, web, or web-build)"
+                "unknown xtask command `{other}` (expected: layers, branding, ci, web, web-build, or update-dev-server)"
             );
             ExitCode::FAILURE
         }
         None => {
-            eprintln!("usage: cargo xtask <layers|branding|ci|web|web-build>");
+            eprintln!("usage: cargo xtask <layers|branding|ci|web|web-build|update-dev-server>");
             ExitCode::FAILURE
         }
     }

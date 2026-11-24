@@ -3567,7 +3567,17 @@ fn draw_right_zone(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
         crate::open_profile_screen(app);
     }
 
-    if compact_icon_button(
+    #[cfg(not(target_arch = "wasm32"))]
+    let has_update = app.updater.has_actionable_update();
+    #[cfg(target_arch = "wasm32")]
+    let has_update = false;
+
+    let settings_tip = if has_update {
+        "Settings (Shortcut: S)\nPen stabilization, studio appearance, live telemetry, and an available app update."
+    } else {
+        "Settings (Shortcut: S)\nPen stabilization, studio appearance, and live stylus telemetry."
+    };
+    let settings_resp = compact_icon_button(
         ui,
         Icon::Settings,
         Some("Settings"),
@@ -3575,11 +3585,16 @@ fn draw_right_zone(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
         true,
         t,
     )
-    .on_hover_text(
-        "Settings (Shortcut: S)\nPen stabilization, studio appearance, and live stylus telemetry.",
-    )
-    .clicked()
-    {
+    .on_hover_text(settings_tip);
+    if has_update && ui.is_rect_visible(settings_resp.rect) {
+        let dot_c = egui::pos2(
+            settings_resp.rect.right() - 4.0,
+            settings_resp.rect.top() + 4.0,
+        );
+        ui.painter().circle_filled(dot_c, 4.0, t.toolbar_bg);
+        ui.painter().circle_filled(dot_c, 3.0, t.accent);
+    }
+    if settings_resp.clicked() {
         app.view.inspector_open = !app.view.inspector_open;
     }
 }

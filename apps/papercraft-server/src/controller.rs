@@ -2,12 +2,13 @@
 
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use papercraft_doc::UiTheme;
 use papercraft_server_cli::db::{PasswordResetOutcome, UserSummary};
 use papercraft_server_cli::{LocalDiscoverySummary, ServerRuntime};
+use papercraft_updater::{AppId, UpdateStatus, UpdateWorker};
 
 use crate::platform;
 use crate::settings::{ConnectionUrls, ServerControlSettings, detect_local_ipv4};
@@ -80,6 +81,7 @@ pub struct ServerController {
     server_stopped_tx: mpsc::Sender<(u64, Result<(), String>)>,
     server_stopped_rx: mpsc::Receiver<(u64, Result<(), String>)>,
     run_generation: u64,
+    pub updater: UpdateWorker,
 }
 
 impl ServerController {
@@ -120,6 +122,7 @@ impl ServerController {
             server_stopped_tx,
             server_stopped_rx,
             run_generation: 0,
+            updater: UpdateWorker::new(AppId::PaperCraftServer, env!("CARGO_PKG_VERSION")),
         };
 
         if auto_start {
@@ -132,6 +135,54 @@ impl ServerController {
 
     pub fn set_repaint_ctx(&mut self, ctx: egui::Context) {
         self.repaint_ctx = Some(ctx);
+    }
+
+    fn updater_notify_cb(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let ctx = self.repaint_ctx.clone();
+        Arc::new(move || {
+            if let Some(ref c) = ctx {
+                c.request_repaint();
+            }
+        })
+    }
+
+    pub fn start_startup_update_check_if_enabled(&mut self) {
+        if self.draft_settings.auto_check_updates {
+            self.updater.check_now(true, self.updater_notify_cb());
+        }
+    }
+
+    pub fn check_for_updates(&mut self) {
+        self.updater.check_now(false, self.updater_notify_cb());
+    }
+
+    pub fn start_update_download(&mut self) {
+        self.updater.start_download(self.updater_notify_cb());
+    }
+
+    pub fn cancel_update_download(&mut self) {
+        self.updater.cancel_download();
+    }
+
+    pub fn open_update_release_page(&mut self) {
+        let url = match self.updater.status() {
+            UpdateStatus::Available(u) => u.release_url.clone(),
+            UpdateStatus::Downloading { update, .. }
+            | UpdateStatus::ReadyToInstall { update, .. } => update.release_url.clone(),
+            UpdateStatus::NoPlatformAsset { release_url, .. }
+            | UpdateStatus::Error { release_url, .. } => release_url.clone(),
+            _ => papercraft_updater::DEFAULT_RELEASES_PAGE_URL.to_string(),
+        };
+        if let Err(err) = platform::open_url_in_browser(&url) {
+            self.notice_banner = Some(NoticeBanner {
+                tone: NoticeTone::Error,
+                text: err,
+            });
+        }
+    }
+
+    pub fn apply_ready_update_and_relaunch(&mut self) -> Result<(), String> {
+        self.updater.apply_ready_update_and_relaunch()
     }
 
     pub fn is_running(&self) -> bool {
@@ -555,6 +606,8 @@ impl ServerController {
         {
             self.copied_url_feedback = None;
         }
+
+        let _ = self.updater.poll();
 
         if self.window_visible
             && self.is_running()

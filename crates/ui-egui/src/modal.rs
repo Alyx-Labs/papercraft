@@ -29,6 +29,7 @@ pub enum ActiveModal {
     DeleteFolder,
     FolderColor,
     TagColor,
+    AppUpdate,
 }
 
 struct DialogSpec {
@@ -78,6 +79,7 @@ impl ActiveModal {
             Self::ConfirmReorderPage => 11,
             Self::FolderColor => 12,
             Self::TagColor => 13,
+            Self::AppUpdate => 16,
         }
     }
 
@@ -178,6 +180,13 @@ impl ActiveModal {
                 icon: Icon::AlertCircle,
                 title: "Sync Conflict Detected",
                 subtitle: "Changes were made while offline. Choose which version should prevail.",
+                width: 480.0,
+                min_body_height: 0.0,
+            },
+            Self::AppUpdate => DialogSpec {
+                icon: Icon::MoveDown,
+                title: "Software Update",
+                subtitle: "Review and install the latest PaperCraft release.",
                 width: 480.0,
                 min_body_height: 0.0,
             },
@@ -288,7 +297,8 @@ pub(crate) fn open(app: &mut PaperCraftApp, target: ActiveModal) {
         | ActiveModal::DeleteFolder
         | ActiveModal::FolderColor
         | ActiveModal::TagColor
-        | ActiveModal::SyncConflict => {}
+        | ActiveModal::SyncConflict
+        | ActiveModal::AppUpdate => {}
         ActiveModal::FirstAccessNickname => {
             app.view.first_access_error = None;
             app.view.first_access_focus_pending = true;
@@ -576,7 +586,35 @@ fn show_inner_with_motion(
             folder_modals::render_tag_color_body,
             folder_modals::render_tag_color_footer,
         ),
+        ActiveModal::AppUpdate => show_dialog(
+            app,
+            ui,
+            active,
+            motion,
+            render_app_update_body,
+            render_app_update_footer,
+        ),
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn render_app_update_body(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> bool {
+    crate::update_modal::render_body(app, ui, t)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn render_app_update_body(_app: &mut PaperCraftApp, _ui: &mut egui::Ui, _t: &Tokens) -> bool {
+    true
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn render_app_update_footer(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> bool {
+    crate::update_modal::render_footer(app, ui, t)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn render_app_update_footer(_app: &mut PaperCraftApp, _ui: &mut egui::Ui, _t: &Tokens) -> bool {
+    true
 }
 
 fn modal_steps(active: ActiveModal) -> Option<&'static [ModalStepSpec]> {
@@ -593,7 +631,8 @@ fn modal_steps(active: ActiveModal) -> Option<&'static [ModalStepSpec]> {
         | ActiveModal::RenameFolder
         | ActiveModal::DeleteFolder
         | ActiveModal::FolderColor
-        | ActiveModal::TagColor => None,
+        | ActiveModal::TagColor
+        | ActiveModal::AppUpdate => None,
     }
 }
 

@@ -82,7 +82,10 @@ impl eframe::App for ServerControlApp {
             tray.sync_state(self.controller.tray_visual_state());
         }
 
-        if self.controller.copied_url_feedback.is_some() || self.controller.is_picking_folder() {
+        if self.controller.copied_url_feedback.is_some()
+            || self.controller.is_picking_folder()
+            || self.controller.updater.is_busy()
+        {
             ctx.request_repaint_after(Duration::from_millis(500));
         } else if self.controller.window_visible && self.controller.is_running() {
             ctx.request_repaint_after(Duration::from_secs(5));
@@ -97,6 +100,26 @@ impl eframe::App for ServerControlApp {
 
         if actions.quit_app {
             self.quit_cleanly(ui.ctx());
+        } else if actions.install_update {
+            let was_running = self.controller.is_running();
+            self.controller.auto_save_settings();
+            self.controller.stop_server();
+            match self.controller.apply_ready_update_and_relaunch() {
+                Ok(()) => {
+                    self.controller.allow_close = true;
+                    self.tray = None;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Err(err) => {
+                    self.controller.notice_banner = Some(controller::NoticeBanner {
+                        tone: controller::NoticeTone::Error,
+                        text: format!("Could not install update: {err}"),
+                    });
+                    if was_running {
+                        self.controller.start_server();
+                    }
+                }
+            }
         } else if actions.hide_to_tray {
             if self.tray.is_some() {
                 self.hide_window(ui.ctx());
@@ -115,6 +138,7 @@ impl eframe::App for ServerControlApp {
 }
 
 fn main() -> eframe::Result {
+    papercraft_updater::cleanup_stale_files(papercraft_updater::AppId::PaperCraftServer);
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
 
@@ -141,6 +165,7 @@ fn main() -> eframe::Result {
         native_options,
         Box::new(move |cc| {
             controller.set_repaint_ctx(cc.egui_ctx.clone());
+            controller.start_startup_update_check_if_enabled();
             let (tray_tx, tray_rx) = mpsc::channel();
             let tray = TrayController::try_new(
                 controller.tray_visual_state(),

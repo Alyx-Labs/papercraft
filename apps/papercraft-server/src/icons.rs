@@ -30,6 +30,8 @@ pub enum Icon {
     Close,
     Search,
     Trash,
+    MoveDown,
+    ExternalLink,
 }
 
 fn icon_svg(icon: Icon) -> &'static str {
@@ -73,6 +75,12 @@ fn icon_svg(icon: Icon) -> &'static str {
         Icon::Close => include_str!("../../../crates/ui-egui/assets/icons/lucide/x.svg"),
         Icon::Search => include_str!("../../../crates/ui-egui/assets/icons/lucide/search.svg"),
         Icon::Trash => include_str!("../../../crates/ui-egui/assets/icons/lucide/trash.svg"),
+        Icon::MoveDown => {
+            include_str!("../../../crates/ui-egui/assets/icons/lucide/arrow-down.svg")
+        }
+        Icon::ExternalLink => {
+            include_str!("../../../crates/ui-egui/assets/icons/lucide/arrow-up-right.svg")
+        }
     }
 }
 
@@ -450,6 +458,8 @@ mod tests {
             Icon::Close,
             Icon::Search,
             Icon::Trash,
+            Icon::MoveDown,
+            Icon::ExternalLink,
         ];
         let rect = Rect::from_min_size(pos2(16.0, 16.0), Vec2::splat(16.0));
         for icon in all {
