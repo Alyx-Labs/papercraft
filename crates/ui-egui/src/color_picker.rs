@@ -209,9 +209,23 @@ pub fn show_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
     let (desired_x, desired_y) = if anchor == Rect::NOTHING {
         (viewport.center().x - total_w * 0.5, viewport.top() + 52.0)
     } else if from_color_dock {
+        let canvas_bounds = app
+            .view
+            .last_canvas_rect
+            .filter(|r| r.is_positive())
+            .unwrap_or(viewport);
         let left_candidate = dock_rect.left() - total_w - 10.0;
         let right_candidate = dock_rect.right() + 10.0;
-        let x = if left_candidate >= viewport.left() + 8.0 {
+        let prefer_right = dock_rect.center().x <= canvas_bounds.center().x;
+        let x = if prefer_right {
+            if right_candidate + total_w <= viewport.right() - 8.0 {
+                right_candidate
+            } else if left_candidate >= viewport.left() + 8.0 {
+                left_candidate
+            } else {
+                viewport.center().x - total_w * 0.5
+            }
+        } else if left_candidate >= viewport.left() + 8.0 {
             left_candidate
         } else if right_candidate + total_w <= viewport.right() - 8.0 {
             right_candidate

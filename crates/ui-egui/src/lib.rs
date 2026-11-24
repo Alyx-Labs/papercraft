@@ -422,7 +422,7 @@ impl Default for ViewState {
             text_draft: String::new(),
             text_edit_index: None,
             text_size_draft: 24.0,
-            text_color_draft: papercraft_color::Color::BLACK,
+            text_color_draft: papercraft_color::INK_PALETTE[1].color,
             text_font_draft: papercraft_doc::TextFont::Sans,
             text_line_spacing_draft: papercraft_doc::DEFAULT_TEXT_LINE_SPACING,
             text_letter_spacing_draft: papercraft_doc::DEFAULT_TEXT_LETTER_SPACING,

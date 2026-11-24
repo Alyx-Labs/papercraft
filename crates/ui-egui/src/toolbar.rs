@@ -116,7 +116,7 @@ pub(crate) type ContextTrayTransition = TrayTransition<ContextTrayMode>;
 
 /// Session state for the floating, draggable color dock.
 ///
-/// Opens vertically docked to the right edge of the canvas until dragged by the user,
+/// Opens vertically docked to the left edge of the canvas until dragged by the user,
 /// glides smoothly during drags and resets, and stays within the visible workspace.
 #[derive(Clone, Debug)]
 pub(crate) struct ColorDockState {
@@ -155,7 +155,7 @@ impl ColorDockState {
         let x = if pos.x.is_finite() {
             pos.x.clamp(min_pos.x, max_pos.x)
         } else {
-            max_pos.x
+            min_pos.x
         };
         let y = if pos.y.is_finite() {
             pos.y.clamp(min_pos.y, max_pos.y)
@@ -1937,7 +1937,7 @@ fn draw_color_dock_grip(
     };
     if !active_drag {
         grip_resp.clone().on_hover_text(
-            "Drag to move colors anywhere\nDouble-click to dock back to the right side",
+            "Drag to move colors anywhere\nDouble-click to dock back to the left side",
         )
     } else {
         grip_resp
@@ -4076,7 +4076,7 @@ fn tray_workspace_bounds(
 }
 
 /// Renders the floating context tray centered within `workspace_rect` and the
-/// floating draggable color dock (initially docked on the right side of `workspace_rect`).
+/// floating draggable color dock (initially docked on the left side of `workspace_rect`).
 pub(crate) fn show_context_tray_in_rect(
     app: &mut PaperCraftApp,
     ui: &mut egui::Ui,
@@ -4265,7 +4265,7 @@ fn show_color_dock_in_rect(
     } else {
         centered_y.clamp(bounds_min.y, bounds_max.y)
     };
-    let default_pos = egui::pos2(bounds_max.x, default_y);
+    let default_pos = egui::pos2(bounds_min.x, default_y);
 
     let prev_visual = app.view.color_dock.visual_pos;
     if app.view.color_dock.is_dragging && dock_open {
@@ -4329,7 +4329,7 @@ fn show_color_dock_in_rect(
     }
 
     let settle_x = if app.view.color_dock.custom_pos.is_none() {
-        (1.0 - reveal) * COLOR_DOCK_SETTLE_OFFSET_X
+        -(1.0 - reveal) * COLOR_DOCK_SETTLE_OFFSET_X
     } else {
         0.0
     };
@@ -6085,11 +6085,11 @@ mod tests {
     }
 
     #[test]
-    fn floating_color_dock_opens_on_right_edge_for_color_tools_and_hides_for_non_color_tools() {
+    fn floating_color_dock_opens_on_left_edge_for_color_tools_and_hides_for_non_color_tools() {
         let mut app = PaperCraftApp::default();
         crate::open_notebook_in_editor(&mut app, 0);
         app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
-        app.view.pages_sidebar_open = true;
+        app.view.pages_sidebar_open = false;
         app.view.inspector_open = false;
 
         let ctx = egui::Context::default();
@@ -6100,7 +6100,7 @@ mod tests {
             let _ = step_editor_frame(&ctx, &mut app, viewport, time, 0.08, Vec::new());
         }
 
-        // 1. Pen mode: top tray keeps thickness dots; color dock opens vertically on right edge.
+        // 1. Pen mode: top tray keeps thickness dots; color dock opens vertically on left edge.
         let t = Tokens::for_theme(app.session.prefs.theme);
         let (shapes, _) =
             step_editor_frame(&ctx, &mut app, viewport, time + 0.08, 0.08, Vec::new());
@@ -6117,27 +6117,27 @@ mod tests {
             "color dock should be a slim vertical capsule, got {dock_rect:?}"
         );
         assert!(
-            (dock_rect.right() - (viewport.x - COLOR_DOCK_OUTER_MARGIN)).abs() <= 2.0,
-            "color dock must open on the right edge of canvas, got {dock_rect:?}"
+            (dock_rect.left() - COLOR_DOCK_OUTER_MARGIN).abs() <= 2.0,
+            "color dock must open on the left edge of canvas, got {dock_rect:?}"
         );
         assert!(
             dock_rect.top() > top_tray.bottom(),
             "color dock must sit cleanly below top tray"
         );
 
-        // 2. Opening Settings on the right glides the docked color bar inward so it stays visible.
-        app.view.inspector_open = true;
+        // 2. Opening Pages sidebar on the left glides the docked color bar inward so it stays visible.
+        app.view.pages_sidebar_open = true;
         for _ in 0..12 {
             time += 0.05;
             let _ = step_editor_frame(&ctx, &mut app, viewport, time, 0.05, Vec::new());
         }
         let shifted_dock = app.view.color_dock.last_rect;
-        let canvas_right = viewport.x - crate::inspector::DEFAULT_INSPECTOR_WIDTH;
+        let canvas_left = crate::pages_sidebar::DEFAULT_SIDEBAR_WIDTH;
         assert!(
-            shifted_dock.right() <= canvas_right - COLOR_DOCK_OUTER_MARGIN + 2.0,
-            "color dock {shifted_dock:?} must stay clear of right inspector ({canvas_right})"
+            shifted_dock.left() >= canvas_left + COLOR_DOCK_OUTER_MARGIN - 2.0,
+            "color dock {shifted_dock:?} must stay clear of left pages sidebar ({canvas_left})"
         );
-        app.view.inspector_open = false;
+        app.view.pages_sidebar_open = false;
         for _ in 0..12 {
             time += 0.05;
             let _ = step_editor_frame(&ctx, &mut app, viewport, time, 0.05, Vec::new());
@@ -6195,7 +6195,7 @@ mod tests {
             "image-only selection must hide color dock"
         );
 
-        // 5. LaserPointer has 4 laser colors -> dock shows on the right side cleanly.
+        // 5. LaserPointer has 4 laser colors -> dock shows on the left side cleanly.
         app.view.clear_selection();
         app.session
             .execute("tool.select", &json!({ "tool": "LaserPointer" }))
@@ -6270,7 +6270,7 @@ mod tests {
         );
         assert_eq!(hover_cursor, egui::CursorIcon::Grab);
 
-        // Press and drag grip to left-center of canvas (~450px left, ~60px up).
+        // Press and drag grip to right-center of canvas (~450px right, ~60px up).
         time += 0.03;
         let _ = step_editor_frame(
             &ctx,
@@ -6289,7 +6289,7 @@ mod tests {
             ],
         );
 
-        let drag_target = egui::pos2(grip_pos.x - 450.0, grip_pos.y - 60.0);
+        let drag_target = egui::pos2(grip_pos.x + 450.0, grip_pos.y - 60.0);
         time += 0.02;
         let (_, drag_cursor) = step_editor_frame(
             &ctx,
@@ -6313,8 +6313,8 @@ mod tests {
         );
         let mid_rect = app.view.color_dock.last_rect;
         assert!(
-            mid_rect.left() < initial_rect.left() - 20.0
-                && mid_rect.left() > initial_rect.left() - 445.0,
+            mid_rect.left() > initial_rect.left() + 20.0
+                && mid_rect.left() < initial_rect.left() + 445.0,
             "expected smooth intermediate drag glide between {initial_rect:?} and target, got {mid_rect:?}"
         );
 
@@ -6342,7 +6342,7 @@ mod tests {
         }
         let settled_rect = app.view.color_dock.last_rect;
         assert!(
-            (settled_rect.left() - (initial_rect.left() - 450.0)).abs() <= 4.0,
+            (settled_rect.left() - (initial_rect.left() + 450.0)).abs() <= 4.0,
             "expected settled dock near dragged target, got {settled_rect:?} from {initial_rect:?}"
         );
         assert!(
@@ -6408,7 +6408,7 @@ mod tests {
             "switching tools within the same session must preserve dragged color dock position"
         );
 
-        // Double-click grip handle -> smoothly glides back to the right edge!
+        // Double-click grip handle -> smoothly glides back to the left edge!
         let moved_grip_pos = egui::pos2(
             settled_rect.center().x,
             settled_rect.top() + COLOR_DOCK_INNER_MARGIN_Y + COLOR_DOCK_GRIP_SIZE.y * 0.5,
@@ -6443,12 +6443,12 @@ mod tests {
         let redocked_rect = app.view.color_dock.last_rect;
         assert!(
             (redocked_rect.left() - initial_rect.left()).abs() <= 2.0,
-            "expected dock to glide back to initial right edge {initial_rect:?}, got {redocked_rect:?}"
+            "expected dock to glide back to initial left edge {initial_rect:?}, got {redocked_rect:?}"
         );
     }
 
     #[test]
-    fn color_picker_opened_from_right_color_dock_positions_to_its_left_without_overlapping() {
+    fn color_picker_opened_from_left_color_dock_positions_to_its_right_without_overlapping() {
         let mut app = PaperCraftApp::default();
         crate::open_notebook_in_editor(&mut app, 0);
         app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
@@ -6518,8 +6518,8 @@ mod tests {
         }
         let picker = picker_rect.expect("color picker popover rect");
         assert!(
-            picker.right() <= dock_rect.left(),
-            "color picker {picker:?} should open cleanly to the left of right-docked color bar {dock_rect:?}"
+            picker.left() >= dock_rect.right(),
+            "color picker {picker:?} should open cleanly to the right of left-docked color bar {dock_rect:?}"
         );
     }
 

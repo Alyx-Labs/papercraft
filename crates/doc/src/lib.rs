@@ -3731,7 +3731,7 @@ impl PenSettings {
     pub fn fountain_pen() -> Self {
         Self {
             kind: PenKind::FountainPen,
-            color: INK_PALETTE[0].color,
+            color: INK_PALETTE[1].color,
             size: 4.5,
             opacity: 1.0,
             hardness: 0.95,
@@ -6890,7 +6890,7 @@ impl Default for StyleFavorite {
         Self {
             id: String::new(),
             kind: PenKind::FountainPen,
-            color: INK_PALETTE[0].color,
+            color: INK_PALETTE[1].color,
             size: 2.2,
         }
     }
