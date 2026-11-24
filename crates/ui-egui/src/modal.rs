@@ -97,14 +97,14 @@ impl ActiveModal {
                 title: "New Notebook",
                 subtitle: "Create your notebook step by step: details, cover, sheet size, and paper style.",
                 width: 680.0,
-                min_body_height: 506.0,
+                min_body_height: 524.0,
             },
             Self::NotebookSettings => DialogSpec {
                 icon: Icon::Notebook,
                 title: "Notebook Settings",
                 subtitle: "Update notebook details, cover finish, page dimensions, and paper style.",
                 width: 680.0,
-                min_body_height: 512.0,
+                min_body_height: 524.0,
             },
             Self::ConfirmDeleteNotebook => DialogSpec {
                 icon: Icon::Trash,
@@ -682,7 +682,7 @@ fn show_dialog(
     let margin_f = f32::from(margin);
     let dialog_width = spec.width.min((viewport.width() - 32.0).max(320.0));
     let inner_w = (dialog_width - margin_f * 2.0 - 2.0).max(260.0);
-    let chrome_reserve = if steps.is_some() { 286.0 } else { 240.0 };
+    let chrome_reserve = if steps.is_some() { 268.0 } else { 240.0 };
     let max_body_height = (viewport.height() - chrome_reserve).max(160.0);
 
     let backdrop_id = ui.make_persistent_id("papercraft_modal_backdrop");

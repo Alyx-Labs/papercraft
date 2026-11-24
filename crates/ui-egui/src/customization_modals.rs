@@ -621,7 +621,6 @@ pub(crate) fn render_new_notebook_body(
             };
             draw_notebook_hero_card(ui, &hero_spec, &mut app.view.new_notebook_title, t);
 
-            ui.add_space(10.0);
             draw_modal_section_title(
                 ui,
                 "Folder, Favorite & Tags",
@@ -650,7 +649,6 @@ pub(crate) fn render_new_notebook_body(
                 t,
             );
 
-            ui.add_space(10.0);
             draw_modal_section_title(
                 ui,
                 "Book Cover",
@@ -786,7 +784,6 @@ pub(crate) fn render_notebook_settings_body(
             };
             draw_notebook_hero_card(ui, &hero_spec, &mut app.view.notebook_title_draft, t);
 
-            ui.add_space(10.0);
             draw_modal_section_title(
                 ui,
                 "Folder, Favorite & Tags",
@@ -815,7 +812,6 @@ pub(crate) fn render_notebook_settings_body(
                 t,
             );
 
-            ui.add_space(10.0);
             draw_modal_section_title(
                 ui,
                 "Book Cover",
@@ -1216,9 +1212,10 @@ fn draw_notebook_organization_section(
         .fill(t.panel_bg)
         .stroke(Stroke::new(1.0, t.border))
         .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(10, 8))
+        .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 5.0;
 
             // Row 1: Folder picker on the left, Favorite toggle right-aligned on the same bar.
             ui.horizontal(|ui| {
@@ -1386,7 +1383,9 @@ fn draw_notebook_organization_section(
             }
 
             // Row 3: Tag entry input + quick 1-click library tag suggestions.
-            ui.add_space(6.0);
+            if !tags.is_empty() {
+                ui.add_space(2.0);
+            }
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 let enter = ui
@@ -1704,7 +1703,7 @@ fn draw_notebook_hero_card(
         .fill(card_fill)
         .stroke(Stroke::new(1.0, t.border))
         .corner_radius(10.0)
-        .inner_margin(Margin::same(12))
+        .inner_margin(Margin::symmetric(12, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             if avail_w >= 460.0 {
@@ -1720,7 +1719,7 @@ fn draw_notebook_hero_card(
                 ui.vertical(|ui| {
                     ui.set_width(ui.available_width());
                     draw_hero_title_column(ui, spec, title_buf, t);
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
                     draw_live_pair_showcase(ui, spec, &preview_title, t);
                 });
             }
@@ -1737,11 +1736,11 @@ fn draw_live_pair_showcase(
         .fill(t.panel_bg)
         .stroke(Stroke::new(1.0, t.border))
         .corner_radius(8.0)
-        .inner_margin(Margin::symmetric(10, 8))
+        .inner_margin(Margin::symmetric(8, 6))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 9.0;
-                let (book_rect, _) = ui.allocate_exact_size(Vec2::new(66.0, 90.0), Sense::hover());
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let (book_rect, _) = ui.allocate_exact_size(Vec2::new(52.0, 72.0), Sense::hover());
                 paint_hardcover_book_cover(
                     ui.painter(),
                     book_rect,
@@ -1750,7 +1749,7 @@ fn draw_live_pair_showcase(
                     t.border,
                 );
 
-                let stage_size = Vec2::new(72.0, 90.0);
+                let stage_size = Vec2::new(58.0, 72.0);
                 let (stage_rect, _) = ui.allocate_exact_size(stage_size, Sense::hover());
                 let (pw, ph) = spec.page_dimensions;
                 let wf = pw.max(64) as f32;
@@ -1776,6 +1775,7 @@ fn draw_hero_title_column(
     title_buf: &mut String,
     t: &Tokens,
 ) {
+    ui.spacing_mut().item_spacing.y = 3.0;
     ui.label(
         RichText::new("Notebook Name")
             .size(13.0)
@@ -1787,11 +1787,11 @@ fn draw_hero_title_column(
             .size(11.0)
             .color(t.text_muted),
     );
-    ui.add_space(6.0);
+    ui.add_space(3.0);
 
     draw_prominent_title_field(ui, spec.title_id_salt, spec.title_hint, title_buf, t);
 
-    ui.add_space(7.0);
+    ui.add_space(3.0);
     egui::Frame::NONE
         .fill(t.panel_bg)
         .stroke(Stroke::new(1.0, t.border))
@@ -1846,7 +1846,7 @@ fn draw_prominent_title_field(
         .fill(box_fill)
         .stroke(stroke)
         .corner_radius(8.0)
-        .inner_margin(Margin::symmetric(10, 8))
+        .inner_margin(Margin::symmetric(10, 5))
         .show(ui, |ui| {
             ui.set_width((avail_w - 22.0).max(90.0));
             ui.horizontal(|ui| {
@@ -1876,35 +1876,14 @@ fn draw_cover_shelf_and_custom_picker(
     draft: &mut CoverColorDraftState,
     t: &Tokens,
 ) {
-    let avail_w = ui.available_width();
-    let cols = if avail_w >= 540.0 {
-        7
-    } else if avail_w >= 340.0 {
-        4
-    } else {
-        3
-    };
-
     let mut items: Vec<Option<NotebookCover>> =
         NotebookCover::ALL.iter().copied().map(Some).collect();
     items.push(None); // Custom cover card.
 
-    let rows: Vec<&[Option<NotebookCover>]> = items.chunks(cols).collect();
-    let total_rows = rows.len();
-    for (row_idx, row) in rows.into_iter().enumerate() {
-        ui.columns(cols, |col_uis| {
-            for (col_idx, item) in row.iter().enumerate() {
-                let col_ui = &mut col_uis[col_idx];
-                match item {
-                    Some(cover) => draw_preset_cover_tile(col_ui, *cover, selected, draft, t),
-                    None => draw_custom_cover_tile(col_ui, selected, draft, t),
-                }
-            }
-        });
-        if row_idx + 1 < total_rows {
-            ui.add_space(6.0);
-        }
-    }
+    draw_preview_grid(ui, &items, |col_ui, item| match item {
+        Some(cover) => draw_preset_cover_tile(col_ui, *cover, selected, draft, t),
+        None => draw_custom_cover_tile(col_ui, selected, draft, t),
+    });
 
     let studio_id = ui.make_persistent_id("custom_cover_studio_collapse");
     crate::motion::animated_collapse(ui, studio_id, draft.open, 184.0, |ui| {
@@ -1920,46 +1899,20 @@ fn draw_preset_cover_tile(
     draft: &mut CoverColorDraftState,
     t: &Tokens,
 ) {
-    let active = *selected == cover;
     let tile_id = ui.make_persistent_id(("cover_shelf_tile", cover.label()));
-    let style = tile_motion_colors(ui, tile_id, active, t);
-
-    let resp = egui::Frame::NONE
-        .fill(style.fill)
-        .stroke(style.stroke)
-        .corner_radius(8.0)
-        .inner_margin(Margin::symmetric(5, 8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.vertical_centered(|ui| {
-                let (book_rect, _) = ui.allocate_exact_size(Vec2::new(34.0, 46.0), Sense::hover());
-                paint_hardcover_book_cover(
-                    ui.painter(),
-                    book_rect,
-                    cover,
-                    None,
-                    style.border_color,
-                );
-                ui.add_space(5.0);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(cover.label())
-                            .size(10.5)
-                            .strong()
-                            .color(style.fg_color),
-                    )
-                    .wrap(),
-                );
-            });
-        })
-        .response;
-    let click_resp = ui
-        .interact(resp.rect, tile_id, Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(cover.description());
-
-    ui.ctx()
-        .data_mut(|d| d.insert_temp(tile_id.with("hov_mem"), click_resp.hovered()));
+    let click_resp = draw_preview_grid_tile(
+        ui,
+        PreviewGridTileSpec {
+            id: tile_id,
+            label: cover.label(),
+            tooltip: cover.description(),
+            selected: *selected == cover,
+        },
+        t,
+        |ui, book_rect, style| {
+            paint_hardcover_book_cover(ui.painter(), book_rect, cover, None, style.border_color);
+        },
+    );
     if click_resp.clicked() {
         *selected = cover;
         draft.set_color(cover.primary_color());
@@ -1980,47 +1933,7 @@ fn draw_custom_cover_tile(
         draft.current_cover()
     };
     let tile_id = ui.make_persistent_id("cover_shelf_tile_custom");
-    let style = tile_motion_colors(ui, tile_id, is_custom || draft.open, t);
-
-    let resp = egui::Frame::NONE
-        .fill(style.fill)
-        .stroke(style.stroke)
-        .corner_radius(8.0)
-        .inner_margin(Margin::symmetric(5, 8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.vertical_centered(|ui| {
-                let (book_rect, _) = ui.allocate_exact_size(Vec2::new(34.0, 46.0), Sense::hover());
-                paint_hardcover_book_cover(
-                    ui.painter(),
-                    book_rect,
-                    preview_cover,
-                    None,
-                    style.border_color,
-                );
-
-                // Subtle palette badge on the cover so its custom-color role is clear.
-                let badge_c = pos2(book_rect.right() - 7.0, book_rect.bottom() - 7.0);
-                ui.painter().circle_filled(badge_c, 7.5, t.field_bg);
-                ui.painter()
-                    .circle_stroke(badge_c, 7.5, Stroke::new(1.0, style.border_color));
-                let badge_icon_rect = Rect::from_center_size(badge_c, Vec2::splat(9.5));
-                paint_icon(ui.painter(), badge_icon_rect, Icon::Palette, t.accent);
-
-                ui.add_space(5.0);
-                let title = if is_custom { "Custom" } else { "Custom Color" };
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(title)
-                            .size(10.5)
-                            .strong()
-                            .color(style.fg_color),
-                    )
-                    .wrap(),
-                );
-            });
-        })
-        .response;
+    let title = if is_custom { "Custom" } else { "Custom Color" };
     let tip = if is_custom {
         format!(
             "{} — Click to toggle color controls",
@@ -2029,13 +1942,33 @@ fn draw_custom_cover_tile(
     } else {
         "Pick any custom cover color using HSV sliders or a #RRGGBB hex code".to_string()
     };
-    let click_resp = ui
-        .interact(resp.rect, tile_id, Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(tip);
+    let click_resp = draw_preview_grid_tile(
+        ui,
+        PreviewGridTileSpec {
+            id: tile_id,
+            label: title,
+            tooltip: &tip,
+            selected: is_custom || draft.open,
+        },
+        t,
+        |ui, book_rect, style| {
+            paint_hardcover_book_cover(
+                ui.painter(),
+                book_rect,
+                preview_cover,
+                None,
+                style.border_color,
+            );
 
-    ui.ctx()
-        .data_mut(|d| d.insert_temp(tile_id.with("hov_mem"), click_resp.hovered()));
+            // Subtle palette badge on the cover so its custom-color role is clear.
+            let badge_c = pos2(book_rect.right() - 8.0, book_rect.bottom() - 8.0);
+            ui.painter().circle_filled(badge_c, 8.5, t.field_bg);
+            ui.painter()
+                .circle_stroke(badge_c, 8.5, Stroke::new(1.0, style.border_color));
+            let badge_icon_rect = Rect::from_center_size(badge_c, Vec2::splat(10.5));
+            paint_icon(ui.painter(), badge_icon_rect, Icon::Palette, t.accent);
+        },
+    );
     if click_resp.clicked() {
         if !is_custom {
             *selected = draft.current_cover();
@@ -2737,6 +2670,82 @@ fn paint_tint_chip_swatch(p: &egui::Painter, rect: Rect, color: PaperColor, bord
     p.rect_stroke(rect, 3.0, Stroke::new(1.0, border), StrokeKind::Inside);
 }
 
+pub(crate) const PREVIEW_GRID_THUMB_SIZE: Vec2 = Vec2::new(52.0, 68.0);
+
+pub(crate) const fn preview_grid_columns(avail_w: f32) -> usize {
+    if avail_w >= 540.0 { 6 } else { 3 }
+}
+
+pub(crate) struct PreviewGridTileSpec<'a> {
+    pub(crate) id: egui::Id,
+    pub(crate) label: &'a str,
+    pub(crate) tooltip: &'a str,
+    pub(crate) selected: bool,
+}
+
+/// Renders `items` inside the standardized responsive preview grid (6 columns on desktop,
+/// 3 columns on compact viewports) shared by Cover, Size, and Paper steps.
+pub(crate) fn draw_preview_grid<T>(
+    ui: &mut egui::Ui,
+    items: &[T],
+    mut draw_tile: impl FnMut(&mut egui::Ui, &T),
+) {
+    let cols = preview_grid_columns(ui.available_width());
+    let rows: Vec<&[T]> = items.chunks(cols).collect();
+    let total_rows = rows.len();
+    for (row_idx, row) in rows.into_iter().enumerate() {
+        ui.columns(cols, |col_uis| {
+            for (col_idx, item) in row.iter().enumerate() {
+                draw_tile(&mut col_uis[col_idx], item);
+            }
+        });
+        if row_idx + 1 < total_rows {
+            ui.add_space(6.0);
+        }
+    }
+}
+
+/// Renders one standardized `52 × 68` preview tile with animated selection/hover state.
+pub(crate) fn draw_preview_grid_tile(
+    ui: &mut egui::Ui,
+    spec: PreviewGridTileSpec<'_>,
+    t: &Tokens,
+    paint_preview: impl FnOnce(&mut egui::Ui, Rect, &TileMotionColors),
+) -> egui::Response {
+    let style = tile_motion_colors(ui, spec.id, spec.selected, t);
+    let resp = egui::Frame::NONE
+        .fill(style.fill)
+        .stroke(style.stroke)
+        .corner_radius(8.0)
+        .inner_margin(Margin::symmetric(5, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical_centered(|ui| {
+                let (thumb_rect, _) =
+                    ui.allocate_exact_size(PREVIEW_GRID_THUMB_SIZE, Sense::hover());
+                paint_preview(ui, thumb_rect, &style);
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(spec.label)
+                            .size(10.5)
+                            .strong()
+                            .color(style.fg_color),
+                    )
+                    .wrap(),
+                );
+            });
+        })
+        .response;
+    let click_resp = ui
+        .interact(resp.rect, spec.id, Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(spec.tooltip);
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(spec.id.with("hov_mem"), click_resp.hovered()));
+    click_resp
+}
+
 struct PaperGridTarget<'a> {
     id_salt: &'static str,
     theme: UiTheme,
@@ -2748,77 +2757,45 @@ struct PaperGridTarget<'a> {
 }
 
 fn draw_paper_sheet_grid_for(ui: &mut egui::Ui, mut target: PaperGridTarget<'_>, t: &Tokens) {
-    let cols = if ui.available_width() >= 540.0 { 6 } else { 3 };
-    let rows: Vec<&[PaperTemplate]> = PaperTemplate::ALL.chunks(cols).collect();
-    let total_rows = rows.len();
     let preview_colors = target
         .color
         .resolved_colors(target.theme, target.auto_contrast);
 
-    for (row_idx, row) in rows.into_iter().enumerate() {
-        ui.columns(cols, |col_uis| {
-            for (col_idx, &template) in row.iter().enumerate() {
-                let col_ui = &mut col_uis[col_idx];
-                let selected = *target.template == template && target.custom_template_id.is_none();
-                let tile_id = col_ui.make_persistent_id((target.id_salt, template.label()));
-                let style = tile_motion_colors(col_ui, tile_id, selected, t);
-
-                let resp = egui::Frame::NONE
-                    .fill(style.fill)
-                    .stroke(style.stroke)
-                    .corner_radius(8.0)
-                    .inner_margin(Margin::symmetric(5, 8))
-                    .show(col_ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.vertical_centered(|ui| {
-                            let (sheet_rect, _) =
-                                ui.allocate_exact_size(Vec2::new(52.0, 68.0), Sense::hover());
-                            ui.painter().rect_filled(
-                                sheet_rect.translate(Vec2::new(0.0, 2.0)),
-                                4.0,
-                                Color32::from_black_alpha(20),
-                            );
-                            paint_paper_preview_colors(
-                                ui.painter(),
-                                sheet_rect,
-                                template,
-                                preview_colors,
-                                style.border_color,
-                            );
-                            ui.add_space(6.0);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(template.label())
-                                        .size(10.5)
-                                        .strong()
-                                        .color(style.fg_color),
-                                )
-                                .wrap(),
-                            );
-                        });
-                    })
-                    .response;
-                let click_resp = col_ui
-                    .interact(resp.rect, tile_id, Sense::click())
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text(template.description());
-
-                col_ui
-                    .ctx()
-                    .data_mut(|d| d.insert_temp(tile_id.with("hov_mem"), click_resp.hovered()));
-                if click_resp.clicked() {
-                    *target.template = template;
-                    *target.custom_template_id = None;
-                    if let Some(clear_flag) = target.clear_custom.as_deref_mut() {
-                        *clear_flag = true;
-                    }
-                }
+    draw_preview_grid(ui, PaperTemplate::ALL, |col_ui, &template| {
+        let selected = *target.template == template && target.custom_template_id.is_none();
+        let tile_id = col_ui.make_persistent_id((target.id_salt, template.label()));
+        let click_resp = draw_preview_grid_tile(
+            col_ui,
+            PreviewGridTileSpec {
+                id: tile_id,
+                label: template.label(),
+                tooltip: template.description(),
+                selected,
+            },
+            t,
+            |ui, sheet_rect, style| {
+                ui.painter().rect_filled(
+                    sheet_rect.translate(Vec2::new(0.0, 2.0)),
+                    4.0,
+                    Color32::from_black_alpha(20),
+                );
+                paint_paper_preview_colors(
+                    ui.painter(),
+                    sheet_rect,
+                    template,
+                    preview_colors,
+                    style.border_color,
+                );
+            },
+        );
+        if click_resp.clicked() {
+            *target.template = template;
+            *target.custom_template_id = None;
+            if let Some(clear_flag) = target.clear_custom.as_deref_mut() {
+                *clear_flag = true;
             }
-        });
-        if row_idx + 1 < total_rows {
-            ui.add_space(6.0);
         }
-    }
+    });
 }
 
 /// Names the notebook and explains its 30-day recovery period before it is confirmed.
@@ -3059,9 +3036,11 @@ pub(crate) fn tile_motion_colors(
 }
 
 fn draw_modal_section_title(ui: &mut egui::Ui, title: &str, subtitle: &str, t: &Tokens) {
-    ui.label(RichText::new(title).size(13.0).strong().color(t.text));
-    ui.add(egui::Label::new(RichText::new(subtitle).size(11.0).color(t.text_muted)).wrap());
-    ui.add_space(6.0);
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.label(RichText::new(title).size(13.0).strong().color(t.text));
+        ui.add(egui::Label::new(RichText::new(subtitle).size(11.0).color(t.text_muted)).wrap());
+    });
 }
 
 #[cfg(test)]
@@ -3764,5 +3743,85 @@ mod tests {
         assert!(app.session.doc.favorite);
         assert_eq!(app.session.doc.tags, vec!["final", "physics", "2026"]);
         assert_eq!(app.session.doc.paper_template, PaperTemplate::Grid);
+    }
+
+    #[test]
+    fn flows_1_2_and_3_share_identical_6_col_grid_card_dimensions() {
+        fn collect_card_rects_containing_label(
+            shapes: &[egui::epaint::ClippedShape],
+            label: &str,
+        ) -> Vec<Rect> {
+            fn collect_rects(shape: &egui::epaint::Shape, out: &mut Vec<Rect>) {
+                match shape {
+                    egui::epaint::Shape::Rect(r) => out.push(r.rect),
+                    egui::epaint::Shape::Vec(children) => {
+                        for child in children {
+                            collect_rects(child, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let center = find_modal_label_center(shapes, label)
+                .unwrap_or_else(|| panic!("expected tile label {label:?}"));
+            let mut rects = Vec::new();
+            for clipped in shapes {
+                collect_rects(&clipped.shape, &mut rects);
+            }
+            rects
+                .into_iter()
+                .filter(|r| {
+                    r.contains(center)
+                        && (80.0..=120.0).contains(&r.width())
+                        && (88.0..=120.0).contains(&r.height())
+                })
+                .collect()
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = PaperCraftApp::default();
+        modal::open(&mut app, modal::ActiveModal::NewNotebook);
+
+        let samples = [
+            (0usize, "Classic Navy", "Custom Color"),
+            (1usize, "Standard", "Custom Size"),
+            (2usize, "Ruled (Narrow)", "Music Staff"),
+        ];
+        let mut measured_sizes = Vec::new();
+        for (step, row1_first, row2_first) in samples {
+            app.view.new_notebook_step = step;
+            let mut shapes = Vec::new();
+            for frame in 0..4 {
+                shapes = run_page_setup_modal_frame(
+                    &ctx,
+                    &mut app,
+                    Vec::new(),
+                    f64::from(step as u32) + f64::from(frame) * 0.05,
+                );
+            }
+            let r1 = collect_card_rects_containing_label(&shapes, row1_first);
+            let r2 = collect_card_rects_containing_label(&shapes, row2_first);
+            assert!(!r1.is_empty(), "missing card rect for {row1_first:?}");
+            assert!(!r2.is_empty(), "missing card rect for {row2_first:?}");
+            let card1 = r1[0];
+            let card2 = r2[0];
+            assert!(
+                (card1.left() - card2.left()).abs() <= 1.0
+                    && (card1.width() - card2.width()).abs() <= 1.0
+                    && card2.top() > card1.bottom(),
+                "step {step} row2 col0 {card2:?} should align directly below row1 col0 {card1:?}"
+            );
+            measured_sizes.push((card1.width(), card1.height()));
+        }
+
+        let base = measured_sizes[2];
+        for (step, &(w, h)) in measured_sizes.iter().enumerate() {
+            assert!(
+                (w - base.0).abs() <= 1.0 && (h - base.1).abs() <= 1.0,
+                "step {step} tile size ({w:.1}×{h:.1}) differed from Flow 3 ({:.1}×{:.1})",
+                base.0,
+                base.1
+            );
+        }
     }
 }

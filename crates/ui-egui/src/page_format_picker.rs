@@ -1,9 +1,12 @@
 //! Reusable Page Size & Orientation picker component shared by New Notebook and Page Setup dialogs.
 
-use egui::{CornerRadius, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
+use egui::{CornerRadius, Rect, Sense, Stroke, StrokeKind, vec2};
 use papercraft_doc::{PageOrientation, PageResolutionPreset, PaperTemplate, ResolvedPaperColors};
 
-use crate::customization_modals::{paint_paper_preview_colors_rotated, tile_motion_colors};
+use crate::customization_modals::{
+    PreviewGridTileSpec, draw_preview_grid, draw_preview_grid_tile,
+    paint_paper_preview_colors_rotated,
+};
 use crate::icons::{
     Icon, SwitchLayout, SwitchOption, compact_icon_button, section_card_header, segmented_switch,
 };
@@ -184,13 +187,16 @@ fn paint_badge_pill(
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_preset_mini_sheet(
     painter: &egui::Painter,
     bounds: Rect,
     preset: PageResolutionPreset,
     orientation: PageOrientation,
+    ratio: &str,
     paper_colors: ResolvedPaperColors,
     selected: bool,
+    border_col: egui::Color32,
     t: &Tokens,
 ) {
     let (w, h) = if preset == PageResolutionPreset::Custom {
@@ -198,20 +204,19 @@ fn paint_preset_mini_sheet(
     } else {
         preset.dimensions_with_orientation(orientation)
     };
-    let sheet_rect = fit_proportional_rect(bounds.shrink2(vec2(6.0, 4.0)), w, h);
-    let shadow_rect = sheet_rect.translate(vec2(1.5, 2.0));
+    let sheet_rect = fit_proportional_rect(bounds, w, h);
+    let shadow_rect = sheet_rect.translate(vec2(0.0, 2.0));
     painter.rect_filled(
         shadow_rect,
-        CornerRadius::same(3),
-        egui::Color32::from_black_alpha(if t.is_dark { 70 } else { 22 }),
+        CornerRadius::same(4),
+        egui::Color32::from_black_alpha(if t.is_dark { 70 } else { 20 }),
     );
     let bg = if preset == PageResolutionPreset::Custom {
         t.field_bg
     } else {
         to_color32(paper_colors.background)
     };
-    painter.rect_filled(sheet_rect, CornerRadius::same(3), bg);
-    let border_col = if selected { t.accent } else { t.border };
+    painter.rect_filled(sheet_rect, CornerRadius::same(4), bg);
     if preset == PageResolutionPreset::Custom {
         let stroke = Stroke::new(1.3, border_col);
         let dash = 4.0_f32;
@@ -238,11 +243,36 @@ fn paint_preset_mini_sheet(
     } else {
         painter.rect_stroke(
             sheet_rect,
-            CornerRadius::same(3),
-            Stroke::new(if selected { 1.4 } else { 1.0 }, border_col),
+            CornerRadius::same(4),
+            Stroke::new(1.0, border_col),
             StrokeKind::Inside,
         );
     }
+
+    let is_dark_paper = u16::from(bg.r()) + u16::from(bg.g()) + u16::from(bg.b()) < 380;
+    let ratio_color = if selected {
+        if is_dark_paper {
+            egui::Color32::from_rgb(0x93, 0xC5, 0xFD)
+        } else {
+            t.accent
+        }
+    } else if is_dark_paper {
+        egui::Color32::from_rgb(0xB8, 0xC2, 0xD4)
+    } else {
+        egui::Color32::from_rgb(0x5C, 0x65, 0x76)
+    };
+    let font_size = if sheet_rect.width() < 42.0 || ratio.len() >= 6 {
+        8.5
+    } else {
+        9.5
+    };
+    painter.text(
+        sheet_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        ratio,
+        egui::FontId::proportional(font_size),
+        ratio_color,
+    );
 }
 
 /// Renders the shared Page Size & Orientation picker (live preview, orientation switch, preset
@@ -422,99 +452,53 @@ pub fn render_page_format_picker(
     );
     ui.add_space(6.0);
 
-    let cols = 4usize;
-    let gap = 10.0_f32;
-    let avail_w = ui.available_width();
-    let card_w = ((avail_w - gap * ((cols - 1) as f32)) / (cols as f32)).floor();
-    let card_h = 84.0_f32;
-
-    for row in PageResolutionPreset::ALL.chunks(cols) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            for &preset in row {
-                let selected = draft.preset == preset;
-                let tile_id = ui.make_persistent_id((preview_ctx.id_prefix, preset));
-                let style = tile_motion_colors(ui, tile_id, selected, t);
-                let (rect, resp) = ui.allocate_exact_size(vec2(card_w, card_h), Sense::click());
-                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-                ui.ctx()
-                    .data_mut(|d| d.insert_temp(tile_id.with("hov_mem"), resp.hovered()));
-                let label = preset_display_title(preset, draft.orientation);
-                let ratio = preset_ratio_badge(preset, draft.orientation);
-                let (pw, ph) = if preset == PageResolutionPreset::Custom {
-                    (
-                        draft.custom_width.clamp(64, 8192),
-                        draft.custom_height.clamp(64, 8192),
-                    )
-                } else {
-                    preset.dimensions_with_orientation(draft.orientation)
-                };
-                ui.painter().rect(
-                    rect,
-                    CornerRadius::same(8),
-                    style.fill,
-                    style.stroke,
-                    StrokeKind::Inside,
-                );
-
-                // Proportional miniature sheet inside the upper half of the card.
-                let thumb_bounds = Rect::from_min_max(
-                    pos2(rect.left() + 8.0, rect.top() + 7.0),
-                    pos2(rect.right() - 8.0, rect.top() + 42.0),
-                );
+    draw_preview_grid(ui, PageResolutionPreset::ALL, |col_ui, &preset| {
+        let selected = draft.preset == preset;
+        let tile_id = col_ui.make_persistent_id((preview_ctx.id_prefix, preset));
+        let label = preset_display_title(preset, draft.orientation);
+        let ratio = preset_ratio_badge(preset, draft.orientation);
+        let (pw, ph) = if preset == PageResolutionPreset::Custom {
+            (
+                draft.custom_width.clamp(64, 8192),
+                draft.custom_height.clamp(64, 8192),
+            )
+        } else {
+            preset.dimensions_with_orientation(draft.orientation)
+        };
+        let hover_text = if preset == PageResolutionPreset::Custom {
+            format!("{label}: {}", preset.description())
+        } else {
+            format!("{label} ({pw} × {ph} pt): {}", preset.description())
+        };
+        let click_resp = draw_preview_grid_tile(
+            col_ui,
+            PreviewGridTileSpec {
+                id: tile_id,
+                label,
+                tooltip: &hover_text,
+                selected,
+            },
+            t,
+            |ui, thumb_bounds, style| {
                 paint_preset_mini_sheet(
                     ui.painter(),
                     thumb_bounds,
                     preset,
                     draft.orientation,
+                    ratio,
                     preview_ctx.paper_colors,
                     selected,
+                    style.border_color,
                     t,
                 );
-
-                // Preset ratio pill tucked cleanly in top-right corner.
-                ui.painter().text(
-                    pos2(rect.right() - 7.0, rect.top() + 7.0),
-                    egui::Align2::RIGHT_TOP,
-                    ratio,
-                    egui::FontId::proportional(9.5),
-                    if selected { t.accent } else { t.text_muted },
-                );
-
-                // Preset title + dimensions cleanly stacked at the bottom of the card.
-                ui.painter().text(
-                    pos2(rect.center().x, rect.bottom() - 25.0),
-                    egui::Align2::CENTER_CENTER,
-                    label,
-                    egui::FontId::proportional(11.5),
-                    if selected { t.text } else { t.text_muted },
-                );
-                let dim_text = if preset == PageResolutionPreset::Custom {
-                    format!("{pw} × {ph}")
-                } else {
-                    format!("{pw} × {ph} pt")
-                };
-                ui.painter().text(
-                    pos2(rect.center().x, rect.bottom() - 11.0),
-                    egui::Align2::CENTER_CENTER,
-                    dim_text,
-                    egui::FontId::proportional(10.0),
-                    if selected { t.accent } else { t.text_muted },
-                );
-
-                let hover_text = if preset == PageResolutionPreset::Custom {
-                    format!("{label}: {}", preset.description())
-                } else {
-                    format!("{label} ({pw} × {ph} pt): {}", preset.description())
-                };
-                if resp.on_hover_text(hover_text).clicked() {
-                    draft.select_preset(preset);
-                    changed = true;
-                }
-            }
-        });
-        ui.add_space(6.0);
-    }
+            },
+        );
+        if click_resp.clicked() {
+            draft.select_preset(preset);
+            changed = true;
+        }
+    });
+    ui.add_space(6.0);
 
     // 3. Inline Custom Width / Height Controls (animated open/close when switching Custom Size).
     let custom_open = draft.preset == PageResolutionPreset::Custom;
