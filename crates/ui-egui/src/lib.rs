@@ -381,6 +381,8 @@ pub struct ViewState {
     pub laser_color: papercraft_color::Color,
     pub laser_points: Vec<LaserPoint>,
     pub elements_popover_open: bool,
+    pub smoothing_popover_open: bool,
+    pub smoothing_popover_anchor: Option<egui::Rect>,
     pub stickers_tab: StickersTab,
     pub modal_open_seq: u64,
     pub element_name_draft: String,
@@ -554,6 +556,8 @@ impl Default for ViewState {
             laser_color: papercraft_color::Color::from_rgba8(0xEF, 0x44, 0x44, 255),
             laser_points: Vec::new(),
             elements_popover_open: false,
+            smoothing_popover_open: false,
+            smoothing_popover_anchor: None,
             stickers_tab: StickersTab::Starter,
             modal_open_seq: 0,
             element_name_draft: String::new(),
@@ -2097,6 +2101,7 @@ impl PaperCraftApp {
                 canvas::show(self, ui);
                 color_picker::show_popover(self, ui);
                 toolbar::show_elements_popover(self, ui);
+                toolbar::show_smoothing_popover(self, ui);
             }
             AppScreen::Profile => {
                 profile_screen::show(self, ui);

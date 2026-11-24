@@ -754,6 +754,7 @@ fn clear_overlay_tools(app: &mut PaperCraftApp, close_color_picker: bool) {
     app.view.text_insert_mode = false;
     app.view.clear_selection();
     app.view.text_style_open = false;
+    app.view.smoothing_popover_open = false;
     app.view.text_link_editor_open = false;
     app.view.text_link_draft = None;
     app.view.text_link_input.clear();
@@ -824,6 +825,7 @@ fn toggle_text_insert_tool(app: &mut PaperCraftApp) {
     }
     app.view.clear_selection();
     app.view.text_style_open = false;
+    app.view.smoothing_popover_open = false;
     app.view.text_link_editor_open = false;
     app.view.text_link_draft = None;
     app.view.text_link_input.clear();
@@ -945,6 +947,7 @@ fn draw_tool_section(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
             app.view.text_insert_mode = false;
             app.view.clear_selection();
             app.view.text_style_open = false;
+            app.view.smoothing_popover_open = false;
             clear_ruler_drag(app);
             app.view.shape_drag_start = None;
             app.view.shape_drag_end = None;
@@ -984,6 +987,7 @@ fn draw_tool_section(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     .on_hover_text("Stickers & Elements — stamp AI stickers or your saved notes and figures");
     if sticker_resp.clicked() {
         crate::canvas::commit_pending_text(app);
+        app.view.smoothing_popover_open = false;
         app.view.elements_popover_open = !app.view.elements_popover_open;
     }
 }
@@ -3380,6 +3384,32 @@ fn push_pen_quick_bar(
             );
         },
     );
+
+    if show_highlighter_modes {
+        let eff_strength = pen.smoothing.effective_strength();
+        let sm_label = crate::inspector::smoothing_value_label(eff_strength);
+        let sm_tip = format!(
+            "Stroke smoothing ({}) — {}\nClick to adjust or disable for faster sharp turns.",
+            sm_label,
+            papercraft_doc::SmoothingConfig::strength_guidance(eff_strength)
+        );
+        let btn_w = compact_icon_button_width(ui, &sm_label);
+        let is_open = app.view.smoothing_popover_open;
+        flow.divider();
+        flow.push(btn_w, move |app, ui, t| {
+            let resp = compact_icon_button(ui, Icon::Stabilizer, Some(&sm_label), is_open, true, t)
+                .on_hover_text(sm_tip);
+            if app.view.smoothing_popover_open {
+                app.view.smoothing_popover_anchor = Some(resp.rect);
+            }
+            if resp.clicked() {
+                app.view.smoothing_popover_open = !app.view.smoothing_popover_open;
+                app.view.smoothing_popover_anchor = Some(resp.rect);
+                app.view.elements_popover_open = false;
+                app.view.color_picker.close();
+            }
+        });
+    }
 }
 
 fn draw_center_zone(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
@@ -4746,6 +4776,188 @@ pub(crate) fn show_elements_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui) 
     }
 }
 
+pub(crate) fn show_smoothing_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
+    if !app.view.smoothing_popover_open {
+        return;
+    }
+    let ToolKind::Pen(kind) = app.session.active_tool else {
+        app.view.smoothing_popover_open = false;
+        return;
+    };
+    if app.view.shape_insert_mode || app.view.text_insert_mode || app.view.text_editing {
+        app.view.smoothing_popover_open = false;
+        return;
+    }
+    let ctx = ui.ctx().clone();
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        app.view.smoothing_popover_open = false;
+        return;
+    }
+
+    let t = Tokens::for_theme(app.session.prefs.theme);
+    let sm = app.session.pen(kind).smoothing.clone();
+    let eff_strength = sm.effective_strength();
+    let is_off = sm.is_smoothing_disabled();
+    let value_label = crate::inspector::smoothing_value_label(eff_strength);
+    let style_label = if is_off {
+        "Direct 1:1"
+    } else {
+        sm.preset().label()
+    };
+
+    let viewport = ctx.content_rect();
+    let pop_w = 264.0_f32;
+    let anchor = app.view.smoothing_popover_anchor;
+    let pop_x = anchor
+        .map_or(viewport.center().x - pop_w * 0.5, |r| {
+            r.center().x - pop_w * 0.5
+        })
+        .clamp(8.0, (viewport.right() - pop_w - 8.0).max(8.0));
+    let pop_y = anchor
+        .map_or(92.0, |r| r.bottom() + 6.0)
+        .clamp(8.0, (viewport.bottom() - 180.0).max(8.0));
+
+    let mut next_strength: Option<(f32, bool)> = None;
+    let mut open_settings = false;
+
+    let area_resp = egui::Area::new(ui.make_persistent_id("papercraft_smoothing_popover"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(pop_x, pop_y))
+        .default_size(Vec2::new(pop_w, 170.0))
+        .constrain_to(viewport.shrink(6.0))
+        .fade_in(false)
+        .show(&ctx, |ui| {
+            egui::Frame::new()
+                .fill(t.panel_bg)
+                .stroke(Stroke::new(1.0, t.border))
+                .corner_radius(CornerRadius::same(10))
+                .shadow(egui::Shadow {
+                    offset: [0, 6],
+                    blur: 18,
+                    spread: 0,
+                    color: Color32::from_black_alpha(if t.is_dark { 110 } else { 32 }),
+                })
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    ui.set_width(pop_w - 24.0);
+                    ui.horizontal(|ui| {
+                        let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                        paint_icon(ui.painter(), ir, Icon::Stabilizer, t.accent);
+                        ui.label(
+                            egui::RichText::new("Stroke Smoothing")
+                                .size(13.0)
+                                .strong()
+                                .color(t.text),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            egui::Frame::new()
+                                .fill(if is_off { t.field_bg } else { t.accent_soft })
+                                .stroke(Stroke::new(
+                                    1.0,
+                                    if is_off { t.border } else { t.accent },
+                                ))
+                                .corner_radius(CornerRadius::same(5))
+                                .inner_margin(egui::Margin::symmetric(7, 2))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(&value_label)
+                                            .size(11.0)
+                                            .strong()
+                                            .monospace()
+                                            .color(if is_off { t.text_muted } else { t.accent }),
+                                    );
+                                });
+                        });
+                    });
+
+                    ui.add_space(6.0);
+                    if let Some(val) = crate::inspector::draw_smoothing_quick_switch(
+                        ui,
+                        "toolbar_smoothing_quick_levels",
+                        eff_strength,
+                        &t,
+                    ) {
+                        next_strength = Some((val, true));
+                    }
+
+                    ui.add_space(4.0);
+                    let slider_w = ui.available_width();
+                    if let Some((val, persist)) = crate::inspector::draw_smoothing_strength_slider(
+                        ui,
+                        ("toolbar_smoothing_strength_slider", kind),
+                        eff_strength,
+                        slider_w,
+                        &t,
+                    ) {
+                        next_strength = Some((val, persist));
+                    }
+
+                    ui.add_space(3.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                papercraft_doc::SmoothingConfig::strength_guidance(eff_strength),
+                            )
+                            .size(11.0)
+                            .color(t.text_muted),
+                        )
+                        .wrap(),
+                    );
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Style: {style_label}"))
+                                .size(10.8)
+                                .color(t.text_muted),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if compact_icon_button(
+                                ui,
+                                Icon::Settings,
+                                Some("All styles…"),
+                                false,
+                                true,
+                                &t,
+                            )
+                            .on_hover_text("Open Pen settings to switch smoothing algorithm and view the live preview")
+                            .clicked()
+                            {
+                                open_settings = true;
+                            }
+                        });
+                    });
+                });
+        });
+
+    if let Some((val, persist)) = next_strength {
+        crate::inspector::apply_smoothing_strength(app, kind, val, persist);
+    }
+    if open_settings {
+        app.view.inspector_open = true;
+        app.view.settings_tab = crate::SettingsTab::Pen;
+        app.view.smoothing_popover_open = false;
+        return;
+    }
+
+    let pressed_pos = ctx.input(|i| {
+        if i.pointer.any_pressed() {
+            i.pointer.interact_pos()
+        } else {
+            None
+        }
+    });
+    if let Some(pos) = pressed_pos {
+        let in_popover = area_resp.response.rect.contains(pos);
+        let in_anchor = anchor.is_some_and(|r| r.contains(pos));
+        if !in_popover && !in_anchor {
+            app.view.smoothing_popover_open = false;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_element_section(
     ui: &mut egui::Ui,
@@ -6107,8 +6319,8 @@ mod tests {
         time += 0.08;
         let top_tray = find_tray_frame_rect(&shapes, t.panel_bg, 40.0).expect("pen top tray");
         assert!(
-            top_tray.width() <= 220.0 && top_tray.height() <= 44.0,
-            "pen top tray should only hold thickness dots + horizontal slider (no swatches), got {top_tray:?}"
+            top_tray.width() <= 290.0 && top_tray.height() <= 44.0,
+            "pen top tray should only hold thickness dots + horizontal slider + smoothing pill (no swatches), got {top_tray:?}"
         );
         let dock_rect = app.view.color_dock.last_rect;
         assert!(dock_rect.is_positive(), "pen mode must show color dock");
@@ -7040,5 +7252,114 @@ mod tests {
             "single edit.undo must restore original shape width {orig_shape_width}, got {}",
             app.session.doc.shapes[0].width
         );
+    }
+
+    #[test]
+    fn pen_context_tray_smoothing_popover_toggles_and_adjusts_strength() {
+        let mut app = PaperCraftApp::default();
+        crate::open_notebook_in_editor(&mut app, 0);
+        app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
+        let ctx = egui::Context::default();
+        let viewport = Vec2::new(1280.0, 800.0);
+        let mut time = 0.0_f64;
+
+        let settle = |ctx: &egui::Context, app: &mut PaperCraftApp, time: &mut f64| {
+            let mut shapes = Vec::new();
+            for _ in 0..4 {
+                *time += 0.08;
+                shapes = step_editor_frame(ctx, app, viewport, *time, 0.08, Vec::new()).0;
+            }
+            shapes
+        };
+
+        let find_text =
+            |shapes: &[egui::epaint::ClippedShape], needle: &str| -> Option<egui::Pos2> {
+                fn visit(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+                    match shape {
+                        egui::Shape::Text(t) if t.galley.text() == needle => {
+                            Some(t.pos + t.galley.rect.center().to_vec2())
+                        }
+                        egui::Shape::Vec(items) => items.iter().find_map(|s| visit(s, needle)),
+                        _ => None,
+                    }
+                }
+                shapes.iter().find_map(|c| visit(&c.shape, needle))
+            };
+
+        let click_at =
+            |ctx: &egui::Context, app: &mut PaperCraftApp, time: &mut f64, pos: egui::Pos2| {
+                for pressed in [true, false] {
+                    *time += 0.03;
+                    let _ = step_editor_frame(
+                        ctx,
+                        app,
+                        viewport,
+                        *time,
+                        0.03,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                }
+            };
+
+        let shapes = settle(&ctx, &mut app, &mut time);
+        let pill_pos =
+            find_text(&shapes, "35%").expect("default 35% smoothing pill in context tray");
+        click_at(&ctx, &mut app, &mut time, pill_pos);
+        assert!(app.view.smoothing_popover_open);
+
+        let pop_shapes = settle(&ctx, &mut app, &mut time);
+        let off_pos = find_text(&pop_shapes, "Off").expect("Off level inside smoothing popover");
+        click_at(&ctx, &mut app, &mut time, off_pos);
+        assert!(
+            app.session
+                .pen(PenKind::FountainPen)
+                .smoothing
+                .is_smoothing_disabled()
+        );
+        assert!(
+            app.session.prefs.pen_smoothings[PenKind::FountainPen.index()].is_smoothing_disabled()
+        );
+
+        let pop_shapes2 = settle(&ctx, &mut app, &mut time);
+        let high_pos =
+            find_text(&pop_shapes2, "High").expect("High level inside smoothing popover");
+        click_at(&ctx, &mut app, &mut time, high_pos);
+        assert_eq!(
+            app.session
+                .pen(PenKind::FountainPen)
+                .smoothing
+                .strength_percent(),
+            80
+        );
+        assert_eq!(
+            app.session.prefs.pen_smoothings[PenKind::FountainPen.index()].strength_percent(),
+            80
+        );
+
+        // Pressing Escape closes the smoothing popover.
+        time += 0.03;
+        let _ = step_editor_frame(
+            &ctx,
+            &mut app,
+            viewport,
+            time,
+            0.03,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!app.view.smoothing_popover_open);
     }
 }

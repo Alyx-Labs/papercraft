@@ -96,6 +96,7 @@ impl LiveStroke {
     pub fn preview_samples(&self) -> Vec<StrokeSample> {
         let mut out = self.smoothed_preview.clone();
         if !self.straight_line
+            && !self.pen.smoothing.is_smoothing_disabled()
             && let Some(tip) = predict_live_tip(&out, self.pen.smoothing.prediction_ms)
         {
             out.push(tip);
@@ -226,11 +227,15 @@ impl Session {
 
     pub(crate) fn apply_pen_size_preferences(&mut self) {
         let sizes = self.prefs.pen_sizes;
+        let smoothings = self.prefs.pen_smoothings.clone();
         for kind in PenKind::ALL {
-            if let (Some(pen), Some(size)) =
-                (self.pens.get_mut(kind.index()), sizes.get(kind.index()))
-            {
-                pen.size = *size;
+            if let Some(pen) = self.pens.get_mut(kind.index()) {
+                if let Some(size) = sizes.get(kind.index()) {
+                    pen.size = *size;
+                }
+                if let Some(smoothing) = smoothings.get(kind.index()) {
+                    pen.smoothing = smoothing.sanitized();
+                }
             }
         }
     }
@@ -2256,5 +2261,97 @@ mod tests {
         s.execute("edit.undo", &serde_json::json!({})).unwrap();
         assert!((s.doc.strokes[0].pen.size - 2.2).abs() < 1e-5);
         assert!((s.doc.shapes[0].x2 - s.doc.shapes[0].x1 - 100.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn pen_smoothing_persists_in_studio_prefs_and_recovers_from_off() {
+        let mut s = Session::open_web_cache(None);
+        // Dragging without persist keeps prefs untouched while live pen updates.
+        s.execute(
+            "pen.setSmoothing",
+            &serde_json::json!({
+                "kind": "FountainPen",
+                "stabilizer_strength": 0.15,
+                "persist": false,
+            }),
+        )
+        .unwrap();
+        assert_eq!(s.pen(PenKind::FountainPen).smoothing.strength_percent(), 15);
+        assert_eq!(
+            s.prefs.pen_smoothings[PenKind::FountainPen.index()].strength_percent(),
+            35
+        );
+
+        // Switching to SimpleDirect (Off) and persisting, then raising strength > 0 upgrades to Adaptive.
+        s.execute(
+            "pen.setSmoothing",
+            &serde_json::json!({
+                "kind": "FountainPen",
+                "preset": "SimpleDirect",
+                "persist": true,
+            }),
+        )
+        .unwrap();
+        assert!(
+            s.pen(PenKind::FountainPen)
+                .smoothing
+                .is_smoothing_disabled()
+        );
+        assert!(s.prefs.pen_smoothings[PenKind::FountainPen.index()].is_smoothing_disabled());
+
+        s.execute(
+            "pen.setSmoothing",
+            &serde_json::json!({
+                "kind": "FountainPen",
+                "stabilizer_strength": 0.25,
+                "persist": true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            s.pen(PenKind::FountainPen).smoothing.preset(),
+            papercraft_doc::StabilizationPreset::Adaptive
+        );
+        assert_eq!(s.pen(PenKind::FountainPen).smoothing.strength_percent(), 25);
+
+        // Switching style with preserve_strength keeps 25%.
+        s.execute(
+            "pen.setSmoothing",
+            &serde_json::json!({
+                "kind": "FountainPen",
+                "preset": "CurvedBezier",
+                "preserve_strength": true,
+                "persist": true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            s.pen(PenKind::FountainPen).smoothing.preset(),
+            papercraft_doc::StabilizationPreset::CurvedBezier
+        );
+        assert_eq!(s.pen(PenKind::FountainPen).smoothing.strength_percent(), 25);
+
+        // Web workspace cache export/import preserves per-pen smoothings across reload.
+        let cached = s.export_web_cache_json().unwrap();
+        let restored = Session::open_web_cache(Some(&cached));
+        assert_eq!(
+            restored.pen(PenKind::FountainPen).smoothing.preset(),
+            papercraft_doc::StabilizationPreset::CurvedBezier
+        );
+        assert_eq!(
+            restored
+                .pen(PenKind::FountainPen)
+                .smoothing
+                .strength_percent(),
+            25
+        );
+        assert_eq!(
+            restored.pen(PenKind::BallPen).smoothing.preset(),
+            papercraft_doc::StabilizationPreset::Adaptive
+        );
+        assert_eq!(
+            restored.pen(PenKind::BallPen).smoothing.strength_percent(),
+            35
+        );
     }
 }

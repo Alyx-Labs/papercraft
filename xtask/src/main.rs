@@ -11,8 +11,37 @@
 mod branding;
 mod layers;
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+
+fn is_workspace_root(dir: &Path) -> bool {
+    dir.join("Cargo.toml").is_file() && dir.join("apps").join("papercraft-web").is_dir()
+}
+
+pub(crate) fn workspace_root() -> Result<PathBuf, String> {
+    if let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR")
+        && let Some(parent) = Path::new(&manifest_dir).parent()
+        && is_workspace_root(parent)
+    {
+        return Ok(parent.to_path_buf());
+    }
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(found) = cwd.ancestors().find(|dir| is_workspace_root(dir))
+    {
+        return Ok(found.to_path_buf());
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(found) = exe.ancestors().find(|dir| is_workspace_root(dir))
+    {
+        return Ok(found.to_path_buf());
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .filter(|dir| is_workspace_root(dir))
+        .ok_or_else(|| "failed to locate workspace root directory".to_string())
+}
 
 fn run_cargo_step(label: &str, args: &[&str]) -> Result<(), String> {
     println!("==> {label}");
@@ -28,11 +57,7 @@ fn run_cargo_step(label: &str, args: &[&str]) -> Result<(), String> {
 }
 
 fn web_app_dir() -> Result<PathBuf, String> {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest_dir
-        .parent()
-        .ok_or_else(|| "failed to locate workspace root from xtask manifest dir".to_string())?;
-    Ok(root.join("apps").join("papercraft-web"))
+    Ok(workspace_root()?.join("apps").join("papercraft-web"))
 }
 
 fn run_trunk(subcommand: &str, default_args: &[&str], extra_args: &[String]) -> Result<(), String> {
@@ -46,12 +71,19 @@ fn run_trunk(subcommand: &str, default_args: &[&str], extra_args: &[String]) -> 
     }
     println!("==> Running `trunk {subcommand}` in {}", web_dir.display());
     let status = cmd.status().map_err(|err| {
-        format!(
-            "failed to start `trunk {subcommand}`: {err}\n\
-             Install WebAssembly prerequisites first:\n\
-             rustup target add wasm32-unknown-unknown\n\
-             cargo install --locked trunk"
-        )
+        if err.kind() == ErrorKind::NotFound {
+            format!(
+                "failed to start `trunk {subcommand}`: `trunk` executable not found ({err})\n\
+                 Install WebAssembly prerequisites first:\n\
+                 rustup target add wasm32-unknown-unknown\n\
+                 cargo install --locked trunk"
+            )
+        } else {
+            format!(
+                "failed to start `trunk {subcommand}` in `{}`: {err}",
+                web_dir.display()
+            )
+        }
     })?;
     if status.success() {
         Ok(())
@@ -136,5 +168,17 @@ fn main() -> ExitCode {
             eprintln!("usage: cargo xtask <layers|branding|ci|web|web-build>");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_app_dir_resolves_existing_directory() {
+        let dir = web_app_dir().unwrap();
+        assert!(dir.is_dir(), "expected web app dir at {}", dir.display());
     }
 }

@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use image::imageops::{self, FilterType};
 use image::{DynamicImage, ImageFormat, ImageReader, Rgba, RgbaImage};
@@ -23,7 +23,7 @@ const MAX_SOURCE_PIXELS: u64 = 16_777_216;
 const MASTER_SIZE: u32 = 1024;
 
 pub fn run() -> Result<usize, String> {
-    let branding_dir = workspace_root()?
+    let branding_dir = crate::workspace_root()?
         .join("apps")
         .join("papercraft")
         .join("assets")
@@ -61,13 +61,6 @@ pub fn run() -> Result<usize, String> {
         source_height
     );
     Ok(pngs.len() + 3)
-}
-
-fn workspace_root() -> Result<PathBuf, String> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "could not locate the workspace root".to_string())
 }
 
 fn image_dimensions(path: &Path) -> Result<(u32, u32), String> {

@@ -90,13 +90,19 @@ impl OneEuroFilter1D {
     }
 }
 
-/// 2D + pressure/tilt adaptive 1€ Stabilizer.
+const ONE_EURO_D_CUTOFF_HZ: f64 = 3.0;
+
+/// Coupled isotropic 2D position + scalar pressure/tilt adaptive 1€ Stabilizer.
 #[derive(Clone, Debug)]
 pub struct OneEuroStabilizer {
     min_cutoff: f64,
     beta: f64,
-    fx: OneEuroFilter1D,
-    fy: OneEuroFilter1D,
+    zoom_scale: f64,
+    initialized: bool,
+    x_prev: f64,
+    y_prev: f64,
+    vx_prev: f64,
+    vy_prev: f64,
     fp: OneEuroFilter1D,
     ftx: OneEuroFilter1D,
     fty: OneEuroFilter1D,
@@ -108,19 +114,37 @@ pub struct OneEuroStabilizer {
 
 impl OneEuroStabilizer {
     pub fn new(strength: f32, catch_up_on_end: bool) -> Self {
+        Self::new_with_zoom(strength, 1.0, false, catch_up_on_end)
+    }
+
+    pub fn new_with_zoom(
+        strength: f32,
+        zoom: f32,
+        adjust_for_zoom: bool,
+        catch_up_on_end: bool,
+    ) -> Self {
         let s = f64::from(if strength.is_finite() {
             strength.clamp(0.0, 1.0)
         } else {
-            0.45
+            0.35
         });
-        // Strength 0 -> min_cutoff=8.0 Hz, beta=0.08; Strength 1 -> min_cutoff=0.4 Hz, beta=0.005.
-        let min_cutoff = 8.0 * (0.05_f64).powf(s);
-        let beta = 0.08 * (0.0625_f64).powf(s);
+        let zoom_scale = if adjust_for_zoom && zoom.is_finite() {
+            f64::from(zoom.clamp(0.25, 8.0))
+        } else {
+            1.0
+        };
+        // Strength 0 -> min_cutoff=10.0 Hz, beta=0.12; Strength 1 -> min_cutoff=0.40 Hz, beta=0.0048.
+        let min_cutoff = 10.0 * (0.04_f64).powf(s);
+        let beta = 0.12 * (0.04_f64).powf(s);
         Self {
             min_cutoff,
             beta,
-            fx: OneEuroFilter1D::new(),
-            fy: OneEuroFilter1D::new(),
+            zoom_scale,
+            initialized: false,
+            x_prev: 0.0,
+            y_prev: 0.0,
+            vx_prev: 0.0,
+            vy_prev: 0.0,
             fp: OneEuroFilter1D::new(),
             ftx: OneEuroFilter1D::new(),
             fty: OneEuroFilter1D::new(),
@@ -129,6 +153,36 @@ impl OneEuroStabilizer {
             last_filtered: None,
             catch_up_on_end,
         }
+    }
+
+    fn filter_xy(&mut self, x: f64, y: f64, dt_s: f64) -> (f64, f64) {
+        if !x.is_finite() || !y.is_finite() {
+            return (self.x_prev, self.y_prev);
+        }
+        if !self.initialized {
+            self.initialized = true;
+            self.x_prev = x;
+            self.y_prev = y;
+            self.vx_prev = 0.0;
+            self.vy_prev = 0.0;
+            return (x, y);
+        }
+        let dt = dt_s.clamp(1.0 / 1000.0, 0.25);
+        let vx = (x - self.x_prev) / dt;
+        let vy = (y - self.y_prev) / dt;
+        let a_d = OneEuroFilter1D::alpha(dt, ONE_EURO_D_CUTOFF_HZ);
+        let vx_hat = self.vx_prev + a_d * (vx - self.vx_prev);
+        let vy_hat = self.vy_prev + a_d * (vy - self.vy_prev);
+        let speed = vx_hat.hypot(vy_hat) * self.zoom_scale;
+        let cutoff = self.min_cutoff + self.beta * speed;
+        let a = OneEuroFilter1D::alpha(dt, cutoff);
+        let x_hat = self.x_prev + a * (x - self.x_prev);
+        let y_hat = self.y_prev + a * (y - self.y_prev);
+        self.x_prev = x_hat;
+        self.y_prev = y_hat;
+        self.vx_prev = vx_hat;
+        self.vy_prev = vy_hat;
+        (x_hat, y_hat)
     }
 
     pub fn push(&mut self, sample: StrokeSample, out: &mut Vec<StrokeSample>) {
@@ -142,8 +196,7 @@ impl OneEuroStabilizer {
         self.last_raw = Some(p);
 
         let dt_s = dt_ms / 1000.0;
-        let x = self.fx.filter(p.x, dt_s, self.min_cutoff, self.beta);
-        let y = self.fy.filter(p.y, dt_s, self.min_cutoff, self.beta);
+        let (x, y) = self.filter_xy(p.x, p.y, dt_s);
         let pressure = self
             .fp
             .filter(
@@ -1070,7 +1123,7 @@ impl ModeledSpringStabilizer {
             v_floor: WOBBLE_SPEED_FLOOR_PX_MS / z,
             v_ceiling: WOBBLE_SPEED_CEILING_PX_MS / z,
             min_step_dist: 0.25 / z,
-            spring_k: 0.075 + 0.085 * (1.0 - s),
+            spring_k: 0.055 + 0.145 * (1.0 - s),
             drag_k: 0.56,
             catch_up_on_end,
             sim_time_ms: 0.0,
@@ -1338,7 +1391,7 @@ impl CurvedBezierStabilizer {
         };
         Self {
             strength: s,
-            min_knot_dist: 1.6 / z,
+            min_knot_dist: (0.6 + 1.8 * s) / z,
             min_subdiv_step: (0.45 / z).clamp(0.25, 2.0),
             catch_up_on_end,
             knots: VecDeque::with_capacity(5),
@@ -1617,10 +1670,18 @@ pub enum StrokeStabilizer {
 impl StrokeStabilizer {
     pub fn new(cfg: &SmoothingConfig, zoom: f32) -> Self {
         let cfg = cfg.sanitized();
+        if cfg.stabilizer_mode == StabilizerMode::None {
+            return Self::None;
+        }
+        if cfg.is_smoothing_disabled() {
+            return Self::SimpleDirect(SimpleDirectStabilizer::new(zoom, cfg.adjust_for_zoom));
+        }
         match cfg.stabilizer_mode {
             StabilizerMode::None => Self::None,
-            StabilizerMode::OneEuro => Self::OneEuro(OneEuroStabilizer::new(
+            StabilizerMode::OneEuro => Self::OneEuro(OneEuroStabilizer::new_with_zoom(
                 cfg.stabilizer_strength,
+                zoom,
+                cfg.adjust_for_zoom,
                 cfg.catch_up_on_end,
             )),
             StabilizerMode::PulledString => Self::PulledString(PulledStringStabilizer::new(
@@ -1820,7 +1881,7 @@ mod tests {
 
     #[test]
     fn arithmetic_mean_buffer_10_prefills_and_finalizes_smoothly_to_endpoint() {
-        let cfg = SmoothingConfig::default();
+        let cfg = SmoothingConfig::classic_arithmetic_buffer();
         let mut stab = StrokeStabilizer::new(&cfg, 1.0);
         let mut out = Vec::new();
         stab.push(StrokeSample::from_xy_pressure(0.0, 0.0, 0.5), &mut out);
@@ -1918,7 +1979,7 @@ mod tests {
 
     #[test]
     fn arithmetic_buffer_filters_micro_motion_updates_first_pressure_and_avoids_reversal_loop() {
-        let cfg = SmoothingConfig::default();
+        let cfg = SmoothingConfig::classic_arithmetic_buffer();
         let mut stab = StrokeStabilizer::new(&cfg, 1.0);
         let mut out = Vec::new();
         stab.push(StrokeSample::from_xy_pressure(10.0, 10.0, 0.2), &mut out);
@@ -2077,5 +2138,128 @@ mod tests {
                 .any(|p| (p.x - 50.0).abs() < 1e-6 && p.y.abs() < 1e-6),
             "SimpleDirect should preserve sharp corner vertex (50, 0)"
         );
+    }
+
+    fn min_dist_to_point(samples: &[StrokeSample], target: Point) -> f64 {
+        samples
+            .iter()
+            .map(|s| s.point().distance(target))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    #[test]
+    fn adaptive_default_preserves_sharp_corners_during_fast_60hz_writing() {
+        use papercraft_doc::StabilizationPreset;
+
+        // Simulate fast 60 Hz (16.67 ms/sample) sharp 'V' and 'M' turns at ~1400 px/s.
+        let dt_ms = 1000.0 / 60.0;
+        let mut v_stroke = Vec::new();
+        for i in 0..=10 {
+            let t = f64::from(i);
+            let (x, y) = if i <= 5 {
+                (t * 14.0, t * 22.0)
+            } else {
+                (70.0 + (t - 5.0) * 14.0, 110.0 - (t - 5.0) * 22.0)
+            };
+            v_stroke.push(StrokeSample {
+                x,
+                y,
+                pressure: 0.6,
+                time_ms: t * dt_ms,
+                ..Default::default()
+            });
+        }
+        let v_tip = Point::new(70.0, 110.0);
+
+        let adaptive = crate::smooth_stroke_samples(&v_stroke, &SmoothingConfig::default(), 1.0);
+        let classic = crate::smooth_stroke_samples(
+            &v_stroke,
+            &SmoothingConfig::classic_arithmetic_buffer(),
+            1.0,
+        );
+        let direct = crate::smooth_stroke_samples(
+            &v_stroke,
+            &StabilizationPreset::Adaptive.to_smoothing_config_with_strength(0.0),
+            1.0,
+        );
+
+        let adaptive_err = min_dist_to_point(&adaptive, v_tip);
+        let classic_err = min_dist_to_point(&classic, v_tip);
+        let direct_err = min_dist_to_point(&direct, v_tip);
+
+        assert!(
+            direct_err < 1e-4,
+            "0% smoothing must hit corner vertex exactly, got {direct_err:.3}"
+        );
+        assert!(
+            adaptive_err < 10.0 && adaptive_err < classic_err * 0.45,
+            "Adaptive 35% should preserve fast 60 Hz corner far better than classic buffer: adaptive={adaptive_err:.2}px, classic={classic_err:.2}px"
+        );
+    }
+
+    #[test]
+    fn smoothing_strength_scales_jitter_reduction_and_zero_preserves_exact_corners() {
+        use papercraft_doc::StabilizationPreset;
+
+        let raw = jitter_wave();
+        let interior_max_dev = |samples: &[StrokeSample]| -> f64 {
+            samples
+                .iter()
+                .filter(|p| p.x > 60.0 && p.x < 170.0)
+                .map(|p| (p.y - 100.0).abs())
+                .fold(0.0_f64, f64::max)
+        };
+
+        for &preset in StabilizationPreset::UI_STYLES {
+            let s0 = crate::smooth_stroke_samples(
+                &raw,
+                &preset.to_smoothing_config_with_strength(0.0),
+                1.0,
+            );
+            let s_low = crate::smooth_stroke_samples(
+                &raw,
+                &preset.to_smoothing_config_with_strength(0.25),
+                1.0,
+            );
+            let s_high = crate::smooth_stroke_samples(
+                &raw,
+                &preset.to_smoothing_config_with_strength(0.80),
+                1.0,
+            );
+            let d0 = interior_max_dev(&s0);
+            let d_low = interior_max_dev(&s_low);
+            let d_high = interior_max_dev(&s_high);
+            assert!(
+                d_low < d0 * 0.85 && d_high < d0 * 0.85,
+                "{preset:?} should reduce jitter at 25% and 80%: 0%={d0:.2}, 25%={d_low:.2}, 80%={d_high:.2}",
+            );
+            if preset != StabilizationPreset::ArithmeticBuffer10 {
+                assert!(
+                    d_high < d_low && d_low < d0,
+                    "{preset:?} should reduce interior peak jitter monotonically: 0%={d0:.2}, 25%={d_low:.2}, 80%={d_high:.2}",
+                );
+            } else {
+                assert!(
+                    preset.to_smoothing_config_with_strength(0.80).buffer_size
+                        > preset.to_smoothing_config_with_strength(0.25).buffer_size,
+                    "ArithmeticBuffer10 buffer_size should grow with strength",
+                );
+            }
+
+            let corner = vec![
+                StrokeSample::from_xy_pressure(0.0, 0.0, 0.6),
+                StrokeSample::from_xy_pressure(50.0, 0.0, 0.6),
+                StrokeSample::from_xy_pressure(50.0, 50.0, 0.6),
+            ];
+            let zero_out = crate::smooth_stroke_samples(
+                &corner,
+                &preset.to_smoothing_config_with_strength(0.0),
+                1.0,
+            );
+            assert!(
+                min_dist_to_point(&zero_out, Point::new(50.0, 0.0)) < 1e-4,
+                "{preset:?} at 0% strength must preserve exact 90-degree corner"
+            );
+        }
     }
 }

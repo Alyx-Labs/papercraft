@@ -781,6 +781,10 @@ struct SetSmoothingParams {
     smoothing: Option<SmoothingConfig>,
     stabilizer_mode: Option<StabilizerMode>,
     stabilizer_strength: Option<f32>,
+    #[serde(default)]
+    preserve_strength: Option<bool>,
+    #[serde(default)]
+    persist: Option<bool>,
     catmull_rom_subdivision: Option<bool>,
     spline_tension: Option<f32>,
     adjust_for_zoom: Option<bool>,
@@ -5092,6 +5096,9 @@ fn cmd_set_pen_settings(
     *session.pen_mut(kind) = clean.clone();
     if (p.size.is_some() || p.settings.is_some()) && p.persist_size.unwrap_or(true) {
         remember_pen_size(session, kind, clean.size);
+        if p.settings.is_some() {
+            remember_pen_smoothing(session, kind, &clean.smoothing);
+        }
     }
     Ok(json!({ "kind": kind, "settings": clean }))
 }
@@ -5104,6 +5111,19 @@ fn remember_pen_size(session: &mut Session, kind: PenKind, size: f32) {
         return;
     }
     *saved_size = size;
+    session.sync_mark_prefs_dirty();
+    let _ = session.save_prefs();
+}
+
+fn remember_pen_smoothing(session: &mut Session, kind: PenKind, smoothing: &SmoothingConfig) {
+    let clean = smoothing.sanitized();
+    let Some(saved) = session.prefs.pen_smoothings.get_mut(kind.index()) else {
+        return;
+    };
+    if *saved == clean {
+        return;
+    }
+    *saved = clean;
     session.sync_mark_prefs_dirty();
     let _ = session.save_prefs();
 }
@@ -5138,20 +5158,61 @@ fn apply_buffer_patches(sm: &mut SmoothingConfig, p: &SetSmoothingParams) {
     }
 }
 
-fn cmd_set_smoothing(
-    session: &mut Session,
-    id: &str,
-    params: &Value,
-) -> Result<Value, EngineError> {
-    let p: SetSmoothingParams = parse_params(id, params)?;
-    let kind = p.kind.unwrap_or_else(|| session.active_pen_kind());
-    let mut sm = if let Some(preset) = p.preset {
-        preset.to_smoothing_config()
-    } else if let Some(smoothing) = &p.smoothing {
-        smoothing.clone()
-    } else {
-        session.pen(kind).smoothing.clone()
-    };
+fn resolve_smoothing_base(
+    session: &Session,
+    kind: PenKind,
+    p: &SetSmoothingParams,
+) -> SmoothingConfig {
+    if let Some(preset) = p.preset {
+        if let Some(raw_s) = p.stabilizer_strength {
+            return preset.to_smoothing_config_with_strength(raw_s);
+        }
+        if p.preserve_strength == Some(true) && preset != StabilizationPreset::SimpleDirect {
+            let cur = session.pen(kind).smoothing.effective_strength();
+            if cur > SmoothingConfig::SMOOTHING_OFF_EPSILON {
+                return preset.to_smoothing_config_with_strength(cur);
+            }
+        }
+        return preset.to_smoothing_config();
+    }
+    if let Some(smoothing) = &p.smoothing {
+        return smoothing.clone();
+    }
+    let mut sm = session.pen(kind).smoothing.clone();
+    if let Some(raw_s) = p.stabilizer_strength
+        && p.stabilizer_mode.is_none()
+    {
+        let clean_s = if raw_s.is_finite() {
+            raw_s.clamp(0.0, 1.0)
+        } else {
+            SmoothingConfig::DEFAULT_ADAPTIVE_STRENGTH
+        };
+        if clean_s > SmoothingConfig::SMOOTHING_OFF_EPSILON
+            && matches!(
+                sm.stabilizer_mode,
+                StabilizerMode::SimpleDirect | StabilizerMode::None
+            )
+        {
+            return StabilizationPreset::Adaptive.to_smoothing_config_with_strength(clean_s);
+        }
+        if sm.stabilizer_mode == StabilizerMode::CircularBuffer && p.buffer_size.is_none() {
+            sm.buffer_size = SmoothingConfig::buffer_size_for_strength(clean_s);
+        } else if sm.stabilizer_mode == StabilizerMode::CurvedBezier
+            && p.streamline_amount.is_none()
+        {
+            sm.streamline_amount = (0.22 * clean_s).clamp(0.0, 0.25);
+        } else if sm.stabilizer_mode == StabilizerMode::ModeledSpring && p.prediction_ms.is_none() {
+            sm.prediction_ms = if clean_s > SmoothingConfig::SMOOTHING_OFF_EPSILON {
+                4.0 * clean_s
+            } else {
+                0.0
+            };
+        }
+    }
+    sm
+}
+
+fn apply_smoothing_overrides(sm: &mut SmoothingConfig, p: &SetSmoothingParams) {
     if let Some(m) = p.stabilizer_mode {
         sm.stabilizer_mode = m;
     }
@@ -5179,10 +5240,29 @@ fn cmd_set_smoothing(
     if let Some(v) = p.prediction_ms {
         sm.prediction_ms = v;
     }
-    apply_buffer_patches(&mut sm, &p);
+    apply_buffer_patches(sm, p);
+}
+
+fn cmd_set_smoothing(
+    session: &mut Session,
+    id: &str,
+    params: &Value,
+) -> Result<Value, EngineError> {
+    let p: SetSmoothingParams = parse_params(id, params)?;
+    let kind = p.kind.unwrap_or_else(|| session.active_pen_kind());
+    let mut sm = resolve_smoothing_base(session, kind, &p);
+    apply_smoothing_overrides(&mut sm, &p);
     let clean = sm.sanitized();
     session.pen_mut(kind).smoothing = clean.clone();
-    Ok(json!({ "kind": kind, "preset": clean.preset(), "smoothing": clean }))
+    if p.persist.unwrap_or(true) {
+        remember_pen_smoothing(session, kind, &clean);
+    }
+    Ok(json!({
+        "kind": kind,
+        "preset": clean.preset(),
+        "strength": clean.effective_strength(),
+        "smoothing": clean,
+    }))
 }
 
 fn cmd_set_pressure_curve(
@@ -5222,6 +5302,7 @@ fn cmd_apply_pen_preset(
     .sanitized();
     *session.pen_mut(kind) = updated.clone();
     remember_pen_size(session, kind, updated.size);
+    remember_pen_smoothing(session, kind, &updated.smoothing);
     session.set_active_tool(ToolKind::Pen(kind));
     Ok(json!({ "kind": kind, "preset": p.preset, "settings": updated }))
 }
@@ -5787,6 +5868,7 @@ fn cmd_preset_save(session: &mut Session, id: &str, params: &Value) -> Result<Va
         let applied = saved.to_applied_settings(session.pen(kind).color, None);
         *session.pen_mut(kind) = applied.clone();
         remember_pen_size(session, kind, applied.size);
+        remember_pen_smoothing(session, kind, &applied.smoothing);
         session.set_active_tool(ToolKind::Pen(kind));
     }
 
@@ -5820,6 +5902,7 @@ fn cmd_preset_apply_custom(
     let applied = preset.to_applied_settings(session.pen(kind).color, p.preserve_color);
     *session.pen_mut(kind) = applied.clone();
     remember_pen_size(session, kind, applied.size);
+    remember_pen_smoothing(session, kind, &applied.smoothing);
     session.set_active_tool(ToolKind::Pen(kind));
     Ok(json!({
         "id": preset.id,

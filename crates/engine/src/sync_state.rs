@@ -2550,6 +2550,7 @@ pub(crate) fn merge_studio_prefs(
         target.auto_contrast_with_theme = incoming.auto_contrast_with_theme;
         target.ui_scale = incoming.ui_scale;
         target.pen_sizes = incoming.pen_sizes;
+        target.pen_smoothings = incoming.pen_smoothings;
         target.ink_palette = incoming.ink_palette;
         target.highlighter_palette = incoming.highlighter_palette;
         target.wildcard_ink = incoming.wildcard_ink;
@@ -3757,5 +3758,28 @@ mod tests {
             "local_discovery_report must never create missing profile directories on disk"
         );
         assert_ne!(secondary.local_profile_id, uninitialized.local_profile_id);
+    }
+
+    #[test]
+    fn merge_studio_prefs_propagates_pen_smoothings_on_overwrite() {
+        let mut target = papercraft_doc::UserStudioConfig::default();
+        let mut incoming = papercraft_doc::UserStudioConfig::default();
+        incoming.pen_smoothings[papercraft_doc::PenKind::FountainPen.index()] =
+            papercraft_doc::StabilizationPreset::CurvedBezier
+                .to_smoothing_config_with_strength(0.75);
+        super::merge_studio_prefs(&mut target, incoming.clone(), false);
+        assert_eq!(
+            target.pen_smoothings[papercraft_doc::PenKind::FountainPen.index()].strength_percent(),
+            35
+        );
+        super::merge_studio_prefs(&mut target, incoming, true);
+        assert_eq!(
+            target.pen_smoothings[papercraft_doc::PenKind::FountainPen.index()].preset(),
+            papercraft_doc::StabilizationPreset::CurvedBezier
+        );
+        assert_eq!(
+            target.pen_smoothings[papercraft_doc::PenKind::FountainPen.index()].strength_percent(),
+            75
+        );
     }
 }

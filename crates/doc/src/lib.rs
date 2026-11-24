@@ -2882,85 +2882,147 @@ impl StabilizerMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StabilizationPreset {
     #[default]
-    #[serde(alias = "ArithmeticBuffer20")]
-    ArithmeticBuffer10,
+    Adaptive,
     #[serde(alias = "QuickNotes")]
     ModeledSpring,
     #[serde(alias = "PrecisionPulledString")]
     CurvedBezier,
+    #[serde(alias = "ArithmeticBuffer20")]
+    ArithmeticBuffer10,
     #[serde(alias = "RawUnfiltered")]
     SimpleDirect,
 }
 
 impl StabilizationPreset {
     pub const ALL: &[Self] = &[
-        Self::ArithmeticBuffer10,
+        Self::Adaptive,
         Self::ModeledSpring,
         Self::CurvedBezier,
+        Self::ArithmeticBuffer10,
         Self::SimpleDirect,
+    ];
+
+    /// The 4 active smoothing styles exposed in Settings → Pen alongside the strength slider.
+    pub const UI_STYLES: &[Self] = &[
+        Self::Adaptive,
+        Self::ModeledSpring,
+        Self::CurvedBezier,
+        Self::ArithmeticBuffer10,
     ];
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::ArithmeticBuffer10 => "Arithmetic Mean (10)",
+            Self::Adaptive => "Adaptive Handwriting",
             Self::ModeledSpring => "Modeled Spring-Mass",
             Self::CurvedBezier => "Curved Cubic Spline",
-            Self::SimpleDirect => "Simple Direct",
+            Self::ArithmeticBuffer10 => "Averaged Buffer",
+            Self::SimpleDirect => "Off (Direct 1:1)",
         }
     }
 
     pub const fn badge(self) -> &'static str {
         match self {
-            Self::ArithmeticBuffer10 => "Buffer 10 · C1 Finalize",
-            Self::ModeledSpring => "180 Hz Spring · Wobble Filter",
-            Self::CurvedBezier => "4-Knot Catmull · Cubic Bézier",
+            Self::Adaptive => "Speed-Adaptive · Sharp Turns",
+            Self::ModeledSpring => "180 Hz Spring · Fluid",
+            Self::CurvedBezier => "4-Knot Catmull · Silky",
+            Self::ArithmeticBuffer10 => "Circular Buffer · Classic",
             Self::SimpleDirect => "1:1 Direct · Zero Lag",
         }
     }
 
     pub const fn description(self) -> &'static str {
         match self {
-            Self::ArithmeticBuffer10 => {
-                "Averages the last 10 samples in a pre-filled circular buffer and completes the tail with a C1 spline for calm, everyday handwriting."
+            Self::Adaptive => {
+                "Smooths slow precision strokes while reacting instantly during fast writing so sharp corners stay crisp."
             }
             Self::ModeledSpring => {
-                "Dampens slow-speed hand tremor with a time-windowed wobble filter while pulling a 180 Hz spring-mass virtual nib with natural momentum."
+                "Dampens slow-speed hand tremor while pulling a spring-mass virtual nib with natural momentum."
             }
             Self::CurvedBezier => {
-                "Fits continuous C1 cubic Bézier curves through a sliding 4-point Catmull-Rom window for flowing cursive writing and calligraphy."
+                "Fits continuous C1 cubic Bézier curves through a sliding 4-point window for flowing cursive and smooth curves."
+            }
+            Self::ArithmeticBuffer10 => {
+                "Uniformly averages recent samples in a circular buffer and finishes the tail with a smooth C1 spline."
             }
             Self::SimpleDirect => {
-                "Connects pointer samples directly with sub-pixel noise filtering and pressure interpolation for immediate 1:1 hardware tracking."
+                "Connects pointer samples directly with sub-pixel noise filtering and zero corner rounding."
             }
         }
     }
 
-    pub fn to_smoothing_config(self) -> SmoothingConfig {
+    /// Default smoothing strength (`0.0..=1.0`) for this style.
+    pub const fn default_strength(self) -> f32 {
         match self {
-            Self::ArithmeticBuffer10 => SmoothingConfig::input_stabilization_default(),
+            Self::Adaptive => SmoothingConfig::DEFAULT_ADAPTIVE_STRENGTH,
+            Self::ModeledSpring => 0.50,
+            Self::CurvedBezier => 0.55,
+            Self::ArithmeticBuffer10 => 0.50,
+            Self::SimpleDirect => 0.0,
+        }
+    }
+
+    /// Builds a [`SmoothingConfig`] for this preset at the given normalized `strength` (`0.0..=1.0`).
+    pub fn to_smoothing_config_with_strength(self, strength: f32) -> SmoothingConfig {
+        let s = if strength.is_finite() {
+            strength.clamp(0.0, 1.0)
+        } else {
+            self.default_strength()
+        };
+        let base = SmoothingConfig::classic_arithmetic_buffer_base();
+        match self {
+            Self::Adaptive => SmoothingConfig {
+                stabilizer_mode: StabilizerMode::OneEuro,
+                stabilizer_strength: s,
+                catmull_rom_subdivision: false,
+                spline_tension: 0.5,
+                adjust_for_zoom: true,
+                catch_up: false,
+                catch_up_on_end: true,
+                streamline_amount: 0.0,
+                prediction_ms: 0.0,
+                ..base
+            },
             Self::ModeledSpring => SmoothingConfig {
                 stabilizer_mode: StabilizerMode::ModeledSpring,
-                stabilizer_strength: 0.55,
+                stabilizer_strength: s,
                 catmull_rom_subdivision: false,
                 spline_tension: 0.5,
                 adjust_for_zoom: true,
                 catch_up: true,
                 catch_up_on_end: true,
                 streamline_amount: 0.0,
-                prediction_ms: 6.0,
-                ..SmoothingConfig::input_stabilization_default()
+                prediction_ms: if s > SmoothingConfig::SMOOTHING_OFF_EPSILON {
+                    4.0 * s
+                } else {
+                    0.0
+                },
+                ..base
             },
             Self::CurvedBezier => SmoothingConfig {
                 stabilizer_mode: StabilizerMode::CurvedBezier,
-                stabilizer_strength: 0.65,
+                stabilizer_strength: s,
                 catmull_rom_subdivision: false,
                 spline_tension: 0.5,
                 adjust_for_zoom: true,
                 catch_up: false,
                 catch_up_on_end: true,
-                streamline_amount: 0.15,
-                prediction_ms: 4.0,
-                ..SmoothingConfig::input_stabilization_default()
+                streamline_amount: (0.22 * s).clamp(0.0, 0.25),
+                prediction_ms: 0.0,
+                ..base
+            },
+            Self::ArithmeticBuffer10 => SmoothingConfig {
+                stabilizer_mode: StabilizerMode::CircularBuffer,
+                stabilizer_strength: s,
+                buffer_averaging: BufferAveraging::ArithmeticMean,
+                buffer_preprocessor: BufferPreprocessor::None,
+                buffer_size: SmoothingConfig::buffer_size_for_strength(s),
+                buffer_finalize_stroke: true,
+                catch_up_on_end: true,
+                catmull_rom_subdivision: false,
+                streamline_amount: 0.0,
+                prediction_ms: 0.0,
+                adjust_for_zoom: false,
+                ..base
             },
             Self::SimpleDirect => SmoothingConfig {
                 stabilizer_mode: StabilizerMode::SimpleDirect,
@@ -2975,13 +3037,18 @@ impl StabilizationPreset {
                 buffer_averaging: BufferAveraging::None,
                 buffer_preprocessor: BufferPreprocessor::None,
                 buffer_finalize_stroke: false,
-                ..SmoothingConfig::input_stabilization_default()
+                ..base
             },
         }
     }
 
+    pub fn to_smoothing_config(self) -> SmoothingConfig {
+        self.to_smoothing_config_with_strength(self.default_strength())
+    }
+
     pub fn from_smoothing_config(cfg: &SmoothingConfig) -> Self {
         match cfg.stabilizer_mode {
+            StabilizerMode::OneEuro => Self::Adaptive,
             StabilizerMode::CircularBuffer => {
                 if cfg.buffer_averaging == BufferAveraging::None
                     && cfg.buffer_preprocessor == BufferPreprocessor::None
@@ -2991,9 +3058,9 @@ impl StabilizationPreset {
                     Self::ArithmeticBuffer10
                 }
             }
-            StabilizerMode::ModeledSpring
-            | StabilizerMode::OneEuro
-            | StabilizerMode::ExponentialMovingAverage => Self::ModeledSpring,
+            StabilizerMode::ModeledSpring | StabilizerMode::ExponentialMovingAverage => {
+                Self::ModeledSpring
+            }
             StabilizerMode::CurvedBezier
             | StabilizerMode::GaussianWindow
             | StabilizerMode::PulledString => Self::CurvedBezier,
@@ -3103,9 +3170,12 @@ impl Default for SmoothingConfig {
 }
 
 impl SmoothingConfig {
-    /// Default input stabilization configuration (`Arithmetic mean`, buffer size `10`,
-    /// preprocessor `None`, `Finalize the stroke` enabled).
-    pub fn input_stabilization_default() -> Self {
+    /// Threshold below which smoothing behaves as direct 1:1 tracking (`Off`).
+    pub const SMOOTHING_OFF_EPSILON: f32 = 0.005;
+    /// Default adaptive smoothing strength (`35%`) balancing tremor reduction and sharp turns.
+    pub const DEFAULT_ADAPTIVE_STRENGTH: f32 = 0.35;
+
+    const fn classic_arithmetic_buffer_base() -> Self {
         Self {
             stabilizer_mode: StabilizerMode::CircularBuffer,
             stabilizer_strength: 0.5,
@@ -3128,9 +3198,77 @@ impl SmoothingConfig {
         }
     }
 
+    /// Maps normalized smoothing strength (`0.0..=1.0`) onto a circular buffer size (`2..=18`).
+    pub fn buffer_size_for_strength(strength: f32) -> u16 {
+        let s = if strength.is_finite() {
+            strength.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        ((2.0 + s * 16.0).round() as u16).clamp(2, 18)
+    }
+
+    /// Classic circular-buffer configuration (`Arithmetic mean`, buffer size `10`,
+    /// preprocessor `None`, `Finalize the stroke` enabled).
+    pub fn classic_arithmetic_buffer() -> Self {
+        Self::classic_arithmetic_buffer_base()
+    }
+
+    /// Default input stabilization configuration (`Adaptive` 2D 1€ filter at `35%`).
+    pub fn input_stabilization_default() -> Self {
+        StabilizationPreset::Adaptive.to_smoothing_config()
+    }
+
     /// Maps this configuration onto the closest curated [`StabilizationPreset`].
     pub fn preset(&self) -> StabilizationPreset {
         StabilizationPreset::from_smoothing_config(self)
+    }
+
+    /// Returns `true` when smoothing is disabled or zero-strength (`1:1` direct tracking).
+    pub fn is_smoothing_disabled(&self) -> bool {
+        let clean = self.sanitized();
+        match clean.stabilizer_mode {
+            StabilizerMode::None | StabilizerMode::SimpleDirect => true,
+            StabilizerMode::CircularBuffer => {
+                !clean.is_buffer_active()
+                    || clean.stabilizer_strength <= Self::SMOOTHING_OFF_EPSILON
+            }
+            _ => clean.stabilizer_strength <= Self::SMOOTHING_OFF_EPSILON,
+        }
+    }
+
+    /// Effective normalized smoothing strength (`0.0..=1.0`), returning `0.0` when disabled.
+    pub fn effective_strength(&self) -> f32 {
+        if self.is_smoothing_disabled() {
+            0.0
+        } else {
+            self.sanitized().stabilizer_strength
+        }
+    }
+
+    /// Effective smoothing strength as a rounded whole-number percentage (`0..=100`).
+    pub fn strength_percent(&self) -> u8 {
+        (self.effective_strength() * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8
+    }
+
+    /// Plain-English explanation of how the given normalized smoothing strength affects writing feel.
+    pub fn strength_guidance(strength: f32) -> &'static str {
+        let s = if strength.is_finite() {
+            strength.clamp(0.0, 1.0)
+        } else {
+            Self::DEFAULT_ADAPTIVE_STRENGTH
+        };
+        if s <= Self::SMOOTHING_OFF_EPSILON {
+            "Off — 1:1 direct tracking with zero lag and exact sharp corners."
+        } else if s <= 0.35 {
+            "Light — ideal for fast handwriting, preserving sharp turns while trimming micro-jitter."
+        } else if s <= 0.65 {
+            "Balanced — smooth everyday writing with responsive corner tracking."
+        } else {
+            "Strong — maximum steadiness for deliberate curves, diagrams, and precision lines."
+        }
     }
 
     /// Returns `true` when either an averaging method or a preprocessor is enabled.
@@ -3143,8 +3281,14 @@ impl SmoothingConfig {
     /// Concise summary label describing the active stabilization pipeline and key parameters.
     pub fn stabilization_summary(&self) -> String {
         let clean = self.sanitized();
+        if clean.stabilizer_mode == StabilizerMode::CircularBuffer && !clean.is_buffer_active() {
+            return "None".to_string();
+        }
+        if clean.is_smoothing_disabled() {
+            return "Off (Direct 1:1)".to_string();
+        }
         if clean.stabilizer_mode != StabilizerMode::CircularBuffer {
-            return clean.stabilizer_mode.label().to_string();
+            return format!("{} · {}%", clean.preset().label(), clean.strength_percent());
         }
         let avg_part = match clean.buffer_averaging {
             BufferAveraging::None => None,
@@ -3165,12 +3309,13 @@ impl SmoothingConfig {
                 clean.buffer_drag, clean.buffer_mass
             )),
         };
-        match (avg_part, pre_part) {
+        let base = match (avg_part, pre_part) {
             (Some(a), Some(p)) => format!("{a} + {p}"),
             (Some(a), None) => a,
             (None, Some(p)) => p,
             (None, None) => "None".to_string(),
-        }
+        };
+        format!("{base} · {}%", clean.strength_percent())
     }
 
     pub fn sanitized(&self) -> Self {
@@ -3278,8 +3423,9 @@ fn calligraphy_silky_smoothing() -> SmoothingConfig {
 
 fn velocity_gaussian_smoothing() -> SmoothingConfig {
     SmoothingConfig {
+        stabilizer_mode: StabilizerMode::CircularBuffer,
         buffer_averaging: BufferAveraging::VelocityGaussian,
-        ..SmoothingConfig::default()
+        ..SmoothingConfig::classic_arithmetic_buffer()
     }
 }
 
@@ -3400,7 +3546,7 @@ impl PenPreset {
     pub fn description(self) -> &'static str {
         match self {
             Self::FountainEveryday => {
-                "Balanced calligraphic nib with subtle directional flair and Arithmetic Mean (Buffer 10) smoothing for daily notes."
+                "Balanced calligraphic nib with subtle directional flair and Adaptive Handwriting smoothing for daily notes."
             }
             Self::FountainCalligraphy => {
                 "Wide flat nib paired with silky Gaussian smoothing for ribbon-like headers and cursive flourishes."
@@ -3412,7 +3558,7 @@ impl PenPreset {
                 "Ultra-consistent fine rollerball line ideal for formulas, small labels, and compact grids."
             }
             Self::BallpointGel => {
-                "Classic smooth ballpoint with Arithmetic Mean (Buffer 10) smoothing for effortless everyday writing."
+                "Classic smooth ballpoint with Adaptive Handwriting smoothing for effortless everyday writing."
             }
             Self::BallpointBold => {
                 "Thick steady marker line with Pulled-String stabilization for bold diagrams and underlines."
@@ -7178,6 +7324,10 @@ fn default_pen_sizes() -> [f32; 5] {
     UserStudioConfig::DEFAULT_PEN_SIZES
 }
 
+fn default_pen_smoothings() -> [SmoothingConfig; 5] {
+    UserStudioConfig::default_pen_smoothings()
+}
+
 fn default_wildcard_ink() -> Color {
     UserStudioConfig::default_wildcard_ink()
 }
@@ -7192,6 +7342,18 @@ where
 {
     let raw = Vec::<f32>::deserialize(deserializer)?;
     let mut out = UserStudioConfig::DEFAULT_PEN_SIZES;
+    for (idx, val) in raw.into_iter().take(5).enumerate() {
+        out[idx] = val;
+    }
+    Ok(out)
+}
+
+fn deserialize_pen_smoothings<'de, D>(deserializer: D) -> Result<[SmoothingConfig; 5], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<SmoothingConfig>::deserialize(deserializer)?;
+    let mut out = UserStudioConfig::default_pen_smoothings();
     for (idx, val) in raw.into_iter().take(5).enumerate() {
         out[idx] = val;
     }
@@ -7364,6 +7526,12 @@ pub struct UserStudioConfig {
         deserialize_with = "deserialize_pen_sizes"
     )]
     pub pen_sizes: [f32; 5],
+    /// Last selected stroke smoothing configuration for fountain, ball, brush, highlighter, and pencil tools.
+    #[serde(
+        default = "default_pen_smoothings",
+        deserialize_with = "deserialize_pen_smoothings"
+    )]
+    pub pen_smoothings: [SmoothingConfig; 5],
     pub ink_palette: Vec<Color>,
     pub highlighter_palette: Vec<Color>,
     #[serde(default = "default_wildcard_ink")]
@@ -7404,6 +7572,7 @@ impl Default for UserStudioConfig {
             auto_contrast_with_theme: false,
             ui_scale: Self::DEFAULT_UI_SCALE,
             pen_sizes: Self::DEFAULT_PEN_SIZES,
+            pen_smoothings: Self::default_pen_smoothings(),
             ink_palette: Self::default_ink_palette(),
             highlighter_palette: Self::default_highlighter_palette(),
             wildcard_ink: Self::default_wildcard_ink(),
@@ -7430,6 +7599,10 @@ impl UserStudioConfig {
     pub const DEFAULT_UI_SCALE: f32 = 1.0;
     pub const MIN_UI_SCALE: f32 = 0.5;
     pub const MAX_UI_SCALE: f32 = 2.5;
+
+    pub fn default_pen_smoothings() -> [SmoothingConfig; 5] {
+        std::array::from_fn(|_| SmoothingConfig::default())
+    }
 
     /// Clamps and rounds `scale` to a safe, deterministic percentage step (`0.50..=2.50`).
     #[must_use]
@@ -7677,6 +7850,8 @@ impl UserStudioConfig {
             }
         }
 
+        let pen_smoothings = std::array::from_fn(|index| self.pen_smoothings[index].sanitized());
+
         let had_explicit_presets = !self.palette_presets.is_empty();
         let mut built_in_slots: [Option<ColorPalettePreset>; 3] = [None, None, None];
         let mut custom_list: Vec<ColorPalettePreset> = Vec::new();
@@ -7830,6 +8005,7 @@ impl UserStudioConfig {
             auto_contrast_with_theme: self.auto_contrast_with_theme,
             ui_scale: Self::sanitize_ui_scale(self.ui_scale),
             pen_sizes,
+            pen_smoothings,
             ink_palette: synced_ink,
             highlighter_palette: synced_hi,
             wildcard_ink: self.wildcard_ink.sanitized().with_alpha(1.0),
@@ -7974,18 +8150,27 @@ mod tests {
             ]
         );
         let def_sm = SmoothingConfig::default();
-        assert_eq!(def_sm.stabilizer_mode, StabilizerMode::CircularBuffer);
-        assert_eq!(def_sm.buffer_averaging, BufferAveraging::ArithmeticMean);
-        assert_eq!(def_sm.buffer_preprocessor, BufferPreprocessor::None);
-        assert_eq!(def_sm.buffer_size, 10);
-        assert_eq!(def_sm.preset(), StabilizationPreset::ArithmeticBuffer10);
-        assert!((def_sm.buffer_sigma - 0.5).abs() < 1e-6);
-        assert!((def_sm.buffer_deadzone_radius - 1.3).abs() < 1e-6);
-        assert!(def_sm.buffer_cusp_detection);
-        assert!((def_sm.buffer_drag - 0.4).abs() < 1e-6);
-        assert!((def_sm.buffer_mass - 5.0).abs() < 1e-6);
-        assert!(def_sm.buffer_finalize_stroke);
-        assert!(def_sm.is_buffer_active());
+        assert_eq!(def_sm.stabilizer_mode, StabilizerMode::OneEuro);
+        assert_eq!(def_sm.preset(), StabilizationPreset::Adaptive);
+        assert!((def_sm.effective_strength() - 0.35).abs() < 1e-6);
+        assert_eq!(def_sm.strength_percent(), 35);
+    }
+
+    #[test]
+    fn classic_arithmetic_buffer_defaults_and_sanitization() {
+        let classic_sm = SmoothingConfig::classic_arithmetic_buffer();
+        assert_eq!(classic_sm.stabilizer_mode, StabilizerMode::CircularBuffer);
+        assert_eq!(classic_sm.buffer_averaging, BufferAveraging::ArithmeticMean);
+        assert_eq!(classic_sm.buffer_preprocessor, BufferPreprocessor::None);
+        assert_eq!(classic_sm.buffer_size, 10);
+        assert_eq!(classic_sm.preset(), StabilizationPreset::ArithmeticBuffer10);
+        assert!((classic_sm.buffer_sigma - 0.5).abs() < 1e-6);
+        assert!((classic_sm.buffer_deadzone_radius - 1.3).abs() < 1e-6);
+        assert!(classic_sm.buffer_cusp_detection);
+        assert!((classic_sm.buffer_drag - 0.4).abs() < 1e-6);
+        assert!((classic_sm.buffer_mass - 5.0).abs() < 1e-6);
+        assert!(classic_sm.buffer_finalize_stroke);
+        assert!(classic_sm.is_buffer_active());
 
         let hostile_sm = SmoothingConfig {
             buffer_size: 1,
@@ -7993,7 +8178,7 @@ mod tests {
             buffer_deadzone_radius: 999.0,
             buffer_drag: -1.0,
             buffer_mass: 0.1,
-            ..def_sm
+            ..classic_sm
         }
         .sanitized();
         assert_eq!(hostile_sm.buffer_size, 2);
@@ -8005,10 +8190,53 @@ mod tests {
         let inactive_sm = SmoothingConfig {
             buffer_averaging: BufferAveraging::None,
             buffer_preprocessor: BufferPreprocessor::None,
-            ..def_sm
+            ..classic_sm
         };
         assert!(!inactive_sm.is_buffer_active());
         assert_eq!(inactive_sm.stabilization_summary(), "None");
+    }
+
+    #[test]
+    fn zero_strength_smoothing_config_reports_disabled() {
+        let zero_adaptive = StabilizationPreset::Adaptive.to_smoothing_config_with_strength(0.0);
+        assert!(zero_adaptive.is_smoothing_disabled());
+        assert_eq!(zero_adaptive.effective_strength(), 0.0);
+        assert_eq!(zero_adaptive.strength_percent(), 0);
+        assert_eq!(zero_adaptive.stabilization_summary(), "Off (Direct 1:1)");
+    }
+
+    #[test]
+    fn studio_config_persists_pen_smoothings_with_legacy_fallback_and_sanitization() {
+        let legacy_json = r#"{ "theme": "Dark" }"#;
+        let legacy: UserStudioConfig = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(
+            legacy.pen_smoothings,
+            UserStudioConfig::default_pen_smoothings()
+        );
+
+        let mut cfg = UserStudioConfig::default();
+        cfg.pen_smoothings[PenKind::FountainPen.index()] =
+            StabilizationPreset::CurvedBezier.to_smoothing_config_with_strength(0.80);
+        cfg.pen_smoothings[PenKind::BallPen.index()] =
+            StabilizationPreset::SimpleDirect.to_smoothing_config();
+        let encoded = serde_json::to_string(&cfg).unwrap();
+        let decoded: UserStudioConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded.pen_smoothings[PenKind::FountainPen.index()].preset(),
+            StabilizationPreset::CurvedBezier
+        );
+        assert_eq!(
+            decoded.pen_smoothings[PenKind::FountainPen.index()].strength_percent(),
+            80
+        );
+        assert!(decoded.pen_smoothings[PenKind::BallPen.index()].is_smoothing_disabled());
+
+        let mut dirty = UserStudioConfig::default();
+        dirty.pen_smoothings[0].stabilizer_strength = f32::NAN;
+        dirty.pen_smoothings[0].buffer_size = 0;
+        let clean = dirty.sanitized();
+        assert!(clean.pen_smoothings[0].stabilizer_strength.is_finite());
+        assert_eq!(clean.pen_smoothings[0].buffer_size, 2);
     }
 
     #[test]

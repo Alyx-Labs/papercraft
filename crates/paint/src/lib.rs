@@ -45,12 +45,14 @@ pub fn finalize_smoothed_samples(
         return Vec::new();
     }
     let cfg = smoothing.sanitized();
+    if cfg.stabilizer_mode == StabilizerMode::SimpleDirect
+        || (cfg.stabilizer_mode != StabilizerMode::None && cfg.is_smoothing_disabled())
+    {
+        return densify_linear(stabilized, 3.5);
+    }
     let faired = apply_streamline(stabilized, cfg.streamline_amount);
     if faired.len() < 2 {
         return faired;
-    }
-    if cfg.stabilizer_mode == StabilizerMode::SimpleDirect {
-        return densify_linear(&faired, 3.5);
     }
     if cfg.catmull_rom_subdivision {
         resample_centripetal_catmull_rom(&faired, cfg.spline_tension, 2.5)

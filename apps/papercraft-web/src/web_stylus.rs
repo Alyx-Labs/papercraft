@@ -271,6 +271,50 @@ fn clear_pen_state(state: &mut WebStylusState) -> bool {
     changed
 }
 
+fn coalesced_pointer_events(ev: &web_sys::PointerEvent) -> Vec<web_sys::PointerEvent> {
+    let Ok(val) = js_sys::Reflect::get(
+        ev.as_ref(),
+        &wasm_bindgen::JsValue::from_str("getCoalescedEvents"),
+    ) else {
+        return Vec::new();
+    };
+    let Ok(func) = val.dyn_into::<js_sys::Function>() else {
+        return Vec::new();
+    };
+    let Ok(arr_val) = func.call0(ev.as_ref()) else {
+        return Vec::new();
+    };
+    let arr = js_sys::Array::from(&arr_val);
+    let count = arr.length().min(64);
+    let mut out = Vec::with_capacity(count as usize);
+    for idx in 0..count {
+        if let Ok(sub_ev) = arr.get(idx).dyn_into::<web_sys::PointerEvent>() {
+            out.push(sub_ev);
+        }
+    }
+    out
+}
+
+fn push_pen_sample_from_event(
+    g: &mut WebStylusState,
+    ev: &web_sys::PointerEvent,
+    phase: PointerPhase,
+    flags: (bool, bool, bool),
+) {
+    let (barrel, secondary, eraser) = flags;
+    let sample = PenSample {
+        pressure: sample_pressure(phase, ev.buttons(), ev.pressure()),
+        tilt_x: ev.tilt_x() as f32,
+        tilt_y: ev.tilt_y() as f32,
+        rotation: ev.twist() as f32,
+        eraser,
+        barrel,
+        barrel_secondary: secondary,
+        time_ms: Some(ev.time_stamp()),
+    };
+    push_bounded_sample(&mut g.samples, sample);
+}
+
 fn handle_pointer_event(
     state: &Arc<Mutex<WebStylusState>>,
     canvas: &web_sys::HtmlCanvasElement,
@@ -334,17 +378,19 @@ fn handle_pointer_event(
         g.last_pen_barrel_time_ms = Some(now_ms);
     }
 
-    let sample = PenSample {
-        pressure: sample_pressure(phase, buttons, ev.pressure()),
-        tilt_x: ev.tilt_x() as f32,
-        tilt_y: ev.tilt_y() as f32,
-        rotation: ev.twist() as f32,
-        eraser,
-        barrel,
-        barrel_secondary: secondary,
-        time_ms: Some(now_ms),
+    let coalesced = if phase == PointerPhase::Move {
+        coalesced_pointer_events(ev)
+    } else {
+        Vec::new()
     };
-    push_bounded_sample(&mut g.samples, sample);
+    if coalesced.is_empty() {
+        push_pen_sample_from_event(&mut g, ev, phase, (barrel, secondary, eraser));
+    } else {
+        for sub_ev in &coalesced {
+            let sub_flags = decode_pen_flags(phase, sub_ev.button(), sub_ev.buttons());
+            push_pen_sample_from_event(&mut g, sub_ev, phase, sub_flags);
+        }
+    }
 
     let contact_queued = record_fallback_contact(&mut g, canvas, ev, phase, button, eraser);
     contact_queued
