@@ -2277,12 +2277,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.pen(PenKind::FountainPen).smoothing.strength_percent(), 15);
+        assert_eq!(s.pen(PenKind::FountainPen).smoothing.buffer_size, 3);
         assert_eq!(
             s.prefs.pen_smoothings[PenKind::FountainPen.index()].strength_percent(),
-            25
+            50
         );
 
-        // Switching to SimpleDirect (Off) and persisting, then raising strength > 0 upgrades to Adaptive.
+        // Switching to SimpleDirect (Off) and persisting, then raising strength > 0 recovers to ArithmeticBuffer10.
         s.execute(
             "pen.setSmoothing",
             &serde_json::json!({
@@ -2310,9 +2311,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             s.pen(PenKind::FountainPen).smoothing.preset(),
-            papercraft_doc::StabilizationPreset::Adaptive
+            papercraft_doc::StabilizationPreset::ArithmeticBuffer10
         );
         assert_eq!(s.pen(PenKind::FountainPen).smoothing.strength_percent(), 25);
+        assert_eq!(s.pen(PenKind::FountainPen).smoothing.buffer_size, 5);
 
         // Switching style with preserve_strength keeps 25%.
         s.execute(
@@ -2347,11 +2349,12 @@ mod tests {
         );
         assert_eq!(
             restored.pen(PenKind::BallPen).smoothing.preset(),
-            papercraft_doc::StabilizationPreset::Adaptive
+            papercraft_doc::StabilizationPreset::ArithmeticBuffer10
         );
         assert_eq!(
             restored.pen(PenKind::BallPen).smoothing.strength_percent(),
-            25
+            50
         );
+        assert_eq!(restored.pen(PenKind::BallPen).smoothing.buffer_size, 10);
     }
 }

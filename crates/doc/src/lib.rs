@@ -2881,12 +2881,12 @@ impl StabilizerMode {
 /// Curated 1-click stroke stabilization presets exposed in the Pen settings drawer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StabilizationPreset {
-    #[default]
     Adaptive,
     #[serde(alias = "QuickNotes")]
     ModeledSpring,
     #[serde(alias = "PrecisionPulledString")]
     CurvedBezier,
+    #[default]
     #[serde(alias = "ArithmeticBuffer20")]
     ArithmeticBuffer10,
     #[serde(alias = "RawUnfiltered")]
@@ -2956,7 +2956,7 @@ impl StabilizationPreset {
             Self::Adaptive => SmoothingConfig::DEFAULT_ADAPTIVE_STRENGTH,
             Self::ModeledSpring => 0.50,
             Self::CurvedBezier => 0.55,
-            Self::ArithmeticBuffer10 => 0.50,
+            Self::ArithmeticBuffer10 => SmoothingConfig::DEFAULT_SMOOTHING_STRENGTH,
             Self::SimpleDirect => 0.0,
         }
     }
@@ -3174,6 +3174,10 @@ impl SmoothingConfig {
     pub const SMOOTHING_OFF_EPSILON: f32 = 0.005;
     /// Default adaptive smoothing strength (`25%`) balancing tremor reduction and crisp corners.
     pub const DEFAULT_ADAPTIVE_STRENGTH: f32 = 0.25;
+    /// Maximum arithmetic circular-buffer window (`100%` smoothing).
+    pub const MAX_ARITHMETIC_BUFFER_SIZE: u16 = 20;
+    /// Default smoothing strength (`50%`, corresponding to arithmetic buffer size `10`).
+    pub const DEFAULT_SMOOTHING_STRENGTH: f32 = 0.50;
 
     const fn classic_arithmetic_buffer_base() -> Self {
         Self {
@@ -3198,14 +3202,16 @@ impl SmoothingConfig {
         }
     }
 
-    /// Maps normalized smoothing strength (`0.0..=1.0`) onto a circular buffer size (`2..=18`).
+    /// Maps normalized smoothing strength (`0.0..=1.0`) onto a circular buffer size (`2..=20`),
+    /// where `50%` maps to `10` and `100%` maps to `20`.
     pub fn buffer_size_for_strength(strength: f32) -> u16 {
         let s = if strength.is_finite() {
             strength.clamp(0.0, 1.0)
         } else {
-            0.5
+            Self::DEFAULT_SMOOTHING_STRENGTH
         };
-        ((2.0 + s * 16.0).round() as u16).clamp(2, 18)
+        ((s * f32::from(Self::MAX_ARITHMETIC_BUFFER_SIZE)).round() as u16)
+            .clamp(2, Self::MAX_ARITHMETIC_BUFFER_SIZE)
     }
 
     /// Classic circular-buffer configuration (`Arithmetic mean`, buffer size `10`,
@@ -3214,9 +3220,9 @@ impl SmoothingConfig {
         Self::classic_arithmetic_buffer_base()
     }
 
-    /// Default input stabilization configuration (`Adaptive` 2D 1€ filter at `25%`).
+    /// Default input stabilization configuration (`Arithmetic mean` circular buffer at `50%` / window `10`).
     pub fn input_stabilization_default() -> Self {
-        StabilizationPreset::Adaptive.to_smoothing_config()
+        StabilizationPreset::ArithmeticBuffer10.to_smoothing_config()
     }
 
     /// Maps this configuration onto the closest curated [`StabilizationPreset`].
@@ -3258,7 +3264,7 @@ impl SmoothingConfig {
         let s = if strength.is_finite() {
             strength.clamp(0.0, 1.0)
         } else {
-            Self::DEFAULT_ADAPTIVE_STRENGTH
+            Self::DEFAULT_SMOOTHING_STRENGTH
         };
         if s <= Self::SMOOTHING_OFF_EPSILON {
             "Off — 1:1 direct tracking with zero lag and exact sharp corners."
@@ -8150,10 +8156,22 @@ mod tests {
             ]
         );
         let def_sm = SmoothingConfig::default();
-        assert_eq!(def_sm.stabilizer_mode, StabilizerMode::OneEuro);
-        assert_eq!(def_sm.preset(), StabilizationPreset::Adaptive);
-        assert!((def_sm.effective_strength() - 0.25).abs() < 1e-6);
-        assert_eq!(def_sm.strength_percent(), 25);
+        assert_eq!(def_sm.stabilizer_mode, StabilizerMode::CircularBuffer);
+        assert_eq!(def_sm.buffer_averaging, BufferAveraging::ArithmeticMean);
+        assert_eq!(def_sm.buffer_size, 10);
+        assert_eq!(def_sm.preset(), StabilizationPreset::ArithmeticBuffer10);
+        assert!((def_sm.effective_strength() - 0.50).abs() < 1e-6);
+        assert_eq!(def_sm.strength_percent(), 50);
+        assert_eq!(SmoothingConfig::buffer_size_for_strength(0.0), 2);
+        assert_eq!(SmoothingConfig::buffer_size_for_strength(0.25), 5);
+        assert_eq!(SmoothingConfig::buffer_size_for_strength(0.50), 10);
+        assert_eq!(SmoothingConfig::buffer_size_for_strength(0.80), 16);
+        assert_eq!(SmoothingConfig::buffer_size_for_strength(1.00), 20);
+        assert!(
+            StabilizationPreset::ArithmeticBuffer10
+                .to_smoothing_config_with_strength(0.0)
+                .is_smoothing_disabled()
+        );
     }
 
     #[test]

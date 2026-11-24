@@ -4823,13 +4823,13 @@ fn apply_smoothing_strength(app: &mut PaperCraftApp, kind: PenKind, strength: f3
     let clean = if strength.is_finite() {
         strength.clamp(0.0, 1.0)
     } else {
-        SmoothingConfig::DEFAULT_ADAPTIVE_STRENGTH
+        SmoothingConfig::DEFAULT_SMOOTHING_STRENGTH
     };
     let _ = app.session.execute(
         "pen.setSmoothing",
         &json!({
             "kind": kind,
-            "preset": StabilizationPreset::Adaptive,
+            "preset": StabilizationPreset::ArithmeticBuffer10,
             "stabilizer_strength": clean,
             "persist": persist,
         }),
@@ -7592,7 +7592,15 @@ mod tests {
 
         let shapes = settle(&ctx, &mut app, &mut time);
         let pill_pos =
-            find_text(&shapes, "25%").expect("default 25% smoothing pill in context tray");
+            find_text(&shapes, "50%").expect("default 50% smoothing pill in context tray");
+        assert_eq!(
+            app.session.pen(PenKind::FountainPen).smoothing.preset(),
+            papercraft_doc::StabilizationPreset::ArithmeticBuffer10
+        );
+        assert_eq!(
+            app.session.pen(PenKind::FountainPen).smoothing.buffer_size,
+            10
+        );
         click_at(&ctx, &mut app, &mut time, pill_pos);
         assert!(app.view.smoothing_popover_open);
 
@@ -7600,6 +7608,8 @@ mod tests {
         let pop_texts = collect_all_texts(&pop_shapes);
         assert!(!pop_texts.contains("Style:"));
         assert!(!pop_texts.contains("All styles"));
+        assert!(!pop_texts.contains("buffer"));
+        assert!(!pop_texts.contains("20"));
         let off_pos = find_text(&pop_shapes, "Off").expect("Off level inside smoothing popover");
         click_at(&ctx, &mut app, &mut time, off_pos);
         assert!(
@@ -7617,6 +7627,10 @@ mod tests {
             find_text(&pop_shapes2, "High").expect("High level inside smoothing popover");
         click_at(&ctx, &mut app, &mut time, high_pos);
         assert_eq!(
+            app.session.pen(PenKind::FountainPen).smoothing.preset(),
+            papercraft_doc::StabilizationPreset::ArithmeticBuffer10
+        );
+        assert_eq!(
             app.session
                 .pen(PenKind::FountainPen)
                 .smoothing
@@ -7624,11 +7638,15 @@ mod tests {
             80
         );
         assert_eq!(
+            app.session.pen(PenKind::FountainPen).smoothing.buffer_size,
+            16
+        );
+        assert_eq!(
             app.session.prefs.pen_smoothings[PenKind::FountainPen.index()].strength_percent(),
             80
         );
 
-        // Switching to BallPen keeps its independent 25% smoothing setting.
+        // Switching to BallPen keeps its independent 50% (buffer size 10) smoothing setting.
         time += 0.03;
         let _ = step_editor_frame(
             &ctx,
@@ -7650,26 +7668,32 @@ mod tests {
             .execute("tool.select", &json!({ "tool": "BallPen" }))
             .unwrap();
         let ball_shapes = settle(&ctx, &mut app, &mut time);
-        let ball_pill = find_text(&ball_shapes, "25%").expect("BallPen starts with default 25%");
+        let ball_pill = find_text(&ball_shapes, "50%").expect("BallPen starts with default 50%");
+        assert_eq!(app.session.pen(PenKind::BallPen).smoothing.buffer_size, 10);
         click_at(&ctx, &mut app, &mut time, ball_pill);
         assert!(app.view.smoothing_popover_open);
 
         let ball_pop = settle(&ctx, &mut app, &mut time);
-        let med_pos = find_text(&ball_pop, "Med").expect("Med level inside BallPen popover");
-        click_at(&ctx, &mut app, &mut time, med_pos);
+        let low_pos = find_text(&ball_pop, "Low").expect("Low level inside BallPen popover");
+        click_at(&ctx, &mut app, &mut time, low_pos);
         assert_eq!(
             app.session
                 .pen(PenKind::BallPen)
                 .smoothing
                 .strength_percent(),
-            50
+            25
         );
+        assert_eq!(app.session.pen(PenKind::BallPen).smoothing.buffer_size, 5);
         assert_eq!(
             app.session
                 .pen(PenKind::FountainPen)
                 .smoothing
                 .strength_percent(),
             80
+        );
+        assert_eq!(
+            app.session.pen(PenKind::FountainPen).smoothing.buffer_size,
+            16
         );
 
         // Pressing Escape closes the smoothing popover.

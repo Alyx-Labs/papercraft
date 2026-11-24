@@ -2251,7 +2251,11 @@ mod tests {
         }
         let v_tip = Point::new(70.0, 110.0);
 
-        let adaptive = crate::smooth_stroke_samples(&v_stroke, &SmoothingConfig::default(), 1.0);
+        let adaptive = crate::smooth_stroke_samples(
+            &v_stroke,
+            &StabilizationPreset::Adaptive.to_smoothing_config(),
+            1.0,
+        );
         let adaptive_high = crate::smooth_stroke_samples(
             &v_stroke,
             &StabilizationPreset::Adaptive.to_smoothing_config_with_strength(0.80),
@@ -2329,10 +2333,25 @@ mod tests {
                     "{preset:?} should reduce interior peak jitter monotonically: 0%={d0:.2}, 25%={d_low:.2}, 80%={d_high:.2}",
                 );
             } else {
-                assert!(
-                    preset.to_smoothing_config_with_strength(0.80).buffer_size
-                        > preset.to_smoothing_config_with_strength(0.25).buffer_size,
-                    "ArithmeticBuffer10 buffer_size should grow with strength",
+                assert_eq!(
+                    SmoothingConfig::default(),
+                    StabilizationPreset::ArithmeticBuffer10.to_smoothing_config_with_strength(0.50)
+                );
+                assert_eq!(
+                    preset.to_smoothing_config_with_strength(0.25).buffer_size,
+                    5
+                );
+                assert_eq!(
+                    preset.to_smoothing_config_with_strength(0.50).buffer_size,
+                    10
+                );
+                assert_eq!(
+                    preset.to_smoothing_config_with_strength(0.80).buffer_size,
+                    16
+                );
+                assert_eq!(
+                    preset.to_smoothing_config_with_strength(1.00).buffer_size,
+                    20
                 );
             }
 

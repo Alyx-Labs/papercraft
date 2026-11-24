@@ -3770,7 +3770,7 @@ mod tests {
         super::merge_studio_prefs(&mut target, incoming.clone(), false);
         assert_eq!(
             target.pen_smoothings[papercraft_doc::PenKind::FountainPen.index()].strength_percent(),
-            25
+            50
         );
         super::merge_studio_prefs(&mut target, incoming, true);
         assert_eq!(

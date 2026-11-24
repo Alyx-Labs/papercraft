@@ -5185,7 +5185,7 @@ fn resolve_smoothing_base(
         let clean_s = if raw_s.is_finite() {
             raw_s.clamp(0.0, 1.0)
         } else {
-            SmoothingConfig::DEFAULT_ADAPTIVE_STRENGTH
+            SmoothingConfig::DEFAULT_SMOOTHING_STRENGTH
         };
         if clean_s > SmoothingConfig::SMOOTHING_OFF_EPSILON
             && matches!(
@@ -5193,7 +5193,8 @@ fn resolve_smoothing_base(
                 StabilizerMode::SimpleDirect | StabilizerMode::None
             )
         {
-            return StabilizationPreset::Adaptive.to_smoothing_config_with_strength(clean_s);
+            return StabilizationPreset::ArithmeticBuffer10
+                .to_smoothing_config_with_strength(clean_s);
         }
         if sm.stabilizer_mode == StabilizerMode::CircularBuffer && p.buffer_size.is_none() {
             sm.buffer_size = SmoothingConfig::buffer_size_for_strength(clean_s);
