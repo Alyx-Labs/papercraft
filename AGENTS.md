@@ -38,6 +38,12 @@ PaperCraft is a cross-platform note-taking and handwriting application written i
 4. **Everything is a command**: All user-visible document/tool mutations dispatch through `papercraft-engine` commands and must pass `panic_hunt`.
 5. **No third-party app names**: Never mention external applications in code identifiers, comments, docstrings, metadata, or UI strings.
 
+## Verification Workflow
+
+1. **Finish sequential edits before heavy checks**: When handling multiple requests or queued follow-ups in sequence, keep applying all requested edits first; light, scoped checks (`cargo check -p <crate>` or a focused crate test) are fine when needed, while heavy workspace-wide commands wait until no pending requests remain.
+2. **Use scoped checks for localized changes**: For small edits contained within one crate, verify with targeted checks (`cargo check -p <crate>`, `cargo test -p <crate>`) rather than running the full workspace suite.
+3. **Save heavy CI commands for the final step**: Run `cargo xtask ci` (plus `wasm32-unknown-unknown` `check` and `clippy` for `papercraft-web` or shared UI/engine changes) only once at the very end when no further requests remain in the batch, and always before opening a PR, pushing `main`, or tagging a release (matching `.github/workflows/ci.yml`).
+
 ## UI & UX Design Rules
 
 1. **100% English UI**: Every user-visible string—button labels, tooltips, presets, explanations, dialogs, and status text—must be written in clear, concise English.

@@ -280,6 +280,7 @@ pub struct ViewState {
     pub ruler_center: [f64; 2],
     pub ruler_angle: f64,
     pub ruler_length: f64,
+    pub ruler_depth: f64,
     pub ruler_drag_mode: Option<RulerDragMode>,
     pub ruler_drag_touch_id: Option<egui::TouchId>,
     pub ruler_drag_anchor: Option<[f64; 2]>,
@@ -462,6 +463,7 @@ impl Default for ViewState {
             ruler_center: [0.0, 0.0],
             ruler_angle: 0.0,
             ruler_length: 0.0,
+            ruler_depth: 0.0,
             ruler_drag_mode: None,
             ruler_drag_touch_id: None,
             ruler_drag_anchor: None,
@@ -2498,6 +2500,7 @@ pub(crate) fn sync_view_to_active_notebook(app: &mut PaperCraftApp) {
     app.view.shape_drag_touch_id = None;
     app.view.ruler_active = false;
     app.view.ruler_initialized = false;
+    app.view.ruler_depth = 0.0;
     app.view.ruler_drag_mode = None;
     app.view.ruler_drag_touch_id = None;
     app.view.ruler_drag_anchor = None;
@@ -2617,23 +2620,28 @@ fn looks_like_raster_image_path(_path: &std::path::Path) -> bool {
 }
 
 impl PaperCraftApp {
-    pub(crate) fn camera_center_page_point(&self) -> papercraft_geom::Point {
-        let page_w = f64::from(self.session.doc.width);
-        let page_h = f64::from(self.session.doc.height);
-        let fallback = papercraft_geom::Point::new(page_w * 0.5, page_h * 0.5);
-        let Some(rect) = self.view.last_canvas_rect else {
-            return fallback;
-        };
+    pub(crate) fn active_camera_viewport(&self) -> Option<(egui::Rect, f32, [f64; 2])> {
+        let rect = self.view.last_canvas_rect?;
         if !(rect.is_finite() && rect.width() > 1.0 && rect.height() > 1.0) {
-            return fallback;
+            return None;
         }
         let (zoom, pan) = match self.view.motion.camera_glide {
             Some(glide) => (glide.target_zoom, glide.target_pan),
             None => (self.view.zoom, self.view.pan),
         };
         if !(zoom.is_finite() && zoom > 1e-6 && pan[0].is_finite() && pan[1].is_finite()) {
-            return fallback;
+            return None;
         }
+        Some((rect, zoom, pan))
+    }
+
+    pub(crate) fn camera_center_page_point(&self) -> papercraft_geom::Point {
+        let page_w = f64::from(self.session.doc.width);
+        let page_h = f64::from(self.session.doc.height);
+        let fallback = papercraft_geom::Point::new(page_w * 0.5, page_h * 0.5);
+        let Some((rect, zoom, pan)) = self.active_camera_viewport() else {
+            return fallback;
+        };
         let xf = papercraft_geom::Affine2::new(f64::from(zoom), pan[0], pan[1]);
         let center_screen = rect.center();
         let pt = xf.to_page(papercraft_geom::Point::new(

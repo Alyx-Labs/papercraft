@@ -1397,7 +1397,7 @@ fn handle_pan_and_zoom(app: &mut PaperCraftApp, ui: &mut egui::Ui, resp: &egui::
 }
 
 const MIN_TOUCH_CONTACT_PRESSURE: f32 = 0.02;
-const RULER_DEPTH: f64 = 64.0;
+pub(crate) const RULER_DEPTH: f64 = 64.0;
 const RULER_EDGE_SNAP_SCREEN: f64 = 16.0;
 
 struct SampleCursor {
@@ -1471,7 +1471,12 @@ fn ruler_geometry(app: &PaperCraftApp) -> (Point, Point, Point, f64, f64) {
     } else {
         f64::from(app.session.doc.width) * 0.72
     };
-    (center, direction, normal, length * 0.5, RULER_DEPTH * 0.5)
+    let depth = if app.view.ruler_depth.is_finite() && app.view.ruler_depth > 0.0 {
+        app.view.ruler_depth
+    } else {
+        RULER_DEPTH
+    };
+    (center, direction, normal, length * 0.5, depth * 0.5)
 }
 
 fn ruler_local_position(app: &PaperCraftApp, point: Point) -> (f64, f64) {
@@ -1522,20 +1527,17 @@ fn ruler_rotation_handle(app: &PaperCraftApp) -> Point {
 }
 
 pub(crate) fn clamp_ruler_center(app: &PaperCraftApp, point: Point) -> Point {
-    let (_, direction, normal, half_length, half_width) = ruler_geometry(app);
     let width = f64::from(app.session.doc.width);
     let height = f64::from(app.session.doc.height);
-    let extent_x = half_length * direction.x.abs() + half_width * normal.x.abs();
-    let extent_y = half_length * direction.y.abs() + half_width * normal.y.abs();
-    let x = if extent_x * 2.0 >= width {
+    let x = if point.x.is_finite() {
+        point.x.clamp(0.0, width)
+    } else {
         width * 0.5
-    } else {
-        point.x.clamp(extent_x, width - extent_x)
     };
-    let y = if extent_y * 2.0 >= height {
-        height * 0.5
+    let y = if point.y.is_finite() {
+        point.y.clamp(0.0, height)
     } else {
-        point.y.clamp(extent_y, height - extent_y)
+        height * 0.5
     };
     Point::new(x, y)
 }
@@ -2813,7 +2815,8 @@ fn handle_ruler_input(
             }
             let (along, across) = ruler_local_position(app, page_pos);
             let (_, _, _, half_length, half_width) = ruler_geometry(app);
-            if along.abs() <= half_length + 4.0 && across.abs() <= half_width {
+            let end_margin = 4.0 / f64::from(app.view.zoom.max(0.05));
+            if along.abs() <= half_length + end_margin && across.abs() <= half_width {
                 start_ruler_drag(app, crate::RulerDragMode::Move, page_pos, touch_id);
                 return true;
             }
@@ -2960,8 +2963,9 @@ fn update_canvas_cursor_icon(app: &PaperCraftApp, ui: &egui::Ui, resp: &egui::Re
                 let handle_dy = f64::from(screen_pos.y) - handle.y;
                 let (along, across) = ruler_local_position(app, page_pos);
                 let (_, _, _, half_length, half_width) = ruler_geometry(app);
+                let end_margin = 4.0 / f64::from(app.view.zoom.max(0.05));
                 handle_dx.hypot(handle_dy) <= 16.0
-                    || (along.abs() <= half_length + 4.0
+                    || (along.abs() <= half_length + end_margin
                         && across.abs() <= half_width
                         && ruler_edge_for_point(app, page_pos).is_none())
             });
@@ -7859,12 +7863,28 @@ fn paint_ruler(
         );
     }
 
-    let tick_count = (half_length * 2.0 / 10.0).floor().clamp(0.0, 2048.0) as usize;
+    let depth = half_width * 2.0;
+    let tick_step = if depth >= 96.0 {
+        25.0
+    } else if depth >= 48.0 {
+        10.0
+    } else if depth >= 24.0 {
+        5.0
+    } else if depth >= 12.0 {
+        2.5
+    } else {
+        2.0
+    };
+    let tick_count = (half_length * 2.0 / tick_step).floor().clamp(0.0, 2048.0) as usize;
     let tick_color = t.text.gamma_multiply(0.72);
     for idx in 0..=tick_count {
-        let along = -half_length + idx as f64 * 10.0;
+        let along = -half_length + idx as f64 * tick_step;
         let major = idx % 5 == 0;
-        let tick_length = if major { 12.0 } else { 6.0 };
+        let tick_length = if major {
+            half_width * 0.375
+        } else {
+            half_width * 0.1875
+        };
         let start = corner(along, half_width);
         let end = corner(along, half_width - tick_length);
         p.line_segment(
@@ -7915,7 +7935,7 @@ fn paint_ruler(
     }
 
     let zoom = app.view.zoom.max(0.05);
-    if RULER_DEPTH as f32 * zoom >= 18.0 {
+    if (half_width * 2.0) as f32 * zoom >= 18.0 {
         let label_size = (11.0_f32 * (zoom / 0.6).sqrt()).clamp(8.0, 14.0);
         let center_screen = xf.to_screen(center);
         let center_screen = pos2(center_screen.x as f32, center_screen.y as f32);
@@ -13420,5 +13440,61 @@ mod tests {
         );
         assert_eq!(app.session.doc.strokes[2].raw_points.len(), 2);
         assert!((app.session.doc.strokes[2].raw_points[0].pressure - 0.25).abs() < 1e-3);
+    }
+
+    #[test]
+    fn zoomed_ruler_clamping_and_edge_snapping_work_near_page_corners() {
+        let ctx = egui::Context::default();
+        let mut app = setup_editor_app(&ctx);
+        app.view.fit_requested = false;
+        app.view.zoom = 3.0;
+        let corner_center = Point::new(50.0, 60.0);
+        app.view.pan = [640.0 - corner_center.x * 3.0, 400.0 - corner_center.y * 3.0];
+        app.view.ruler_active = true;
+        app.view.ruler_initialized = true;
+        app.view.ruler_center = [corner_center.x, corner_center.y];
+        app.view.ruler_angle = 0.0;
+        app.view.ruler_length = 300.0;
+        app.view.ruler_depth = 20.0;
+
+        // Even when half_length (150) exceeds distance to the left/top margin (50, 60),
+        // clamping keeps the ruler center anchored at the corner instead of pushing it off-screen.
+        let clamped = clamp_ruler_center(&app, corner_center);
+        assert!((clamped.x - 50.0).abs() < 1e-6);
+        assert!((clamped.y - 60.0).abs() < 1e-6);
+
+        // Hover/press along the ruler's upper edge (y = 60 - 10 = 50) snaps cleanly onto that edge.
+        let xf = page_affine(&app);
+        let p0 = xf.to_screen(Point::new(20.0, 50.0));
+        let p1 = xf.to_screen(Point::new(90.0, 50.0));
+        run_editor_frame(
+            &ctx,
+            &mut app,
+            0.032,
+            vec![
+                egui::Event::PointerMoved(pos2(p0.x as f32, p0.y as f32)),
+                egui::Event::PointerButton {
+                    pos: pos2(p0.x as f32, p0.y as f32),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(pos2(p1.x as f32, p1.y as f32)),
+                egui::Event::PointerButton {
+                    pos: pos2(p1.x as f32, p1.y as f32),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(app.session.doc.strokes.len(), 1);
+        for pt in app.session.doc.strokes[0].raw_points.iter() {
+            assert!(
+                (pt.y - 50.0).abs() < 1e-3,
+                "expected ruler edge projection at y=50.0, got {}",
+                pt.y
+            );
+        }
     }
 }
