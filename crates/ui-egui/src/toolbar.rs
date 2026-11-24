@@ -3623,9 +3623,9 @@ fn draw_right_zone(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     let has_update = false;
 
     let settings_tip = if has_update {
-        "Settings (Shortcut: S)\nPen stabilization, studio appearance, live telemetry, and an available app update."
+        "Settings (Shortcut: S)\nPen shortcuts, studio appearance, system info, and an available app update."
     } else {
-        "Settings (Shortcut: S)\nPen stabilization, studio appearance, and live stylus telemetry."
+        "Settings (Shortcut: S)\nPen shortcuts, studio appearance, and system info."
     };
     let settings_resp = compact_icon_button(
         ui,

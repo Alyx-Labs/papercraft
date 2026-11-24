@@ -1330,15 +1330,150 @@ pub(crate) fn draw_library_nav(
     t: &Tokens,
     mode: NavMode,
 ) {
+    #[cfg(not(target_arch = "wasm32"))]
+    let notice = {
+        let status = app.updater.status().clone();
+        sidebar_update_notice_spec(&status)
+    };
+    #[cfg(target_arch = "wasm32")]
+    let notice: Option<SidebarUpdateNoticeSpec> = None;
+
+    draw_library_nav_with_notice(app, ui, t, mode, notice.as_ref());
+}
+
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarUpdateNoticeKind {
+    Available,
+    Downloading,
+    ReadyToInstall,
+}
+
+#[derive(Clone, Debug)]
+struct SidebarUpdateNoticeSpec {
+    kind: SidebarUpdateNoticeKind,
+    title: String,
+    subtitle: String,
+    badge: String,
+    tooltip: String,
+    progress_frac: Option<f32>,
+    indeterminate: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sidebar_update_notice_spec(
+    status: &papercraft_updater::UpdateStatus,
+) -> Option<SidebarUpdateNoticeSpec> {
+    use papercraft_updater::{UpdateStatus, format_bytes};
+
+    match status {
+        UpdateStatus::Available(u) => Some(SidebarUpdateNoticeSpec {
+            kind: SidebarUpdateNoticeKind::Available,
+            title: "Update available".to_string(),
+            subtitle: format!("v{} · Click to review & install", u.version),
+            badge: format!("v{}", u.version),
+            tooltip: format!(
+                "PaperCraft v{} is available (current: v{}). Click to review release notes and install, or check Settings -> System anytime.",
+                u.version, u.current_version
+            ),
+            progress_frac: None,
+            indeterminate: false,
+        }),
+        UpdateStatus::Downloading {
+            update,
+            downloaded_bytes,
+            total_bytes,
+        } => {
+            let is_verifying = *total_bytes > 0 && *downloaded_bytes >= *total_bytes;
+            let title = if is_verifying {
+                "Verifying update..."
+            } else {
+                "Downloading update..."
+            };
+            let (badge, progress_frac, indeterminate, subtitle) = if *total_bytes > 0 {
+                let frac = (*downloaded_bytes as f32 / *total_bytes as f32).clamp(0.0, 1.0);
+                let pct = (frac * 100.0).round() as u32;
+                (
+                    format!("{pct}%"),
+                    Some(frac),
+                    false,
+                    format!(
+                        "{} / {}",
+                        format_bytes(*downloaded_bytes),
+                        format_bytes(*total_bytes)
+                    ),
+                )
+            } else {
+                (
+                    format_bytes(*downloaded_bytes),
+                    None,
+                    true,
+                    format!("v{} · Click for details", update.version),
+                )
+            };
+            Some(SidebarUpdateNoticeSpec {
+                kind: SidebarUpdateNoticeKind::Downloading,
+                title: title.to_string(),
+                subtitle,
+                badge,
+                tooltip: format!(
+                    "Downloading PaperCraft v{}. Click to view progress or cancel.",
+                    update.version
+                ),
+                progress_frac,
+                indeterminate,
+            })
+        }
+        UpdateStatus::ReadyToInstall { update, .. } => Some(SidebarUpdateNoticeSpec {
+            kind: SidebarUpdateNoticeKind::ReadyToInstall,
+            title: "Update ready".to_string(),
+            subtitle: format!("Click to restart & install v{}", update.version),
+            badge: format!("v{}", update.version),
+            tooltip: format!(
+                "PaperCraft v{} is verified and ready. Click to save open work and restart.",
+                update.version
+            ),
+            progress_frac: None,
+            indeterminate: false,
+        }),
+        _ => None,
+    }
+}
+
+fn draw_library_nav_with_notice(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    mode: NavMode,
+    notice: Option<&SidebarUpdateNoticeSpec>,
+) {
     let snapshot = NavSnapshot::capture(app);
     let mut actions = Vec::new();
     let show_footer = mode == NavMode::Sidebar;
+    let sidebar_notice = if show_footer { notice } else { None };
     let item_gap = ui.spacing().item_spacing.y;
+    let notice_h_id = ui.make_persistent_id("papercraft_sidebar_update_notice_h");
+    let estimated_notice_h = sidebar_notice.map_or(0.0, |spec| {
+        let fallback = if spec.kind == SidebarUpdateNoticeKind::Downloading {
+            66.0
+        } else {
+            54.0
+        };
+        ui.ctx()
+            .data(|d| d.get_temp::<f32>(notice_h_id))
+            .unwrap_or(fallback)
+    });
     let scroll = egui::ScrollArea::vertical()
         .id_salt(("papercraft_library_nav_scroll", mode == NavMode::Popup));
     let scroll = match mode {
         NavMode::Sidebar => {
-            let max_h = (ui.available_height() - SIDEBAR_FOOTER_HEIGHT - item_gap).max(60.0);
+            let notice_reserve = if sidebar_notice.is_some() {
+                estimated_notice_h + item_gap
+            } else {
+                0.0
+            };
+            let max_h = (ui.available_height() - SIDEBAR_FOOTER_HEIGHT - item_gap - notice_reserve)
+                .max(60.0);
             scroll.auto_shrink([false, false]).max_height(max_h)
         }
         NavMode::Popup => scroll.auto_shrink([false, true]).max_height(440.0),
@@ -1357,8 +1492,139 @@ pub(crate) fn draw_library_nav(
     for action in actions {
         apply_library_action(app, action);
     }
-    if show_footer && draw_sidebar_footer(ui, t) {
-        crate::open_external_url(app, ui.ctx(), crate::GITHUB_REPO_URL);
+    if show_footer {
+        if let Some(spec) = sidebar_notice {
+            let modal_open = app.view.active_modal == Some(ActiveModal::AppUpdate);
+            let (clicked, rect) = draw_sidebar_update_notice(ui, spec, modal_open, t);
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(notice_h_id, rect.height()));
+            if clicked {
+                modal::open(app, ActiveModal::AppUpdate);
+            }
+        }
+        if draw_sidebar_footer(ui, t) {
+            crate::open_external_url(app, ui.ctx(), crate::GITHUB_REPO_URL);
+        }
+    }
+}
+
+fn draw_sidebar_update_notice(
+    ui: &mut egui::Ui,
+    spec: &SidebarUpdateNoticeSpec,
+    active: bool,
+    t: &Tokens,
+) -> (bool, Rect) {
+    let notice_id = ui.make_persistent_id("papercraft_sidebar_update_notice");
+    let was_hovered = ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(notice_id.with("prev_hov")))
+        .unwrap_or(false);
+    let hover_t =
+        crate::motion::hover_factor(ui.ctx(), notice_id.with("hov"), was_hovered || active);
+
+    let (base_fill, base_border, icon, accent_fg, title_fg) = match spec.kind {
+        SidebarUpdateNoticeKind::Available | SidebarUpdateNoticeKind::Downloading => {
+            (t.accent_soft, t.accent, Icon::MoveDown, t.accent, t.text)
+        }
+        SidebarUpdateNoticeKind::ReadyToInstall => (
+            t.success_bg,
+            t.success_border,
+            Icon::CheckCircle,
+            t.success_fg,
+            t.success_fg,
+        ),
+    };
+    let fill = crate::motion::lerp_color(base_fill, t.panel_bg, hover_t * 0.22);
+    let border = crate::motion::lerp_color(base_border, accent_fg, hover_t.max(0.2));
+
+    let frame_resp = egui::Frame::NONE
+        .fill(fill)
+        .stroke(Stroke::new(1.0, border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(9, 7))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let (ir, _) = ui.allocate_exact_size(Vec2::splat(13.5), Sense::hover());
+                paint_icon(ui.painter(), ir, icon, accent_fg);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(&spec.badge)
+                            .size(10.5)
+                            .monospace()
+                            .strong()
+                            .color(accent_fg),
+                    );
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&spec.title)
+                                    .size(11.5)
+                                    .strong()
+                                    .color(title_fg),
+                            )
+                            .truncate(),
+                        );
+                    });
+                });
+            });
+            if spec.progress_frac.is_some() || spec.indeterminate {
+                ui.add_space(1.0);
+                draw_sidebar_update_progress(ui, spec.progress_frac, spec.indeterminate, t);
+                ui.add_space(1.0);
+            }
+            ui.add(
+                egui::Label::new(RichText::new(&spec.subtitle).size(10.5).color(t.text_muted))
+                    .truncate(),
+            );
+        });
+
+    let rect = frame_resp.response.rect;
+    let resp = ui
+        .interact(rect, notice_id, Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(&spec.tooltip);
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(notice_id.with("prev_hov"), resp.hovered()));
+    (resp.clicked(), rect)
+}
+
+fn draw_sidebar_update_progress(
+    ui: &mut egui::Ui,
+    progress_frac: Option<f32>,
+    indeterminate: bool,
+    t: &Tokens,
+) {
+    let track_h = 4.0_f32;
+    let radius = 2_u8;
+    let (bar_rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), track_h), Sense::hover());
+    if !ui.is_rect_visible(bar_rect) {
+        return;
+    }
+    let p = ui.painter();
+    p.rect_filled(bar_rect, CornerRadius::same(radius), t.panel_bg);
+    if let Some(frac) = progress_frac {
+        let fill_w = bar_rect.width() * frac.clamp(0.0, 1.0);
+        if fill_w > 0.5 {
+            p.rect_filled(
+                Rect::from_min_size(bar_rect.min, Vec2::new(fill_w, track_h)),
+                CornerRadius::same(radius),
+                t.accent,
+            );
+        }
+    } else if indeterminate {
+        let time_s = ui.ctx().input(|i| i.time);
+        let seg_w = (bar_rect.width() * 0.30).max(18.0).min(bar_rect.width());
+        let travel = bar_rect.width() + seg_w;
+        let phase = ((time_s * 0.85) % 1.0) as f32;
+        let left = bar_rect.left() - seg_w + travel * phase;
+        let seg_rect = Rect::from_min_size(pos2(left, bar_rect.top()), Vec2::new(seg_w, track_h));
+        p.with_clip_rect(bar_rect)
+            .rect_filled(seg_rect, CornerRadius::same(radius), t.accent);
+        ui.ctx().request_repaint();
     }
 }
 
@@ -2580,5 +2846,189 @@ mod tests {
         }
         assert!(editor_gh.is_none(), "Editor must omit Home GitHub footer");
         assert!(editor_ver.is_none(), "Editor must omit Home version footer");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn home_sidebar_update_notice_renders_above_footer_and_opens_modal() {
+        use papercraft_updater::{
+            AppId, AssetFormat, AvailableUpdate, InstallCapability, PlatformAsset, SemVer,
+            StagedUpdate, UpdateStatus,
+        };
+
+        let mut app = PaperCraftApp::default();
+        let ctx = egui::Context::default();
+        let t = Tokens::light();
+        let update = AvailableUpdate {
+            app: AppId::PaperCraft,
+            current_version: SemVer::parse("0.2.0").unwrap(),
+            version: SemVer::parse("0.3.0").unwrap(),
+            tag: "v0.3.0".to_string(),
+            release_url: "https://github.com/alyxhard/papercraft/releases/tag/v0.3.0".to_string(),
+            published_at: "2026-11-24T16:40:00Z".to_string(),
+            notes: "Bug fixes".to_string(),
+            platform: "windows-x86_64".to_string(),
+            asset: PlatformAsset {
+                file_name: "papercraft-windows-x86_64.exe".to_string(),
+                url: "https://github.com/alyxhard/papercraft/releases/download/v0.3.0/papercraft-windows-x86_64.exe".to_string(),
+                sha256: "0".repeat(64),
+                size_bytes: 20_000_000,
+                format: AssetFormat::Exe,
+            },
+            capability: InstallCapability::Supported {
+                target_path: std::path::PathBuf::from("papercraft.exe"),
+                staging_dir: std::env::temp_dir(),
+            },
+            is_custom_feed: false,
+        };
+
+        let find_rect = |shapes: &[egui::epaint::ClippedShape], needle: &str| -> Option<Rect> {
+            fn visit(shape: &egui::Shape, needle: &str) -> Option<Rect> {
+                match shape {
+                    egui::Shape::Text(text) if text.galley.text() == needle => {
+                        Some(text.visual_bounding_rect())
+                    }
+                    egui::Shape::Vec(items) => items.iter().find_map(|s| visit(s, needle)),
+                    _ => None,
+                }
+            }
+            shapes.iter().find_map(|c| visit(&c.shape, needle))
+        };
+
+        // 1. Available notice renders in Sidebar below New Folder and above GitHub footer, and opens modal on click.
+        let avail_spec =
+            sidebar_update_notice_spec(&UpdateStatus::Available(Box::new(update.clone())))
+                .expect("Available status should build sidebar notice");
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(SIDEBAR_WIDTH, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                    draw_library_nav_with_notice(
+                        &mut app,
+                        ui,
+                        &t,
+                        NavMode::Sidebar,
+                        Some(&avail_spec),
+                    );
+                },
+            );
+            shapes = std::mem::take(&mut out.shapes);
+            out.drop_without_applying_deltas();
+        }
+        let folders_r = find_rect(&shapes, "New Folder").expect("New Folder visible");
+        let notice_title_r = find_rect(&shapes, "Update available").expect("Update notice title");
+        let notice_badge_r = find_rect(&shapes, "v0.3.0").expect("Update notice badge");
+        let gh_r = find_rect(&shapes, "GitHub").expect("GitHub footer visible");
+        assert!(folders_r.bottom() < notice_title_r.top());
+        assert!(notice_title_r.right() < notice_badge_r.left());
+        assert!(notice_title_r.bottom() < gh_r.top());
+
+        let click_pos = notice_title_r.center();
+        for (pressed, time) in [(true, 0.05), (false, 0.10)] {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(SIDEBAR_WIDTH, 700.0),
+                    )),
+                    time: Some(time),
+                    events: vec![
+                        egui::Event::PointerMoved(click_pos),
+                        egui::Event::PointerButton {
+                            pos: click_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                    draw_library_nav_with_notice(
+                        &mut app,
+                        ui,
+                        &t,
+                        NavMode::Sidebar,
+                        Some(&avail_spec),
+                    );
+                },
+            );
+            out.drop_without_applying_deltas();
+        }
+        assert_eq!(app.view.active_modal, Some(ActiveModal::AppUpdate));
+
+        // 2. Downloading and ReadyToInstall specs render cleanly, and Popup mode omits the notice.
+        let dl_spec = sidebar_update_notice_spec(&UpdateStatus::Downloading {
+            update: Box::new(update.clone()),
+            downloaded_bytes: 10_000_000,
+            total_bytes: 20_000_000,
+        })
+        .expect("Downloading status should build sidebar notice");
+        let dl_out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(SIDEBAR_WIDTH, 700.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                draw_library_nav_with_notice(&mut app, ui, &t, NavMode::Sidebar, Some(&dl_spec));
+            },
+        );
+        assert!(find_rect(&dl_out.shapes, "Downloading update...").is_some());
+        assert!(find_rect(&dl_out.shapes, "50%").is_some());
+        dl_out.drop_without_applying_deltas();
+
+        let ready_spec = sidebar_update_notice_spec(&UpdateStatus::ReadyToInstall {
+            update: Box::new(update),
+            staged: StagedUpdate {
+                app: AppId::PaperCraft,
+                version: SemVer::parse("0.3.0").unwrap(),
+                staged_path: std::path::PathBuf::from("staged.exe"),
+                target_path: std::path::PathBuf::from("papercraft.exe"),
+                format: AssetFormat::Exe,
+                sha256: "0".repeat(64),
+            },
+        })
+        .expect("ReadyToInstall status should build sidebar notice");
+        let ready_out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(SIDEBAR_WIDTH, 700.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                draw_library_nav_with_notice(&mut app, ui, &t, NavMode::Sidebar, Some(&ready_spec));
+            },
+        );
+        assert!(find_rect(&ready_out.shapes, "Update ready").is_some());
+        ready_out.drop_without_applying_deltas();
+
+        let popup_out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(320.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                draw_library_nav_with_notice(&mut app, ui, &t, NavMode::Popup, Some(&avail_spec));
+            },
+        );
+        assert!(find_rect(&popup_out.shapes, "Update available").is_none());
+        popup_out.drop_without_applying_deltas();
     }
 }

@@ -66,7 +66,7 @@ pub enum SettingsTab {
     #[default]
     Pen,
     Appearance,
-    Telemetry,
+    System,
 }
 
 /// Pending drag-and-drop page reorder awaiting modal confirmation.
@@ -3918,9 +3918,9 @@ mod tests {
             out.drop_without_applying_deltas();
         };
 
-        // Render Editor + Sidebar + Settings -> Telemetry tab + NotebookSettings modal without panicking.
+        // Render Editor + Sidebar + Settings -> System tab + NotebookSettings modal without panicking.
         app.view.inspector_open = true;
-        app.view.settings_tab = SettingsTab::Telemetry;
+        app.view.settings_tab = SettingsTab::System;
         run_frame(&ctx, &mut app, 0.05);
         modal::open(&mut app, modal::ActiveModal::NotebookSettings);
         run_frame(&ctx, &mut app, 0.10);

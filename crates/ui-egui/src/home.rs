@@ -424,6 +424,11 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
                     ui.set_height(HEADER_ROW_HEIGHT);
                     ui.spacing_mut().item_spacing.x = 6.0;
 
+                    let settings_tip = if cfg!(target_arch = "wasm32") {
+                        "Settings (Shortcut: S)\nPen shortcuts, studio appearance, and system info."
+                    } else {
+                        "Settings (Shortcut: S)\nPen shortcuts, studio appearance, system info, and app updates."
+                    };
                     if compact_icon_button(
                         ui,
                         Icon::Settings,
@@ -432,9 +437,7 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
                         true,
                         t,
                     )
-                    .on_hover_text(
-                        "Settings (Shortcut: S)\nStudio theme, app scale, pen stabilization, and live telemetry.",
-                    )
+                    .on_hover_text(settings_tip)
                     .clicked()
                     {
                         if !app.view.inspector_open {
@@ -442,9 +445,6 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
                         }
                         app.view.inspector_open = !app.view.inspector_open;
                     }
-
-                    #[cfg(not(target_arch = "wasm32"))]
-                    draw_home_update_pill(app, ui, t);
 
                     let pkg_resp =
                         icon_button(ui, Icon::Library, Some("Package"), false, true, t)
@@ -509,25 +509,6 @@ fn truncate_label(raw: &str, max_chars: usize) -> String {
         format!("{collected}…")
     } else {
         collected
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn draw_home_update_pill(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
-    use papercraft_updater::UpdateStatus;
-
-    let label = match app.updater.status() {
-        UpdateStatus::Available(u) => format!("Update v{}", u.version),
-        UpdateStatus::Downloading { .. } => "Updating...".to_string(),
-        UpdateStatus::ReadyToInstall { .. } => "Restart to Update".to_string(),
-        _ => return,
-    };
-    let modal_open = app.view.active_modal == Some(ActiveModal::AppUpdate);
-    if compact_icon_button(ui, Icon::MoveDown, Some(&label), modal_open, true, t)
-        .on_hover_text("A newer PaperCraft release is available. Click to review and install.")
-        .clicked()
-    {
-        modal::open(app, ActiveModal::AppUpdate);
     }
 }
 

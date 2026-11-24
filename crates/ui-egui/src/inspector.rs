@@ -1,4 +1,4 @@
-//! Dedicated minimalist Settings drawer: Pen stylus shortcuts, studio appearance, and live Telemetry.
+//! Dedicated minimalist Settings drawer: Pen stylus shortcuts, studio appearance, and system info.
 
 use egui::{CornerRadius, Frame, Margin, Rect, RichText, Sense, Stroke, Vec2};
 use papercraft_doc::{
@@ -658,172 +658,148 @@ fn draw_app_updates_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens)
     });
 }
 
-fn sanitize_metric(val: f32, lo: f32, hi: f32) -> f32 {
-    if val.is_finite() {
-        val.clamp(lo, hi)
-    } else {
-        0.0
+fn draw_system_info_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    monospace: bool,
+    tooltip: Option<&str>,
+    t: &Tokens,
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.label(RichText::new(label).size(11.5).color(t.text_muted));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut text = RichText::new(value).size(11.5).strong().color(t.text);
+            if monospace {
+                text = text.monospace();
+            }
+            let resp = ui.add(egui::Label::new(text).truncate());
+            if let Some(tip) = tooltip {
+                resp.on_hover_text(tip);
+            }
+        });
+    });
+}
+
+fn system_platform_label() -> String {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        papercraft_updater::current_platform_label()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        "Web (WebAssembly)".to_string()
     }
 }
 
-fn draw_metric_cell(ui: &mut egui::Ui, label: &str, value: &str, active: bool, t: &Tokens) {
-    let fill = if active { t.accent_soft } else { t.panel_bg };
-    let border = if active { t.accent } else { t.border };
-    let value_color = if active { t.accent } else { t.text };
-    Frame::new()
-        .fill(fill)
-        .corner_radius(CornerRadius::same(7))
-        .inner_margin(Margin::symmetric(9, 6))
-        .stroke(Stroke::new(1.0, border))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(label).size(10.5).color(t.text_muted));
-            ui.label(
-                RichText::new(value)
-                    .size(12.5)
-                    .strong()
-                    .monospace()
-                    .color(value_color),
-            );
-        });
+fn system_renderer_label(wgpu_enabled: bool) -> &'static str {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if wgpu_enabled {
+            "wgpu (Hardware GPU)"
+        } else {
+            "Default"
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        if wgpu_enabled {
+            "wgpu (Browser GPU)"
+        } else {
+            "Browser Canvas"
+        }
+    }
 }
 
-fn draw_live_telemetry_card(app: &PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
-    let tel = app.stylus.telemetry;
-    let pressure = sanitize_metric(tel.pressure, 0.0, 1.0);
-    let tilt_x = sanitize_metric(tel.tilt_x, -90.0, 90.0);
-    let tilt_y = sanitize_metric(tel.tilt_y, -90.0, 90.0);
-    let rotation = sanitize_metric(tel.rotation, 0.0, 360.0);
-    let velocity = sanitize_metric(tel.velocity_px_ms, 0.0, 999.0);
+fn system_storage_info(app: &PaperCraftApp) -> (String, Option<String>) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if let Some(dir) = app.session.library_dir() {
+            let full = dir.display().to_string();
+            let short = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|s| !s.is_empty())
+                .map_or_else(|| full.clone(), ToString::to_string);
+            (short, Some(full))
+        } else {
+            ("In-memory session".to_string(), None)
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = app;
+        ("Browser localStorage".to_string(), None)
+    }
+}
+
+fn system_workspace_info(app: &PaperCraftApp) -> (String, Option<String>) {
+    let summary = app.session.sync_status_summary();
+    if summary.viewing_cloud {
+        let handle = summary
+            .username
+            .as_deref()
+            .map_or_else(|| "Cloud".to_string(), |u| format!("@{u}"));
+        let tip = if summary.server_url.trim().is_empty() {
+            None
+        } else {
+            Some(format!("Connected server: {}", summary.server_url))
+        };
+        (format!("Cloud ({handle})"), tip)
+    } else {
+        let prof = summary
+            .active_local_profile_name
+            .as_deref()
+            .unwrap_or("Personal");
+        (format!("Local ({prof})"), None)
+    }
+}
+
+fn draw_system_info_card(app: &PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let platform = system_platform_label();
+    let renderer = system_renderer_label(app.wgpu_enabled);
+    let (workspace, workspace_tip) = system_workspace_info(app);
+    let notebooks = format!(
+        "{} active · {} in Trash",
+        app.session.notebooks.len(),
+        app.session.trashed_notebooks.len()
+    );
+    let (storage, storage_tip) = system_storage_info(app);
 
     card_frame(t).show(ui, |ui| {
         ui.set_width(ui.available_width());
         section_card_header(
             ui,
-            Icon::Telemetry,
-            "Live Stylus Telemetry",
-            "Monitor real-time digitizer pressure, tilt angles, barrel rotation, and stylus buttons.",
+            Icon::Info,
+            "System Info",
+            "Installed build, runtime environment, and workspace storage details.",
             t,
         );
 
-        let (source_label, source_color, source_fill, source_border) = if tel.hardware_active {
-            ("Hardware Stylus Active", t.accent, t.accent_soft, t.accent)
-        } else {
-            (
-                "Mouse / Trackpad Fallback",
-                t.text_muted,
-                t.panel_bg,
-                t.border,
-            )
-        };
         Frame::new()
-            .fill(source_fill)
+            .fill(t.panel_bg)
             .corner_radius(CornerRadius::same(7))
-            .inner_margin(Margin::symmetric(9, 6))
-            .stroke(Stroke::new(1.0, source_border))
+            .inner_margin(Margin::symmetric(10, 8))
+            .stroke(Stroke::new(1.0, t.border))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                    ui.painter()
-                        .circle_filled(dot_rect.center(), 4.0, source_color);
-                    ui.label(RichText::new(source_label).size(12.0).strong().color(source_color));
-                });
-            });
-
-        ui.add_space(8.0);
-        let pressure_pct = (pressure * 100.0).round();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Pressure").size(11.5).strong().color(t.text));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new(format!("{pressure_pct:.0}% ({pressure:.2})"))
-                        .size(11.5)
-                        .monospace()
-                        .color(t.text_muted),
+                ui.spacing_mut().item_spacing.y = 5.0;
+                draw_system_info_row(ui, "Version", &version, true, None, t);
+                draw_system_info_row(ui, "Platform", &platform, false, None, t);
+                draw_system_info_row(ui, "Renderer", renderer, false, None, t);
+                draw_system_info_row(
+                    ui,
+                    "Workspace",
+                    &workspace,
+                    false,
+                    workspace_tip.as_deref(),
+                    t,
                 );
+                draw_system_info_row(ui, "Notebooks", &notebooks, false, None, t);
+                draw_system_info_row(ui, "Storage", &storage, true, storage_tip.as_deref(), t);
             });
-        });
-        ui.add_space(3.0);
-        let (bar_rect, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 10.0), Sense::hover());
-        let p = ui.painter();
-        p.rect_filled(bar_rect, 5.0, t.border);
-        let fill = Rect::from_min_size(
-            bar_rect.min,
-            Vec2::new(bar_rect.width() * pressure, bar_rect.height()),
-        );
-        p.rect_filled(fill, 5.0, t.accent);
-
-        ui.add_space(8.0);
-        ui.columns(2, |cols| {
-            draw_metric_cell(&mut cols[0], "Tilt X", &format!("{tilt_x:+.1}°"), false, t);
-            draw_metric_cell(&mut cols[1], "Tilt Y", &format!("{tilt_y:+.1}°"), false, t);
-        });
-        ui.add_space(6.0);
-        ui.columns(2, |cols| {
-            draw_metric_cell(
-                &mut cols[0],
-                "Rotation",
-                &format!("{rotation:.1}°"),
-                false,
-                t,
-            );
-            draw_metric_cell(
-                &mut cols[1],
-                "Speed",
-                &format!("{velocity:.2} px/ms"),
-                false,
-                t,
-            );
-        });
-        ui.add_space(6.0);
-        ui.columns(2, |cols| {
-            draw_metric_cell(
-                &mut cols[0],
-                "Eraser End",
-                if tel.eraser_inverted { "ACTIVE" } else { "Off" },
-                tel.eraser_inverted,
-                t,
-            );
-            draw_metric_cell(
-                &mut cols[1],
-                "Barrel Button",
-                if tel.barrel_held { "HELD" } else { "Off" },
-                tel.barrel_held,
-                t,
-            );
-        });
-        ui.add_space(6.0);
-        let stylus_connected = app.is_stylus_connected();
-        ui.columns(2, |cols| {
-            draw_metric_cell(
-                &mut cols[0],
-                "Side Button 2",
-                if tel.secondary_barrel_held { "HELD" } else { "Off" },
-                tel.secondary_barrel_held,
-                t,
-            );
-            draw_metric_cell(
-                &mut cols[1],
-                "Stylus",
-                if stylus_connected { "Connected" } else { "None" },
-                stylus_connected,
-                t,
-            );
-        });
-
-        ui.add_space(8.0);
-        ui.add(
-            egui::Label::new(
-                RichText::new(
-                    "Tip: Inverting a supported stylus or holding its side buttons runs your configured shortcuts. Customize button actions in the Pen tab while a stylus is connected.",
-                )
-                .size(11.0)
-                .color(t.text_muted),
-            )
-            .wrap(),
-        );
     });
 }
 
@@ -915,12 +891,17 @@ fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, kind: PenKin
         }
     });
     ui.label(
-        RichText::new("Hardware stylus shortcuts, studio appearance, and live telemetry.")
+        RichText::new("Hardware stylus shortcuts, studio appearance, and system info.")
             .size(11.5)
             .color(t.text_muted),
     );
     ui.add_space(6.0);
 
+    let system_tip = if cfg!(target_arch = "wasm32") {
+        "System info and keyboard shortcuts"
+    } else {
+        "System info, app updates, and keyboard shortcuts"
+    };
     let tabs = [
         (
             SettingsTab::Pen,
@@ -934,12 +915,7 @@ fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, kind: PenKin
             "Appearance",
             "Studio theme, app interface scale, and automatic canvas color contrast",
         ),
-        (
-            SettingsTab::Telemetry,
-            Icon::Telemetry,
-            "Telemetry",
-            "Live stylus telemetry and keyboard shortcuts",
-        ),
+        (SettingsTab::System, Icon::Info, "System", system_tip),
     ];
     let active_idx = tabs
         .iter()
@@ -1065,14 +1041,14 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
                         draw_appearance_card(app, ui, &t);
                         ui.add_space(8.0);
                         draw_app_scale_card(app, ui, &t);
+                    }
+                    SettingsTab::System => {
+                        draw_system_info_card(app, ui, &t);
                         #[cfg(not(target_arch = "wasm32"))]
                         {
                             ui.add_space(8.0);
                             draw_app_updates_card(app, ui, &t);
                         }
-                    }
-                    SettingsTab::Telemetry => {
-                        draw_live_telemetry_card(app, ui, &t);
                         ui.add_space(8.0);
                         draw_shortcuts_card(ui, &t);
                     }
@@ -1270,7 +1246,7 @@ mod auto_contrast_ui_tests {
     }
 
     #[test]
-    fn settings_three_way_tab_switch_cycles_between_pen_appearance_and_telemetry() {
+    fn settings_three_way_tab_switch_cycles_between_pen_appearance_and_system() {
         let ctx = egui::Context::default();
         let mut app = PaperCraftApp::default();
         app.view.screen = AppScreen::Editor;
@@ -1291,14 +1267,17 @@ mod auto_contrast_ui_tests {
         assert!(
             find_text_rect_in_shapes(&shapes_app, "Auto-adapt canvas colors to theme").is_some()
         );
+        assert!(find_text_rect_in_shapes(&shapes_app, "App Updates").is_none());
 
-        let telemetry_tab = find_text_rect_in_shapes(&shapes_app, "Telemetry")
-            .expect("Telemetry tab should be rendered in 3-way switch");
-        let shapes_tel = click_at(&ctx, &mut app, telemetry_tab.center(), &mut time_s);
-        assert_eq!(app.view.settings_tab, SettingsTab::Telemetry);
-        assert!(find_text_rect_in_shapes(&shapes_tel, "Live Stylus Telemetry").is_some());
+        let system_tab = find_text_rect_in_shapes(&shapes_app, "System")
+            .expect("System tab should be rendered in 3-way switch");
+        let shapes_sys = click_at(&ctx, &mut app, system_tab.center(), &mut time_s);
+        assert_eq!(app.view.settings_tab, SettingsTab::System);
+        assert!(find_text_rect_in_shapes(&shapes_sys, "System Info").is_some());
+        #[cfg(not(target_arch = "wasm32"))]
+        assert!(find_text_rect_in_shapes(&shapes_sys, "App Updates").is_some());
 
-        let pen_tab = find_text_rect_in_shapes(&shapes_tel, "Pen")
+        let pen_tab = find_text_rect_in_shapes(&shapes_sys, "Pen")
             .expect("Pen tab should be rendered in 3-way switch");
         let shapes_back = click_at(&ctx, &mut app, pen_tab.center(), &mut time_s);
         assert_eq!(app.view.settings_tab, SettingsTab::Pen);
@@ -1363,7 +1342,8 @@ mod tests {
         }
         assert!(last_texts.lines().any(|line| line == "Pen"));
         assert!(last_texts.lines().any(|line| line == "Appearance"));
-        assert!(last_texts.lines().any(|line| line == "Telemetry"));
+        assert!(last_texts.lines().any(|line| line == "System"));
+        assert!(!last_texts.lines().any(|line| line == "Telemetry"));
         assert!(!last_texts.lines().any(|line| line == "Page"));
         assert!(!last_texts.contains("Input stabilization"));
         assert!(!last_texts.contains("Smoothing strength"));
@@ -1372,38 +1352,31 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_tab_renders_live_metrics_and_shortcuts() {
+    fn system_tab_renders_system_info_app_updates_and_shortcuts_without_telemetry() {
         let mut app = PaperCraftApp::default();
-        app.stylus.telemetry.hardware_active = true;
-        app.stylus.telemetry.pressure = f32::NAN;
-        app.stylus.telemetry.tilt_x = f32::INFINITY;
-        app.stylus.telemetry.tilt_y = -200.0;
-        app.stylus.telemetry.rotation = f32::NEG_INFINITY;
-        app.stylus.telemetry.velocity_px_ms = f32::NAN;
-        app.stylus.telemetry.eraser_inverted = true;
-        app.stylus.telemetry.barrel_held = true;
-
-        let (_, tel_texts) = render_inspector_tab(&mut app, SettingsTab::Telemetry);
-        assert!(tel_texts.contains("Hardware Stylus Active"));
-        assert!(tel_texts.contains("Live Stylus Telemetry"));
-        assert!(tel_texts.contains("Pressure"));
-        assert!(tel_texts.contains("0% (0.00)"));
-        assert!(tel_texts.contains("Tilt X"));
-        assert!(tel_texts.contains("Tilt Y"));
-        assert!(tel_texts.contains("-90.0°"));
-        assert!(tel_texts.contains("Rotation"));
-        assert!(tel_texts.contains("Speed"));
-        assert!(tel_texts.contains("ACTIVE"));
-        assert!(tel_texts.contains("HELD"));
-        assert!(tel_texts.contains("Keyboard & Canvas Shortcuts"));
-        assert!(!tel_texts.contains("Auto-adapt canvas colors to theme"));
-        assert!(!tel_texts.contains("Paper Ruling"));
-        assert!(!tel_texts.contains("NaN"));
-        assert!(!tel_texts.contains("inf"));
+        let (_, sys_texts) = render_inspector_tab(&mut app, SettingsTab::System);
+        assert!(sys_texts.contains("System Info"));
+        assert!(sys_texts.contains("Version"));
+        assert!(sys_texts.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(sys_texts.contains("Platform"));
+        assert!(sys_texts.contains("Renderer"));
+        assert!(sys_texts.contains("Workspace"));
+        assert!(sys_texts.contains("Notebooks"));
+        assert!(sys_texts.contains("Storage"));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            assert!(sys_texts.contains("App Updates"));
+            assert!(sys_texts.contains("Check for updates automatically on startup"));
+        }
+        assert!(sys_texts.contains("Keyboard & Canvas Shortcuts"));
+        assert!(!sys_texts.contains("Live Stylus Telemetry"));
+        assert!(!sys_texts.contains("Hardware Stylus Active"));
+        assert!(!sys_texts.contains("Auto-adapt canvas colors to theme"));
+        assert!(!sys_texts.contains("Paper Ruling"));
     }
 
     #[test]
-    fn appearance_tab_renders_theme_switch_and_auto_contrast_card() {
+    fn appearance_tab_renders_theme_switch_and_auto_contrast_without_app_updates() {
         let mut app = PaperCraftApp::default();
         let (_, app_texts) = render_inspector_tab(&mut app, SettingsTab::Appearance);
         assert!(app_texts.contains("Appearance"));
@@ -1416,11 +1389,8 @@ mod tests {
         assert!(app_texts.contains("125%"));
         assert!(app_texts.contains("150%"));
         assert!(app_texts.contains("175%"));
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            assert!(app_texts.contains("App Updates"));
-            assert!(app_texts.contains("Check for updates automatically on startup"));
-        }
+        assert!(!app_texts.contains("App Updates"));
+        assert!(!app_texts.contains("System Info"));
         assert!(!app_texts.contains("Live Stylus Telemetry"));
         assert!(!app_texts.contains("Keyboard & Canvas Shortcuts"));
     }
@@ -1433,7 +1403,7 @@ mod tests {
         app.view.screen = crate::AppScreen::Editor;
         app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
         app.view.inspector_open = true;
-        app.view.settings_tab = SettingsTab::Appearance;
+        app.view.settings_tab = SettingsTab::System;
         assert!(app.session.prefs.auto_check_updates);
 
         let mut time_s = 1.0_f64;
@@ -1472,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_header_has_pen_appearance_and_telemetry_tabs_on_single_row() {
+    fn settings_header_has_pen_appearance_and_system_tabs_on_single_row() {
         let mut app = PaperCraftApp::default();
         app.view.inspector_open = true;
         let ctx = egui::Context::default();
@@ -1494,10 +1464,11 @@ mod tests {
         }
         let pen_pos = find_text_center(&shapes, "Pen").unwrap();
         let app_pos = find_text_center(&shapes, "Appearance").unwrap();
-        let tel_pos = find_text_center(&shapes, "Telemetry").unwrap();
+        let sys_pos = find_text_center(&shapes, "System").unwrap();
         assert!((pen_pos.y - app_pos.y).abs() <= 1.0);
-        assert!((pen_pos.y - tel_pos.y).abs() <= 1.0);
-        assert!(pen_pos.x < app_pos.x && app_pos.x < tel_pos.x);
+        assert!((pen_pos.y - sys_pos.y).abs() <= 1.0);
+        assert!(pen_pos.x < app_pos.x && app_pos.x < sys_pos.x);
+        assert!(find_text_center(&shapes, "Telemetry").is_none());
         assert!(find_text_center(&shapes, "Reset Tool").is_some());
         assert!(find_text_center(&shapes, "Page").is_none());
     }

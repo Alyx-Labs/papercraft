@@ -29,6 +29,16 @@ pub struct UiActions {
 
 /// Renders the entire PaperCraft Server control window and returns requested window actions.
 pub fn render_window(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Tokens) -> UiActions {
+    let update_status = ctrl.updater.status().clone();
+    render_window_with_update_status(ctrl, ui, t, &update_status)
+}
+
+fn render_window_with_update_status(
+    ctrl: &mut ServerController,
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    update_status: &papercraft_updater::UpdateStatus,
+) -> UiActions {
     let mut actions = UiActions::default();
     let ctx = ui.ctx().clone();
 
@@ -71,11 +81,16 @@ pub fn render_window(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Tokens)
                     match ctrl.active_tab {
                         ControlTab::Server => {
                             render_status_card(ctrl, ui, t);
-                            render_update_banner(ctrl, ui, t, &mut actions);
                             render_banners(ctrl, ui, t);
                             render_essential_settings_card(ctrl, &ctx, ui, t);
                             render_advanced_card(ctrl, ui, t);
-                            render_updates_card(ctrl, ui, t);
+                            render_updates_card_with_status(
+                                ctrl,
+                                update_status,
+                                ui,
+                                t,
+                                &mut actions,
+                            );
                         }
                         ControlTab::Users => {
                             render_users_view(ctrl, ui, t);
@@ -463,216 +478,214 @@ fn render_banners(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Tokens) {
     }
 }
 
-fn render_update_banner(
+fn render_update_available_box(
     ctrl: &mut ServerController,
+    update: &papercraft_updater::AvailableUpdate,
+    is_custom_feed: bool,
     ui: &mut egui::Ui,
     t: &Tokens,
-    actions: &mut UiActions,
 ) {
-    use papercraft_updater::{InstallCapability, UpdateStatus, format_bytes as upd_format_bytes};
+    use papercraft_updater::{InstallCapability, format_bytes as upd_format_bytes};
 
-    let status = ctrl.updater.status().clone();
-    match status {
-        UpdateStatus::Available(update) => {
-            egui::Frame::new()
-                .fill(t.accent_soft)
-                .stroke(Stroke::new(1.0, t.accent))
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::symmetric(12, 10))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.spacing_mut().item_spacing.y = 6.0;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                        paint_icon(ui.painter(), ir, Icon::MoveDown, t.accent);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Update available: v{} (current: v{})",
-                                update.version, update.current_version
-                            ))
-                            .size(12.5)
-                            .strong()
-                            .color(t.text),
-                        );
-                        if update.is_custom_feed {
-                            draw_compact_pill(ui, None, "Dev feed", t.field_bg, t.accent, t.accent);
-                        }
-                    });
-                    if !update.notes.trim().is_empty() {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(update.notes.trim())
-                                    .size(11.0)
-                                    .color(t.text_muted),
-                            )
-                            .wrap(),
-                        );
-                    }
-                    match &update.capability {
-                        InstallCapability::Supported { .. } => {
-                            let size_info = if update.asset.size_bytes > 0 {
-                                format!(
-                                    "Download size: {}",
-                                    upd_format_bytes(update.asset.size_bytes)
-                                )
-                            } else {
-                                "Verified HTTPS + SHA-256 update".to_string()
-                            };
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(size_info)
-                                        .size(11.0)
-                                        .color(t.text_muted),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if primary_button(
-                                            ui,
-                                            Icon::MoveDown,
-                                            "Download Update",
-                                            true,
-                                            t,
-                                        )
-                                        .clicked()
-                                        {
-                                            ctrl.start_update_download();
-                                        }
-                                    },
-                                );
-                            });
-                        }
-                        InstallCapability::ReadOnly { reason, .. }
-                        | InstallCapability::UnsupportedLayout { reason } => {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(reason).size(11.0).color(t.warning_fg),
-                                )
-                                .wrap(),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if icon_button(
-                                            ui,
-                                            Icon::ExternalLink,
-                                            Some("Open Release Page"),
-                                            false,
-                                            true,
-                                            t,
-                                        )
-                                        .clicked()
-                                        {
-                                            ctrl.open_update_release_page();
-                                        }
-                                    },
-                                );
-                            });
-                        }
-                    }
-                });
-        }
-        UpdateStatus::Downloading {
-            update,
-            downloaded_bytes,
-            total_bytes,
-        } => {
-            let is_verifying = total_bytes > 0 && downloaded_bytes >= total_bytes;
-            let title = if is_verifying {
-                format!("Verifying v{} (SHA-256)...", update.version)
-            } else {
-                format!("Downloading v{}...", update.version)
-            };
-            let readout = if total_bytes > 0 {
-                let frac = (downloaded_bytes as f32 / total_bytes as f32).clamp(0.0, 1.0);
-                let pct = (frac * 100.0).round() as u32;
-                format!(
-                    "{} / {} · {pct}%",
-                    upd_format_bytes(downloaded_bytes),
-                    upd_format_bytes(total_bytes)
-                )
-            } else {
-                upd_format_bytes(downloaded_bytes)
-            };
-            egui::Frame::new()
-                .fill(t.accent_soft)
-                .stroke(Stroke::new(1.0, t.accent))
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::symmetric(12, 10))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.spacing_mut().item_spacing.y = 6.0;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(egui::RichText::new(title).size(12.0).strong().color(t.text));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.spacing_mut().item_spacing.x = 8.0;
-                            if secondary_button(ui, "Cancel", true, t).clicked() {
-                                ctrl.cancel_update_download();
-                            }
-                            ui.label(
-                                egui::RichText::new(readout)
-                                    .size(11.5)
-                                    .monospace()
-                                    .strong()
-                                    .color(t.accent),
-                            );
-                        });
-                    });
-                    draw_update_progress_bar(ui, downloaded_bytes, total_bytes, t);
-                });
-        }
-        UpdateStatus::ReadyToInstall { update, .. } => {
-            egui::Frame::new()
-                .fill(t.success_bg)
-                .stroke(Stroke::new(1.0, t.success_border))
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::symmetric(12, 10))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.spacing_mut().item_spacing.y = 6.0;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                        paint_icon(ui.painter(), ir, Icon::CheckCircle, t.success_fg);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Update v{} verified and ready to install",
-                                update.version
-                            ))
-                            .size(12.0)
-                            .strong()
-                            .color(t.success_fg),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "Stops sync server safely, swaps the binary, and relaunches.",
-                            )
+    egui::Frame::new()
+        .fill(t.accent_soft)
+        .stroke(Stroke::new(1.0, t.accent))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 6.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                paint_icon(ui.painter(), ir, Icon::MoveDown, t.accent);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Update available: v{} (current: v{})",
+                        update.version, update.current_version
+                    ))
+                    .size(12.5)
+                    .strong()
+                    .color(t.text),
+                );
+                if update.is_custom_feed && !is_custom_feed {
+                    draw_compact_pill(ui, None, "Dev feed", t.field_bg, t.accent, t.accent);
+                }
+            });
+            if !update.notes.trim().is_empty() {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(update.notes.trim())
                             .size(11.0)
                             .color(t.text_muted),
+                    )
+                    .wrap(),
+                );
+            }
+            match &update.capability {
+                InstallCapability::Supported { .. } => {
+                    let size_info = if update.asset.size_bytes > 0 {
+                        format!(
+                            "Download size: {}",
+                            upd_format_bytes(update.asset.size_bytes)
+                        )
+                    } else {
+                        "Verified HTTPS + SHA-256 update".to_string()
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(size_info)
+                                .size(11.0)
+                                .color(t.text_muted),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if primary_button(
+                            if primary_button(ui, Icon::MoveDown, "Download Update", true, t)
+                                .clicked()
+                            {
+                                ctrl.start_update_download();
+                            }
+                        });
+                    });
+                }
+                InstallCapability::ReadOnly { reason, .. }
+                | InstallCapability::UnsupportedLayout { reason } => {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(reason).size(11.0).color(t.warning_fg),
+                        )
+                        .wrap(),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if icon_button(
                                 ui,
-                                Icon::RotateCw,
-                                "Stop Server, Install & Restart",
+                                Icon::ExternalLink,
+                                Some("Open Release Page"),
+                                false,
                                 true,
                                 t,
                             )
                             .clicked()
                             {
-                                actions.install_update = true;
+                                ctrl.open_update_release_page();
                             }
                         });
                     });
+                }
+            }
+        });
+}
+
+fn render_update_downloading_box(
+    ctrl: &mut ServerController,
+    update: &papercraft_updater::AvailableUpdate,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+    ui: &mut egui::Ui,
+    t: &Tokens,
+) {
+    use papercraft_updater::format_bytes as upd_format_bytes;
+
+    let is_verifying = total_bytes > 0 && downloaded_bytes >= total_bytes;
+    let title = if is_verifying {
+        format!("Verifying v{} (SHA-256)...", update.version)
+    } else {
+        format!("Downloading v{}...", update.version)
+    };
+    let readout = if total_bytes > 0 {
+        let frac = (downloaded_bytes as f32 / total_bytes as f32).clamp(0.0, 1.0);
+        let pct = (frac * 100.0).round() as u32;
+        format!(
+            "{} / {} · {pct}%",
+            upd_format_bytes(downloaded_bytes),
+            upd_format_bytes(total_bytes)
+        )
+    } else {
+        upd_format_bytes(downloaded_bytes)
+    };
+    egui::Frame::new()
+        .fill(t.accent_soft)
+        .stroke(Stroke::new(1.0, t.accent))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 6.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(egui::RichText::new(title).size(12.0).strong().color(t.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if secondary_button(ui, "Cancel", true, t).clicked() {
+                        ctrl.cancel_update_download();
+                    }
+                    ui.label(
+                        egui::RichText::new(readout)
+                            .size(11.5)
+                            .monospace()
+                            .strong()
+                            .color(t.accent),
+                    );
                 });
-        }
-        _ => {}
-    }
+            });
+            draw_update_progress_bar(ui, downloaded_bytes, total_bytes, t);
+        });
+}
+
+fn render_update_ready_box(
+    update: &papercraft_updater::AvailableUpdate,
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    actions: &mut UiActions,
+) {
+    egui::Frame::new()
+        .fill(t.success_bg)
+        .stroke(Stroke::new(1.0, t.success_border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 6.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                paint_icon(ui.painter(), ir, Icon::CheckCircle, t.success_fg);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Update v{} verified and ready to install",
+                        update.version
+                    ))
+                    .size(12.0)
+                    .strong()
+                    .color(t.success_fg),
+                );
+            });
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "Stops sync server safely, swaps the binary, and relaunches.",
+                    )
+                    .size(11.0)
+                    .color(t.text_muted),
+                )
+                .wrap(),
+            );
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if primary_button(
+                        ui,
+                        Icon::RotateCw,
+                        "Stop Server, Install & Restart",
+                        true,
+                        t,
+                    )
+                    .clicked()
+                    {
+                        actions.install_update = true;
+                    }
+                });
+            });
+        });
 }
 
 fn draw_update_progress_bar(
@@ -729,7 +742,13 @@ fn draw_update_progress_bar(
     }
 }
 
-fn render_updates_card(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Tokens) {
+fn render_updates_card_with_status(
+    ctrl: &mut ServerController,
+    status: &papercraft_updater::UpdateStatus,
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    actions: &mut UiActions,
+) {
     use papercraft_updater::UpdateStatus;
 
     let current_ver = ctrl.updater.config().map_or_else(
@@ -737,8 +756,10 @@ fn render_updates_card(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Token
         |cfg| cfg.current_version.to_string(),
     );
     let is_custom_feed = ctrl.updater.config().is_some_and(|cfg| cfg.is_custom_feed);
-    let busy = ctrl.updater.is_busy();
-    let status = ctrl.updater.status().clone();
+    let busy = matches!(
+        status,
+        UpdateStatus::Checking { .. } | UpdateStatus::Downloading { .. }
+    );
 
     draw_card(ui, t, |ui| {
         draw_section_header(
@@ -776,56 +797,7 @@ fn render_updates_card(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Token
             });
         });
 
-        match &status {
-            UpdateStatus::UpToDate { latest_version } => {
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "PaperCraft Server is up to date (latest: v{latest_version})."
-                    ))
-                    .size(11.0)
-                    .color(t.success_fg),
-                );
-            }
-            UpdateStatus::NoPlatformAsset { latest_version, .. } => {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Release v{latest_version} requires manual download for this platform."
-                        ))
-                        .size(11.0)
-                        .color(t.warning_fg),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_button(
-                            ui,
-                            Icon::ExternalLink,
-                            Some("Open Release Page"),
-                            false,
-                            true,
-                            t,
-                        )
-                        .clicked()
-                        {
-                            ctrl.open_update_release_page();
-                        }
-                    });
-                });
-            }
-            UpdateStatus::Error {
-                message,
-                was_silent: false,
-                ..
-            } => {
-                ui.add_space(6.0);
-                ui.add(
-                    egui::Label::new(egui::RichText::new(message).size(11.0).color(t.danger_fg))
-                        .wrap(),
-                );
-            }
-            _ => {}
-        }
+        render_update_status_details(ctrl, status, is_custom_feed, ui, t, actions);
 
         ui.add_space(10.0);
         draw_hairline(ui, t);
@@ -845,6 +817,83 @@ fn render_updates_card(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Token
             .color(t.text_muted),
         );
     });
+}
+
+fn render_update_status_details(
+    ctrl: &mut ServerController,
+    status: &papercraft_updater::UpdateStatus,
+    is_custom_feed: bool,
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    actions: &mut UiActions,
+) {
+    use papercraft_updater::UpdateStatus;
+
+    match status {
+        UpdateStatus::Available(update) => {
+            ui.add_space(10.0);
+            render_update_available_box(ctrl, update, is_custom_feed, ui, t);
+        }
+        UpdateStatus::Downloading {
+            update,
+            downloaded_bytes,
+            total_bytes,
+        } => {
+            ui.add_space(10.0);
+            render_update_downloading_box(ctrl, update, *downloaded_bytes, *total_bytes, ui, t);
+        }
+        UpdateStatus::ReadyToInstall { update, .. } => {
+            ui.add_space(10.0);
+            render_update_ready_box(update, ui, t, actions);
+        }
+        UpdateStatus::UpToDate { latest_version } => {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "PaperCraft Server is up to date (latest: v{latest_version})."
+                ))
+                .size(11.0)
+                .color(t.success_fg),
+            );
+        }
+        UpdateStatus::NoPlatformAsset { latest_version, .. } => {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Release v{latest_version} requires manual download for this platform."
+                    ))
+                    .size(11.0)
+                    .color(t.warning_fg),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(
+                        ui,
+                        Icon::ExternalLink,
+                        Some("Open Release Page"),
+                        false,
+                        true,
+                        t,
+                    )
+                    .clicked()
+                    {
+                        ctrl.open_update_release_page();
+                    }
+                });
+            });
+        }
+        UpdateStatus::Error {
+            message,
+            was_silent: false,
+            ..
+        } => {
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(egui::RichText::new(message).size(11.0).color(t.danger_fg)).wrap(),
+            );
+        }
+        _ => {}
+    }
 }
 
 fn render_essential_settings_card(
@@ -2407,5 +2456,140 @@ mod tests {
                 out.drop_without_applying_deltas();
             }
         }
+    }
+
+    fn find_text_y(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<f32> {
+        fn visit(shape: &Shape, needle: &str) -> Option<f32> {
+            match shape {
+                Shape::Text(t) if t.galley.text().contains(needle) => Some(t.pos.y),
+                Shape::Vec(items) => items.iter().find_map(|s| visit(s, needle)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|c| visit(&c.shape, needle))
+    }
+
+    #[test]
+    fn server_update_states_render_inside_app_updates_card_in_consistent_order() {
+        use papercraft_updater::{
+            AppId, AssetFormat, AvailableUpdate, InstallCapability, PlatformAsset, SemVer,
+            StagedUpdate, UpdateStatus,
+        };
+
+        let dir = temp_dir("update-order");
+        let cfg_path = dir.0.join(CONFIG_FILE_NAME);
+        let settings = crate::settings::ServerControlSettings {
+            data_dir: dir.0.join("vault").to_string_lossy().into_owned(),
+            port: 18947,
+            auto_start_server: false,
+            theme: UiTheme::Dark,
+            ..Default::default()
+        };
+        settings.save_atomic(&cfg_path).unwrap();
+        let mut ctrl = ServerController::new(cfg_path, false);
+
+        let update = AvailableUpdate {
+            app: AppId::PaperCraftServer,
+            current_version: SemVer::parse("0.1.2").unwrap(),
+            version: SemVer::parse("0.2.0").unwrap(),
+            tag: "v0.2.0".to_string(),
+            release_url: "https://github.com/alyxhard/papercraft/releases/tag/v0.2.0".to_string(),
+            published_at: "2026-11-24T16:00:00Z".to_string(),
+            notes: "- feat: release notes line".to_string(),
+            platform: "windows-x86_64".to_string(),
+            asset: PlatformAsset {
+                file_name: "papercraft-server-windows-x86_64.exe".to_string(),
+                url: "https://github.com/alyxhard/papercraft/releases/download/v0.2.0/papercraft-server-windows-x86_64.exe".to_string(),
+                sha256: "0".repeat(64),
+                size_bytes: 24_117_248,
+                format: AssetFormat::Exe,
+            },
+            capability: InstallCapability::Supported {
+                target_path: dir.0.join("papercraft-server.exe"),
+                staging_dir: dir.0.clone(),
+            },
+            is_custom_feed: false,
+        };
+
+        let ctx = egui::Context::default();
+        let raw_tall = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(620.0, 1400.0))),
+            ..Default::default()
+        };
+        apply_visuals(&ctx, ctrl.theme());
+        let dark_tokens = Tokens::for_theme(ctrl.theme());
+
+        // 1. Available state renders inside App Updates (below Server Settings, never above it).
+        let available_status = UpdateStatus::Available(Box::new(update.clone()));
+        let out_avail = ctx.run_ui(raw_tall.clone(), |ui| {
+            let _ =
+                render_window_with_update_status(&mut ctrl, ui, &dark_tokens, &available_status);
+        });
+        let text_avail = collect_text(&out_avail.shapes);
+        let y_connect = find_text_y(&out_avail.shapes, "Server address").unwrap();
+        let y_settings = find_text_y(&out_avail.shapes, "Where to save your notebooks").unwrap();
+        let y_updates_hdr = find_text_y(&out_avail.shapes, "App Updates").unwrap();
+        let y_avail = find_text_y(&out_avail.shapes, "Update available: v0.2.0").unwrap();
+        let y_auto_chk = find_text_y(
+            &out_avail.shapes,
+            "Check for updates automatically on startup",
+        )
+        .unwrap();
+        out_avail.drop_without_applying_deltas();
+
+        assert!(text_avail.contains("Download Update"));
+        assert!(y_connect < y_settings);
+        assert!(y_settings < y_updates_hdr);
+        assert!(y_updates_hdr < y_avail);
+        assert!(y_avail < y_auto_chk);
+
+        // 2. Downloading and ReadyToInstall states also render inside App Updates cleanly.
+        let downloading_status = UpdateStatus::Downloading {
+            update: Box::new(update.clone()),
+            downloaded_bytes: 12_000_000,
+            total_bytes: 24_000_000,
+        };
+        let out_dl = ctx.run_ui(raw_tall.clone(), |ui| {
+            let _ =
+                render_window_with_update_status(&mut ctrl, ui, &dark_tokens, &downloading_status);
+        });
+        let text_dl = collect_text(&out_dl.shapes);
+        let y_dl = find_text_y(&out_dl.shapes, "Downloading v0.2.0...").unwrap();
+        let y_dl_hdr = find_text_y(&out_dl.shapes, "App Updates").unwrap();
+        let y_dl_chk =
+            find_text_y(&out_dl.shapes, "Check for updates automatically on startup").unwrap();
+        out_dl.drop_without_applying_deltas();
+        assert!(text_dl.contains("Cancel"));
+        assert!(y_dl_hdr < y_dl && y_dl < y_dl_chk);
+
+        let ready_status = UpdateStatus::ReadyToInstall {
+            update: Box::new(update.clone()),
+            staged: StagedUpdate {
+                app: AppId::PaperCraftServer,
+                version: SemVer::parse("0.2.0").unwrap(),
+                staged_path: dir.0.join("staged.exe"),
+                target_path: dir.0.join("papercraft-server.exe"),
+                format: AssetFormat::Exe,
+                sha256: "0".repeat(64),
+            },
+        };
+        let out_ready = ctx.run_ui(raw_tall, |ui| {
+            let _ = render_window_with_update_status(&mut ctrl, ui, &dark_tokens, &ready_status);
+        });
+        let text_ready = collect_text(&out_ready.shapes);
+        let y_ready = find_text_y(
+            &out_ready.shapes,
+            "Update v0.2.0 verified and ready to install",
+        )
+        .unwrap();
+        let y_ready_hdr = find_text_y(&out_ready.shapes, "App Updates").unwrap();
+        let y_ready_chk = find_text_y(
+            &out_ready.shapes,
+            "Check for updates automatically on startup",
+        )
+        .unwrap();
+        out_ready.drop_without_applying_deltas();
+        assert!(text_ready.contains("Stop Server, Install & Restart"));
+        assert!(y_ready_hdr < y_ready && y_ready < y_ready_chk);
     }
 }
