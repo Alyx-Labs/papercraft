@@ -2116,9 +2116,6 @@ fn cmd_transform_selection(
                 };
                 stroke.raw_points = Arc::new(transform_samples(&stroke.raw_points));
                 stroke.smoothed_points = Arc::new(transform_samples(&stroke.smoothed_points));
-                if is_uniform_scale {
-                    stroke.pen.size = (f64::from(stroke.pen.size) * scale_x) as f32;
-                }
                 stroke.pen.nib_angle_deg =
                     ((f64::from(stroke.pen.nib_angle_deg) + rotation_degrees + 180.0)
                         .rem_euclid(360.0)
@@ -2158,10 +2155,6 @@ fn cmd_transform_selection(
                     pt.y = transformed_center.y + slx * sin + sly * cos;
                 }
                 shape.angle_degrees += rotation_degrees;
-                if is_uniform_scale {
-                    shape.width = (f64::from(shape.width) * scale_x) as f32;
-                    shape.curve *= scale_x;
-                }
                 if let Some(target) = next.shapes.get_mut(index) {
                     *target = Arc::new(shape.sanitized());
                 }

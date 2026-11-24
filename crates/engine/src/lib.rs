@@ -2158,4 +2158,103 @@ mod tests {
         assert_eq!(s.active_pen().color, papercraft_color::INK_PALETTE[1].color);
         assert_eq!(s.active_pen().color.to_hex(), "#0052FF");
     }
+
+    #[test]
+    fn selection_transform_uniform_scale_preserves_stroke_and_shape_path_widths() {
+        let mut s = Session::default();
+        let mut ball_pen = papercraft_doc::PenSettings::ball_pen();
+        ball_pen.size = 2.2;
+        let stroke_res = s
+            .execute(
+                "stroke.draw",
+                &serde_json::json!({
+                    "pen": ball_pen,
+                    "points": [
+                        { "x": 100.0, "y": 100.0, "pressure": 0.5 },
+                        { "x": 120.0, "y": 135.0, "pressure": 0.5 },
+                        { "x": 140.0, "y": 170.0, "pressure": 0.5 },
+                        { "x": 160.0, "y": 180.0, "pressure": 0.5 },
+                        { "x": 190.0, "y": 150.0, "pressure": 0.5 },
+                        { "x": 220.0, "y": 110.0, "pressure": 0.5 },
+                    ],
+                }),
+            )
+            .unwrap();
+        let stroke_id = stroke_res["strokeId"].as_u64().unwrap();
+
+        s.execute(
+            "shape.insert",
+            &serde_json::json!({
+                "kind": "Rectangle",
+                "x1": 100.0,
+                "y1": 100.0,
+                "x2": 200.0,
+                "y2": 160.0,
+                "width": 3.5,
+                "curve": 12.0,
+            }),
+        )
+        .unwrap();
+
+        let orig_span = papercraft_geom::Rect::from_point_iter(
+            s.doc.strokes[0].smoothed_points.iter().map(|pt| pt.point()),
+        );
+        s.execute(
+            "selection.transform",
+            &serde_json::json!({
+                "targets": [
+                    { "kind": "stroke", "id": stroke_id },
+                    { "kind": "shape", "index": 0 },
+                ],
+                "pivot": { "x": 100.0, "y": 100.0 },
+                "translation": { "x": 0.0, "y": 0.0 },
+                "scale_x": 3.0,
+                "scale_y": 3.0,
+                "rotation_degrees": 0.0,
+            }),
+        )
+        .unwrap();
+
+        // Stroke geometry scales 3x while pen thickness stays unchanged.
+        let scaled_stroke = &s.doc.strokes[0];
+        let scaled_span = papercraft_geom::Rect::from_point_iter(
+            scaled_stroke.smoothed_points.iter().map(|pt| pt.point()),
+        );
+        assert!(
+            (scaled_stroke.pen.size - 2.2).abs() < 1e-5,
+            "uniform resize must preserve stroke pen.size (expected 2.2, got {})",
+            scaled_stroke.pen.size
+        );
+        assert!(
+            (scaled_span.w - orig_span.w * 3.0).abs() < 1e-3,
+            "expected stroke width to scale 3x ({} -> {})",
+            orig_span.w,
+            scaled_span.w
+        );
+        assert!(
+            (scaled_span.h - orig_span.h * 3.0).abs() < 1e-3,
+            "expected stroke height to scale 3x ({} -> {})",
+            orig_span.h,
+            scaled_span.h
+        );
+
+        // Shape geometry scales 3x while outline path width and curve stay unchanged.
+        let scaled_shape = &s.doc.shapes[0];
+        assert!((scaled_shape.x2 - scaled_shape.x1 - 300.0).abs() < 1e-4);
+        assert!((scaled_shape.y2 - scaled_shape.y1 - 180.0).abs() < 1e-4);
+        assert!(
+            (scaled_shape.width - 3.5).abs() < 1e-5,
+            "uniform resize must preserve shape width (expected 3.5, got {})",
+            scaled_shape.width
+        );
+        assert!(
+            (scaled_shape.curve - 12.0).abs() < 1e-5,
+            "uniform resize must preserve shape curve (expected 12.0, got {})",
+            scaled_shape.curve
+        );
+
+        s.execute("edit.undo", &serde_json::json!({})).unwrap();
+        assert!((s.doc.strokes[0].pen.size - 2.2).abs() < 1e-5);
+        assert!((s.doc.shapes[0].x2 - s.doc.shapes[0].x1 - 100.0).abs() < 1e-4);
+    }
 }

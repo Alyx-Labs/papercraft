@@ -10088,6 +10088,128 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_and_shift_corner_resize_preserves_stroke_and_shape_path_width() {
+        let ctx = egui::Context::default();
+        let mut app = setup_editor_app(&ctx);
+        crate::activate_select_tool(&mut app);
+
+        let mut ball_pen = papercraft_doc::PenSettings::ball_pen();
+        ball_pen.size = 2.2;
+        let stroke_res = app
+            .session
+            .execute(
+                "stroke.draw",
+                &serde_json::json!({
+                    "pen": ball_pen,
+                    "points": [
+                        { "x": 160.0, "y": 160.0, "pressure": 0.5 },
+                        { "x": 180.0, "y": 195.0, "pressure": 0.5 },
+                        { "x": 200.0, "y": 230.0, "pressure": 0.5 },
+                        { "x": 230.0, "y": 200.0, "pressure": 0.5 },
+                        { "x": 260.0, "y": 170.0, "pressure": 0.5 },
+                    ],
+                }),
+            )
+            .unwrap();
+        let stroke_id = StrokeId(stroke_res["strokeId"].as_u64().unwrap());
+
+        app.session
+            .execute(
+                "shape.insert",
+                &serde_json::json!({
+                    "kind": "Rectangle",
+                    "x1": 160.0,
+                    "y1": 300.0,
+                    "x2": 260.0,
+                    "y2": 360.0,
+                    "width": 2.2,
+                }),
+            )
+            .unwrap();
+
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let zoom = app.view.zoom;
+        let mut time = 0.016;
+
+        let drag_corner = |app: &mut PaperCraftApp, time: &mut f64, modifiers: egui::Modifiers| {
+            run_editor_frame_with_hooks(&ctx, app, *time, Vec::new())
+                .drop_without_applying_deltas();
+            let bounds = selected_objects_bounds(app, &painter, page_affine(app)).unwrap();
+            let corner = non_text_corner_handles(bounds)[3];
+            let target = pos2(corner.x + 120.0 * zoom, corner.y + 40.0 * zoom);
+            *time += 0.016;
+            run_editor_frame_with_hooks(
+                &ctx,
+                app,
+                *time,
+                vec![
+                    egui::Event::PointerMoved(corner),
+                    egui::Event::PointerButton {
+                        pos: corner,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers,
+                    },
+                    egui::Event::PointerMoved(target),
+                    egui::Event::PointerButton {
+                        pos: target,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers,
+                    },
+                ],
+            )
+            .drop_without_applying_deltas();
+        };
+
+        // Ctrl+corner drag scales stroke dimensions proportionally without changing pen.size.
+        app.view.selected_object = Some(SelectedObject::Stroke(stroke_id));
+        app.view.selected_objects = vec![SelectedObject::Stroke(stroke_id)];
+        let stroke_span_before = papercraft_geom::Rect::from_point_iter(
+            app.session.doc.strokes[0]
+                .smoothed_points
+                .iter()
+                .map(|pt| pt.point()),
+        );
+        let stroke_aspect_before = stroke_span_before.w / stroke_span_before.h;
+        drag_corner(&mut app, &mut time, egui::Modifiers::CTRL);
+        let stroke_after = &app.session.doc.strokes[0];
+        let stroke_span_after = papercraft_geom::Rect::from_point_iter(
+            stroke_after.smoothed_points.iter().map(|pt| pt.point()),
+        );
+        let stroke_aspect_after = stroke_span_after.w / stroke_span_after.h;
+        assert!(
+            stroke_span_after.w > stroke_span_before.w * 1.5,
+            "Ctrl+corner drag must enlarge stroke dimensions"
+        );
+        assert!(
+            (stroke_aspect_after - stroke_aspect_before).abs() < 0.01,
+            "Ctrl+corner drag must preserve stroke aspect ratio (before={stroke_aspect_before}, after={stroke_aspect_after})"
+        );
+        assert!(
+            (stroke_after.pen.size - 2.2).abs() < 1e-5,
+            "Ctrl+corner drag must keep stroke path size at 2.2, got {}",
+            stroke_after.pen.size
+        );
+
+        // Shift+corner drag scales shape dimensions proportionally without changing shape.width.
+        app.view.selected_object = Some(SelectedObject::Shape(0));
+        app.view.selected_objects = vec![SelectedObject::Shape(0)];
+        let shape_before = app.session.doc.shapes[0].as_ref().clone();
+        drag_corner(&mut app, &mut time, egui::Modifiers::SHIFT);
+        let shape_after = &app.session.doc.shapes[0];
+        assert!(
+            (shape_after.x2 - shape_after.x1) > (shape_before.x2 - shape_before.x1) * 1.5,
+            "Shift+corner drag must enlarge shape dimensions"
+        );
+        assert!(
+            (shape_after.width - 2.2).abs() < 1e-5,
+            "Shift+corner drag must keep shape path width at 2.2, got {}",
+            shape_after.width
+        );
+    }
+
+    #[test]
     fn lasso_drag_selects_enclosed_objects_and_excludes_outside() {
         let ctx = egui::Context::default();
         let mut app = setup_editor_app(&ctx);
