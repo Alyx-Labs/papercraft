@@ -4313,8 +4313,28 @@ mod tests {
             }
         }
 
+        struct TempDirGuard(std::path::PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let temp_root = std::env::temp_dir().join(format!(
+            "papercraft_ui_migration_test_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let _guard = TempDirGuard(temp_root.clone());
+
         let ctx = egui::Context::default();
-        let mut app = PaperCraftApp::default();
+        let mut app = PaperCraftApp::new(
+            papercraft_engine::Session::open_desktop_library(temp_root),
+            crate::PlatformHooks::default(),
+        );
         app.session.prefs.theme = papercraft_doc::UiTheme::Light;
 
         // Create a local profile while signed into User A (bound to u-other) and an unlinked local
