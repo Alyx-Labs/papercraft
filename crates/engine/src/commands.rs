@@ -524,7 +524,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "profile.dismissWelcomeBanner",
         label: "Dismiss Welcome Banner",
-        description: "Mark the first-launch welcome banner as seen for this installation",
+        description: "Mark the release welcome banner as seen for the active build version",
     },
     CommandSpec {
         id: "profile.create",
@@ -6360,6 +6360,7 @@ fn cmd_profile_dismiss_welcome_banner(session: &mut Session) -> Result<Value, En
     session.dismiss_welcome_banner();
     Ok(json!({
         "welcomeBannerSeen": !session.should_show_welcome_banner(),
+        "welcomeBannerSeenVersion": session.welcome_banner_seen_version(),
         "needsInitialNickname": session.needs_initial_nickname(),
     }))
 }

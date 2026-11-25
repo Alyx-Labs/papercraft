@@ -395,21 +395,49 @@ impl Session {
         self.sync.global.needs_initial_nickname
     }
 
-    /// Returns `true` when the first-launch welcome banner has not yet been dismissed
-    /// on a persisted Desktop or Web workspace.
-    pub fn should_show_welcome_banner(&self) -> bool {
-        self.is_sync_persistence_enabled() && !self.sync.global.welcome_banner_seen
+    /// Returns `true` when the release welcome banner has not yet been dismissed
+    /// for `current_version` on a persisted Desktop or Web workspace.
+    pub fn should_show_welcome_banner_for_version(&self, current_version: &str) -> bool {
+        if !self.is_sync_persistence_enabled() {
+            return false;
+        }
+        let Some(target) = sanitize_welcome_version(current_version) else {
+            return false;
+        };
+        self.sync.global.welcome_banner_seen_version.as_deref() != Some(target.as_str())
     }
 
-    /// Marks the first-launch welcome banner as seen and persists global workspace state.
-    pub fn dismiss_welcome_banner(&mut self) {
-        if self.sync.global.welcome_banner_seen {
+    /// Returns `true` when the release welcome banner has not yet been dismissed
+    /// for the running build's version on a persisted Desktop or Web workspace.
+    pub fn should_show_welcome_banner(&self) -> bool {
+        self.should_show_welcome_banner_for_version(env!("CARGO_PKG_VERSION"))
+    }
+
+    /// Returns the last release version for which the welcome banner was dismissed.
+    pub fn welcome_banner_seen_version(&self) -> Option<&str> {
+        self.sync.global.welcome_banner_seen_version.as_deref()
+    }
+
+    /// Marks the release welcome banner as seen for `current_version` and persists global state.
+    pub fn dismiss_welcome_banner_for_version(&mut self, current_version: &str) {
+        let Some(target) = sanitize_welcome_version(current_version) else {
+            return;
+        };
+        if self.sync.global.welcome_banner_seen
+            && self.sync.global.welcome_banner_seen_version.as_deref() == Some(target.as_str())
+        {
             return;
         }
         self.sync.global.welcome_banner_seen = true;
+        self.sync.global.welcome_banner_seen_version = Some(target);
         self.sync_persist_global_state();
         self.save_current_web_bundle();
         self.bump_revision();
+    }
+
+    /// Marks the release welcome banner as seen for the running build's version.
+    pub fn dismiss_welcome_banner(&mut self) {
+        self.dismiss_welcome_banner_for_version(env!("CARGO_PKG_VERSION"));
     }
 
     pub fn offline_edits_pending(&self) -> bool {
@@ -2785,6 +2813,16 @@ fn migrate_web_cache_if_needed(cache: &mut WebWorkspaceCache) {
     cache.version = WEB_CACHE_VERSION;
 }
 
+fn sanitize_welcome_version(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control() && !c.is_whitespace())
+        .take(32)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 fn sanitize_global_state(global: &mut GlobalSyncState) {
     global.server_url =
         normalize_server_url(&global.server_url).unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string());
@@ -2793,6 +2831,10 @@ fn sanitize_global_state(global: &mut GlobalSyncState) {
     if global.client_id.is_empty() {
         global.client_id = Uuid::new_v4().to_string();
     }
+    global.welcome_banner_seen_version = global
+        .welcome_banner_seen_version
+        .as_deref()
+        .and_then(sanitize_welcome_version);
     if let Some(session) = global.session.as_mut() {
         if let Ok(norm) = normalize_server_url(&session.server_url) {
             session.server_url = norm;
@@ -3490,7 +3532,7 @@ mod tests {
     }
 
     #[test]
-    fn welcome_banner_shows_once_on_persisted_desktop_and_web_sessions() {
+    fn welcome_banner_shows_once_per_release_on_persisted_desktop_and_web_sessions() {
         let ephemeral = Session::default();
         assert!(!ephemeral.should_show_welcome_banner());
 
@@ -3501,9 +3543,23 @@ mod tests {
             .execute("profile.dismissWelcomeBanner", &json!({}))
             .unwrap();
         assert!(!desktop.should_show_welcome_banner());
+        assert_eq!(
+            desktop.welcome_banner_seen_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
 
         let reopened_desktop = Session::open_desktop_library(dir.0.clone());
         assert!(!reopened_desktop.should_show_welcome_banner());
+        // Updating to a newer release version triggers the welcome banner again.
+        assert!(reopened_desktop.should_show_welcome_banner_for_version("99.0.0"));
+
+        // Legacy workspaces from older builds (welcome_banner_seen=true, no version) also show.
+        let mut legacy = papercraft_sync::load_global_state(&dir.0);
+        legacy.welcome_banner_seen = true;
+        legacy.welcome_banner_seen_version = None;
+        papercraft_sync::save_global_state(&dir.0, &legacy).unwrap();
+        let updated_from_legacy = Session::open_desktop_library(dir.0.clone());
+        assert!(updated_from_legacy.should_show_welcome_banner());
 
         let mut web = Session::open_web_cache(None);
         assert!(web.should_show_welcome_banner());
@@ -3513,6 +3569,7 @@ mod tests {
         let saved_web = web.export_web_cache_json().unwrap();
         let reopened_web = Session::open_web_cache(Some(&saved_web));
         assert!(!reopened_web.should_show_welcome_banner());
+        assert!(reopened_web.should_show_welcome_banner_for_version("99.0.0"));
     }
 
     #[test]
