@@ -8,7 +8,7 @@
   Write across pages, choose your paper, and export your notes in a few clicks.
 </p>
 <p align="center">
-  <a href="https://github.com/alyxhard/papercraft/releases/latest"><img alt="Release v0.5.0" src="https://img.shields.io/badge/release-v0.5.0%20(alpha)-f59e0b?style=flat-square"></a>
+  <a href="https://github.com/Alyx-Labs/papercraft/releases/latest"><img alt="Release v0.5.1" src="https://img.shields.io/badge/release-v0.5.1%20(alpha)-f59e0b?style=flat-square"></a>
   <a href="#downloads"><img alt="Downloads for Windows, Linux, and macOS" src="https://img.shields.io/badge/downloads-Windows%20%7C%20Linux%20%7C%20macOS-10b981?style=flat-square"></a>
   <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust-b7410e?style=flat-square&logo=rust">
   <a href="https://web.papercraft.ink/"><img alt="Live Web Demo" src="https://img.shields.io/badge/live%20demo-web.papercraft.ink-2f7bf5?style=flat-square"></a>
@@ -78,7 +78,7 @@ PaperCraft is built around three simple principles:
 
 > **Live Web Demo:** Try PaperCraft directly in your browser at **[https://web.papercraft.ink/](https://web.papercraft.ink/)** — runs 100% client-side via WebAssembly with no installation required.
 
-Pre-built binaries are published on [GitHub Releases (`v0.5.0`)](https://github.com/alyxhard/papercraft/releases/latest) for **Windows**, **Linux**, and **macOS**. PaperCraft ships as **two separate standalone apps**—install the Desktop App on its own for offline note-taking, and add the Server only if you want self-hosted multi-device sync:
+Pre-built binaries are published on [GitHub Releases (`v0.5.1`)](https://github.com/Alyx-Labs/papercraft/releases/latest) for **Windows**, **Linux**, and **macOS**. PaperCraft ships as **two separate standalone apps**—install the Desktop App on its own for offline note-taking, and add the Server only if you want self-hosted multi-device sync:
 
 <table>
   <tr>
@@ -86,18 +86,18 @@ Pre-built binaries are published on [GitHub Releases (`v0.5.0`)](https://github.
       <h3>📓 PaperCraft App (Desktop)</h3>
       <p>The notebook &amp; handwriting workspace. Works <b>100% offline</b> with local accounts out of the box.</p>
       <ul>
-        <li><b>Windows</b> (<code>x86_64</code>): <a href="https://github.com/alyxhard/papercraft/releases/latest/download/papercraft-windows-x86_64.exe"><code>papercraft-windows-x86_64.exe</code></a> <sub>(portable <code>.exe</code>)</sub></li>
-        <li><b>Linux</b> (<code>x86_64</code>): <a href="https://github.com/alyxhard/papercraft/releases/latest/download/papercraft-linux-x86_64.AppImage"><code>papercraft-linux-x86_64.AppImage</code></a> <sub>(<code>chmod +x</code> before running)</sub></li>
-        <li><b>macOS</b> (<code>arm64</code>): <a href="https://github.com/alyxhard/papercraft/releases/latest/download/papercraft-macos-arm64.dmg"><code>papercraft-macos-arm64.dmg</code></a> <sub>(Apple Silicon · experimental)</sub></li>
+        <li><b>Windows</b> (<code>x86_64</code>): <a href="https://github.com/Alyx-Labs/papercraft/releases/latest/download/papercraft-windows-x86_64.exe"><code>papercraft-windows-x86_64.exe</code></a> <sub>(portable <code>.exe</code>)</sub></li>
+        <li><b>Linux</b> (<code>x86_64</code>): <a href="https://github.com/Alyx-Labs/papercraft/releases/latest/download/papercraft-linux-x86_64.AppImage"><code>papercraft-linux-x86_64.AppImage</code></a> <sub>(<code>chmod +x</code> before running)</sub></li>
+        <li><b>macOS</b> (<code>arm64</code>): <a href="https://github.com/Alyx-Labs/papercraft/releases/latest/download/papercraft-macos-arm64.dmg"><code>papercraft-macos-arm64.dmg</code></a> <sub>(Apple Silicon · experimental)</sub></li>
       </ul>
     </td>
     <td width="50%" valign="top">
       <h3>☁️ PaperCraft Server (System Tray — Optional)</h3>
       <p>Optional self-hosted sync server &amp; account manager that sits in your tray (LAN or private mesh VPN).</p>
       <ul>
-        <li><b>Windows</b> (<code>x86_64</code>): <a href="https://github.com/alyxhard/papercraft/releases/latest/download/papercraft-server-windows-x86_64.exe"><code>papercraft-server-windows-x86_64.exe</code></a> <sub>(portable <code>.exe</code>)</sub></li>
-        <li><b>Linux</b> (<code>x86_64</code>): <a href="https://github.com/alyxhard/papercraft/releases/latest/download/papercraft-server-linux-x86_64.AppImage"><code>papercraft-server-linux-x86_64.AppImage</code></a> <sub>(<code>chmod +x</code> before running)</sub></li>
-        <li><b>macOS</b> (<code>arm64</code>): <a href="https://github.com/alyxhard/papercraft/releases/latest/download/papercraft-server-macos-arm64.dmg"><code>papercraft-server-macos-arm64.dmg</code></a> <sub>(Apple Silicon · experimental)</sub></li>
+        <li><b>Windows</b> (<code>x86_64</code>): <a href="https://github.com/Alyx-Labs/papercraft/releases/latest/download/papercraft-server-windows-x86_64.exe"><code>papercraft-server-windows-x86_64.exe</code></a> <sub>(portable <code>.exe</code>)</sub></li>
+        <li><b>Linux</b> (<code>x86_64</code>): <a href="https://github.com/Alyx-Labs/papercraft/releases/latest/download/papercraft-server-linux-x86_64.AppImage"><code>papercraft-server-linux-x86_64.AppImage</code></a> <sub>(<code>chmod +x</code> before running)</sub></li>
+        <li><b>macOS</b> (<code>arm64</code>): <a href="https://github.com/Alyx-Labs/papercraft/releases/latest/download/papercraft-server-macos-arm64.dmg"><code>papercraft-server-macos-arm64.dmg</code></a> <sub>(Apple Silicon · experimental)</sub></li>
       </ul>
     </td>
   </tr>
@@ -114,8 +114,8 @@ Pre-built binaries are published on [GitHub Releases (`v0.5.0`)](https://github.
 <details>
 <summary><b>WebAssembly bundle, SHA-256 checksums, headless CLI server, and platform notes</b></summary>
 
-- **Live Web Demo (WebAssembly):** [web.papercraft.ink](https://web.papercraft.ink/) — runs 100% client-side in your browser via WebAssembly (or download [papercraft-web.zip](https://github.com/alyxhard/papercraft/releases/latest/download/papercraft-web.zip) to host on any static web server).
-- **Checksums & all assets:** [SHA256SUMS.txt](https://github.com/alyxhard/papercraft/releases/latest/download/SHA256SUMS.txt) on the [GitHub Releases page](https://github.com/alyxhard/papercraft/releases/latest).
+- **Live Web Demo (WebAssembly):** [web.papercraft.ink](https://web.papercraft.ink/) — runs 100% client-side in your browser via WebAssembly (or download [papercraft-web.zip](https://github.com/Alyx-Labs/papercraft/releases/latest/download/papercraft-web.zip) to host on any static web server).
+- **Checksums & all assets:** [SHA256SUMS.txt](https://github.com/Alyx-Labs/papercraft/releases/latest/download/SHA256SUMS.txt) on the [GitHub Releases page](https://github.com/Alyx-Labs/papercraft/releases/latest).
 - **Headless terminal server (`papercraft-server-cli`):** For Linux/server hosts without a desktop tray, build from source with `cargo build --release -p papercraft-server-cli`.
 - **macOS notice:** macOS `.dmg` builds are compiled and packaged in GitHub Actions, but remain **experimental** (not yet tested on physical Mac hardware).
 

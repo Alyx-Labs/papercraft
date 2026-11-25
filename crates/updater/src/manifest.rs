@@ -8,14 +8,13 @@ use crate::UpdateError;
 
 pub const PUBLISHER_NAME: &str = "Alyx Labs";
 
-// TODO(org): Update these GitHub URLs once the repository moves to the final Alyx Labs GitHub organization slug.
 pub const DEFAULT_MANIFEST_URL: &str =
-    "https://github.com/alyxhard/papercraft/releases/latest/download/latest.json";
+    "https://github.com/Alyx-Labs/papercraft/releases/latest/download/latest.json";
 pub const DEFAULT_RELEASES_PAGE_URL: &str =
-    "https://github.com/alyxhard/papercraft/releases/latest";
-pub const OFFICIAL_RELEASES_PREFIX: &str = "https://github.com/alyxhard/papercraft/releases/";
+    "https://github.com/Alyx-Labs/papercraft/releases/latest";
+pub const OFFICIAL_RELEASES_PREFIX: &str = "https://github.com/Alyx-Labs/papercraft/releases/";
 pub const OFFICIAL_DOWNLOAD_PREFIX: &str =
-    "https://github.com/alyxhard/papercraft/releases/download/";
+    "https://github.com/Alyx-Labs/papercraft/releases/download/";
 
 pub const ENV_MANIFEST_URL: &str = "PAPERCRAFT_UPDATE_MANIFEST_URL";
 pub const ENV_CURRENT_VERSION: &str = "PAPERCRAFT_UPDATE_CURRENT_VERSION";
@@ -327,7 +326,7 @@ mod tests {
         assert!(validate_manifest_url("http://127.0.0.1:8799/latest.json", true).is_ok());
         assert!(validate_manifest_url("http://192.168.1.10:8799/latest.json", true).is_err());
 
-        let official_dl = "https://github.com/alyxhard/papercraft/releases/download/v0.1.2/papercraft-windows-x86_64.exe";
+        let official_dl = "https://github.com/Alyx-Labs/papercraft/releases/download/v0.1.2/papercraft-windows-x86_64.exe";
         assert!(validate_asset_url(official_dl, DEFAULT_MANIFEST_URL, false).is_ok());
         assert!(
             validate_asset_url(
@@ -378,14 +377,14 @@ mod tests {
             "schema_version": 1,
             "version": "0.1.2",
             "tag": "v0.1.2",
-            "release_url": "https://github.com/alyxhard/papercraft/releases/tag/v0.1.2",
+            "release_url": "https://github.com/Alyx-Labs/papercraft/releases/tag/v0.1.2",
             "published_at": "2026-11-24T12:00:00Z",
             "notes": "- Added auto-updater",
             "assets": {
                 "papercraft": {
                     "windows-x86_64": {
                         "file_name": "papercraft-windows-x86_64.exe",
-                        "url": "https://github.com/alyxhard/papercraft/releases/download/v0.1.2/papercraft-windows-x86_64.exe",
+                        "url": "https://github.com/Alyx-Labs/papercraft/releases/download/v0.1.2/papercraft-windows-x86_64.exe",
                         "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                         "size_bytes": 123456,
                         "format": "exe"

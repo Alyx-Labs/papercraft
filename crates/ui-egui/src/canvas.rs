@@ -3147,6 +3147,23 @@ fn live_pointer_screen_pos(app: &PaperCraftApp, xf: Affine2) -> Option<Pos2> {
     (out.x.is_finite() && out.y.is_finite()).then_some(out)
 }
 
+#[cfg(target_os = "windows")]
+fn windows_blank_cursor_image() -> Option<egui::CustomCursorImage> {
+    static BLANK_CURSOR_RGBA: std::sync::OnceLock<Arc<[u8]>> = std::sync::OnceLock::new();
+    let rgba =
+        Arc::clone(BLANK_CURSOR_RGBA.get_or_init(|| Arc::from([0u8; 16 * 16 * 4].as_slice())));
+    Some(egui::CustomCursorImage {
+        rgba,
+        size: [16, 16],
+        hotspot: [0, 0],
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_blank_cursor_image() -> Option<egui::CustomCursorImage> {
+    None
+}
+
 fn update_canvas_cursor_icon(app: &PaperCraftApp, ui: &egui::Ui, resp: &egui::Response) {
     if !resp.hovered() {
         return;
@@ -3221,6 +3238,11 @@ fn update_canvas_cursor_icon(app: &PaperCraftApp, ui: &egui::Ui, resp: &egui::Re
         egui::CursorIcon::None
     };
     ui.ctx().set_cursor_icon(icon);
+    if icon == egui::CursorIcon::None {
+        ui.ctx().set_cursor_image(windows_blank_cursor_image());
+    } else {
+        ui.ctx().set_cursor_image(None);
+    }
 }
 
 fn text_font_id_styled(font: TextFont, size: f32, bold: bool, italic: bool) -> FontId {

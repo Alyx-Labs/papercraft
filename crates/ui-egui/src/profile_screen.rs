@@ -721,7 +721,7 @@ fn draw_self_hosted_download_disclaimer(app: &mut PaperCraftApp, ui: &mut egui::
                         let link_resp = ui
                             .add(
                                 egui::Label::new(
-                                    egui::RichText::new("github.com/alyxhard/papercraft")
+                                    egui::RichText::new("github.com/Alyx-Labs/papercraft")
                                         .size(11.0)
                                         .color(t.accent),
                                 )
@@ -1053,9 +1053,9 @@ mod tests {
         let (light_text, shapes) = run_settled(&ctx, &mut app, &mut time);
         assert!(light_text.contains("PaperCraft Server"));
         assert!(light_text.contains("standalone local desktop app"));
-        assert!(light_text.contains("github.com/alyxhard/papercraft"));
+        assert!(light_text.contains("github.com/Alyx-Labs/papercraft"));
 
-        let link_pos = find_text_center(&shapes, "github.com/alyxhard/papercraft")
+        let link_pos = find_text_center(&shapes, "github.com/Alyx-Labs/papercraft")
             .expect("GitHub disclaimer link should render");
         for pressed in [true, false] {
             time += 0.05;
@@ -1085,7 +1085,7 @@ mod tests {
         }
         assert_eq!(
             *opened.lock().unwrap(),
-            vec!["https://github.com/alyxhard/papercraft".to_string()]
+            vec!["https://github.com/Alyx-Labs/papercraft".to_string()]
         );
 
         let _ = app
@@ -1094,7 +1094,7 @@ mod tests {
         let (dark_text, _) = run_settled(&ctx, &mut app, &mut time);
         assert!(dark_text.contains("PaperCraft Server"));
         assert!(dark_text.contains("standalone local desktop app"));
-        assert!(dark_text.contains("github.com/alyxhard/papercraft"));
+        assert!(dark_text.contains("github.com/Alyx-Labs/papercraft"));
     }
 
     #[test]

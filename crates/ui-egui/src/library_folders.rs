@@ -2682,7 +2682,7 @@ mod tests {
         let ctx = egui::Context::default();
         let viewport = Vec2::new(1280.0, 800.0);
         let expected_version = format!("v{}", env!("CARGO_PKG_VERSION"));
-        assert_eq!(expected_version, "v0.5.0");
+        assert_eq!(expected_version, "v0.5.1");
 
         let mut sidebar_rect = Rect::NOTHING;
         let mut github_rect = None;
@@ -2866,13 +2866,13 @@ mod tests {
             current_version: SemVer::parse("0.2.0").unwrap(),
             version: SemVer::parse("0.3.0").unwrap(),
             tag: "v0.3.0".to_string(),
-            release_url: "https://github.com/alyxhard/papercraft/releases/tag/v0.3.0".to_string(),
+            release_url: "https://github.com/Alyx-Labs/papercraft/releases/tag/v0.3.0".to_string(),
             published_at: "2026-11-24T16:40:00Z".to_string(),
             notes: "Bug fixes".to_string(),
             platform: "windows-x86_64".to_string(),
             asset: PlatformAsset {
                 file_name: "papercraft-windows-x86_64.exe".to_string(),
-                url: "https://github.com/alyxhard/papercraft/releases/download/v0.3.0/papercraft-windows-x86_64.exe".to_string(),
+                url: "https://github.com/Alyx-Labs/papercraft/releases/download/v0.3.0/papercraft-windows-x86_64.exe".to_string(),
                 sha256: "0".repeat(64),
                 size_bytes: 20_000_000,
                 format: AssetFormat::Exe,

@@ -52,8 +52,7 @@ use papercraft_paint::RibbonMesh;
 use serde_json::json;
 
 /// Public source repository URL displayed in Home and Profile links.
-// TODO(org): Update GITHUB_REPO_URL (and profile_screen.rs display text) once transferred to the Alyx Labs GitHub organization slug.
-pub(crate) const GITHUB_REPO_URL: &str = "https://github.com/alyxhard/papercraft";
+pub(crate) const GITHUB_REPO_URL: &str = "https://github.com/Alyx-Labs/papercraft";
 
 /// Top-level workspace screen mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2317,6 +2316,9 @@ impl PaperCraftApp {
         modal::show(self, ui);
         if let Some(name) = self.view.pdf_import_in_flight.as_deref() {
             render_importing_pdf_banner(&ctx, name, &tokens);
+        }
+        if ctx.output(|o| o.cursor_icon != egui::CursorIcon::None && o.cursor_image.is_some()) {
+            ctx.set_cursor_image(None);
         }
         self.sync_ui_scale_after_render(&ctx);
         self.forward_output_commands(&ctx);
