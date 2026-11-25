@@ -29,6 +29,7 @@ pub mod pdf_view;
 pub mod profile_screen;
 pub mod stylus;
 pub mod sync_worker;
+pub mod tab_strip;
 pub mod theme;
 pub mod toolbar;
 #[cfg(not(target_arch = "wasm32"))]
@@ -239,6 +240,7 @@ fn is_picked_package(picked: &PickedOpenFile) -> bool {
 pub struct ViewState {
     pub screen: AppScreen,
     pub profile_return_screen: AppScreen,
+    pub open_tabs: Vec<tab_strip::OpenTab>,
     pub library_search: String,
     pub library_show_trash: bool,
     pub last_autosave_s: f64,
@@ -429,6 +431,7 @@ impl Default for ViewState {
         Self {
             screen: AppScreen::Home,
             profile_return_screen: AppScreen::Home,
+            open_tabs: Vec::new(),
             library_search: String::new(),
             library_show_trash: false,
             last_autosave_s: 0.0,
@@ -999,6 +1002,7 @@ impl PaperCraftApp {
                 sync_view_to_active_notebook(self);
                 self.view.inspector_open = false;
                 self.view.screen = AppScreen::Editor;
+                tab_strip::sync_open_tabs(self);
                 if self.view.active_modal == Some(modal::ActiveModal::Export) {
                     modal::close(self);
                 }
@@ -1117,6 +1121,7 @@ impl PaperCraftApp {
                     }
                 }
                 self.view.screen = AppScreen::Editor;
+                tab_strip::sync_open_tabs(self);
                 if self.view.active_modal == Some(modal::ActiveModal::Export) {
                     modal::close(self);
                 }
@@ -1303,6 +1308,7 @@ impl PaperCraftApp {
                 sync_view_to_active_notebook(self);
                 self.view.inspector_open = false;
                 self.view.screen = AppScreen::Editor;
+                tab_strip::sync_open_tabs(self);
                 true
             }
             Err(err) => {
@@ -1766,6 +1772,9 @@ impl PaperCraftApp {
         if i.modifiers.command && i.key_pressed(egui::Key::Y) {
             return Some(KeyboardShortcutAction::Redo);
         }
+        if !self.view.text_editing && i.modifiers.command && i.key_pressed(egui::Key::W) {
+            return Some(KeyboardShortcutAction::CloseActiveTab);
+        }
         if !self.view.text_editing && i.modifiers.command && i.key_pressed(egui::Key::V) {
             return Some(KeyboardShortcutAction::RequestPaste);
         }
@@ -1916,6 +1925,9 @@ impl PaperCraftApp {
             KeyboardShortcutAction::ReturnToHome => {
                 return_to_home(self);
             }
+            KeyboardShortcutAction::CloseActiveTab => {
+                tab_strip::close_active_tab(self);
+            }
             KeyboardShortcutAction::CloseProfile => {
                 close_profile_screen(self);
             }
@@ -1960,6 +1972,7 @@ enum KeyboardShortcutAction {
     ToggleInspector,
     TogglePagesSidebar,
     ReturnToHome,
+    CloseActiveTab,
     CloseProfile,
     StepPage(isize),
 }
@@ -2165,13 +2178,17 @@ impl PaperCraftApp {
             ctx.request_repaint();
         }
 
+        let tokens = theme::Tokens::for_theme(self.session.prefs.theme);
         let exiting_screen = self.view.motion.screen.is_exiting();
+        let tab_out = tab_strip::show(self, ui);
         match self.view.motion.screen.rendered {
             AppScreen::Home => {
                 home::show(self, ui);
+                tab_strip::paint_active_tab_bridge(ui, &tab_out, &tokens);
             }
             AppScreen::Editor => {
                 let header_rect = toolbar::show_inner(self, ui);
+                tab_strip::paint_active_tab_bridge(ui, &tab_out, &tokens);
                 pages_sidebar::show(self, ui);
                 inspector::show(self, ui);
                 let canvas_rect = ui.available_rect_before_wrap();
@@ -2202,7 +2219,6 @@ impl PaperCraftApp {
                     let _ = ui.allocate_exact_size(viewport.size(), egui::Sense::click_and_drag());
                 });
         }
-        let tokens = theme::Tokens::for_theme(self.session.prefs.theme);
         motion::paint_screen_veil(ui, self.view.motion.screen.veil_alpha(), tokens.panel_bg);
         modal::show(self, ui);
         if let Some(name) = self.view.pdf_import_in_flight.as_deref() {
@@ -2636,6 +2652,7 @@ pub(crate) fn open_notebook_in_editor(app: &mut PaperCraftApp, index: usize) {
         sync_view_to_active_notebook(app);
         app.view.inspector_open = false;
         app.view.screen = AppScreen::Editor;
+        tab_strip::sync_open_tabs(app);
     }
 }
 
@@ -3424,6 +3441,7 @@ mod tests {
         return_to_home(&mut app);
         assert_eq!(app.view.screen, AppScreen::Home);
         assert_eq!(app.session.active_notebook, 1);
+        assert_eq!(app.view.open_tabs.len(), 1);
     }
 
     #[test]

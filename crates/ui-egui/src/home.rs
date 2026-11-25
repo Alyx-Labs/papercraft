@@ -2611,6 +2611,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         let mut lib_btn_pos = None;
+        let row_h = crate::icons::TOOLBAR_CONTROL_HEIGHT;
         for _ in 0..2 {
             let raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
@@ -2620,27 +2621,37 @@ mod tests {
                 crate::theme::apply_light_visuals(ui.ctx());
                 crate::toolbar::show(&mut app, ui);
             });
-            fn find_label_center(shape: &egui::Shape, target: &str, out: &mut Option<Pos2>) {
+            // Locate the square 36x36 Library icon button right of the left edge tab.
+            let mut square_btns = Vec::new();
+            fn find_left_squares(shape: &egui::Shape, row_h: f32, out: &mut Vec<Rect>) {
                 match shape {
-                    egui::Shape::Text(text) if text.galley.text() == target => {
-                        *out = Some(text.visual_bounding_rect().center());
+                    egui::Shape::Rect(rs)
+                        if rs.rect.left() > 40.0
+                            && rs.rect.left() < 120.0
+                            && (rs.rect.width() - row_h).abs() <= 1.0
+                            && (rs.rect.height() - row_h).abs() <= 1.0 =>
+                    {
+                        out.push(rs.rect);
                     }
                     egui::Shape::Vec(items) => {
                         for item in items {
-                            find_label_center(item, target, out);
+                            find_left_squares(item, row_h, out);
                         }
                     }
                     _ => {}
                 }
             }
             for clipped in &out.shapes {
-                find_label_center(&clipped.shape, "Library", &mut lib_btn_pos);
+                find_left_squares(&clipped.shape, row_h, &mut square_btns);
             }
+            lib_btn_pos = square_btns
+                .into_iter()
+                .min_by(|a, b| a.left().total_cmp(&b.left()))
+                .map(|r| r.center());
             out.drop_without_applying_deltas();
         }
 
-        // Click the Library button (positioned right of the Notebook sidebar edge button).
-        let lib_btn_pos = lib_btn_pos.expect("expected 'Library' button in editor toolbar");
+        let lib_btn_pos = lib_btn_pos.expect("expected icon-only Library button in editor toolbar");
         for (pressed, time) in [(true, 0.1), (false, 0.2)] {
             let raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
@@ -2704,10 +2715,15 @@ mod tests {
         crate::open_notebook_in_editor(&mut app, 1);
         let short_tb = run_toolbar(&mut app);
         assert!(
-            (home_metrics.header_rect.height() - short_tb.height()).abs() <= 1.0,
-            "home header ({:.1}) and editor toolbar ({:.1}) heights must match",
-            home_metrics.header_rect.height(),
-            short_tb.height()
+            home_metrics.header_rect.height() <= 48.0,
+            "home header should stay compact (<= 48px), got {:.1}",
+            home_metrics.header_rect.height()
+        );
+        assert!(
+            short_tb.height() > home_metrics.header_rect.height() && short_tb.height() <= 56.0,
+            "editor toolbar ({:.1}) should be larger than home header ({:.1}) for bigger icons",
+            short_tb.height(),
+            home_metrics.header_rect.height()
         );
 
         crate::open_notebook_in_editor(&mut app, 2);

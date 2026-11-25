@@ -747,6 +747,7 @@ pub(crate) fn render_new_notebook_footer(
         crate::sync_view_to_active_notebook(app);
         app.view.inspector_open = false;
         app.view.screen = crate::AppScreen::Editor;
+        crate::tab_strip::sync_open_tabs(app);
         return true;
     }
     outcome.close_modal

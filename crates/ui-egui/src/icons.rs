@@ -103,6 +103,7 @@ pub enum Icon {
     GripHorizontal,
     Text,
     GitHub,
+    Home,
 }
 
 /// Load the local outline SVG assigned to a semantic icon.
@@ -200,6 +201,7 @@ fn icon_svg(icon: Icon) -> &'static str {
         Icon::GripHorizontal => include_str!("../assets/icons/lucide/grip-horizontal.svg"),
         Icon::Text => include_str!("../assets/icons/lucide/type.svg"),
         Icon::GitHub => include_str!("../assets/icons/lucide/github.svg"),
+        Icon::Home => include_str!("../assets/icons/lucide/house.svg"),
     }
 }
 
@@ -312,6 +314,20 @@ impl ButtonStyle {
         }
     }
 
+    const fn toolbar() -> Self {
+        Self {
+            max_width: None,
+            height: TOOLBAR_CONTROL_HEIGHT,
+            min_width: TOOLBAR_CONTROL_HEIGHT,
+            corner_radius: 9,
+            icon_dim: TOOLBAR_ICON_DIM,
+            font_size: 13.0,
+            pad_left: 9.0,
+            gap: 6.0,
+            pad_right: 10.0,
+        }
+    }
+
     fn square(size: f32, icon_dim: f32, corner_radius: u8) -> Self {
         let safe_size = if size.is_finite() {
             size.clamp(16.0, 96.0)
@@ -400,6 +416,11 @@ pub fn tray_icon_button_width(ui: &egui::Ui, label: &str) -> f32 {
         Color32::BLACK,
     )
     .1
+}
+
+/// Measures the rendered width of a [`toolbar_icon_button`] with `label`.
+pub fn toolbar_icon_button_width(ui: &egui::Ui, label: &str) -> f32 {
+    layout_button_label_and_width(ui, Some(label), &ButtonStyle::toolbar(), Color32::BLACK).1
 }
 
 /// Measures the rendered width of a [`max_width_icon_button`] with `label` and `max_width`.
@@ -493,6 +514,31 @@ pub fn tray_icon_button(
         selected,
         enabled,
         &ButtonStyle::tray_compact(),
+        t,
+    )
+}
+
+/// Outer height of every control in the main editor toolbar row.
+pub const TOOLBAR_CONTROL_HEIGHT: f32 = 36.0;
+/// Icon size used by main editor toolbar controls.
+pub const TOOLBAR_ICON_DIM: f32 = 20.0;
+
+/// Large tactile button (`36.0` px tall, `20.0` px icon) for the main editor toolbar row.
+pub fn toolbar_icon_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: Option<&str>,
+    selected: bool,
+    enabled: bool,
+    t: &Tokens,
+) -> Response {
+    draw_styled_icon_button(
+        ui,
+        icon,
+        label,
+        selected,
+        enabled,
+        &ButtonStyle::toolbar(),
         t,
     )
 }
@@ -601,28 +647,78 @@ fn draw_styled_icon_button(
     }
 }
 
-const SIDEBAR_EDGE_HEIGHT: f32 = 28.0;
-const SIDEBAR_EDGE_MIN_WIDTH: f32 = 36.0;
-const SIDEBAR_EDGE_BAR_W: f32 = 3.0;
-const SIDEBAR_EDGE_PAD_OUTER: f32 = 9.0;
-const SIDEBAR_EDGE_ICON_DIM: f32 = 14.0;
-const SIDEBAR_EDGE_ICON_GAP: f32 = 5.0;
-const SIDEBAR_EDGE_CHEVRON_GAP: f32 = 4.0;
-const SIDEBAR_EDGE_CHEVRON_DIM: f32 = 12.0;
-const SIDEBAR_EDGE_PAD_INNER: f32 = 8.0;
-const SIDEBAR_EDGE_FONT_SIZE: f32 = 12.0;
-const SIDEBAR_EDGE_INNER_RADIUS: u8 = 14;
-const SIDEBAR_EDGE_CHROME_WITH_LABEL: f32 = SIDEBAR_EDGE_PAD_OUTER
-    + SIDEBAR_EDGE_ICON_DIM
-    + SIDEBAR_EDGE_ICON_GAP
-    + SIDEBAR_EDGE_CHEVRON_GAP
-    + SIDEBAR_EDGE_CHEVRON_DIM
-    + SIDEBAR_EDGE_PAD_INNER;
-const SIDEBAR_EDGE_CHROME_NO_LABEL: f32 = SIDEBAR_EDGE_PAD_OUTER
-    + SIDEBAR_EDGE_ICON_DIM
-    + SIDEBAR_EDGE_CHEVRON_GAP
-    + SIDEBAR_EDGE_CHEVRON_DIM
-    + SIDEBAR_EDGE_PAD_INNER;
+/// Size variant for [`sidebar_edge_button_sized`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SidebarEdgeSize {
+    /// Standard `28.0` px pull-tab used by Home and Profile headers.
+    #[default]
+    Standard,
+    /// Large `36.0` px pull-tab matching the main editor toolbar controls.
+    Toolbar,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EdgeMetrics {
+    height: f32,
+    min_width: f32,
+    bar_w: f32,
+    pad_outer: f32,
+    icon_dim: f32,
+    icon_gap: f32,
+    chevron_gap: f32,
+    chevron_dim: f32,
+    pad_inner: f32,
+    font_size: f32,
+    inner_radius: u8,
+}
+
+impl EdgeMetrics {
+    fn chrome_with_label(&self) -> f32 {
+        self.pad_outer
+            + self.icon_dim
+            + self.icon_gap
+            + self.chevron_gap
+            + self.chevron_dim
+            + self.pad_inner
+    }
+
+    fn chrome_no_label(&self) -> f32 {
+        self.pad_outer + self.icon_dim + self.chevron_gap + self.chevron_dim + self.pad_inner
+    }
+}
+
+impl SidebarEdgeSize {
+    const fn metrics(self) -> EdgeMetrics {
+        match self {
+            Self::Standard => EdgeMetrics {
+                height: 28.0,
+                min_width: 36.0,
+                bar_w: 3.0,
+                pad_outer: 9.0,
+                icon_dim: 14.0,
+                icon_gap: 5.0,
+                chevron_gap: 4.0,
+                chevron_dim: 12.0,
+                pad_inner: 8.0,
+                font_size: 12.0,
+                inner_radius: 14,
+            },
+            Self::Toolbar => EdgeMetrics {
+                height: TOOLBAR_CONTROL_HEIGHT,
+                min_width: 44.0,
+                bar_w: 3.0,
+                pad_outer: 11.0,
+                icon_dim: TOOLBAR_ICON_DIM,
+                icon_gap: 6.0,
+                chevron_gap: 4.0,
+                chevron_dim: 14.0,
+                pad_inner: 9.0,
+                font_size: 13.0,
+                inner_radius: 18,
+            },
+        }
+    }
+}
 
 /// Which window edge a flush sidebar drawer pull-tab attaches to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -647,17 +743,20 @@ fn layout_sidebar_edge_button(
     label: &str,
     max_width: Option<f32>,
     text_color: Color32,
+    m: &EdgeMetrics,
 ) -> (Option<std::sync::Arc<egui::Galley>>, f32) {
+    let chrome_with_label = m.chrome_with_label();
+    let chrome_no_label = m.chrome_no_label();
     let max_width = max_width
         .filter(|w| w.is_finite())
-        .map(|w| w.max(SIDEBAR_EDGE_MIN_WIDTH));
-    let show_label = !label.is_empty()
-        && max_width.is_none_or(|limit| limit >= SIDEBAR_EDGE_CHROME_WITH_LABEL + 12.0);
+        .map(|w| w.max(m.min_width));
+    let show_label =
+        !label.is_empty() && max_width.is_none_or(|limit| limit >= chrome_with_label + 12.0);
     let galley = if show_label {
-        let font = FontId::proportional(SIDEBAR_EDGE_FONT_SIZE);
+        let font = FontId::proportional(m.font_size);
         Some(match max_width {
             Some(limit_w) => {
-                let max_text_w = (limit_w - SIDEBAR_EDGE_CHROME_WITH_LABEL).max(12.0);
+                let max_text_w = (limit_w - chrome_with_label).max(12.0);
                 let mut job = egui::text::LayoutJob::single_section(
                     label.to_string(),
                     egui::TextFormat {
@@ -681,16 +780,12 @@ fn layout_sidebar_edge_button(
     };
 
     let width = match (max_width, &galley) {
-        (Some(limit_w), Some(galley)) => (SIDEBAR_EDGE_CHROME_WITH_LABEL + galley.size().x)
+        (Some(limit_w), Some(galley)) => (chrome_with_label + galley.size().x)
             .min(limit_w)
-            .max(SIDEBAR_EDGE_MIN_WIDTH),
-        (Some(limit_w), None) => SIDEBAR_EDGE_CHROME_NO_LABEL
-            .min(limit_w)
-            .max(SIDEBAR_EDGE_MIN_WIDTH),
-        (None, Some(galley)) => {
-            (SIDEBAR_EDGE_CHROME_WITH_LABEL + galley.size().x).max(SIDEBAR_EDGE_MIN_WIDTH)
-        }
-        (None, None) => SIDEBAR_EDGE_CHROME_NO_LABEL.max(SIDEBAR_EDGE_MIN_WIDTH),
+            .max(m.min_width),
+        (Some(limit_w), None) => chrome_no_label.min(limit_w).max(m.min_width),
+        (None, Some(galley)) => (chrome_with_label + galley.size().x).max(m.min_width),
+        (None, None) => chrome_no_label.max(m.min_width),
     };
 
     (galley, width)
@@ -698,7 +793,17 @@ fn layout_sidebar_edge_button(
 
 /// Measures the rendered width of a [`sidebar_edge_button`].
 pub fn sidebar_edge_button_width(ui: &egui::Ui, label: &str, max_width: Option<f32>) -> f32 {
-    layout_sidebar_edge_button(ui, label, max_width, Color32::BLACK).1
+    sidebar_edge_button_sized_width(ui, label, max_width, SidebarEdgeSize::Standard)
+}
+
+/// Measures the rendered width of a [`sidebar_edge_button_sized`].
+pub fn sidebar_edge_button_sized_width(
+    ui: &egui::Ui,
+    label: &str,
+    max_width: Option<f32>,
+    size: SidebarEdgeSize,
+) -> f32 {
+    layout_sidebar_edge_button(ui, label, max_width, Color32::BLACK, &size.metrics()).1
 }
 
 fn paint_sidebar_edge_chrome(
@@ -707,6 +812,7 @@ fn paint_sidebar_edge_chrome(
     edge: SidebarEdge,
     hover_t: f32,
     open_t: f32,
+    m: &EdgeMetrics,
     t: &Tokens,
 ) {
     let closed_fill = crate::motion::lerp_color(t.field_bg, t.accent_soft, hover_t * 0.55);
@@ -727,26 +833,20 @@ fn paint_sidebar_edge_chrome(
             CornerRadius {
                 nw: 0,
                 sw: 0,
-                ne: SIDEBAR_EDGE_INNER_RADIUS,
-                se: SIDEBAR_EDGE_INNER_RADIUS,
+                ne: m.inner_radius,
+                se: m.inner_radius,
             },
-            Rect::from_min_max(
-                rect.min,
-                pos2(rect.left() + SIDEBAR_EDGE_BAR_W, rect.bottom()),
-            ),
+            Rect::from_min_max(rect.min, pos2(rect.left() + m.bar_w, rect.bottom())),
         ),
         SidebarEdge::Right => (
             Rect::from_min_max(rect.min, pos2(rect.right() + 2.0, rect.bottom())),
             CornerRadius {
-                nw: SIDEBAR_EDGE_INNER_RADIUS,
-                sw: SIDEBAR_EDGE_INNER_RADIUS,
+                nw: m.inner_radius,
+                sw: m.inner_radius,
                 ne: 0,
                 se: 0,
             },
-            Rect::from_min_max(
-                pos2(rect.right() - SIDEBAR_EDGE_BAR_W, rect.top()),
-                rect.max,
-            ),
+            Rect::from_min_max(pos2(rect.right() - m.bar_w, rect.top()), rect.max),
         ),
     };
 
@@ -767,6 +867,7 @@ struct SidebarEdgeContentDraw<'a> {
     galley: Option<&'a std::sync::Arc<egui::Galley>>,
     hover_t: f32,
     open_t: f32,
+    m: EdgeMetrics,
 }
 
 fn paint_sidebar_edge_contents(
@@ -774,6 +875,7 @@ fn paint_sidebar_edge_contents(
     draw: &SidebarEdgeContentDraw<'_>,
     t: &Tokens,
 ) {
+    let m = &draw.m;
     let rect = draw.rect;
     let spec = draw.spec;
     let cy = rect.center().y;
@@ -798,32 +900,23 @@ fn paint_sidebar_edge_contents(
 
     let (icon_rect, chevron_rect, text_clip_max_x) = match spec.edge {
         SidebarEdge::Left => {
-            let icon_cx = rect.left() + SIDEBAR_EDGE_PAD_OUTER + SIDEBAR_EDGE_ICON_DIM * 0.5;
-            let chevron_cx =
-                rect.right() - SIDEBAR_EDGE_PAD_INNER - SIDEBAR_EDGE_CHEVRON_DIM * 0.5 + nudge_x;
-            let icon_rect =
-                Rect::from_center_size(pos2(icon_cx, cy), Vec2::splat(SIDEBAR_EDGE_ICON_DIM));
+            let icon_cx = rect.left() + m.pad_outer + m.icon_dim * 0.5;
+            let chevron_cx = rect.right() - m.pad_inner - m.chevron_dim * 0.5 + nudge_x;
+            let icon_rect = Rect::from_center_size(pos2(icon_cx, cy), Vec2::splat(m.icon_dim));
             let chevron_rect =
-                Rect::from_center_size(pos2(chevron_cx, cy), Vec2::splat(SIDEBAR_EDGE_CHEVRON_DIM));
-            let clip_max_x = (rect.right() - SIDEBAR_EDGE_PAD_INNER - SIDEBAR_EDGE_CHEVRON_DIM
-                + nudge_x.min(0.0)
-                - 2.0)
+                Rect::from_center_size(pos2(chevron_cx, cy), Vec2::splat(m.chevron_dim));
+            let clip_max_x = (rect.right() - m.pad_inner - m.chevron_dim + nudge_x.min(0.0) - 2.0)
                 .max(icon_rect.right());
             (icon_rect, chevron_rect, clip_max_x)
         }
         SidebarEdge::Right => {
-            let chevron_cx =
-                rect.left() + SIDEBAR_EDGE_PAD_INNER + SIDEBAR_EDGE_CHEVRON_DIM * 0.5 + nudge_x;
-            let icon_cx = rect.left()
-                + SIDEBAR_EDGE_PAD_INNER
-                + SIDEBAR_EDGE_CHEVRON_DIM
-                + SIDEBAR_EDGE_CHEVRON_GAP
-                + SIDEBAR_EDGE_ICON_DIM * 0.5;
+            let chevron_cx = rect.left() + m.pad_inner + m.chevron_dim * 0.5 + nudge_x;
+            let icon_cx =
+                rect.left() + m.pad_inner + m.chevron_dim + m.chevron_gap + m.icon_dim * 0.5;
             let chevron_rect =
-                Rect::from_center_size(pos2(chevron_cx, cy), Vec2::splat(SIDEBAR_EDGE_CHEVRON_DIM));
-            let icon_rect =
-                Rect::from_center_size(pos2(icon_cx, cy), Vec2::splat(SIDEBAR_EDGE_ICON_DIM));
-            let clip_max_x = (rect.right() - SIDEBAR_EDGE_PAD_OUTER + 2.0).max(icon_rect.right());
+                Rect::from_center_size(pos2(chevron_cx, cy), Vec2::splat(m.chevron_dim));
+            let icon_rect = Rect::from_center_size(pos2(icon_cx, cy), Vec2::splat(m.icon_dim));
+            let clip_max_x = (rect.right() - m.pad_outer + 2.0).max(icon_rect.right());
             (icon_rect, chevron_rect, clip_max_x)
         }
     };
@@ -831,7 +924,7 @@ fn paint_sidebar_edge_contents(
     let content_painter = painter.with_clip_rect(painter.clip_rect().intersect(rect));
     paint_icon(&content_painter, icon_rect, spec.icon, foreground);
     if let Some(galley) = draw.galley {
-        let text_x = icon_rect.right() + SIDEBAR_EDGE_ICON_GAP;
+        let text_x = icon_rect.right() + m.icon_gap;
         let text_pos = pos2(text_x, cy - galley.size().y * 0.5);
         let text_clip = Rect::from_min_max(
             pos2(text_x - 1.0, rect.top()),
@@ -850,19 +943,31 @@ pub fn sidebar_edge_button(
     spec: SidebarEdgeButtonSpec<'_>,
     t: &Tokens,
 ) -> Response {
+    sidebar_edge_button_sized(ui, spec, SidebarEdgeSize::Standard, t)
+}
+
+/// [`sidebar_edge_button`] rendered at an explicit [`SidebarEdgeSize`].
+pub fn sidebar_edge_button_sized(
+    ui: &mut egui::Ui,
+    spec: SidebarEdgeButtonSpec<'_>,
+    size: SidebarEdgeSize,
+    t: &Tokens,
+) -> Response {
+    let m = size.metrics();
     let base_color = if !spec.enabled {
         t.text_muted.gamma_multiply(0.55)
     } else {
         t.text
     };
-    let (galley, width) = layout_sidebar_edge_button(ui, spec.label, spec.max_width, base_color);
+    let (galley, width) =
+        layout_sidebar_edge_button(ui, spec.label, spec.max_width, base_color, &m);
 
     let sense = if spec.enabled {
         Sense::click()
     } else {
         Sense::hover()
     };
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, SIDEBAR_EDGE_HEIGHT), sense);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, m.height), sense);
     if ui.is_rect_visible(rect) {
         let hovered = spec.enabled && response.hovered();
         let hover_t = crate::motion::hover_factor(ui.ctx(), response.id.with("hov"), hovered);
@@ -872,7 +977,7 @@ pub fn sidebar_edge_button(
             0.0
         };
         let painter = ui.painter();
-        paint_sidebar_edge_chrome(painter, rect, spec.edge, hover_t, open_t, t);
+        paint_sidebar_edge_chrome(painter, rect, spec.edge, hover_t, open_t, &m, t);
         paint_sidebar_edge_contents(
             painter,
             &SidebarEdgeContentDraw {
@@ -881,6 +986,7 @@ pub fn sidebar_edge_button(
                 galley: galley.as_ref(),
                 hover_t,
                 open_t,
+                m,
             },
             t,
         );
@@ -899,6 +1005,8 @@ pub enum SwitchLayout {
     Compact,
     /// Inline floating-tray switch (`32.0` px tall) proportionally scaled for the context tray.
     TrayCompact,
+    /// Inline main-toolbar switch (`36.0` px tall) with large `20.0` px icons.
+    Toolbar,
     /// Full-width switch dividing `ui.available_width()` equally across all segments (`32.0` px tall).
     EqualWidth,
 }
@@ -934,6 +1042,16 @@ impl SwitchLayout {
                 font_size: 13.0,
                 icon_dim: 16.0,
                 pad_x: 8.5,
+                gap: 5.5,
+                equal_width: false,
+            },
+            Self::Toolbar => SwitchMetrics {
+                track_h: TOOLBAR_CONTROL_HEIGHT,
+                track_radius: 9,
+                pill_radius: 7,
+                font_size: 13.0,
+                icon_dim: TOOLBAR_ICON_DIM,
+                pad_x: 8.0,
                 gap: 5.5,
                 equal_width: false,
             },
@@ -1409,10 +1527,13 @@ pub fn section_card_header(ui: &mut egui::Ui, icon: Icon, title: &str, subtitle:
 #[cfg(test)]
 mod tests {
     use super::{
-        Icon, SidebarEdge, SidebarEdgeButtonSpec, SwitchLayout, SwitchOption,
-        max_width_icon_button, max_width_icon_button_width, paint_icon, segmented_switch,
-        sidebar_edge_button, sidebar_edge_button_width, toggle_switch, toggle_switch_row,
+        Icon, SidebarEdge, SidebarEdgeButtonSpec, SidebarEdgeSize, SwitchLayout, SwitchOption,
+        TOOLBAR_CONTROL_HEIGHT, max_width_icon_button, max_width_icon_button_width, paint_icon,
+        segmented_switch, sidebar_edge_button, sidebar_edge_button_sized,
+        sidebar_edge_button_sized_width, sidebar_edge_button_width, toggle_switch,
+        toggle_switch_row, toolbar_icon_button,
     };
+    use crate::theme::Tokens;
     use egui::{Color32, Pos2, RawInput, Rect, Vec2, epaint::Primitive};
 
     fn all_icons() -> &'static [(Icon, &'static str)] {
@@ -1509,6 +1630,7 @@ mod tests {
             (Icon::GripHorizontal, "GripHorizontal"),
             (Icon::Text, "Text"),
             (Icon::GitHub, "GitHub"),
+            (Icon::Home, "Home"),
         ]
     }
 
@@ -2098,5 +2220,81 @@ mod tests {
             assert!(inf_rect.width().is_finite() && inf_rect.width() >= 36.0);
             assert_eq!(inf_text, "Math");
         }
+    }
+
+    #[test]
+    fn toolbar_sized_controls_scale_up_and_omit_text_when_unlabeled() {
+        let ctx = egui::Context::default();
+        let t = Tokens::light();
+        let mut btn_rect = Rect::NOTHING;
+        let mut switch_rect = Rect::NOTHING;
+        let mut edge_left = Rect::NOTHING;
+        let mut edge_right = Rect::NOTHING;
+        let mut edge_left_w = 0.0_f32;
+        let out = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 120.0))),
+                ..Default::default()
+            },
+            |ui| {
+                ui.horizontal(|ui| {
+                    edge_left = sidebar_edge_button_sized(
+                        ui,
+                        SidebarEdgeButtonSpec {
+                            edge: SidebarEdge::Left,
+                            icon: Icon::Notebook,
+                            label: "",
+                            max_width: None,
+                            open: false,
+                            enabled: true,
+                        },
+                        SidebarEdgeSize::Toolbar,
+                        &t,
+                    )
+                    .rect;
+                    edge_left_w =
+                        sidebar_edge_button_sized_width(ui, "", None, SidebarEdgeSize::Toolbar);
+                    btn_rect = toolbar_icon_button(ui, Icon::Library, None, false, true, &t).rect;
+                    let opts = [
+                        SwitchOption::new(Some(Icon::Select), None, "Select", true),
+                        SwitchOption::new(Some(Icon::FountainPen), None, "Pen", true),
+                    ];
+                    switch_rect = segmented_switch(
+                        ui,
+                        "tb_sized_sw",
+                        &opts,
+                        Some(0),
+                        SwitchLayout::Toolbar,
+                        &t,
+                    )
+                    .1
+                    .rect;
+                    edge_right = sidebar_edge_button_sized(
+                        ui,
+                        SidebarEdgeButtonSpec {
+                            edge: SidebarEdge::Right,
+                            icon: Icon::Settings,
+                            label: "",
+                            max_width: None,
+                            open: false,
+                            enabled: true,
+                        },
+                        SidebarEdgeSize::Toolbar,
+                        &t,
+                    )
+                    .rect;
+                });
+            },
+        );
+        assert!(collect_galleys(&out.shapes).is_empty());
+        out.drop_without_applying_deltas();
+
+        assert!((btn_rect.height() - TOOLBAR_CONTROL_HEIGHT).abs() < 0.01);
+        assert!((btn_rect.width() - TOOLBAR_CONTROL_HEIGHT).abs() < 0.01);
+        assert!((switch_rect.height() - TOOLBAR_CONTROL_HEIGHT).abs() < 0.01);
+        assert!((edge_left.height() - TOOLBAR_CONTROL_HEIGHT).abs() < 0.01);
+        assert!((edge_right.height() - TOOLBAR_CONTROL_HEIGHT).abs() < 0.01);
+        assert!((edge_left.width() - edge_left_w).abs() < 0.01);
+        assert!((edge_left.width() - 58.0).abs() < 0.01);
     }
 }
