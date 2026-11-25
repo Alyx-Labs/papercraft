@@ -356,11 +356,11 @@ fn pressure_ink_color(pen: &PenSettings, p_curved: f32) -> Color {
         1.0
     };
     let min_strength = if pen.pressure_opacity_min.is_finite() {
-        pen.pressure_opacity_min.clamp(0.68, 1.0)
+        pen.pressure_opacity_min.clamp(0.45, 1.0)
     } else {
-        0.68
+        0.50
     };
-    // The square root gives light touches a visible response without keeping ordinary pressure pale.
+    // Light touches start with a soft, lighter tone that firms up quickly at normal pressure.
     let strength = lerpf(min_strength, 1.0, p.sqrt());
     let base = pen.color.sanitized();
     Color::new(
@@ -604,29 +604,102 @@ mod tests {
     }
 
     #[test]
-    fn comfortable_stylus_pressure_reaches_natural_width_and_rich_opacity() {
+    fn normal_stylus_pressure_reaches_natural_width_and_rich_opacity() {
         for pen in [
             PenSettings::fountain_pen(),
             PenSettings::ball_pen(),
             PenSettings::brush_pen(),
         ] {
-            let light_writing = vec![
-                StrokeSample::from_xy_pressure(0.0, 0.0, 0.30),
-                StrokeSample::from_xy_pressure(50.0, 0.0, 0.30),
+            let normal_writing = vec![
+                StrokeSample::from_xy_pressure(0.0, 0.0, 0.55),
+                StrokeSample::from_xy_pressure(50.0, 0.0, 0.55),
             ];
-            let nodes = evaluate_spine(&pen, &light_writing);
+            let nodes = evaluate_spine(&pen, &normal_writing);
             assert!(
                 nodes[0].alpha >= 0.85,
-                "{:?} should render crisp rich ink at comfortable pressure 0.30, got {}",
+                "{:?} should render crisp rich ink at normal pressure 0.55, got {}",
                 pen.kind,
                 nodes[0].alpha
             );
             assert!(
-                nodes[0].radius >= pen.size * 0.15,
-                "{:?} should retain healthy stroke width at pressure 0.30, got radius {}",
+                nodes[0].radius >= pen.size * 0.25,
+                "{:?} should reach natural stroke width at normal pressure 0.55, got radius {}",
                 pen.kind,
                 nodes[0].radius
             );
+        }
+    }
+
+    #[test]
+    fn light_stylus_pressure_starts_fine_and_soft() {
+        let eval_mid = |pen: &PenSettings, pressure: f32| -> SpineNode {
+            // Vary endpoints slightly when testing full 1.0 pressure so stylus streams do not look
+            // like a constant-1.0 mouse stroke (`constant_mouse_pressure` velocity simulation).
+            let end_p = if pressure >= 0.999 { 0.80 } else { pressure };
+            let samples = vec![
+                StrokeSample::from_xy_pressure(0.0, 0.0, end_p),
+                StrokeSample::from_xy_pressure(50.0, 0.0, pressure),
+                StrokeSample::from_xy_pressure(100.0, 0.0, end_p),
+            ];
+            evaluate_spine(pen, &samples)[1]
+        };
+
+        for mut pen in [
+            PenSettings::fountain_pen(),
+            PenSettings::ball_pen(),
+            PenSettings::brush_pen(),
+            PenSettings::pencil(),
+        ] {
+            pen.color = Color::BLACK;
+            let light = eval_mid(&pen, 0.10);
+            let normal = eval_mid(&pen, 0.55);
+            let firm = eval_mid(&pen, 1.0);
+
+            assert!(
+                light.radius <= normal.radius * 0.6,
+                "{:?} light radius {} should be <= 60% of normal radius {}",
+                pen.kind,
+                light.radius,
+                normal.radius
+            );
+            assert!(
+                normal.radius < firm.radius,
+                "{:?} normal radius {} should stay below firm radius {}",
+                pen.kind,
+                normal.radius,
+                firm.radius
+            );
+            assert!(
+                (firm.radius - pen.size * 0.5).abs() < 1e-3,
+                "{:?} firm radius {} should match half pen size {}",
+                pen.kind,
+                firm.radius,
+                pen.size * 0.5
+            );
+            assert!(
+                light.color.r >= 0.35,
+                "{:?} light touch should have soft ink tone, got r={}",
+                pen.kind,
+                light.color.r
+            );
+            assert!(
+                light.color.r > normal.color.r,
+                "{:?} light tone r={} should be lighter than normal r={}",
+                pen.kind,
+                light.color.r,
+                normal.color.r
+            );
+
+            let mut prev_radius = 0.0_f32;
+            for p in [0.05, 0.10, 0.20, 0.30, 0.45, 0.60, 0.80, 1.0] {
+                let r = eval_mid(&pen, p).radius;
+                assert!(
+                    r + 1e-6 >= prev_radius,
+                    "{:?} radius decreased at pressure {p}: {r} < {prev_radius}",
+                    pen.kind
+                );
+                prev_radius = r;
+            }
         }
     }
 }

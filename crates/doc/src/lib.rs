@@ -3355,6 +3355,7 @@ impl SmoothingConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PressureCurvePreset {
     Linear,
+    GentleStart,
     Soft,
     Firm,
     SCurve,
@@ -3364,6 +3365,7 @@ pub enum PressureCurvePreset {
 impl PressureCurvePreset {
     pub const ALL: &[Self] = &[
         Self::Linear,
+        Self::GentleStart,
         Self::Soft,
         Self::Firm,
         Self::SCurve,
@@ -3373,6 +3375,7 @@ impl PressureCurvePreset {
     pub fn label(self) -> &'static str {
         match self {
             Self::Linear => "Linear",
+            Self::GentleStart => "Gentle Start",
             Self::Soft => "Soft",
             Self::Firm => "Firm",
             Self::SCurve => "S-Curve",
@@ -3384,6 +3387,9 @@ impl PressureCurvePreset {
         match self {
             Self::Linear => {
                 "Direct 1:1 response between physical stylus force and stroke thickness."
+            }
+            Self::GentleStart => {
+                "Light touches draw fine, delicate lines; the stroke widens naturally at normal writing pressure."
             }
             Self::Soft => "Reaches full stroke width with a lighter touch to reduce hand fatigue.",
             Self::Firm => {
@@ -3690,6 +3696,14 @@ impl PressureCurve {
     pub fn from_preset(preset: PressureCurvePreset) -> Self {
         let pts = match preset {
             PressureCurvePreset::Linear => vec![[0.0, 0.0], [1.0, 1.0]],
+            PressureCurvePreset::GentleStart => vec![
+                [0.0, 0.0],
+                [0.1, 0.03],
+                [0.25, 0.12],
+                [0.5, 0.48],
+                [0.75, 0.80],
+                [1.0, 1.0],
+            ],
             PressureCurvePreset::Soft => {
                 vec![
                     [0.0, 0.0],
@@ -3888,8 +3902,8 @@ impl PenSettings {
             opacity: 1.0,
             hardness: 0.95,
             pressure_enabled: true,
-            pressure_size_min: 0.18,
-            pressure_opacity_min: 0.68,
+            pressure_size_min: 0.10,
+            pressure_opacity_min: 0.50,
             velocity_pressure_simulation: true,
             tilt_sensitivity: 0.25,
             nib_flatness: 0.68,
@@ -3897,7 +3911,7 @@ impl PenSettings {
             start_taper_px: 0.0,
             end_taper_px: 0.0,
             smoothing: SmoothingConfig::default(),
-            pressure_curve: PressureCurve::from_preset(PressureCurvePreset::Linear),
+            pressure_curve: PressureCurve::from_preset(PressureCurvePreset::GentleStart),
         }
     }
 
@@ -3909,8 +3923,8 @@ impl PenSettings {
             opacity: 1.0,
             hardness: 0.98,
             pressure_enabled: true,
-            pressure_size_min: 0.55,
-            pressure_opacity_min: 0.68,
+            pressure_size_min: 0.30,
+            pressure_opacity_min: 0.50,
             velocity_pressure_simulation: false,
             tilt_sensitivity: 0.0,
             nib_flatness: 0.0,
@@ -3918,7 +3932,7 @@ impl PenSettings {
             start_taper_px: 0.0,
             end_taper_px: 0.0,
             smoothing: SmoothingConfig::default(),
-            pressure_curve: PressureCurve::from_preset(PressureCurvePreset::Linear),
+            pressure_curve: PressureCurve::from_preset(PressureCurvePreset::GentleStart),
         }
     }
 
@@ -3930,8 +3944,8 @@ impl PenSettings {
             opacity: 1.0,
             hardness: 0.88,
             pressure_enabled: true,
-            pressure_size_min: 0.10,
-            pressure_opacity_min: 0.68,
+            pressure_size_min: 0.06,
+            pressure_opacity_min: 0.50,
             velocity_pressure_simulation: true,
             tilt_sensitivity: 0.85,
             nib_flatness: 0.15,
@@ -3939,7 +3953,7 @@ impl PenSettings {
             start_taper_px: 0.0,
             end_taper_px: 0.0,
             smoothing: SmoothingConfig::default(),
-            pressure_curve: PressureCurve::from_preset(PressureCurvePreset::Linear),
+            pressure_curve: PressureCurve::from_preset(PressureCurvePreset::GentleStart),
         }
     }
 
@@ -3972,7 +3986,7 @@ impl PenSettings {
             opacity: 0.78,
             hardness: 0.72,
             pressure_enabled: true,
-            pressure_size_min: 0.42,
+            pressure_size_min: 0.25,
             pressure_opacity_min: 0.35,
             velocity_pressure_simulation: true,
             tilt_sensitivity: 0.90,
@@ -3981,7 +3995,7 @@ impl PenSettings {
             start_taper_px: 0.0,
             end_taper_px: 0.0,
             smoothing: SmoothingConfig::default(),
-            pressure_curve: PressureCurve::from_preset(PressureCurvePreset::Linear),
+            pressure_curve: PressureCurve::from_preset(PressureCurvePreset::GentleStart),
         }
     }
 
@@ -3992,7 +4006,7 @@ impl PenSettings {
         let (op_min_floor, op_min_fallback) = if matches!(self.kind, PenKind::Pencil) {
             (0.15, 0.35)
         } else {
-            (0.68, 0.68)
+            (0.45, 0.50)
         };
         Self {
             kind: self.kind,
@@ -6580,7 +6594,7 @@ fn sanitize_swatch_list(raw: &[Color], fallback: fn() -> Vec<Color>) -> Vec<Colo
     let mut out: Vec<Color> = raw
         .iter()
         .take(MAX_PALETTE_COLORS)
-        .map(|c| c.sanitized().with_alpha(1.0))
+        .map(|c| c.sanitized())
         .collect();
     if out.is_empty() {
         out = fallback();
@@ -6730,7 +6744,7 @@ impl ColorPalettePreset {
             .ink_colors
             .iter()
             .take(MAX_PALETTE_COLORS)
-            .map(|c| c.sanitized().with_alpha(1.0))
+            .map(|c| c.sanitized())
             .collect();
         if ink_colors.is_empty() {
             ink_colors = UserStudioConfig::default_ink_palette();
@@ -6739,7 +6753,7 @@ impl ColorPalettePreset {
             .highlighter_colors
             .iter()
             .take(MAX_PALETTE_COLORS)
-            .map(|c| c.sanitized().with_alpha(1.0))
+            .map(|c| c.sanitized())
             .collect();
         if highlighter_colors.is_empty() {
             highlighter_colors = UserStudioConfig::default_highlighter_palette();
@@ -7058,7 +7072,7 @@ impl StyleFavorite {
         Self {
             id: sanitize_preset_id(&self.id),
             kind: self.kind,
-            color: self.color.sanitized().with_alpha(1.0),
+            color: self.color.sanitized(),
             size,
         }
     }
@@ -7653,7 +7667,7 @@ impl UserStudioConfig {
     }
 
     pub fn set_wildcard_color(&mut self, target: PaletteTarget, color: Color) {
-        let clean = color.sanitized().with_alpha(1.0);
+        let clean = color.sanitized();
         match target {
             PaletteTarget::Ink => self.wildcard_ink = clean,
             PaletteTarget::Highlighter => self.wildcard_highlighter = clean,
@@ -8021,8 +8035,8 @@ impl UserStudioConfig {
             pen_smoothings,
             ink_palette: synced_ink,
             highlighter_palette: synced_hi,
-            wildcard_ink: self.wildcard_ink.sanitized().with_alpha(1.0),
-            wildcard_highlighter: self.wildcard_highlighter.sanitized().with_alpha(1.0),
+            wildcard_ink: self.wildcard_ink.sanitized(),
+            wildcard_highlighter: self.wildcard_highlighter.sanitized(),
             palette_presets,
             active_palette_id,
             custom_presets: presets,
@@ -8108,6 +8122,28 @@ mod tests {
                 prev = y;
             }
         }
+    }
+
+    #[test]
+    fn gentle_start_curve_keeps_light_touch_fine() {
+        let curve = PressureCurve::from_preset(PressureCurvePreset::GentleStart);
+        assert!(curve.eval(0.1) <= 0.05);
+        assert!(curve.eval(0.25) <= 0.15);
+        assert!((0.40..=0.60).contains(&curve.eval(0.5)));
+        assert!((curve.eval(1.0) - 1.0).abs() < 1e-5);
+
+        for pen in [
+            PenSettings::fountain_pen(),
+            PenSettings::ball_pen(),
+            PenSettings::brush_pen(),
+            PenSettings::pencil(),
+        ] {
+            assert_eq!(pen.pressure_curve, curve, "{:?}", pen.kind);
+        }
+        assert_eq!(
+            PenSettings::highlighter().pressure_curve,
+            PressureCurve::from_preset(PressureCurvePreset::Constant)
+        );
     }
 
     #[test]
@@ -8387,7 +8423,10 @@ mod tests {
         let clean = hostile.sanitized();
         assert_eq!(clean.ink_palette.len(), INK_PALETTE.len());
         assert_eq!(clean.highlighter_palette.len(), MAX_PALETTE_COLORS);
-        assert_eq!(clean.highlighter_palette[0].a, 1.0);
+        assert!((clean.highlighter_palette[0].a - 0.2).abs() < 1e-6);
+        assert_eq!(clean.highlighter_palette[0].r, 0.0);
+        assert_eq!(clean.highlighter_palette[0].g, 1.0);
+        assert_eq!(clean.highlighter_palette[0].b, 0.0);
         assert_eq!(clean.custom_presets.len(), 2);
         assert_eq!(clean.custom_presets[0].name, "Custom Preset");
         assert_eq!(clean.custom_presets[0].description, "HelloWorld");
@@ -9192,8 +9231,8 @@ mod tests {
             ..UserStudioConfig::default()
         };
         let mut clean = dirty.sanitized();
-        assert_eq!(clean.wildcard_ink, Color::new(0.0, 1.0, 0.0, 1.0));
-        assert_eq!(clean.wildcard_highlighter, Color::new(0.5, 0.0, 0.25, 1.0));
+        assert_eq!(clean.wildcard_ink, Color::new(0.0, 1.0, 0.0, 0.25));
+        assert_eq!(clean.wildcard_highlighter, Color::new(0.5, 0.0, 0.25, 0.1));
         assert_eq!(clean.palette_presets, ColorPalettePreset::built_ins());
 
         let blue = Color::from_hex("#2563EB").unwrap();
@@ -9202,11 +9241,11 @@ mod tests {
         clean.set_wildcard_color(PaletteTarget::Highlighter, lime.with_alpha(0.5));
         assert_eq!(
             clean.wildcard_color(PaletteTarget::Ink),
-            blue.with_alpha(1.0)
+            blue.with_alpha(0.3)
         );
         assert_eq!(
             clean.wildcard_color(PaletteTarget::Highlighter),
-            lime.with_alpha(1.0)
+            lime.with_alpha(0.5)
         );
     }
 

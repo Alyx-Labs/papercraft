@@ -10734,7 +10734,8 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = setup_editor_app(&ctx);
         app.view.shape_fill_enabled = true;
-        app.view.shape_fill_opacity = 0.45;
+        app.view.shape_fill_color =
+            Some(papercraft_color::Color::from_rgba8(0x28, 0x66, 0xE8, 115));
         app.view.shape_line_style = papercraft_doc::ShapeLineStyle::Dashed;
         let star_pts: Vec<Point> = (0..10)
             .map(|i| {

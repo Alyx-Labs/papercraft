@@ -126,6 +126,12 @@ impl Color {
         format!("#{r:02X}{g:02X}{b:02X}")
     }
 
+    /// Formats all RGBA channels as `#RRGGBBAA`.
+    pub fn to_hex_rgba(self) -> String {
+        let [r, g, b, a] = self.to_rgba8();
+        format!("#{r:02X}{g:02X}{b:02X}{a:02X}")
+    }
+
     /// Converts RGB channels to `[hue, saturation, value]` in `0.0..=1.0`.
     pub fn to_hsv(self) -> [f32; 3] {
         let s = self.sanitized();
@@ -935,5 +941,20 @@ mod tests {
 
         let hostile = Color::from_hsv(f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::NAN);
         assert!(hostile.r.is_finite() && hostile.g.is_finite() && hostile.b.is_finite());
+    }
+
+    #[test]
+    fn hex_rgba_roundtrips_translucent_and_transparent_colors() {
+        let semi = Color::from_rgba8(0x28, 0x66, 0xE8, 0x80);
+        assert_eq!(semi.to_hex(), "#2866E8");
+        assert_eq!(semi.to_hex_rgba(), "#2866E880");
+        assert_eq!(Color::from_hex(&semi.to_hex_rgba()).unwrap(), semi);
+
+        let clear = Color::from_rgba8(0xEF, 0x44, 0x44, 0x00);
+        assert_eq!(clear.to_hex_rgba(), "#EF444400");
+        assert_eq!(
+            Color::from_hex(&clear.to_hex_rgba()).unwrap().to_rgba8(),
+            [0xEF, 0x44, 0x44, 0x00]
+        );
     }
 }

@@ -12,7 +12,9 @@ use papercraft_geom::{Affine2, Point};
 use serde_json::json;
 
 use crate::PaperCraftApp;
-use crate::color_picker::{ColorPopoverMode, same_rgb};
+use crate::color_picker::{
+    ColorPopoverMode, format_color_label, paint_checkerboard_circle, same_rgb, same_rgba,
+};
 use crate::icons::{
     Icon, SquareButtonSpec, SwitchLayout, SwitchOption, compact_icon_button,
     compact_icon_button_width, icon_button, max_width_icon_button, max_width_icon_button_width,
@@ -522,11 +524,18 @@ fn paint_path_size_slider(
         t.field_bg,
         Stroke::new(2.5, fill_color),
     );
-    let ink_c32 = to_color32(spec.display_color);
-    let core_color = if color_contrast_dist(ink_c32, t.field_bg) > 0.16 {
-        ink_c32
+    let clean_c = spec.display_color.sanitized();
+    let core_color = if clean_c.a <= 0.01 {
+        t.text_muted
+    } else if clean_c.a < 0.25 {
+        to_color32(clean_c.with_alpha(0.25))
     } else {
-        fill_color
+        let ink_c32 = to_color32(clean_c);
+        if color_contrast_dist(ink_c32, t.field_bg) > 0.16 {
+            ink_c32
+        } else {
+            fill_color
+        }
     };
     p.circle_filled(thumb_center, 3.0, core_color);
     thumb_center
@@ -614,13 +623,19 @@ fn push_path_size_controls<'a>(
     for (idx, (label, preset_size)) in spec.presets.iter().copied().enumerate() {
         let selected = (spec.current - preset_size).abs() < 0.3;
         let dot_r = [3.1_f32, 5.3, 7.8][idx];
-        let disp_color = spec.display_color;
+        let disp_color = spec.display_color.sanitized();
         let tip = format!("{}{label}", spec.preset_tooltip_prefix);
         let apply = on_apply.clone();
         let draw_fn = move |app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens| {
             let (rect, resp, _) = draw_size_tile_bg(ui, t, selected);
-            ui.painter()
-                .circle_filled(rect.center(), dot_r, to_color32(disp_color));
+            let dot_col = if disp_color.a <= 0.01 {
+                t.text_muted
+            } else if disp_color.a < 0.25 {
+                to_color32(disp_color.with_alpha(0.25))
+            } else {
+                to_color32(disp_color)
+            };
+            ui.painter().circle_filled(rect.center(), dot_r, dot_col);
             if resp.on_hover_text(tip).clicked() {
                 apply(app, preset_size, true, true);
             }
@@ -683,7 +698,11 @@ fn color_dot_sized(
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         let center = rect.center();
-        p.circle_filled(center, dot_r, to_color32(c));
+        let clean = c.sanitized();
+        if clean.a < 0.99 {
+            paint_checkerboard_circle(p, center, dot_r, t);
+        }
+        p.circle_filled(center, dot_r, to_color32(clean));
         p.circle_stroke(center, ring_r, Stroke::new(ring_w, ring_c));
     }
     resp.on_hover_text(tooltip)
@@ -726,7 +745,11 @@ fn wildcard_dot_sized(
         }
 
         let fill_r = 5.8 * scale;
-        p.circle_filled(center, fill_r, to_color32(c));
+        let clean = c.sanitized();
+        if clean.a < 0.99 {
+            paint_checkerboard_circle(p, center, fill_r, t);
+        }
+        p.circle_filled(center, fill_r, to_color32(clean));
         let inner_rim = if t.is_dark {
             Color32::from_white_alpha(44)
         } else {
@@ -1353,15 +1376,6 @@ fn plan_dock_rows(
     out
 }
 
-fn opacity_pill_width(ui: &egui::Ui, label: &str) -> f32 {
-    let galley = ui.painter().layout_no_wrap(
-        label.to_string(),
-        FontId::proportional(11.5),
-        Color32::WHITE,
-    );
-    (galley.size().x + ui.spacing().button_padding.x * 2.0).max(34.0)
-}
-
 const SHAPE_KIND_ITEMS: [(ShapeKind, Icon); 6] = [
     (ShapeKind::Line, Icon::LineShape),
     (ShapeKind::Rectangle, Icon::RectangleShape),
@@ -1501,69 +1515,9 @@ fn push_shape_quick_bar<'a>(app: &PaperCraftApp, ui: &egui::Ui, flow: &mut DockF
     });
 
     flow.divider();
-    let active_fill = effective_shape_insert_fill(app);
-    push_shape_style_controls(
-        flow,
-        ui,
-        active_fill,
-        Some(app.view.shape_line_style),
-        app.view.shape_fill_opacity,
-        |app, action| match action {
-            ShapeStyleAction::ToggleFill => {
-                app.view.shape_fill_enabled = !app.view.shape_fill_enabled;
-                if app.view.shape_fill_enabled {
-                    if app.view.shape_fill_color.is_none() {
-                        let seed = effective_shape_insert_border(app)
-                            .unwrap_or_else(|| app.session.active_pen().color)
-                            .with_alpha(1.0);
-                        app.view.shape_fill_color = Some(seed);
-                    }
-                    app.view.shape_color_target = crate::ShapeColorTarget::Fill;
-                }
-            }
-            ShapeStyleAction::SetFillOpacity(alpha) => {
-                app.view.shape_fill_opacity = alpha;
-                app.view.shape_fill_enabled = true;
-                if app.view.shape_fill_color.is_none() {
-                    let seed = effective_shape_insert_border(app)
-                        .unwrap_or_else(|| app.session.active_pen().color)
-                        .with_alpha(1.0);
-                    app.view.shape_fill_color = Some(seed);
-                }
-            }
-            ShapeStyleAction::SetLineStyle(style) => {
-                app.view.shape_line_style = style;
-            }
-        },
-    );
-}
-
-#[derive(Clone, Copy)]
-enum ShapeStyleAction {
-    ToggleFill,
-    SetFillOpacity(f32),
-    SetLineStyle(ShapeLineStyle),
-}
-
-fn draw_opacity_pill(ui: &mut egui::Ui, label: &str, selected: bool, t: &Tokens) -> egui::Response {
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).size(11.5).color(if selected {
-            t.accent
-        } else {
-            t.text_muted
-        }))
-        .fill(if selected {
-            t.accent_soft
-        } else {
-            Color32::TRANSPARENT
-        })
-        .stroke(Stroke::new(
-            if selected { 1.1 } else { 0.8 },
-            if selected { t.accent } else { t.border },
-        ))
-        .corner_radius(CornerRadius::same(7))
-        .min_size(Vec2::new(34.0, CONTEXT_TRAY_TILE_SIZE)),
-    )
+    push_shape_line_style_controls(flow, Some(app.view.shape_line_style), |app, style| {
+        app.view.shape_line_style = style;
+    });
 }
 
 fn draw_line_style_button(
@@ -1612,52 +1566,17 @@ fn draw_line_style_button(
     resp.on_hover_text(tip)
 }
 
-fn push_shape_style_controls<'a>(
+fn push_shape_line_style_controls<'a>(
     flow: &mut DockFlow<'a>,
-    ui: &egui::Ui,
-    active_fill: Option<Color>,
     active_line_style: Option<ShapeLineStyle>,
-    default_opacity: f32,
-    on_action: impl Fn(&mut PaperCraftApp, ShapeStyleAction) + Clone + 'a,
+    on_select: impl Fn(&mut PaperCraftApp, ShapeLineStyle) + Clone + 'a,
 ) {
-    let fill_on = active_fill.is_some();
-    let cb = on_action.clone();
-    flow.push(tray_icon_button_width(ui, "Fill"), move |app, ui, t| {
-        if tray_icon_button(ui, Icon::FillBucket, Some("Fill"), fill_on, true, t)
-            .on_hover_text("Toggle shape interior fill and opacity")
-            .clicked()
-        {
-            cb(app, ShapeStyleAction::ToggleFill);
-        }
-    });
-
-    if let Some(fill) = active_fill {
-        let cur_alpha = if fill.a > 0.01 {
-            fill.a
-        } else {
-            default_opacity
-        };
-        for (label, alpha) in [("20%", 0.20_f32), ("45%", 0.45), ("85%", 0.85)] {
-            let cb = on_action.clone();
-            let pill_w = opacity_pill_width(ui, label);
-            flow.push_cohesive(pill_w, move |app, ui, t| {
-                if draw_opacity_pill(ui, label, (cur_alpha - alpha).abs() < 0.09, t)
-                    .on_hover_text(format!("Set shape fill opacity to {label}"))
-                    .clicked()
-                {
-                    cb(app, ShapeStyleAction::SetFillOpacity(alpha));
-                }
-            });
-        }
-    }
-
-    flow.divider();
     for (idx, &style) in ShapeLineStyle::ALL.iter().enumerate() {
         let selected = active_line_style == Some(style);
-        let cb = on_action.clone();
+        let cb = on_select.clone();
         let draw_fn = move |app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens| {
             if draw_line_style_button(ui, style, selected, t).clicked() {
-                cb(app, ShapeStyleAction::SetLineStyle(style));
+                cb(app, style);
             }
         };
         if idx == 0 {
@@ -1707,22 +1626,23 @@ fn set_selected_color(app: &mut PaperCraftApp, color: Color) {
 }
 
 pub(crate) fn effective_shape_insert_border(app: &PaperCraftApp) -> Option<Color> {
-    app.view.shape_border_enabled.then(|| {
-        app.view
-            .shape_border_color
-            .unwrap_or_else(|| app.session.active_pen().color)
-            .with_alpha(1.0)
-    })
+    app.view
+        .shape_border_enabled
+        .then(|| {
+            app.view
+                .shape_border_color
+                .unwrap_or_else(|| app.session.active_pen().color)
+                .sanitized()
+        })
+        .filter(|c| c.a > 0.0)
 }
 
 pub(crate) fn effective_shape_insert_fill(app: &PaperCraftApp) -> Option<Color> {
-    app.view.shape_fill_enabled.then(|| {
-        app.view
-            .shape_fill_color
-            .or(app.view.shape_border_color)
-            .unwrap_or_else(|| app.session.active_pen().color)
-            .with_alpha(app.view.shape_fill_opacity.clamp(0.15, 0.95))
-    })
+    app.view
+        .shape_fill_enabled
+        .then(|| app.view.shape_fill_color.map(Color::sanitized))
+        .flatten()
+        .filter(|c| c.a > 0.0)
 }
 
 pub(crate) fn is_shape_color_context(app: &PaperCraftApp) -> bool {
@@ -1757,15 +1677,17 @@ pub(crate) fn apply_shape_color_from_dock(app: &mut PaperCraftApp, color: Option
     if app.view.shape_insert_mode {
         match (target_channel, color) {
             (crate::ShapeColorTarget::Border, Some(c)) => {
-                app.view.shape_border_enabled = true;
-                app.view.shape_border_color = Some(c.with_alpha(1.0));
+                let clean = c.sanitized();
+                app.view.shape_border_enabled = clean.a > 0.0;
+                app.view.shape_border_color = Some(clean);
             }
             (crate::ShapeColorTarget::Border, None) => {
                 app.view.shape_border_enabled = false;
             }
             (crate::ShapeColorTarget::Fill, Some(c)) => {
-                app.view.shape_fill_enabled = true;
-                app.view.shape_fill_color = Some(c.with_alpha(1.0));
+                let clean = c.sanitized();
+                app.view.shape_fill_enabled = clean.a > 0.0;
+                app.view.shape_fill_color = Some(clean);
             }
             (crate::ShapeColorTarget::Fill, None) => {
                 app.view.shape_fill_enabled = false;
@@ -1792,27 +1714,18 @@ pub(crate) fn apply_shape_color_from_dock(app: &mut PaperCraftApp, color: Option
         let targets = selected_targets_json(&selection);
         let params = match (target_channel, color) {
             (crate::ShapeColorTarget::Border, Some(c)) => {
-                json!({ "targets": targets, "color": c.with_alpha(1.0) })
+                json!({ "targets": targets, "color": c.sanitized() })
             }
             (crate::ShapeColorTarget::Border, None) => {
                 json!({ "targets": targets, "color": Color::TRANSPARENT })
             }
             (crate::ShapeColorTarget::Fill, Some(c)) => {
-                let alpha = selection
-                    .iter()
-                    .find_map(|object| match object {
-                        crate::SelectedObject::Shape(idx) => app
-                            .session
-                            .doc
-                            .shapes
-                            .get(*idx)
-                            .and_then(|s| s.fill_color)
-                            .filter(|fc| fc.a > 0.01)
-                            .map(|fc| fc.a),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| app.view.shape_fill_opacity.clamp(0.15, 0.95));
-                json!({ "targets": targets, "fill_color": c.with_alpha(alpha) })
+                let clean = c.sanitized();
+                if clean.a > 0.0 {
+                    json!({ "targets": targets, "fill_color": clean })
+                } else {
+                    json!({ "targets": targets, "clear_fill": true })
+                }
             }
             (crate::ShapeColorTarget::Fill, None) => {
                 json!({ "targets": targets, "clear_fill": true })
@@ -1826,21 +1739,18 @@ pub(crate) fn apply_shape_color_from_dock(app: &mut PaperCraftApp, color: Option
     };
     let params = match (target_channel, color) {
         (crate::ShapeColorTarget::Border, Some(c)) => {
-            json!({ "index": index, "color": c.with_alpha(1.0) })
+            json!({ "index": index, "color": c.sanitized() })
         }
         (crate::ShapeColorTarget::Border, None) => {
             json!({ "index": index, "color": Color::TRANSPARENT })
         }
         (crate::ShapeColorTarget::Fill, Some(c)) => {
-            let alpha = app
-                .session
-                .doc
-                .shapes
-                .get(index)
-                .and_then(|s| s.fill_color)
-                .filter(|fc| fc.a > 0.01)
-                .map_or_else(|| app.view.shape_fill_opacity.clamp(0.15, 0.95), |fc| fc.a);
-            json!({ "index": index, "fill_color": c.with_alpha(alpha) })
+            let clean = c.sanitized();
+            if clean.a > 0.0 {
+                json!({ "index": index, "fill_color": clean })
+            } else {
+                json!({ "index": index, "clear_fill": true })
+            }
         }
         (crate::ShapeColorTarget::Fill, None) => {
             json!({ "index": index, "clear_fill": true })
@@ -1982,16 +1892,16 @@ fn summarize_channel_preview(mut iter: impl Iterator<Item = Option<Color>>) -> C
     let Some(first) = iter.next() else {
         return ChannelPreview::None;
     };
-    let first_opaque = first.filter(|c| c.a > 0.0).map(|c| c.with_alpha(1.0));
+    let first_col = first.map(Color::sanitized).filter(|c| c.a > 0.0);
     for next in iter {
-        let next_opaque = next.filter(|c| c.a > 0.0).map(|c| c.with_alpha(1.0));
-        match (first_opaque, next_opaque) {
+        let next_col = next.map(Color::sanitized).filter(|c| c.a > 0.0);
+        match (first_col, next_col) {
             (None, None) => {}
-            (Some(a), Some(b)) if same_rgb(a, b) => {}
+            (Some(a), Some(b)) if same_rgba(a, b) => {}
             _ => return ChannelPreview::Mixed,
         }
     }
-    match first_opaque {
+    match first_col {
         Some(c) => ChannelPreview::Color(c),
         None => ChannelPreview::None,
     }
@@ -2014,12 +1924,10 @@ fn color_dock_mode(app: &PaperCraftApp) -> Option<ColorDockMode> {
         return Some(ColorDockMode::TextInsert);
     }
     if app.view.shape_insert_mode {
-        let border = effective_shape_insert_border(app).map_or(ChannelPreview::None, |c| {
-            ChannelPreview::Color(c.with_alpha(1.0))
-        });
-        let fill = effective_shape_insert_fill(app).map_or(ChannelPreview::None, |c| {
-            ChannelPreview::Color(c.with_alpha(1.0))
-        });
+        let border =
+            effective_shape_insert_border(app).map_or(ChannelPreview::None, ChannelPreview::Color);
+        let fill =
+            effective_shape_insert_fill(app).map_or(ChannelPreview::None, ChannelPreview::Color);
         return Some(ColorDockMode::ShapeInsert { border, fill });
     }
     if app.session.active_tool == ToolKind::Select
@@ -2050,13 +1958,13 @@ fn color_dock_mode(app: &PaperCraftApp) -> Option<ColorDockMode> {
                 let border = summarize_channel_preview(
                     shapes
                         .iter()
-                        .map(|s| (s.color.a > 0.0).then_some(s.color.with_alpha(1.0))),
+                        .map(|s| (s.color.a > 0.0).then_some(s.color.sanitized())),
                 );
-                let fill = summarize_channel_preview(shapes.iter().map(|s| {
-                    s.fill_color
-                        .filter(|fc| fc.a > 0.0)
-                        .map(|fc| fc.with_alpha(1.0))
-                }));
+                let fill = summarize_channel_preview(
+                    shapes
+                        .iter()
+                        .map(|s| s.fill_color.map(Color::sanitized).filter(|fc| fc.a > 0.0)),
+                );
                 let info = ShapeChannelInfo {
                     active_target: app.view.shape_color_target,
                     border,
@@ -2091,7 +1999,7 @@ fn color_dock_mode(app: &PaperCraftApp) -> Option<ColorDockMode> {
                 .find_map(|object| selected_object_color(app, *object))?;
             let color_is_common = selection.iter().all(|object| {
                 selected_object_color(app, *object)
-                    .is_some_and(|color| same_rgb(color, first_color))
+                    .is_some_and(|color| same_rgba(color, first_color))
             });
             return Some(ColorDockMode::Selection {
                 color: Some(first_color),
@@ -2115,12 +2023,16 @@ fn color_dock_mode(app: &PaperCraftApp) -> Option<ColorDockMode> {
             crate::SelectedObject::Shape(index) => {
                 let shape = app.session.doc.shapes.get(index)?;
                 let border = if shape.color.a > 0.0 {
-                    ChannelPreview::Color(shape.color.with_alpha(1.0))
+                    ChannelPreview::Color(shape.color.sanitized())
                 } else {
                     ChannelPreview::None
                 };
-                let fill = match shape.fill_color.filter(|fc| fc.a > 0.0) {
-                    Some(fc) => ChannelPreview::Color(fc.with_alpha(1.0)),
+                let fill = match shape
+                    .fill_color
+                    .map(Color::sanitized)
+                    .filter(|fc| fc.a > 0.0)
+                {
+                    Some(fc) => ChannelPreview::Color(fc),
                     None => ChannelPreview::None,
                 };
                 let info = ShapeChannelInfo {
@@ -2373,6 +2285,9 @@ fn draw_channel_indicator_dot(
     match preview {
         ChannelPreview::Color(c) => {
             let resolved = paper_color.resolve_ink_color(theme, auto_contrast, c, false);
+            if resolved.a < 0.99 {
+                paint_checkerboard_circle(painter, center, r, t);
+            }
             painter.circle_filled(center, r, to_color32(resolved));
             let rim = if t.is_dark {
                 Color32::from_white_alpha(44)
@@ -2618,8 +2533,8 @@ fn draw_palette_dock_controls(
                 crate::ShapeColorTarget::Fill => channels.fill,
             };
             let matches_wc =
-                matches!(next_preview, ChannelPreview::Color(c) if same_rgb(c, wildcard_color));
-            let matches_pal = matches!(next_preview, ChannelPreview::Color(c) if swatches.iter().any(|&s| same_rgb(c, s)));
+                matches!(next_preview, ChannelPreview::Color(c) if same_rgba(c, wildcard_color));
+            let matches_pal = matches!(next_preview, ChannelPreview::Color(c) if swatches.iter().any(|&s| same_rgba(c, s)));
             if matches_wc && !matches_pal {
                 app.view.color_dock.selected_wildcard = Some(spec.target);
             } else {
@@ -2639,27 +2554,33 @@ fn draw_palette_dock_controls(
     }
 
     let matches_wildcard =
-        spec.color_is_common && spec.color.is_some_and(|c| same_rgb(c, wildcard_color));
+        spec.color_is_common && spec.color.is_some_and(|c| same_rgba(c, wildcard_color));
     let matches_any_palette = spec.color_is_common
         && spec
             .color
-            .is_some_and(|c| swatches.iter().any(|&s| same_rgb(c, s)));
-    let wildcard_selected = matches_wildcard
-        && (app.view.color_dock.selected_wildcard == Some(spec.target) || !matches_any_palette);
+            .is_some_and(|c| swatches.iter().any(|&s| same_rgba(c, s)));
+    let zero_alpha_wildcard = spec.shape_channels.is_some()
+        && spec.color_is_common
+        && spec.color.is_none()
+        && wildcard_color.a <= 0.0
+        && app.view.color_dock.selected_wildcard == Some(spec.target);
+    let wildcard_selected = zero_alpha_wildcard
+        || (matches_wildcard
+            && (app.view.color_dock.selected_wildcard == Some(spec.target)
+                || !matches_any_palette));
 
+    let wildcard_label = format_color_label(wildcard_color);
     let wildcard_tip = if wildcard_selected {
         format!(
-            "Custom color ({}) — Independent of palettes\nClick or right-click to change color",
-            wildcard_color.to_hex()
+            "Custom color ({wildcard_label}) — Independent of palettes\nClick or right-click to change color"
         )
     } else {
         format!(
-            "Custom color ({}) — Independent of palettes\nClick to select · Click again or right-click to pick any color",
-            wildcard_color.to_hex()
+            "Custom color ({wildcard_label}) — Independent of palettes\nClick to select · Click again or right-click to pick any color"
         )
     };
     let wildcard_resp = if let Some(channels) = spec.shape_channels {
-        let no_color_selected = spec.color_is_common && spec.color.is_none();
+        let no_color_selected = spec.color_is_common && spec.color.is_none() && !wildcard_selected;
         let no_color_tip = match channels.active_target {
             crate::ShapeColorTarget::Border => "No border — remove shape outline color",
             crate::ShapeColorTarget::Fill => "No fill — remove shape interior fill",
@@ -2757,7 +2678,7 @@ fn draw_palette_dock_controls(
         };
         let selected = !wildcard_selected
             && spec.color_is_common
-            && spec.color.is_some_and(|c| same_rgb(c, sw_color));
+            && spec.color.is_some_and(|c| same_rgba(c, sw_color));
         let display_sw =
             paper_color.resolve_ink_color(theme, auto_contrast, sw_color, is_highlighter);
         let right_action = if active_is_builtin {
@@ -2765,17 +2686,17 @@ fn draw_palette_dock_controls(
         } else {
             "Right-click to edit or remove"
         };
+        let sw_label = format_color_label(sw_color);
+        let disp_label = format_color_label(display_sw);
         let tip = if spec.include_contrast_tip && auto_contrast && !same_rgb(display_sw, sw_color) {
             format!(
-                "{} (shown as {} in {} theme) — Click to select · {right_action}",
-                sw_color.to_hex(),
-                display_sw.to_hex(),
+                "{sw_label} (shown as {disp_label} in {} theme) — Click to select · {right_action}",
                 theme.label()
             )
         } else if spec.include_contrast_tip {
-            format!("{} — Click to select · {right_action}", sw_color.to_hex())
+            format!("{sw_label} — Click to select · {right_action}")
         } else {
-            format!("{} — Click to apply · {right_action}", sw_color.to_hex())
+            format!("{sw_label} — Click to apply · {right_action}")
         };
         let resp = color_dot_sized(ui, cell_size, display_sw, selected, &tip, t);
         if resp.clicked() {
@@ -3063,55 +2984,12 @@ fn push_selected_shape_controls(
         },
     );
     flow.divider();
-    let shape_fill = shape.fill_color;
-    push_shape_style_controls(
-        flow,
-        ui,
-        shape_fill,
-        Some(shape.line_style),
-        app.view.shape_fill_opacity,
-        move |app, action| match action {
-            ShapeStyleAction::ToggleFill => {
-                let params = if shape_fill.is_some() {
-                    json!({ "index": index, "clear_fill": true })
-                } else {
-                    let base = if shape_color.a > 0.0 {
-                        shape_color
-                    } else {
-                        app.view
-                            .shape_fill_color
-                            .unwrap_or_else(|| app.session.active_pen().color)
-                    };
-                    let c = base.with_alpha(app.view.shape_fill_opacity.clamp(0.15, 0.95));
-                    app.view.shape_color_target = crate::ShapeColorTarget::Fill;
-                    json!({ "index": index, "fill_color": c })
-                };
-                let _ = app.session.execute("shape.update", &params);
-            }
-            ShapeStyleAction::SetFillOpacity(alpha) => {
-                app.view.shape_fill_opacity = alpha;
-                let base = shape_fill.unwrap_or_else(|| {
-                    if shape_color.a > 0.0 {
-                        shape_color
-                    } else {
-                        app.view
-                            .shape_fill_color
-                            .unwrap_or_else(|| app.session.active_pen().color)
-                    }
-                });
-                let _ = app.session.execute(
-                    "shape.update",
-                    &json!({ "index": index, "fill_color": base.with_alpha(alpha) }),
-                );
-            }
-            ShapeStyleAction::SetLineStyle(style) => {
-                let _ = app.session.execute(
-                    "shape.update",
-                    &json!({ "index": index, "line_style": style }),
-                );
-            }
-        },
-    );
+    push_shape_line_style_controls(flow, Some(shape.line_style), move |app, style| {
+        let _ = app.session.execute(
+            "shape.update",
+            &json!({ "index": index, "line_style": style }),
+        );
+    });
     true
 }
 
@@ -3856,62 +3734,33 @@ fn push_multi_selection_controls<'a>(
             },
         );
         flow.divider();
-        let first_shape = selected.iter().find_map(|object| match object {
-            crate::SelectedObject::Shape(idx) => {
-                app.session.doc.shapes.get(*idx).map(|s| s.as_ref())
+        let common_line_style = {
+            let mut first = None;
+            let mut all_match = true;
+            for object in selected {
+                let crate::SelectedObject::Shape(idx) = object else {
+                    all_match = false;
+                    continue;
+                };
+                let Some(s) = app.session.doc.shapes.get(*idx) else {
+                    all_match = false;
+                    continue;
+                };
+                match first {
+                    None => first = Some(s.line_style),
+                    Some(ls) if ls == s.line_style => {}
+                    Some(_) => all_match = false,
+                }
             }
-            _ => None,
-        });
-        if let Some(first_shape) = first_shape {
-            let first_fill = first_shape.fill_color;
-            let first_color = first_shape.color;
-            push_shape_style_controls(
-                flow,
-                ui,
-                first_fill,
-                Some(first_shape.line_style),
-                app.view.shape_fill_opacity,
-                move |app, action| {
-                    let targets = selected_targets_json(selected);
-                    let params = match action {
-                        ShapeStyleAction::ToggleFill => {
-                            if first_fill.is_some() {
-                                json!({ "targets": targets, "clear_fill": true })
-                            } else {
-                                let base = if first_color.a > 0.0 {
-                                    first_color
-                                } else {
-                                    app.view
-                                        .shape_fill_color
-                                        .unwrap_or_else(|| app.session.active_pen().color)
-                                };
-                                let c =
-                                    base.with_alpha(app.view.shape_fill_opacity.clamp(0.15, 0.95));
-                                app.view.shape_color_target = crate::ShapeColorTarget::Fill;
-                                json!({ "targets": targets, "fill_color": c })
-                            }
-                        }
-                        ShapeStyleAction::SetFillOpacity(alpha) => {
-                            app.view.shape_fill_opacity = alpha;
-                            let base = first_fill.unwrap_or_else(|| {
-                                if first_color.a > 0.0 {
-                                    first_color
-                                } else {
-                                    app.view
-                                        .shape_fill_color
-                                        .unwrap_or_else(|| app.session.active_pen().color)
-                                }
-                            });
-                            json!({ "targets": targets, "fill_color": base.with_alpha(alpha) })
-                        }
-                        ShapeStyleAction::SetLineStyle(style) => {
-                            json!({ "targets": targets, "line_style": style })
-                        }
-                    };
-                    let _ = app.session.execute("selection.update", &params);
-                },
+            if all_match { first } else { None }
+        };
+        push_shape_line_style_controls(flow, common_line_style, move |app, style| {
+            let targets = selected_targets_json(selected);
+            let _ = app.session.execute(
+                "selection.update",
+                &json!({ "targets": targets, "line_style": style }),
             );
-        }
+        });
     } else {
         let label = format!("{} selected", selected.len());
         let label_w = crate::theme::studio_row_label_width(
@@ -8581,11 +8430,68 @@ mod tests {
     }
 
     #[test]
-    fn shape_context_tray_removes_fill_color_dots_and_keeps_fill_opacity_and_line_styles() {
+    fn shape_context_tray_omits_fill_and_opacity_pills_while_keeping_line_styles() {
         let mut app = PaperCraftApp::default();
         crate::open_notebook_in_editor(&mut app, 0);
         app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
 
+        let ctx = egui::Context::default();
+        let viewport = Vec2::new(1280.0, 800.0);
+        let t = Tokens::for_theme(app.session.prefs.theme);
+        let mut time = 0.0_f64;
+
+        let assert_no_fill_controls =
+            |ctx: &egui::Context, app: &mut PaperCraftApp, time: &mut f64, label: &str| {
+                let mut shapes = Vec::new();
+                for _ in 0..4 {
+                    *time += 0.08;
+                    shapes = step_editor_frame(ctx, app, viewport, *time, 0.08, Vec::new()).0;
+                }
+                let tray_rect =
+                    find_tray_frame_rect(&shapes, t.panel_bg, 40.0).expect("shape top tray");
+                let boxes = collect_text_boxes_inside(&shapes, tray_rect);
+                for forbidden in ["Fill", "20%", "45%", "85%"] {
+                    assert!(
+                        !boxes.iter().any(|(txt, _)| txt == forbidden),
+                        "{label}: fixed top tray must not contain {forbidden:?}, got {boxes:?}"
+                    );
+                }
+                assert!(
+                    boxes.iter().any(|(txt, _)| txt == "Rectangle"),
+                    "{label}: expected shape kind controls in top tray, got {boxes:?}"
+                );
+                fn count_swatch_dots(shape: &egui::Shape, tray_rect: egui::Rect) -> usize {
+                    match shape {
+                        egui::Shape::Circle(c)
+                            if tray_rect.contains(c.center) && (c.radius - 6.5).abs() < 0.2 =>
+                        {
+                            1
+                        }
+                        egui::Shape::Vec(items) => {
+                            items.iter().map(|s| count_swatch_dots(s, tray_rect)).sum()
+                        }
+                        _ => 0,
+                    }
+                }
+                let swatch_dots: usize = shapes
+                    .iter()
+                    .map(|c| count_swatch_dots(&c.shape, tray_rect))
+                    .sum();
+                assert_eq!(
+                    swatch_dots, 0,
+                    "{label}: fixed top context tray must not contain fill color dots"
+                );
+            };
+
+        // 1. ShapeInsert mode.
+        app.view.shape_insert_mode = true;
+        app.view.shape_fill_enabled = true;
+        app.view.shape_fill_color =
+            Some(papercraft_color::Color::from_rgba8(0x28, 0x66, 0xE8, 115));
+        assert_no_fill_controls(&ctx, &mut app, &mut time, "ShapeInsert");
+        app.view.shape_insert_mode = false;
+
+        // 2. Single selected shape.
         app.session
             .execute(
                 "shape.insert",
@@ -8602,47 +8508,26 @@ mod tests {
         crate::activate_select_tool(&mut app);
         app.view.selected_object = Some(crate::SelectedObject::Shape(0));
         app.view.selected_objects = vec![crate::SelectedObject::Shape(0)];
+        assert_no_fill_controls(&ctx, &mut app, &mut time, "SingleShape");
 
-        let ctx = egui::Context::default();
-        let viewport = Vec2::new(1280.0, 800.0);
-        let t = Tokens::for_theme(app.session.prefs.theme);
-        let mut time = 0.0_f64;
-        let mut shapes = Vec::new();
-        for _ in 0..4 {
-            time += 0.08;
-            shapes = step_editor_frame(&ctx, &mut app, viewport, time, 0.08, Vec::new()).0;
-        }
-        let tray_rect = find_tray_frame_rect(&shapes, t.panel_bg, 40.0).expect("shape top tray");
-        let boxes = collect_text_boxes_inside(&shapes, tray_rect);
-        for expected in ["Fill", "20%", "45%", "85%"] {
-            assert!(
-                boxes.iter().any(|(txt, _)| txt == expected),
-                "expected {expected:?} in shape top tray, got {boxes:?}"
-            );
-        }
-
-        // No 6.5px fill color swatch circles should exist inside the fixed top tray.
-        fn count_swatch_dots(shape: &egui::Shape, tray_rect: egui::Rect) -> usize {
-            match shape {
-                egui::Shape::Circle(c)
-                    if tray_rect.contains(c.center) && (c.radius - 6.5).abs() < 0.2 =>
-                {
-                    1
-                }
-                egui::Shape::Vec(items) => {
-                    items.iter().map(|s| count_swatch_dots(s, tray_rect)).sum()
-                }
-                _ => 0,
-            }
-        }
-        let swatch_dots: usize = shapes
-            .iter()
-            .map(|c| count_swatch_dots(&c.shape, tray_rect))
-            .sum();
-        assert_eq!(
-            swatch_dots, 0,
-            "fixed top context tray must not contain fill color dots"
-        );
+        // 3. Multi-selected shapes.
+        app.session
+            .execute(
+                "shape.insert",
+                &json!({
+                    "kind": "Ellipse",
+                    "x1": 260.0,
+                    "y1": 100.0,
+                    "x2": 360.0,
+                    "y2": 180.0,
+                }),
+            )
+            .unwrap();
+        app.view.selected_objects = vec![
+            crate::SelectedObject::Shape(0),
+            crate::SelectedObject::Shape(1),
+        ];
+        assert_no_fill_controls(&ctx, &mut app, &mut time, "MultiShape");
     }
 
     #[test]
@@ -9062,5 +8947,265 @@ mod tests {
         assert!(app.session.doc.shapes.iter().all(|s| s.color.a == 0.0));
         app.session.execute("edit.undo", &json!({})).unwrap();
         assert!(app.session.doc.shapes.iter().all(|s| s.color.a > 0.99));
+    }
+
+    #[test]
+    fn color_picker_alpha_applies_to_shapes_pens_text_and_handles_zero_percent_gracefully() {
+        let mut app = PaperCraftApp::default();
+        crate::open_notebook_in_editor(&mut app, 0);
+        app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
+
+        app.session
+            .execute(
+                "shape.insert",
+                &json!({
+                    "kind": "Rectangle",
+                    "x1": 100.0,
+                    "y1": 100.0,
+                    "x2": 260.0,
+                    "y2": 200.0,
+                }),
+            )
+            .unwrap();
+        crate::activate_select_tool(&mut app);
+        app.view.selected_object = Some(crate::SelectedObject::Shape(0));
+        app.view.selected_objects = vec![crate::SelectedObject::Shape(0)];
+
+        let ctx = egui::Context::default();
+        let viewport = Vec2::new(1280.0, 800.0);
+        let mut time = 0.0_f64;
+        let settle = |ctx: &egui::Context, app: &mut PaperCraftApp, time: &mut f64| {
+            let mut shapes = Vec::new();
+            for _ in 0..5 {
+                *time += 0.08;
+                shapes = step_editor_frame(ctx, app, viewport, *time, 0.08, Vec::new()).0;
+            }
+            shapes
+        };
+        let click_at =
+            |ctx: &egui::Context, app: &mut PaperCraftApp, time: &mut f64, pos: egui::Pos2| {
+                for pressed in [true, false] {
+                    *time += 0.04;
+                    let _ = step_editor_frame(
+                        ctx,
+                        app,
+                        viewport,
+                        *time,
+                        0.04,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                }
+            };
+        let find_alpha_bar = |shapes: &[egui::epaint::ClippedShape]| {
+            shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Mesh(m) => {
+                        let mut r = egui::Rect::NOTHING;
+                        for v in &m.vertices {
+                            r.extend_with(v.pos);
+                        }
+                        if (r.width() - 232.0).abs() < 2.0 && (r.height() - 14.0).abs() < 2.0 {
+                            Some(r)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+                .next()
+        };
+
+        let shapes = settle(&ctx, &mut app, &mut time);
+        let dock_rect = app.view.color_dock.last_rect;
+        let dock_texts = collect_text_boxes_inside(&shapes, dock_rect);
+        let border_pos = dock_texts
+            .iter()
+            .find(|(txt, _)| txt == "Border")
+            .map(|(_, r)| r.center())
+            .expect("Border toggle");
+        let fill_pos = dock_texts
+            .iter()
+            .find(|(txt, _)| txt == "Fill")
+            .map(|(_, r)| r.center())
+            .expect("Fill toggle");
+
+        let special_y = dock_rect.top()
+            + COLOR_DOCK_INNER_MARGIN_Y
+            + COLOR_DOCK_GRIP_SIZE.y
+            + COLOR_DOCK_ITEM_GAP
+            + COLOR_DOCK_DIVIDER_H
+            + COLOR_DOCK_ITEM_GAP
+            + COLOR_DOCK_SHAPE_SWITCH_H
+            + COLOR_DOCK_ITEM_GAP
+            + COLOR_DOCK_DIVIDER_H
+            + COLOR_DOCK_ITEM_GAP
+            + COLOR_DOCK_SHAPE_SPECIAL_SIZE.y * 0.5;
+        let wc_pos = egui::pos2(
+            dock_rect.center().x - (COLOR_DOCK_SHAPE_SPECIAL_SIZE.x + COLOR_DOCK_ITEM_GAP) * 0.5,
+            special_y,
+        );
+
+        // 1. Switch to Fill, open Wildcard ColorPicker, adjust alpha to 30% -> shape fill gets 0.30 alpha.
+        click_at(&ctx, &mut app, &mut time, fill_pos);
+        click_at(&ctx, &mut app, &mut time, wc_pos);
+        click_at(&ctx, &mut app, &mut time, wc_pos);
+        assert!(app.view.color_picker.is_wildcard_mode());
+
+        let pop_shapes = settle(&ctx, &mut app, &mut time);
+        let alpha_bar = find_alpha_bar(&pop_shapes).expect("alpha bar in Shape Fill Color");
+        click_at(
+            &ctx,
+            &mut app,
+            &mut time,
+            egui::pos2(
+                alpha_bar.left() + alpha_bar.width() * 0.30,
+                alpha_bar.center().y,
+            ),
+        );
+        let fill = app.session.doc.shapes[0].fill_color.expect("fill applied");
+        assert!(
+            (fill.a - 0.30).abs() < 0.02,
+            "expected 0.30 alpha, got {}",
+            fill.a
+        );
+
+        // 2. Dragging alpha to 0% clears fill_color without closing the picker or trapping wildcard selection.
+        click_at(
+            &ctx,
+            &mut app,
+            &mut time,
+            egui::pos2(alpha_bar.left() + 0.5, alpha_bar.center().y),
+        );
+        assert!(app.session.doc.shapes[0].fill_color.is_none());
+        assert!(app.view.color_picker.open);
+        assert_eq!(
+            app.view.color_dock.selected_wildcard,
+            Some(PaletteTarget::Ink)
+        );
+
+        // Raising alpha to 65% restores fill_color cleanly.
+        click_at(
+            &ctx,
+            &mut app,
+            &mut time,
+            egui::pos2(
+                alpha_bar.left() + alpha_bar.width() * 0.65,
+                alpha_bar.center().y,
+            ),
+        );
+        let restored_fill = app.session.doc.shapes[0].fill_color.expect("fill restored");
+        assert!(
+            (restored_fill.a - 0.65).abs() < 0.02,
+            "expected 0.65 alpha, got {}",
+            restored_fill.a
+        );
+
+        // 3. Switch to Border and set 50% opacity via alpha bar.
+        click_at(&ctx, &mut app, &mut time, border_pos);
+        click_at(&ctx, &mut app, &mut time, wc_pos);
+        if !app.view.color_picker.is_wildcard_mode() {
+            click_at(&ctx, &mut app, &mut time, wc_pos);
+        }
+        let border_pop = settle(&ctx, &mut app, &mut time);
+        let border_alpha = find_alpha_bar(&border_pop).expect("alpha bar in Shape Border Color");
+        click_at(
+            &ctx,
+            &mut app,
+            &mut time,
+            egui::pos2(
+                border_alpha.left() + border_alpha.width() * 0.50,
+                border_alpha.center().y,
+            ),
+        );
+        assert!(
+            (app.session.doc.shapes[0].color.a - 0.50).abs() < 0.02,
+            "expected 0.50 border alpha, got {}",
+            app.session.doc.shapes[0].color.a
+        );
+
+        // 4. Pen wildcard picker preserves alpha on the active pen.
+        app.view.color_picker.close();
+        app.view.clear_selection();
+        app.session
+            .execute("tool.select", &json!({ "tool": "FountainPen" }))
+            .unwrap();
+        let pen_shapes = settle(&ctx, &mut app, &mut time);
+        let pen_dock = app.view.color_dock.last_rect;
+        let pen_wc_pos = egui::pos2(
+            pen_dock.center().x,
+            pen_dock.top()
+                + COLOR_DOCK_INNER_MARGIN_Y
+                + COLOR_DOCK_GRIP_SIZE.y
+                + COLOR_DOCK_ITEM_GAP
+                + COLOR_DOCK_DIVIDER_H
+                + COLOR_DOCK_ITEM_GAP
+                + COLOR_DOCK_WILDCARD_SIZE.y * 0.5,
+        );
+        click_at(&ctx, &mut app, &mut time, pen_wc_pos);
+        if !app.view.color_picker.is_wildcard_mode() {
+            click_at(&ctx, &mut app, &mut time, pen_wc_pos);
+        }
+        let _ = pen_shapes;
+        let pen_pop = settle(&ctx, &mut app, &mut time);
+        let pen_alpha = find_alpha_bar(&pen_pop).expect("alpha bar for Pen color");
+        click_at(
+            &ctx,
+            &mut app,
+            &mut time,
+            egui::pos2(
+                pen_alpha.left() + pen_alpha.width() * 0.45,
+                pen_alpha.center().y,
+            ),
+        );
+        assert!(
+            (app.session.active_pen().color.a - 0.45).abs() < 0.02,
+            "expected 0.45 pen alpha, got {}",
+            app.session.active_pen().color.a
+        );
+
+        // 5. Text insert mode preserves alpha on text_color_draft.
+        app.view.color_picker.close();
+        app.view.text_insert_mode = true;
+        let _ = settle(&ctx, &mut app, &mut time);
+        let text_dock = app.view.color_dock.last_rect;
+        let text_wc_pos = egui::pos2(
+            text_dock.center().x,
+            text_dock.top()
+                + COLOR_DOCK_INNER_MARGIN_Y
+                + COLOR_DOCK_GRIP_SIZE.y
+                + COLOR_DOCK_ITEM_GAP
+                + COLOR_DOCK_DIVIDER_H
+                + COLOR_DOCK_ITEM_GAP
+                + COLOR_DOCK_WILDCARD_SIZE.y * 0.5,
+        );
+        click_at(&ctx, &mut app, &mut time, text_wc_pos);
+        if !app.view.color_picker.is_wildcard_mode() {
+            click_at(&ctx, &mut app, &mut time, text_wc_pos);
+        }
+        let text_pop = settle(&ctx, &mut app, &mut time);
+        let text_alpha = find_alpha_bar(&text_pop).expect("alpha bar for Text color");
+        click_at(
+            &ctx,
+            &mut app,
+            &mut time,
+            egui::pos2(
+                text_alpha.left() + text_alpha.width() * 0.70,
+                text_alpha.center().y,
+            ),
+        );
+        assert!(
+            (app.view.text_color_draft.a - 0.70).abs() < 0.02,
+            "expected 0.70 text draft alpha, got {}",
+            app.view.text_color_draft.a
+        );
     }
 }

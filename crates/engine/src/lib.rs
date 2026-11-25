@@ -2388,4 +2388,70 @@ mod tests {
         );
         assert_eq!(restored.pen(PenKind::BallPen).smoothing.buffer_size, 10);
     }
+
+    #[test]
+    fn palette_and_wildcard_commands_preserve_rgba_alpha_and_roundtrip() {
+        let mut s = Session::open_web_cache(None);
+        let translucent = papercraft_color::Color::from_rgba8(0x28, 0x66, 0xE8, 128);
+        let hex8 = "#EF444440";
+        let hex8_color = papercraft_color::Color::from_hex(hex8).unwrap();
+
+        s.execute(
+            "palette.setWildcard",
+            &serde_json::json!({
+                "target": "ink",
+                "color": translucent,
+                "apply_to_pen": true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(s.prefs.wildcard_ink, translucent);
+        assert_eq!(s.pen(PenKind::FountainPen).color, translucent);
+
+        s.execute(
+            "palette.setWildcard",
+            &serde_json::json!({
+                "target": "highlighter",
+                "color_hex": hex8,
+                "apply_to_pen": false,
+            }),
+        )
+        .unwrap();
+        assert_eq!(s.prefs.wildcard_highlighter, hex8_color);
+
+        let created = s
+            .execute(
+                "palette.savePreset",
+                &serde_json::json!({
+                    "name": "Alpha Swatches",
+                    "seed_color_hex": "#16A34A80",
+                    "select": true,
+                }),
+            )
+            .unwrap();
+        let pid = created["id"].as_str().unwrap().to_string();
+        assert_eq!(s.prefs.ink_palette[0].to_hex_rgba(), "#16A34A80");
+
+        s.execute(
+            "palette.setColor",
+            &serde_json::json!({
+                "preset_id": pid,
+                "target": "ink",
+                "index": 0,
+                "color": translucent,
+                "apply_to_pen": false,
+            }),
+        )
+        .unwrap();
+        assert_eq!(s.prefs.ink_palette[0], translucent);
+
+        let cached = s.export_web_cache_json().unwrap();
+        let restored = Session::open_web_cache(Some(&cached));
+        assert_eq!(restored.prefs.wildcard_ink, translucent);
+        assert_eq!(restored.prefs.wildcard_highlighter, hex8_color);
+        assert_eq!(
+            restored.prefs.palette_by_id(&pid).unwrap().ink_colors[0],
+            translucent
+        );
+    }
 }

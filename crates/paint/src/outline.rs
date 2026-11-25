@@ -251,19 +251,18 @@ fn clean_spine_nodes(nodes: &[SpineNode]) -> Vec<CleanNode> {
         if !node.point.is_finite() {
             continue;
         }
+        let color = node.color.sanitized();
+        let base_alpha = if node.alpha.is_finite() {
+            node.alpha.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let clean = CleanNode {
             point: node.point,
             radius: sanitize_radius(f64::from(node.radius)),
             basis: NibBasis::from_node(node),
-            alpha: if node.alpha.is_finite() {
-                node.alpha.clamp(0.0, 1.0)
-            } else {
-                0.0
-            },
-            rgb: {
-                let color = node.color.sanitized();
-                [color.r, color.g, color.b]
-            },
+            alpha: (base_alpha * color.a).clamp(0.0, 1.0),
+            rgb: [color.r, color.g, color.b],
         };
         if let Some(last) = deduped.last_mut()
             && last.point.distance(clean.point) < MIN_STEP_PX
@@ -1774,5 +1773,30 @@ mod tests {
         let acute_translucent = &strokes[2];
         let corner_mesh = build_stroke_ribbon(&pen, acute_translucent, feather);
         assert_eq!(solid_tri_hits(&corner_mesh, Point::new(97.5, 50.5)), 1);
+    }
+
+    #[test]
+    fn ribbon_applies_node_color_alpha_proportionally() {
+        let pen = PenSettings::fountain_pen();
+        let mut opaque = node(50.0, 60.0, 4.0);
+        opaque.color = Color::from_rgba8(0x28, 0x66, 0xE8, 255);
+        let mut half = opaque;
+        half.color = opaque.color.with_alpha(0.5);
+        let mut clear = opaque;
+        clear.color = opaque.color.with_alpha(0.0);
+
+        let opaque_mesh = build_stroke_ribbon(&pen, &[opaque], 0.75);
+        let half_mesh = build_stroke_ribbon(&pen, &[half], 0.75);
+        let clear_mesh = build_stroke_ribbon(&pen, &[clear], 0.75);
+
+        let max_a = |mesh: &RibbonMesh| {
+            mesh.vertices
+                .iter()
+                .map(|v| v.rgba[3])
+                .fold(0.0_f32, f32::max)
+        };
+        assert!((max_a(&opaque_mesh) - 1.0).abs() < 1e-5);
+        assert!((max_a(&half_mesh) - 0.5).abs() < 1e-5);
+        assert!(max_a(&clear_mesh) <= 1e-6);
     }
 }

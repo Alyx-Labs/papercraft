@@ -165,13 +165,16 @@ fn build_paper_geometry(width: u32, height: u32, template: PaperTemplate) -> Exp
 
 fn stroke_spine_mean_alpha(stroke: &InkStroke, nodes: &[papercraft_paint::SpineNode]) -> f32 {
     let base = stroke.pen.color.sanitized().a;
+    if base <= 0.0 {
+        return 0.0;
+    }
     if nodes.is_empty() {
         let flow = if stroke.pen.opacity.is_finite() {
             stroke.pen.opacity.clamp(0.03, 1.0)
         } else {
             1.0
         };
-        return (base * flow).clamp(0.03, 1.0);
+        return (base * flow).clamp(0.0, 1.0);
     }
     let mut weighted_sum = 0.0_f64;
     let mut total_len = 0.0_f64;
@@ -196,7 +199,7 @@ fn stroke_spine_mean_alpha(stroke: &InkStroke, nodes: &[papercraft_paint::SpineN
         let count = nodes.iter().filter(|n| n.alpha.is_finite()).count().max(1);
         (sum / count as f64) as f32
     };
-    (base * mean_node_alpha).clamp(0.03, 1.0)
+    (base * mean_node_alpha).clamp(0.0, 1.0)
 }
 
 fn stroke_spine_mean_color(stroke: &InkStroke, nodes: &[papercraft_paint::SpineNode]) -> Color {
@@ -615,12 +618,12 @@ fn append_svg_strokes(out: &mut String, doc: &Document) {
 
     for stroke in &doc.strokes {
         let (segs, color, alpha) = build_stroke_path(stroke);
-        if segs.is_empty() {
+        if segs.is_empty() || alpha <= 1e-4 {
             continue;
         }
         let path_data = format_svg_path_data(&segs);
         let [r, g, b, _] = color.to_rgba8();
-        let alpha_q = (alpha.clamp(0.03, 1.0) * 1000.0).round() as u16;
+        let alpha_q = (alpha.clamp(0.0, 1.0) * 1000.0).round() as u16;
         let is_hi = stroke.pen.kind == PenKind::Highlighter;
         let style_key = ([r, g, b], alpha_q, is_hi);
 
@@ -1243,7 +1246,7 @@ pub fn render_document_svg(doc: &Document) -> String {
 }
 
 fn register_pdf_state(states: &mut Vec<(bool, u8)>, is_highlighter: bool, alpha: f32) -> usize {
-    let q = (alpha.clamp(0.03, 1.0) * 255.0).round() as u8;
+    let q = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
     let key = (is_highlighter, q);
     if let Some(pos) = states.iter().position(|&item| item == key) {
         return pos;
@@ -1998,7 +2001,7 @@ fn build_pdf_page_stream(
 
     for stroke in &page.strokes {
         let (segs, color, alpha) = build_stroke_path(stroke);
-        if segs.is_empty() {
+        if segs.is_empty() || alpha <= 1e-4 {
             continue;
         }
         let is_hi = stroke.pen.kind == PenKind::Highlighter;
@@ -2690,6 +2693,67 @@ mod tests {
         );
 
         let pdf = export_notebook_pdf(&doc);
+        let parsed =
+            hayro::hayro_syntax::Pdf::new(Arc::new(pdf)).expect("generated PDF should parse");
+        assert_eq!(parsed.pages().len(), 1);
+    }
+
+    #[test]
+    fn translucent_and_zero_alpha_strokes_export_cleanly_to_svg_and_pdf() {
+        use papercraft_color::Color;
+
+        let mut doc = Document::new(400, 400);
+        doc.paper_color = PaperColor::PureWhite;
+
+        let mut half_pen = PenSettings::ball_pen();
+        half_pen.color = Color::from_rgba8(0x28, 0x66, 0xE8, 128);
+        half_pen.pressure_enabled = false;
+        let half_id = doc.alloc_stroke_id();
+        let half_pts = vec![
+            StrokeSample::from_xy_pressure(40.0, 100.0, 1.0),
+            StrokeSample::from_xy_pressure(180.0, 100.0, 1.0),
+        ];
+        doc.strokes.push(Arc::new(InkStroke::new(
+            half_id,
+            half_pen,
+            half_pts.clone(),
+            half_pts,
+        )));
+
+        let mut clear_pen = PenSettings::ball_pen();
+        clear_pen.color = Color::from_rgba8(0xEF, 0x44, 0x44, 0);
+        clear_pen.pressure_enabled = false;
+        let clear_id = doc.alloc_stroke_id();
+        let clear_pts = vec![
+            StrokeSample::from_xy_pressure(40.0, 220.0, 1.0),
+            StrokeSample::from_xy_pressure(180.0, 220.0, 1.0),
+        ];
+        doc.strokes.push(Arc::new(InkStroke::new(
+            clear_id,
+            clear_pen,
+            clear_pts.clone(),
+            clear_pts,
+        )));
+        doc.sync_active_to_pages();
+
+        let svg = render_document_svg(&doc);
+        assert!(svg.contains("fill=\"#2866E8\""), "svg={svg}");
+        assert!(svg.contains("fill-opacity=\"0.50"), "svg={svg}");
+        assert!(!svg.contains("#EF4444"), "0% alpha stroke omitted: {svg}");
+
+        let (stream_bytes, states) = build_pdf_page_stream(&doc.pages[0], "Paper", &[]);
+        let stream_text = String::from_utf8_lossy(&stream_bytes);
+        assert!(stream_text.contains("/GS0 gs"), "stream={stream_text}");
+        assert_eq!(states.len(), 1);
+        let clear_rgb = color_rgb_pdf(Color::from_rgba8(0xEF, 0x44, 0x44, 255));
+        assert!(
+            !stream_text.contains(&format!("{clear_rgb} rg")),
+            "0% alpha stroke omitted from PDF stream: {stream_text}"
+        );
+
+        let pdf = export_notebook_pdf(&doc);
+        let pdf_text = String::from_utf8_lossy(&pdf);
+        assert!(pdf_text.contains("/ca 0.502"));
         let parsed =
             hayro::hayro_syntax::Pdf::new(Arc::new(pdf)).expect("generated PDF should parse");
         assert_eq!(parsed.pages().len(), 1);

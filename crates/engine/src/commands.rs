@@ -5353,7 +5353,7 @@ fn cmd_set_highlighter(
     Ok(json!({ "mode": session.highlighter_mode }))
 }
 
-fn parse_finite_opaque_color(
+fn parse_finite_color(
     cmd_id: &str,
     color: Option<Color>,
     color_hex: Option<&str>,
@@ -5371,7 +5371,15 @@ fn parse_finite_opaque_color(
     {
         return Err(invalid(cmd_id, "color components must be finite"));
     }
-    Ok(raw_color.sanitized().with_alpha(1.0))
+    Ok(raw_color.sanitized())
+}
+
+fn parse_finite_opaque_color(
+    cmd_id: &str,
+    color: Option<Color>,
+    color_hex: Option<&str>,
+) -> Result<Color, EngineError> {
+    parse_finite_color(cmd_id, color, color_hex).map(|c| c.with_alpha(1.0))
 }
 
 fn allocate_unique_id(existing: &[&str], preferred: Option<&str>, prefix: &str) -> String {
@@ -5404,7 +5412,7 @@ fn sanitize_color_vec(
         if !(c.r.is_finite() && c.g.is_finite() && c.b.is_finite() && c.a.is_finite()) {
             return Err(invalid(cmd_id, "color components must be finite"));
         }
-        out.push(c.sanitized().with_alpha(1.0));
+        out.push(c.sanitized());
     }
     Ok(out)
 }
@@ -5430,7 +5438,7 @@ fn cmd_palette_set_wildcard(
     let target = p
         .target
         .unwrap_or_else(|| PaletteTarget::for_pen(session.active_pen_kind()));
-    let clean_color = parse_finite_opaque_color(id, p.color, p.color_hex.as_deref())?;
+    let clean_color = parse_finite_color(id, p.color, p.color_hex.as_deref())?;
     session.prefs.set_wildcard_color(target, clean_color);
 
     if p.apply_to_pen.unwrap_or(true) {
@@ -5453,7 +5461,7 @@ fn cmd_palette_set_color(
     let target = p
         .target
         .unwrap_or_else(|| PaletteTarget::for_pen(session.active_pen_kind()));
-    let clean_color = parse_finite_opaque_color(id, p.color, p.color_hex.as_deref())?;
+    let clean_color = parse_finite_color(id, p.color, p.color_hex.as_deref())?;
 
     let target_preset_id = p
         .preset_id
@@ -5671,7 +5679,7 @@ fn cmd_palette_save_preset(
         }
         let seed_color = match (p.seed_color, p.seed_color_hex.as_deref()) {
             (None, None) => None,
-            (c, hex) => Some(parse_finite_opaque_color(id, c, hex)?),
+            (c, hex) => Some(parse_finite_color(id, c, hex)?),
         };
         let copy_source = if let Some(raw_source) = p.copy_from_id.as_deref() {
             let source_id = sanitize_preset_id(raw_source);
@@ -5694,10 +5702,7 @@ fn cmd_palette_save_preset(
         } else if let Some(ref src) = copy_source {
             src.ink_colors.clone()
         } else if active_target == PaletteTarget::Ink {
-            vec![
-                seed_color
-                    .unwrap_or_else(|| session.active_pen().color.sanitized().with_alpha(1.0)),
-            ]
+            vec![seed_color.unwrap_or_else(|| session.active_pen().color.sanitized())]
         } else {
             vec![
                 active_pal
@@ -5713,26 +5718,14 @@ fn cmd_palette_save_preset(
         } else if let Some(ref src) = copy_source {
             src.highlighter_colors.clone()
         } else if active_target == PaletteTarget::Highlighter {
-            vec![seed_color.unwrap_or_else(|| {
-                session
-                    .pen(PenKind::Highlighter)
-                    .color
-                    .sanitized()
-                    .with_alpha(1.0)
-            })]
+            vec![seed_color.unwrap_or_else(|| session.pen(PenKind::Highlighter).color.sanitized())]
         } else {
             vec![
                 active_pal
                     .highlighter_colors
                     .first()
                     .copied()
-                    .unwrap_or_else(|| {
-                        session
-                            .pen(PenKind::Highlighter)
-                            .color
-                            .sanitized()
-                            .with_alpha(1.0)
-                    }),
+                    .unwrap_or_else(|| session.pen(PenKind::Highlighter).color.sanitized()),
             ]
         };
 
@@ -7093,15 +7086,13 @@ fn cmd_style_favorite_save(
     }
     let kind = p.kind.unwrap_or_else(|| session.active_pen_kind());
     let base_pen = session.pen(kind);
-    let color = p
-        .color
-        .unwrap_or(base_pen.color)
-        .sanitized()
-        .with_alpha(1.0);
+    let color = p.color.unwrap_or(base_pen.color).sanitized();
     let size = p.size.unwrap_or(base_pen.size).clamp(0.5, 120.0);
 
     if let Some(existing) = session.prefs.style_favorites.iter().find(|f| {
-        f.kind == kind && f.color.to_hex() == color.to_hex() && (f.size - size).abs() < 0.05
+        f.kind == kind
+            && f.color.to_hex_rgba() == color.to_hex_rgba()
+            && (f.size - size).abs() < 0.05
     }) {
         return Ok(json!({
             "favorite": existing,

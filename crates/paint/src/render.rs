@@ -96,6 +96,7 @@ fn stamp_dab(
             });
             let cov = dab_coverage(cx - node.point.x, cy - node.point.y, node, hardness)
                 * node.alpha
+                * color.a
                 * start_coverage
                 * end_coverage;
             if cov > 0.0 {
@@ -341,16 +342,16 @@ mod tests {
             &mut s,
             &pen,
             &[
-                StrokeSample::from_xy_pressure(20.0, 20.0, 0.05),
-                StrokeSample::from_xy_pressure(140.0, 20.0, 0.05),
+                StrokeSample::from_xy_pressure(20.0, 20.5, 0.05),
+                StrokeSample::from_xy_pressure(140.0, 20.5, 0.05),
             ],
         );
         render_stroke_to_surface(
             &mut s,
             &pen,
             &[
-                StrokeSample::from_xy_pressure(20.0, 55.0, 0.95),
-                StrokeSample::from_xy_pressure(140.0, 55.0, 0.95),
+                StrokeSample::from_xy_pressure(20.0, 55.5, 0.95),
+                StrokeSample::from_xy_pressure(140.0, 55.5, 0.95),
             ],
         );
 
@@ -366,5 +367,39 @@ mod tests {
             light_center[0] > firm_center[0] + 30,
             "light={light_center:?} firm={firm_center:?}"
         );
+    }
+
+    #[test]
+    fn cpu_stroke_renderer_respects_pen_color_alpha() {
+        let mut s_half = Surface::new(120, 60, Color::WHITE);
+        let mut half_pen = PenSettings::ball_pen();
+        half_pen.color = Color::from_rgba8(0, 0, 255, 128);
+        half_pen.size = 8.0;
+        half_pen.pressure_enabled = false;
+        render_stroke_to_surface(
+            &mut s_half,
+            &half_pen,
+            &[
+                StrokeSample::from_xy_pressure(20.0, 30.0, 1.0),
+                StrokeSample::from_xy_pressure(100.0, 30.0, 1.0),
+            ],
+        );
+        let px = s_half.pixel_u8(60, 30);
+        assert!(
+            (110..=145).contains(&px[0]) && (110..=145).contains(&px[1]) && px[2] > 240,
+            "expected ~50% blue blend over white, got {px:?}"
+        );
+
+        let mut s_clear = Surface::new(120, 60, Color::WHITE);
+        half_pen.color = half_pen.color.with_alpha(0.0);
+        render_stroke_to_surface(
+            &mut s_clear,
+            &half_pen,
+            &[
+                StrokeSample::from_xy_pressure(20.0, 30.0, 1.0),
+                StrokeSample::from_xy_pressure(100.0, 30.0, 1.0),
+            ],
+        );
+        assert_eq!(s_clear.pixel_u8(60, 30), [255, 255, 255, 255]);
     }
 }

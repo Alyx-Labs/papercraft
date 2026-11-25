@@ -22,9 +22,135 @@ const SV_BOX_HEIGHT_WILDCARD: f32 = 128.0;
 const SV_BOX_HEIGHT_SWATCH: f32 = 124.0;
 const SV_BOX_HEIGHT_EDITOR: f32 = 114.0;
 const HUE_BAR_HEIGHT: f32 = 14.0;
+const ALPHA_BAR_HEIGHT: f32 = 14.0;
+const ALPHA_BAR_WIDTH: f32 = 232.0;
 
 pub(crate) fn same_rgb(a: Color, b: Color) -> bool {
     (a.r - b.r).abs() < 0.02 && (a.g - b.g).abs() < 0.02 && (a.b - b.b).abs() < 0.02
+}
+
+pub(crate) fn same_rgba(a: Color, b: Color) -> bool {
+    same_rgb(a, b) && (a.a - b.a).abs() < 0.02
+}
+
+pub(crate) fn format_hex_draft(color: Color) -> String {
+    let clean = color.sanitized();
+    if clean.to_rgba8()[3] == 255 {
+        clean.to_hex()
+    } else {
+        clean.to_hex_rgba()
+    }
+}
+
+pub(crate) fn format_color_label(color: Color) -> String {
+    let clean = color.sanitized();
+    let [_, _, _, a] = clean.to_rgba8();
+    if a == 255 {
+        clean.to_hex()
+    } else {
+        let pct = (f32::from(a) / 255.0 * 100.0).round() as u8;
+        format!("{} ({pct}%)", clean.to_hex())
+    }
+}
+
+fn checkerboard_colors(t: &Tokens) -> (Color32, Color32) {
+    if t.is_dark {
+        (
+            Color32::from_rgb(0x46, 0x4C, 0x5A),
+            Color32::from_rgb(0x2D, 0x32, 0x3C),
+        )
+    } else {
+        (
+            Color32::from_rgb(0xFA, 0xFB, 0xFD),
+            Color32::from_rgb(0xD4, 0xDA, 0xE3),
+        )
+    }
+}
+
+/// Paints a rounded checkerboard rectangle to make translucent and transparent colors readable.
+pub(crate) fn paint_checkerboard_rect(p: &egui::Painter, rect: Rect, cell_size: f32, t: &Tokens) {
+    if !rect.is_positive()
+        || !rect.left().is_finite()
+        || !rect.top().is_finite()
+        || !rect.right().is_finite()
+        || !rect.bottom().is_finite()
+    {
+        return;
+    }
+    let cell = if cell_size.is_finite() {
+        cell_size.clamp(2.0, 24.0)
+    } else {
+        5.0
+    };
+    let (light_c, dark_c) = checkerboard_colors(t);
+    p.rect_filled(rect, CornerRadius::same(4), light_c);
+    let inner = rect.shrink(0.5);
+    if !inner.is_positive() {
+        return;
+    }
+    let cols = ((inner.width() / cell).ceil().max(1.0) as usize).min(128);
+    let rows = ((inner.height() / cell).ceil().max(1.0) as usize).min(64);
+    for r in 0..rows {
+        let y0 = inner.top() + r as f32 * cell;
+        let y1 = (y0 + cell).min(inner.bottom());
+        if y1 <= y0 {
+            break;
+        }
+        for c in 0..cols {
+            if (r + c) % 2 == 0 {
+                continue;
+            }
+            let x0 = inner.left() + c as f32 * cell;
+            let x1 = (x0 + cell).min(inner.right());
+            if x1 <= x0 {
+                break;
+            }
+            p.rect_filled(
+                Rect::from_min_max(pos2(x0, y0), pos2(x1, y1)),
+                CornerRadius::ZERO,
+                dark_c,
+            );
+        }
+    }
+}
+
+/// Paints a circular checkerboard background using two opposite quadrant wedges.
+pub(crate) fn paint_checkerboard_circle(
+    p: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    t: &Tokens,
+) {
+    if !center.x.is_finite() || !center.y.is_finite() || !radius.is_finite() || radius <= 0.0 {
+        return;
+    }
+    let (light_c, dark_c) = checkerboard_colors(t);
+    p.circle_filled(center, radius, light_c);
+
+    let mut mesh = Mesh::default();
+    let center_idx = mesh.vertices.len() as u32;
+    mesh.vertices.push(Vertex {
+        pos: center,
+        uv: WHITE_UV,
+        color: dark_c,
+    });
+    const STEPS: usize = 6;
+    for base_angle in [0.0_f32, std::f32::consts::PI] {
+        let start_idx = mesh.vertices.len() as u32;
+        for step in 0..=STEPS {
+            let frac = step as f32 / STEPS as f32;
+            let angle = base_angle + frac * std::f32::consts::FRAC_PI_2;
+            mesh.vertices.push(Vertex {
+                pos: center + Vec2::new(angle.cos(), angle.sin()) * radius,
+                uv: WHITE_UV,
+                color: dark_c,
+            });
+        }
+        for step in 0..STEPS as u32 {
+            mesh.add_triangle(center_idx, start_idx + step, start_idx + step + 1);
+        }
+    }
+    p.add(egui::Shape::mesh(mesh));
 }
 
 fn palette_target_str(target: PaletteTarget) -> &'static str {
@@ -62,6 +188,8 @@ pub struct ColorPickerState {
     pub target: PaletteTarget,
     /// `[hue (0..=1), saturation (0..=1), value (0..=1)]`.
     pub hsv: [f32; 3],
+    /// Opacity alpha (`0.0..=1.0`).
+    pub alpha: f32,
     pub hex_draft: String,
     pub anchor_rect: Rect,
     opened_this_frame: bool,
@@ -77,7 +205,8 @@ impl Default for ColorPickerState {
             mode: ColorPopoverMode::Wildcard,
             target: PaletteTarget::Ink,
             hsv: initial.to_hsv(),
-            hex_draft: initial.to_hex(),
+            alpha: initial.a,
+            hex_draft: format_hex_draft(initial),
             anchor_rect: Rect::NOTHING,
             opened_this_frame: false,
             preset_name_draft: String::new(),
@@ -156,13 +285,14 @@ impl ColorPickerState {
     }
 
     pub fn sync_from_color(&mut self, color: Color) {
-        let opaque = color.with_alpha(1.0);
-        self.hsv = opaque.to_hsv();
-        self.hex_draft = opaque.to_hex();
+        let clean = color.sanitized();
+        self.hsv = clean.to_hsv();
+        self.alpha = clean.a;
+        self.hex_draft = format_hex_draft(clean);
     }
 
     pub fn current_color(&self) -> Color {
-        Color::from_hsv(self.hsv[0], self.hsv[1], self.hsv[2], 1.0)
+        Color::from_hsv(self.hsv[0], self.hsv[1], self.hsv[2], self.alpha)
     }
 }
 
@@ -194,10 +324,10 @@ pub fn show_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
     }
 
     let est_height = match &app.view.color_picker.mode {
-        ColorPopoverMode::Wildcard => 270.0,
-        ColorPopoverMode::EditSwatch { .. } => 315.0,
+        ColorPopoverMode::Wildcard => 298.0,
+        ColorPopoverMode::EditSwatch { .. } => 343.0,
         ColorPopoverMode::Palettes => 380.0,
-        ColorPopoverMode::PaletteEditor { .. } => 450.0,
+        ColorPopoverMode::PaletteEditor { .. } => 478.0,
     };
     let anchor = app.view.color_picker.anchor_rect;
     let margin = 12_i8;
@@ -363,6 +493,8 @@ fn render_wildcard_mode(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) 
         draw_sv_square(ui, &mut app.view.color_picker, SV_BOX_HEIGHT_WILDCARD, t);
     ui.add_space(6.0);
     color_changed |= draw_hue_bar(ui, &mut app.view.color_picker, t);
+    ui.add_space(6.0);
+    color_changed |= draw_alpha_row(ui, &mut app.view.color_picker, t);
     ui.add_space(8.0);
     color_changed |= draw_preview_and_hex_row(ui, &mut app.view.color_picker, t);
 
@@ -417,6 +549,8 @@ fn render_edit_swatch_mode(
     let mut color_changed = draw_sv_square(ui, &mut app.view.color_picker, SV_BOX_HEIGHT_SWATCH, t);
     ui.add_space(6.0);
     color_changed |= draw_hue_bar(ui, &mut app.view.color_picker, t);
+    ui.add_space(6.0);
+    color_changed |= draw_alpha_row(ui, &mut app.view.color_picker, t);
     ui.add_space(8.0);
     color_changed |= draw_preview_and_hex_row(ui, &mut app.view.color_picker, t);
 
@@ -688,13 +822,13 @@ fn render_palettes_mode(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) 
         }
     } else if create_clicked {
         let new_name = next_unique_palette_name(&presets, "My Palette");
-        let seed_hex = app.view.color_picker.current_color().to_hex();
+        let seed_color = app.view.color_picker.current_color();
         if let Ok(res) = app.session.execute(
             "palette.savePreset",
             &json!({
                 "name": new_name,
                 "copy_from_active": false,
-                "seed_color_hex": seed_hex,
+                "seed_color": seed_color,
                 "select": true,
             }),
         ) && let Some(new_id) = res["id"].as_str().map(str::to_string)
@@ -821,7 +955,11 @@ fn draw_palette_row(
         let mut dot_x = select_rect.right() - 7.0;
         for &c in colors.iter().take(preview_count).rev() {
             let c_pos = pos2(dot_x, select_rect.center().y);
-            p.circle_filled(c_pos, 3.2, to_color32(c.with_alpha(1.0)));
+            let clean = c.sanitized();
+            if clean.a < 0.99 {
+                paint_checkerboard_circle(p, c_pos, 3.2, t);
+            }
+            p.circle_filled(c_pos, 3.2, to_color32(clean));
             p.circle_stroke(c_pos, 3.2, Stroke::new(0.6, rim));
             dot_x -= 8.0;
         }
@@ -990,7 +1128,7 @@ fn render_palette_editor_mode(
             let tip = format!(
                 "Swatch #{} ({}) — Click to edit",
                 idx + 1,
-                sw_color.to_hex()
+                format_color_label(sw_color)
             );
             if paint_editor_swatch(ui, sw_color, idx == active_slot, t)
                 .on_hover_text(tip)
@@ -1025,7 +1163,7 @@ fn render_palette_editor_mode(
                 &json!({
                     "preset_id": preset_id,
                     "target": palette_target_str(target),
-                    "color_hex": next_color.to_hex(),
+                    "color": next_color,
                     "apply_to_pen": false,
                 }),
             )
@@ -1068,6 +1206,8 @@ fn render_palette_editor_mode(
     let mut color_changed = draw_sv_square(ui, &mut app.view.color_picker, SV_BOX_HEIGHT_EDITOR, t);
     ui.add_space(6.0);
     color_changed |= draw_hue_bar(ui, &mut app.view.color_picker, t);
+    ui.add_space(6.0);
+    color_changed |= draw_alpha_row(ui, &mut app.view.color_picker, t);
     ui.add_space(8.0);
     color_changed |= draw_preview_and_hex_row(ui, &mut app.view.color_picker, t);
 
@@ -1180,20 +1320,21 @@ pub(crate) fn commit_palette_name_draft(app: &mut PaperCraftApp) {
 }
 
 fn next_distinct_swatch_color(current: Color, existing: &[Color]) -> Color {
-    if !existing.iter().any(|&c| same_rgb(c, current)) {
-        return current.with_alpha(1.0);
+    let clean = current.sanitized();
+    if !existing.iter().any(|&c| same_rgba(c, clean)) {
+        return clean;
     }
-    let [mut h, mut s, mut v] = current.with_alpha(1.0).to_hsv();
+    let [mut h, mut s, mut v] = clean.to_hsv();
     s = s.max(0.80);
     v = v.max(0.90);
     for _ in 0..8 {
         h = (h + 0.14).rem_euclid(1.0);
-        let candidate = Color::from_hsv(h, s, v, 1.0);
-        if !existing.iter().any(|&c| same_rgb(c, candidate)) {
+        let candidate = Color::from_hsv(h, s, v, clean.a);
+        if !existing.iter().any(|&c| same_rgba(c, candidate)) {
             return candidate;
         }
     }
-    current.with_alpha(1.0)
+    clean
 }
 
 fn next_unique_palette_name(presets: &[ColorPalettePreset], base: &str) -> String {
@@ -1387,7 +1528,7 @@ fn draw_sv_square(
     t: &Tokens,
 ) -> bool {
     if paint_sv_square_picker(ui, Vec2::new(POPOVER_WIDTH, height), &mut state.hsv, t) {
-        state.hex_draft = state.current_color().to_hex();
+        state.hex_draft = format_hex_draft(state.current_color());
         return true;
     }
     false
@@ -1409,20 +1550,136 @@ fn draw_hue_bar(ui: &mut egui::Ui, state: &mut ColorPickerState, t: &Tokens) -> 
         if state.hsv[2] < 0.45 {
             state.hsv[2] = 0.95;
         }
-        state.hex_draft = state.current_color().to_hex();
+        state.hex_draft = format_hex_draft(state.current_color());
         return true;
     }
     false
 }
 
+fn draw_alpha_row(ui: &mut egui::Ui, state: &mut ColorPickerState, t: &Tokens) -> bool {
+    let mut changed = false;
+    let rgb = Color::from_hsv(state.hsv[0], state.hsv[1], state.hsv[2], 1.0);
+    let [r, g, b, _] = rgb.to_rgba8();
+
+    ui.horizontal(|ui| {
+        ui.set_width(POPOVER_WIDTH);
+        ui.set_height(22.0);
+        ui.spacing_mut().item_spacing.x = 8.0;
+
+        let (alloc_rect, bar_resp) =
+            ui.allocate_exact_size(Vec2::new(ALPHA_BAR_WIDTH, 22.0), Sense::click_and_drag());
+        let bar_rect = Rect::from_center_size(
+            alloc_rect.center(),
+            Vec2::new(ALPHA_BAR_WIDTH, ALPHA_BAR_HEIGHT),
+        );
+        if ui.is_rect_visible(bar_rect) {
+            let p = ui.painter();
+            paint_checkerboard_rect(p, bar_rect, 5.0, t);
+
+            let left_col = Color32::from_rgba_unmultiplied(r, g, b, 0);
+            let right_col = Color32::from_rgba_unmultiplied(r, g, b, 255);
+            let mut mesh = Mesh::default();
+            mesh.vertices.push(Vertex {
+                pos: bar_rect.left_top(),
+                uv: WHITE_UV,
+                color: left_col,
+            });
+            mesh.vertices.push(Vertex {
+                pos: bar_rect.right_top(),
+                uv: WHITE_UV,
+                color: right_col,
+            });
+            mesh.vertices.push(Vertex {
+                pos: bar_rect.right_bottom(),
+                uv: WHITE_UV,
+                color: right_col,
+            });
+            mesh.vertices.push(Vertex {
+                pos: bar_rect.left_bottom(),
+                uv: WHITE_UV,
+                color: left_col,
+            });
+            mesh.add_triangle(0, 1, 2);
+            mesh.add_triangle(0, 2, 3);
+            p.add(egui::Shape::mesh(mesh));
+            p.rect_stroke(
+                bar_rect,
+                CornerRadius::same(4),
+                Stroke::new(1.0, t.border),
+                StrokeKind::Inside,
+            );
+
+            let clamped_a = if state.alpha.is_finite() {
+                state.alpha.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let ax = egui::lerp(bar_rect.left()..=bar_rect.right(), clamped_a);
+            let marker = Rect::from_center_size(
+                pos2(ax, bar_rect.center().y),
+                Vec2::new(6.0, bar_rect.height() + 2.0),
+            );
+            p.rect_filled(marker, CornerRadius::same(2), Color32::WHITE);
+            p.rect_stroke(
+                marker,
+                CornerRadius::same(2),
+                Stroke::new(1.2, t.text),
+                StrokeKind::Outside,
+            );
+        }
+
+        if (bar_resp.clicked() || bar_resp.dragged())
+            && let Some(pos) = bar_resp.interact_pointer_pos()
+        {
+            let frac = ((pos.x - bar_rect.left()) / bar_rect.width().max(1.0)).clamp(0.0, 1.0);
+            let quantized = ((frac * 100.0).round() / 100.0).clamp(0.0, 1.0);
+            if (quantized - state.alpha).abs() > 1e-4 {
+                state.alpha = quantized;
+                state.hex_draft = format_hex_draft(state.current_color());
+                changed = true;
+            }
+        }
+        bar_resp
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Opacity (0%–100%) — drag or click to adjust color transparency");
+
+        let mut pct = if state.alpha.is_finite() {
+            (state.alpha.clamp(0.0, 1.0) * 100.0).round()
+        } else {
+            100.0
+        };
+        let pct_resp = ui.add_sized(
+            [48.0, 22.0],
+            egui::DragValue::new(&mut pct)
+                .range(0.0..=100.0)
+                .fixed_decimals(0)
+                .suffix("%")
+                .speed(1.0),
+        );
+        if pct_resp.changed() && pct.is_finite() {
+            let next_alpha = (pct.clamp(0.0, 100.0) / 100.0).clamp(0.0, 1.0);
+            if (next_alpha - state.alpha).abs() > 1e-4 {
+                state.alpha = next_alpha;
+                state.hex_draft = format_hex_draft(state.current_color());
+                changed = true;
+            }
+        }
+        pct_resp.on_hover_text(
+            "Opacity percentage (0%–100%) — double-click to type or drag to adjust transparency",
+        );
+    });
+    changed
+}
+
 fn draw_preview_and_hex_row(ui: &mut egui::Ui, state: &mut ColorPickerState, t: &Tokens) -> bool {
     let mut changed = false;
     let current = state.current_color();
-    let [r, g, b, _] = current.to_rgba8();
+    let [r, g, b, a] = current.to_rgba8();
 
     ui.horizontal(|ui| {
         ui.set_height(26.0);
         let (preview_rect, _) = ui.allocate_exact_size(Vec2::new(34.0, 26.0), Sense::hover());
+        paint_checkerboard_rect(ui.painter(), preview_rect, 5.0, t);
         ui.painter()
             .rect_filled(preview_rect, CornerRadius::same(5), to_color32(current));
         ui.painter().rect_stroke(
@@ -1438,28 +1695,30 @@ fn draw_preview_and_hex_row(ui: &mut egui::Ui, state: &mut ColorPickerState, t: 
             26.0,
         );
         let hex_resp = ui.add_sized(
-            [76.0, 26.0],
+            [86.0, 26.0],
             egui::TextEdit::singleline(&mut state.hex_draft)
-                .desired_width(72.0)
-                .char_limit(7)
+                .desired_width(82.0)
+                .char_limit(9)
                 .font(egui::TextStyle::Monospace)
                 .margin(egui::Margin::symmetric(6, 2))
                 .align(egui::Align2::LEFT_CENTER),
         );
         if hex_resp.changed()
-            && let Some(parsed) = Color::from_hex(&state.hex_draft)
+            && let Some(parsed) = Color::from_hex(state.hex_draft.trim())
         {
-            state.hsv = parsed.with_alpha(1.0).to_hsv();
+            let clean = parsed.sanitized();
+            state.hsv = clean.to_hsv();
+            state.alpha = clean.a;
             changed = true;
         }
         if hex_resp.lost_focus() {
-            state.hex_draft = state.current_color().to_hex();
+            state.hex_draft = format_hex_draft(state.current_color());
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             crate::theme::studio_row_label(
                 ui,
-                RichText::new(format!("{r},{g},{b}"))
+                RichText::new(format!("{r},{g},{b},{a}"))
                     .size(10.5)
                     .monospace()
                     .color(t.text_muted),
@@ -1491,7 +1750,11 @@ fn paint_editor_swatch(
                 Stroke::new(1.1, t.text_muted.gamma_multiply(0.5 * hov_t)),
             );
         }
-        p.circle_filled(center, 7.2, to_color32(color.with_alpha(1.0)));
+        let clean = color.sanitized();
+        if clean.a < 0.99 {
+            paint_checkerboard_circle(p, center, 7.2, t);
+        }
+        p.circle_filled(center, 7.2, to_color32(clean));
         let rim = if t.is_dark {
             Color32::from_white_alpha(48)
         } else {
@@ -2239,5 +2502,174 @@ mod tests {
         ));
         assert_eq!(app.session.prefs.palette_presets.len(), 3);
         assert!(app.session.prefs.palette_by_id(&created_id).is_none());
+    }
+
+    #[test]
+    fn alpha_bar_and_hex8_preserve_opacity_in_wildcard_edit_swatch_and_palette_editor() {
+        let mut app = PaperCraftApp::default();
+        crate::open_notebook_in_editor(&mut app, 0);
+
+        let initial = Color::from_rgba8(0x28, 0x66, 0xE8, 255);
+        let anchor = Rect::from_min_size(pos2(500.0, 12.0), Vec2::splat(24.0));
+        app.view
+            .color_picker
+            .open_wildcard(PenKind::FountainPen, initial, anchor);
+
+        let ctx = egui::Context::default();
+        let mut time = 0.0_f64;
+        let mut shapes = Vec::new();
+        for _ in 0..4 {
+            time += 0.05;
+            shapes = step_popover_frame(&ctx, &mut app, time, Vec::new());
+        }
+
+        // Locate the alpha gradient bar mesh (horizontal 288px bar below hue bar, width 232px).
+        let alpha_rect = shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Mesh(m) => {
+                    let mut r = Rect::NOTHING;
+                    for v in &m.vertices {
+                        r.extend_with(v.pos);
+                    }
+                    if (r.width() - ALPHA_BAR_WIDTH).abs() < 2.0
+                        && (r.height() - ALPHA_BAR_HEIGHT).abs() < 2.0
+                    {
+                        Some(r)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .next()
+            .expect("alpha gradient mesh in wildcard popover");
+
+        // Click near 25% along the alpha bar.
+        let click_alpha = pos2(
+            alpha_rect.left() + alpha_rect.width() * 0.25,
+            alpha_rect.center().y,
+        );
+        let _ = click_popover_point(&ctx, &mut app, &mut time, click_alpha);
+        assert!(
+            (app.view.color_picker.alpha - 0.25).abs() < 0.02,
+            "expected alpha ~0.25, got {}",
+            app.view.color_picker.alpha
+        );
+        assert!(
+            (app.session.prefs.wildcard_ink.a - 0.25).abs() < 0.02
+                && (app.session.active_pen().color.a - 0.25).abs() < 0.02
+        );
+        assert!(app.view.color_picker.hex_draft.ends_with("40"));
+
+        // Verify EditSwatch and PaletteEditor preserve alpha when editing swatches.
+        let created = app
+            .session
+            .execute(
+                "palette.savePreset",
+                &json!({ "name": "Alpha Edits", "seed_color_hex": "#2866E880", "select": true }),
+            )
+            .unwrap();
+        let pid = created["id"].as_str().unwrap().to_string();
+        assert_eq!(app.session.prefs.ink_palette[0].to_hex_rgba(), "#2866E880");
+
+        app.view.color_picker.open_edit_swatch(
+            PaletteTarget::Ink,
+            pid.clone(),
+            0,
+            app.session.prefs.ink_palette[0],
+            anchor,
+        );
+        assert!((app.view.color_picker.alpha - 128.0 / 255.0).abs() < 0.02);
+        assert_eq!(app.view.color_picker.hex_draft, "#2866E880");
+
+        for _ in 0..3 {
+            time += 0.05;
+            shapes = step_popover_frame(&ctx, &mut app, time, Vec::new());
+        }
+        let alpha_rect_sw = shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Mesh(m) => {
+                    let mut r = Rect::NOTHING;
+                    for v in &m.vertices {
+                        r.extend_with(v.pos);
+                    }
+                    if (r.width() - ALPHA_BAR_WIDTH).abs() < 2.0
+                        && (r.height() - ALPHA_BAR_HEIGHT).abs() < 2.0
+                    {
+                        Some(r)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .next()
+            .expect("alpha gradient mesh in EditSwatch popover");
+        let click_half = pos2(
+            alpha_rect_sw.left() + alpha_rect_sw.width() * 0.40,
+            alpha_rect_sw.center().y,
+        );
+        let _ = click_popover_point(&ctx, &mut app, &mut time, click_half);
+        assert!(
+            (app.session.prefs.ink_palette[0].a - 0.40).abs() < 0.02,
+            "EditSwatch should persist alpha to custom palette"
+        );
+
+        // Open PaletteEditor and ensure alpha row is rendered and functional too.
+        app.view.color_picker.preset_name_draft = "Alpha Edits".to_string();
+        app.view.color_picker.mode = ColorPopoverMode::PaletteEditor {
+            preset_id: pid,
+            selected_slot: 0,
+            confirm_delete: false,
+        };
+        for _ in 0..3 {
+            time += 0.05;
+            shapes = step_popover_frame(&ctx, &mut app, time, Vec::new());
+        }
+        let editor_texts = collect_picker_texts(&shapes);
+        assert!(
+            editor_texts.contains("40\n%") || editor_texts.contains("40%"),
+            "expected 40% DragValue in PaletteEditor: {editor_texts}"
+        );
+    }
+
+    #[test]
+    fn draw_alpha_row_accepts_percentage_drag_and_hex8_roundtrip() {
+        let ctx = egui::Context::default();
+        let t = Tokens::light();
+        let mut state = ColorPickerState::default();
+        state.sync_from_color(Color::from_rgba8(0x25, 0x63, 0xEB, 255));
+        assert_eq!(state.hex_draft, "#2563EB");
+
+        state.hex_draft = "#2563EB80".to_string();
+        let parsed = Color::from_hex(&state.hex_draft).unwrap();
+        state.sync_from_color(parsed);
+        assert_eq!(state.hex_draft, "#2563EB80");
+        assert!((state.alpha - 128.0 / 255.0).abs() < 0.01);
+
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(400.0, 200.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(raw, |ui| {
+            crate::theme::apply_light_visuals(ui.ctx());
+            let _ = draw_alpha_row(ui, &mut state, &t);
+            let _ = draw_preview_and_hex_row(ui, &mut state, &t);
+        });
+        let texts = collect_picker_texts(&out.shapes);
+        out.drop_without_applying_deltas();
+        assert!(
+            texts.contains("50\n%") || texts.contains("50%"),
+            "expected 50% DragValue in alpha row: {texts}"
+        );
+        assert!(
+            texts.contains("37,99,235,128"),
+            "expected RGBA readout: {texts}"
+        );
     }
 }
