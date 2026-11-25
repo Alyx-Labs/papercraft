@@ -3,6 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="text-scale" content="scale">
     <title>Paper Craft - Online Handwriting &amp; Notes Studio</title>
     <meta name="description" content="Pure Rust handwriting, drawing, and notebook studio running 100% in the browser via WebAssembly.">
 
@@ -17,7 +18,7 @@
             src: url("./BricolageGrotesque-Bold.ttf") format("truetype");
             font-weight: 700;
             font-style: normal;
-            font-display: block;
+            font-display: swap;
         }
 
         :root {
@@ -25,12 +26,11 @@
             --bg-canvas: #0F1117;
             --bg-surface: #15181F;
             --bg-track: #232834;
-            --bg-pill: #15293B;
-            --border-subtle: #2A303D;
-            --border-divider: #222733;
+            --border-subtle: #2F3646;
+            --border-divider: #252B38;
             --text-primary: #EDF0F6;
-            --text-muted: #9AA3B5;
-            --text-dim: #7D8799;
+            --text-secondary: #C2CAD8;
+            --text-muted: #98A2B5;
             --brand-sky: #82CAF2;
             --brand-sky-border: rgba(130, 202, 243, 0.72);
             --brand-accent: #3B76EC;
@@ -39,8 +39,8 @@
         html, body {
             margin: 0;
             padding: 0;
-            width: 100%;
-            height: 100%;
+            inline-size: 100%;
+            block-size: 100%;
             overflow: hidden;
             background-color: var(--bg-canvas);
             user-select: none;
@@ -50,10 +50,10 @@
 
         #the_canvas_id {
             position: absolute;
-            left: 0;
-            top: 0;
-            width: 100%;
-            height: 100%;
+            inset-inline-start: 0;
+            inset-block-start: 0;
+            inline-size: 100%;
+            block-size: 100%;
             touch-action: none;
         }
 
@@ -63,77 +63,88 @@
             z-index: 10;
             display: grid;
             place-items: center;
-            padding: 20px;
+            place-items: safe center;
+            min-block-size: 100dvh;
+            padding: clamp(1rem, 4dvw, 2.5rem);
+            box-sizing: border-box;
+            overflow-y: auto;
             background:
-                radial-gradient(680px 340px at 50% 34%, rgba(130, 202, 243, 0.09), transparent 72%),
+                radial-gradient(56rem 28rem at 50% 34%, rgba(130, 202, 243, 0.10), transparent 72%),
                 var(--bg-canvas);
             color: var(--text-primary);
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            line-height: 1.5;
             pointer-events: none;
         }
 
         .splash-card {
-            width: min(440px, calc(100vw - 32px));
+            container: splash / inline-size;
+            inline-size: min(40rem, 100%);
             box-sizing: border-box;
             background: var(--bg-surface);
             border: 1px solid var(--border-subtle);
-            border-radius: 16px;
-            padding: 28px 28px 22px;
-            box-shadow: 0 24px 64px rgba(0, 0, 0, 0.48);
+            border-radius: 1.375rem;
+            padding-block: clamp(1.75rem, 1.1rem + 3.2vw, 2.75rem);
+            padding-inline: clamp(1.5rem, 1rem + 3.6vw, 2.75rem);
+            box-shadow: 0 28px 72px rgba(0, 0, 0, 0.52);
             display: flex;
             flex-direction: column;
-            gap: 22px;
+            gap: clamp(1.5rem, 1rem + 2.5vw, 2.25rem);
         }
 
         .splash-brand {
             display: flex;
             align-items: center;
-            gap: 16px;
+            gap: clamp(1rem, 0.65rem + 2vw, 1.5rem);
         }
 
         .splash-logo {
             position: relative;
-            width: 58px;
-            height: 58px;
-            border-radius: 13px;
+            inline-size: clamp(4.25rem, 2.75rem + 5.5vw, 5.5rem);
+            aspect-ratio: 1;
+            border-radius: 1.125rem;
             border: 1.5px solid var(--brand-sky-border);
             background: #82CAF3;
             overflow: hidden;
             flex-shrink: 0;
-            box-shadow: 0 6px 20px rgba(10, 114, 181, 0.22);
+            box-shadow: 0 8px 24px rgba(10, 114, 181, 0.24);
         }
 
         .splash-logo img {
             display: block;
-            width: 100%;
-            height: 100%;
+            inline-size: 100%;
+            block-size: 100%;
             object-fit: cover;
         }
 
         .splash-logo-fallback {
             display: none;
-            width: 100%;
-            height: 100%;
+            inline-size: 100%;
+            block-size: 100%;
             place-items: center;
             font-family: "Bricolage Grotesque", -apple-system, BlinkMacSystemFont, sans-serif;
             font-weight: 700;
-            font-size: 1.35rem;
+            font-size: clamp(1.45rem, 1rem + 2vw, 2rem);
             letter-spacing: -0.02em;
             color: #0F1117;
         }
 
         .splash-title-group {
-            min-width: 0;
+            min-inline-size: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
         }
 
         .splash-wordmark {
             font-family: "Bricolage Grotesque", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             font-weight: 700;
-            font-size: clamp(1.65rem, 4.2vw, 2rem);
+            font-size: clamp(1.75rem, 1.15rem + 4vw, 2.85rem);
             line-height: 1.06;
             letter-spacing: -0.025em;
             color: var(--text-primary);
             margin: 0;
+            text-wrap: balance;
         }
 
         .splash-wordmark .craft {
@@ -141,98 +152,173 @@
         }
 
         .splash-subtitle {
-            margin: 4px 0 0;
-            font-size: 0.84rem;
+            margin: 0;
+            font-size: clamp(0.95rem, 0.8rem + 0.8vw, 1.2rem);
+            line-height: 1.35;
             font-weight: 500;
             color: var(--text-muted);
+            text-wrap: balance;
         }
 
         .splash-progress {
             display: flex;
             flex-direction: column;
-            gap: 8px;
+            gap: clamp(0.625rem, 0.45rem + 0.7vw, 0.875rem);
         }
 
         .splash-status {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            font-size: 0.78rem;
+            display: block;
+            font-size: clamp(0.9375rem, 0.82rem + 0.6vw, 1.0625rem);
+            line-height: 1.4;
             font-weight: 500;
-            color: var(--text-muted);
+            color: var(--text-secondary);
         }
 
-        .progress-track {
-            width: 100%;
-            height: 3px;
-            border-radius: 999px;
+        .splash-progress-bar {
+            display: block;
+            inline-size: 100%;
+            block-size: 0.4375rem;
+            appearance: none;
+            border: 0 solid;
+            border-radius: 9999px;
+            overflow: clip;
             background: var(--bg-track);
-            overflow: hidden;
+            container-type: inline-size;
+            --progress-bar-indeterminate-size: 38%;
+            --progress-bar-indeterminate-animation-duration: 1.35s;
         }
 
-        .progress-bar {
-            width: 42%;
-            height: 100%;
-            border-radius: 999px;
+        .splash-progress-bar:indeterminate {
+            --progress-bar-animation: splash-progress-indeterminate
+                var(--progress-bar-indeterminate-animation-duration)
+                cubic-bezier(0.4, 0, 0.2, 1)
+                infinite;
+        }
+
+        .splash-progress-bar:dir(rtl):indeterminate {
+            --progress-bar-animation: splash-progress-indeterminate
+                var(--progress-bar-indeterminate-animation-duration)
+                cubic-bezier(0.4, 0, 0.2, 1)
+                infinite
+                reverse;
+        }
+
+        .splash-progress-bar::-webkit-progress-bar {
+            background: transparent;
+        }
+
+        .splash-progress-bar::-webkit-progress-value {
+            border-radius: 9999px;
             background: linear-gradient(90deg, var(--brand-accent) 0%, var(--brand-sky) 100%);
-            animation: splash-sweep 1.35s cubic-bezier(0.4, 0, 0.2, 1) infinite;
-            transform-origin: left center;
+            animation: var(--progress-bar-animation, revert-rule);
         }
 
-        @keyframes splash-sweep {
-            0% {
-                transform: translateX(-110%);
+        .splash-progress-bar::-moz-progress-bar {
+            border-radius: 9999px;
+            background: linear-gradient(90deg, var(--brand-accent) 0%, var(--brand-sky) 100%);
+            animation: var(--progress-bar-animation, revert-rule);
+        }
+
+        @keyframes splash-progress-indeterminate {
+            from, to {
+                inline-size: var(--progress-bar-indeterminate-size);
+                margin-right: auto;
             }
-            100% {
-                transform: translateX(270%);
+            from {
+                translate: -100%;
+            }
+            to {
+                translate: 100cqi;
             }
         }
 
         @media (prefers-reduced-motion: reduce) {
-            .progress-bar {
-                width: 65%;
-                animation: none;
+            .splash-progress-bar {
+                --progress-bar-indeterminate-animation-duration: 10s;
             }
         }
 
-        .splash-license {
-            border-top: 1px solid var(--border-divider);
-            padding-top: 15px;
+        .splash-footer {
+            border-block-start: 1px solid var(--border-divider);
+            padding-block-start: clamp(1rem, 0.7rem + 1.3vw, 1.35rem);
             display: flex;
-            align-items: center;
+            align-items: baseline;
             justify-content: space-between;
             flex-wrap: wrap;
-            gap: 8px 12px;
+            gap: 0.4rem 1.25rem;
+            font-size: clamp(0.875rem, 0.78rem + 0.45vw, 0.95rem);
+            line-height: 1.45;
+            font-weight: 500;
+            color: var(--text-muted);
         }
 
-        .license-badge-group {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
+        .splash-meta-primary,
+        .splash-meta-secondary {
+            min-inline-size: 0;
         }
 
-        .license-pill {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 6px;
-            background: var(--bg-pill);
-            border: 1px solid rgba(130, 202, 243, 0.24);
-            color: var(--brand-sky);
-            font-size: 0.7rem;
-            font-weight: 600;
-            letter-spacing: 0.01em;
+        @supports (font-size: 1cqi) {
+            .splash-brand {
+                gap: clamp(1rem, 0.65rem + 2.2cqi, 1.5rem);
+            }
+
+            .splash-logo {
+                inline-size: clamp(4.25rem, 2.75rem + 6.5cqi, 5.5rem);
+            }
+
+            .splash-logo-fallback {
+                font-size: clamp(1.45rem, 1rem + 2.3cqi, 2rem);
+            }
+
+            .splash-wordmark {
+                font-size: clamp(1.75rem, 1.15rem + 4.3cqi, 2.85rem);
+            }
+
+            .splash-subtitle {
+                font-size: clamp(0.95rem, 0.8rem + 0.9cqi, 1.2rem);
+            }
+
+            .splash-progress {
+                gap: clamp(0.625rem, 0.45rem + 0.8cqi, 0.875rem);
+            }
+
+            .splash-status {
+                font-size: clamp(0.9375rem, 0.82rem + 0.65cqi, 1.0625rem);
+            }
+
+            .splash-footer {
+                padding-block-start: clamp(1rem, 0.7rem + 1.5cqi, 1.35rem);
+                font-size: clamp(0.875rem, 0.78rem + 0.5cqi, 0.95rem);
+            }
         }
 
-        .license-name {
-            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-            font-size: 0.75rem;
-            font-weight: 600;
-            color: var(--text-primary);
-        }
+        @media (forced-colors: active) {
+            .splash-card {
+                border-color: CanvasText;
+                box-shadow: none;
+            }
 
-        .license-note {
-            font-size: 0.73rem;
-            color: var(--text-dim);
+            .splash-logo {
+                border-color: CanvasText;
+                box-shadow: none;
+            }
+
+            .splash-progress-bar {
+                border: 1px solid CanvasText;
+                background: Canvas;
+            }
+
+            .splash-progress-bar::-webkit-progress-value {
+                background: Highlight;
+            }
+
+            .splash-progress-bar::-moz-progress-bar {
+                background: Highlight;
+            }
+
+            .splash-footer {
+                border-block-start-color: CanvasText;
+            }
         }
     </style>
 </head>
@@ -244,8 +330,8 @@
                     <img
                         src="./papercraft-256.png"
                         alt=""
-                        width="58"
-                        height="58"
+                        width="88"
+                        height="88"
                         onerror="this.style.display='none';this.nextElementSibling.style.display='grid';"
                     />
                     <span class="splash-logo-fallback">PC</span>
@@ -257,20 +343,19 @@
             </div>
 
             <div class="splash-progress">
-                <div class="splash-status">
-                    <span>Loading WebAssembly workspace...</span>
-                </div>
-                <div class="progress-track">
-                    <div class="progress-bar"></div>
-                </div>
+                <label class="splash-status" id="splash-status-label" for="splash-progress">
+                    Loading WebAssembly workspace...
+                </label>
+                <progress
+                    class="splash-progress-bar"
+                    id="splash-progress"
+                    aria-labelledby="splash-status-label"
+                ></progress>
             </div>
 
-            <div class="splash-license">
-                <div class="license-badge-group">
-                    <span class="license-pill">Open Source</span>
-                    <span class="license-name">MIT OR Apache-2.0 License</span>
-                </div>
-                <span class="license-note">Pure Rust &amp; WebAssembly</span>
+            <div class="splash-footer">
+                <span class="splash-meta-primary">Open Source · MIT OR Apache-2.0</span>
+                <span class="splash-meta-secondary">Pure Rust &amp; WebAssembly</span>
             </div>
         </div>
     </div>

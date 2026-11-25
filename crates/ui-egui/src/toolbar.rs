@@ -883,47 +883,12 @@ fn clear_ruler_drag(app: &mut PaperCraftApp) {
     app.view.ruler_drag_anchor = None;
 }
 
-fn ruler_dimensions_for_viewport(app: &PaperCraftApp, angle: f64) -> (f64, f64) {
+fn standard_ruler_dimensions(app: &PaperCraftApp) -> (f64, f64) {
     let page_w = f64::from(app.session.doc.width).max(64.0);
     let page_h = f64::from(app.session.doc.height).max(64.0);
-    let default_length = (page_w * 0.72).clamp(64.0, page_w);
-    let Some((rect, zoom, _)) = app.active_camera_viewport() else {
-        return (default_length, crate::canvas::RULER_DEPTH);
-    };
-    let z = f64::from(zoom);
-    let vis_w = f64::from(rect.width()) / z;
-    let vis_h = f64::from(rect.height()) / z;
-    let cos_a = angle.cos().abs();
-    let sin_a = angle.sin().abs();
-    let span_limit = |w: f64, h: f64| -> f64 {
-        let lx = if cos_a > 1e-4 {
-            (w * 0.72) / cos_a
-        } else {
-            f64::INFINITY
-        };
-        let ly = if sin_a > 1e-4 {
-            (h * 0.72) / sin_a
-        } else {
-            f64::INFINITY
-        };
-        lx.min(ly)
-    };
-    let page_span = span_limit(page_w, page_h);
-    let view_span = span_limit(vis_w, vis_h);
-    let raw_length = page_span.min(view_span);
-    let max_length = page_w.max(page_h);
-    let min_length = (48.0 / z).min(page_span).clamp(12.0, max_length);
-    let length = if raw_length.is_finite() {
-        raw_length.clamp(min_length, max_length)
-    } else {
-        default_length
-    };
-
+    let length = (page_w * 0.72).clamp(64.0, page_w);
     let page_cap = (page_w.min(page_h) * 0.25).max(8.0);
-    let depth = crate::canvas::RULER_DEPTH
-        .clamp(24.0 / z, 60.0 / z)
-        .min(page_cap)
-        .max(8.0);
+    let depth = crate::canvas::RULER_DEPTH.min(page_cap).max(8.0);
     (length, depth)
 }
 
@@ -936,7 +901,7 @@ fn toggle_ruler_tool(app: &mut PaperCraftApp) {
             0.0
         };
         let center = app.camera_center_page_point();
-        let (length, depth) = ruler_dimensions_for_viewport(app, angle);
+        let (length, depth) = standard_ruler_dimensions(app);
         app.view.ruler_center = [center.x, center.y];
         app.view.ruler_angle = angle;
         app.view.ruler_length = length;
@@ -7882,7 +7847,7 @@ mod tests {
     }
 
     #[test]
-    fn activating_ruler_centers_and_sizes_at_active_camera_viewport_not_page_center() {
+    fn activating_ruler_centers_at_active_camera_and_keeps_standard_size_regardless_of_zoom() {
         let mut app = PaperCraftApp::default();
         crate::open_notebook_in_editor(&mut app, 0);
         app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
@@ -7894,6 +7859,10 @@ mod tests {
             time += 0.08;
             let _ = step_editor_frame(&ctx, &mut app, viewport, time, 0.08, Vec::new());
         }
+
+        let expected_length = (f64::from(app.session.doc.width) * 0.72)
+            .clamp(64.0, f64::from(app.session.doc.width).max(64.0));
+        let expected_depth = crate::canvas::RULER_DEPTH;
 
         // 1. Zoom in and pan to the upper-left quadrant, well away from page center.
         app.view.fit_requested = false;
@@ -7918,15 +7887,15 @@ mod tests {
                 && (app.view.ruler_center[1] - page_cy).abs() > 100.0,
             "ruler should spawn at active camera center, not page center"
         );
-        let screen_len_1 = app.view.ruler_length * 1.8;
-        let screen_depth_1 = app.view.ruler_depth * 1.8;
         assert!(
-            screen_len_1 <= f64::from(canvas_rect.width()) * 0.75 && screen_len_1 >= 120.0,
-            "expected zoomed ruler screen length to fit viewport, got {screen_len_1}"
+            (app.view.ruler_length - expected_length).abs() < 1e-6,
+            "ruler length must stay standard ({expected_length}) at zoom 1.8, got {}",
+            app.view.ruler_length
         );
         assert!(
-            (23.5..=60.5).contains(&screen_depth_1),
-            "expected zoomed ruler screen depth in ergonomic bounds, got {screen_depth_1}"
+            (app.view.ruler_depth - expected_depth).abs() < 1e-6,
+            "ruler depth must stay standard ({expected_depth}) at zoom 1.8, got {}",
+            app.view.ruler_depth
         );
 
         // 2. Deactivate, rotate ruler preference, pan/zoom to bottom-right quadrant, and re-activate.
@@ -7949,14 +7918,18 @@ mod tests {
             (app.view.ruler_angle - std::f64::consts::FRAC_PI_2).abs() < 1e-6,
             "subsequent activation should keep the user's ruler angle"
         );
-        let screen_span_y = app.view.ruler_length * 3.5;
         assert!(
-            screen_span_y <= f64::from(canvas_rect.height()) * 0.75,
-            "vertical zoomed ruler screen span {screen_span_y} must fit canvas height {}",
-            canvas_rect.height()
+            (app.view.ruler_length - expected_length).abs() < 1e-6,
+            "vertical ruler length must stay standard ({expected_length}) at zoom 3.5, got {}",
+            app.view.ruler_length
+        );
+        assert!(
+            (app.view.ruler_depth - expected_depth).abs() < 1e-6,
+            "vertical ruler depth must stay standard ({expected_depth}) at zoom 3.5, got {}",
+            app.view.ruler_depth
         );
 
-        // 3. Active camera_glide uses the glide's target camera center & zoom.
+        // 3. Active camera_glide uses the glide's target camera center & keeps standard size.
         toggle_ruler_tool(&mut app);
         let glide_target = papercraft_geom::Point::new(140.0, 180.0);
         let glide_zoom = 2.5_f32;
@@ -7976,6 +7949,8 @@ mod tests {
         toggle_ruler_tool(&mut app);
         assert!((app.view.ruler_center[0] - glide_target.x).abs() < 1.0);
         assert!((app.view.ruler_center[1] - glide_target.y).abs() < 1.0);
+        assert!((app.view.ruler_length - expected_length).abs() < 1e-6);
+        assert!((app.view.ruler_depth - expected_depth).abs() < 1e-6);
     }
 
     #[test]
