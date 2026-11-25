@@ -306,29 +306,29 @@ impl Session {
         }
 
         let viewing_cloud = global.is_viewing_cloud();
-        let (mut session, owner, is_placeholder, connection) =
-            if viewing_cloud && let Some(ref acct) = global.session {
-                let acct_dir = account_library_dir(&root_dir, &acct.user.user_id);
-                let (s, placeholder) =
-                    Self::open_library_mode(acct_dir, LibraryInitMode::BlankPlaceholderOnly);
-                (
-                    s,
-                    OwnerId::CloudUser(acct.user.user_id.clone()),
-                    placeholder,
-                    SyncConnectionState::Offline,
-                )
+        let (mut session, owner, is_placeholder, connection) = if viewing_cloud
+            && let Some(ref acct) = global.session
+        {
+            let acct_dir = account_library_dir(&root_dir, &acct.user.user_id);
+            let (s, placeholder) =
+                Self::open_library_mode(acct_dir, LibraryInitMode::BlankPlaceholderOnly);
+            (
+                s,
+                OwnerId::CloudUser(acct.user.user_id.clone()),
+                placeholder,
+                SyncConnectionState::Offline,
+            )
+        } else {
+            let pid = ensure_default_profile_in_global(&mut global);
+            let prof_dir = profile_library_dir(&root_dir, &pid);
+            let (s, placeholder) = Self::open_library_mode(prof_dir, LibraryInitMode::EmptyClean);
+            let conn = if global.session.is_some() {
+                SyncConnectionState::Offline
             } else {
-                let pid = ensure_default_profile_in_global(&mut global);
-                let prof_dir = profile_library_dir(&root_dir, &pid);
-                let (s, placeholder) =
-                    Self::open_library_mode(prof_dir, LibraryInitMode::SeedStartersIfFresh);
-                let conn = if global.session.is_some() {
-                    SyncConnectionState::Offline
-                } else {
-                    SyncConnectionState::SignedOut
-                };
-                (s, OwnerId::LocalProfile(pid), placeholder, conn)
+                SyncConnectionState::SignedOut
             };
+            (s, OwnerId::LocalProfile(pid), placeholder, conn)
+        };
 
         session.sync.desktop_root = Some(root_dir);
         session.sync.track_manifest = true;
@@ -1132,7 +1132,7 @@ impl Session {
             let keep_global = self.sync.global.clone();
             let prof_dir = profile_library_dir(&root, profile_id);
             let (next_session, is_placeholder) =
-                Self::open_library_mode(prof_dir, LibraryInitMode::SeedStartersIfFresh);
+                Self::open_library_mode(prof_dir, LibraryInitMode::EmptyClean);
             *self = next_session;
             self.sync.desktop_root = Some(root);
             self.sync.track_manifest = true;
@@ -1362,6 +1362,10 @@ impl Session {
             self.sync.slot_ids.push(id.clone());
             self.sync.slot_dirty_hash.push(true);
             self.sync.slot_placeholder_blank.push(false);
+            if self.notebooks.len() == 1 {
+                self.active_notebook = 0;
+                self.doc = Arc::clone(&self.notebooks[0]);
+            }
         }
         self.sync.manifest.owner_id = Some(OwnerId::CloudUser(user_id.to_string()));
         self.sync.manifest.mark_notebook_dirty(&id, &hash);
@@ -2421,6 +2425,11 @@ impl Session {
         self.sync.slot_ids.push(update.notebook_id.clone());
         self.sync.slot_dirty_hash.push(false);
         self.sync.slot_placeholder_blank.push(false);
+        if self.notebooks.len() == 1 {
+            self.active_notebook = 0;
+            self.doc = Arc::clone(&self.notebooks[0]);
+            self.history.clear();
+        }
         self.sync.manifest.mark_notebook_synced(
             &update.notebook_id,
             update.version,
@@ -2924,6 +2933,11 @@ fn merge_captured_into_session(
             session.sync.slot_ids.push(doc_id.clone());
             session.sync.slot_dirty_hash.push(true);
             session.sync.slot_placeholder_blank.push(false);
+            if session.notebooks.len() == 1 {
+                session.active_notebook = 0;
+                session.doc = Arc::clone(&session.notebooks[0]);
+                placeholder_consumed = true;
+            }
         }
         session
             .sync
@@ -3100,6 +3114,9 @@ mod tests {
         let mut session = Session::open_desktop_library(dir.0.clone());
         assert!(!session.is_signed_in());
         assert!(!session.is_viewing_cloud());
+        assert!(session.notebooks.is_empty());
+        assert!(session.prefs.library_folders.is_empty());
+        assert!(session.prefs.library_tag_colors.is_empty());
         assert_eq!(session.local_profiles().len(), 1);
         let personal_id = session
             .active_local_profile()
@@ -3117,9 +3134,11 @@ mod tests {
         let personal_nb_id = session.doc.id.clone();
         assert!(!personal_nb_id.is_empty());
 
-        // Create a second local profile ("Work") -> completely isolated.
+        // Create a second local profile ("Work") -> completely isolated and empty.
         let _work = session.create_local_profile("Work", true).unwrap();
         assert_eq!(session.local_profiles().len(), 2);
+        assert!(session.notebooks.is_empty());
+        assert!(session.prefs.library_folders.is_empty());
         assert!(!has_notebook_title(&session, "Personal Offline Idea"));
 
         // Switch into Cloud account via SwitchOnly -> NEVER touches or duplicates local profiles!
@@ -3173,6 +3192,7 @@ mod tests {
         let dir = temp_dir("link_and_transfer");
         let mut session = Session::open_desktop_library(dir.0.clone());
         let starter_count = session.notebooks.len();
+        assert_eq!(starter_count, 0);
         session
             .execute("notebook.create", &json!({ "title": "To Promote" }))
             .unwrap();
@@ -3201,7 +3221,7 @@ mod tests {
             keep_prof.local_profile_id
         );
 
-        // Switch to "Keep Local" and create a notebook; Move it to Cloud -> same UUID!
+        // Switch to "Keep Local" and create notebooks; Move one to Cloud -> same UUID!
         session
             .switch_to_local_profile(&keep_prof.local_profile_id)
             .unwrap();
@@ -3209,6 +3229,9 @@ mod tests {
             .execute("notebook.create", &json!({ "title": "Moved Individual" }))
             .unwrap();
         let moved_id = session.doc.id.clone();
+        session
+            .execute("notebook.create", &json!({ "title": "Copied Individual" }))
+            .unwrap();
         let res_id = session
             .transfer_local_notebook_to_cloud(&keep_prof.local_profile_id, &moved_id, true)
             .unwrap();
@@ -3355,7 +3378,9 @@ mod tests {
         assert!(session.is_sync_persistence_enabled());
         assert!(!session.is_signed_in());
         let guest_start = session.notebooks.len();
-        assert!(guest_start >= 1);
+        assert_eq!(guest_start, 6);
+        assert!(!session.prefs.library_folders.is_empty());
+        assert!(!session.prefs.library_tag_colors.is_empty());
 
         session
             .execute("notebook.create", &json!({ "title": "Web Browser Note" }))

@@ -169,6 +169,7 @@ struct StarterNotebookSpec {
     tags: &'static [&'static str],
 }
 
+/// Demo folder hierarchy seeded exclusively in the WebAssembly browser demo (`Session::open_web_cache`).
 const STARTER_FOLDERS: &[(&str, &str)] = &[
     ("Computer Science", "#2563EB"),
     ("Computer Science/Algorithms", "#7C3AED"),
@@ -178,6 +179,7 @@ const STARTER_FOLDERS: &[(&str, &str)] = &[
     ("Humanities", "#DB2777"),
 ];
 
+/// Demo tag palette seeded exclusively in the WebAssembly browser demo (`Session::open_web_cache`).
 const STARTER_TAG_COLORS: &[(&str, &str)] = &[
     ("exam", "#DC2626"),
     ("lecture", "#2563EB"),
@@ -189,6 +191,7 @@ const STARTER_TAG_COLORS: &[(&str, &str)] = &[
     ("review", "#DB2777"),
 ];
 
+/// Demo notebooks seeded exclusively in the WebAssembly browser demo (`Session::open_web_cache`).
 const STARTER_NOTEBOOK_SPECS: &[StarterNotebookSpec] = &[
     StarterNotebookSpec {
         title: "Data Structures & Algorithms",
@@ -240,6 +243,7 @@ const STARTER_NOTEBOOK_SPECS: &[StarterNotebookSpec] = &[
     },
 ];
 
+/// Builds the pre-populated demo notebooks shown exclusively in the WebAssembly browser demo.
 pub(crate) fn starter_documents() -> Vec<Document> {
     let now = unix_now_ms();
     STARTER_NOTEBOOK_SPECS
@@ -272,6 +276,7 @@ pub(crate) fn starter_documents() -> Vec<Document> {
         .collect()
 }
 
+/// Seeds the demo folders and tag colors used exclusively in the WebAssembly browser demo.
 pub(crate) fn seed_starter_library_prefs(prefs: &mut UserStudioConfig) {
     let mut folders = prefs.library_folders.clone();
     for (folder_path, _) in STARTER_FOLDERS {
@@ -490,19 +495,19 @@ fn write_prefs_file(dir: &Path, prefs: &UserStudioConfig) -> Result<(), String> 
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LibraryInitMode {
-    SeedStartersIfFresh,
+    EmptyClean,
     BlankPlaceholderOnly,
 }
 
 impl Session {
-    /// Opens (or initializes) a persistent `.pcraft` notebook library in `dir`.
+    /// Opens (or initializes cleanly) a persistent `.pcraft` notebook library in `dir`.
     pub fn open_library(dir: PathBuf) -> Self {
-        Self::open_library_mode(dir, LibraryInitMode::SeedStartersIfFresh).0
+        Self::open_library_mode(dir, LibraryInitMode::EmptyClean).0
     }
 
     pub(crate) fn open_library_mode(dir: PathBuf, mode: LibraryInitMode) -> (Self, bool) {
         if fs::create_dir_all(&dir).is_err() {
-            return (Self::with_starter_library(None), false);
+            return (Self::with_empty_library(None), false);
         }
 
         let prefs = load_prefs_file(&dir);
@@ -526,29 +531,16 @@ impl Session {
                 session.trashed_notebooks = read_trash_entries(&dir);
                 return (session, true);
             }
-            let fresh_seed = !marker_exists;
-            let docs = if fresh_seed {
-                starter_documents()
-            } else {
-                Vec::new()
-            };
-            let mut prefs = prefs;
-            if fresh_seed {
-                seed_starter_library_prefs(&mut prefs);
-            }
             let mut session = Self {
                 prefs,
                 ..Default::default()
             };
             session.apply_pen_size_preferences();
-            session.replace_notebooks_for_library(docs, Some(dir));
+            session.replace_notebooks_for_library(Vec::new(), Some(dir));
             if let Some(ref library_dir) = session.library.dir {
                 session.trashed_notebooks = read_trash_entries(library_dir);
             }
             let _ = session.save_library();
-            if fresh_seed {
-                let _ = session.save_prefs();
-            }
             let _ = fs::write(&marker, b"1");
             return (session, false);
         }
@@ -583,11 +575,9 @@ impl Session {
         (session, false)
     }
 
-    fn with_starter_library(dir: Option<PathBuf>) -> Self {
+    fn with_empty_library(dir: Option<PathBuf>) -> Self {
         let mut session = Self::default();
-        let docs = starter_documents();
-        seed_starter_library_prefs(&mut session.prefs);
-        session.replace_notebooks_for_library(docs, dir);
+        session.replace_notebooks_for_library(Vec::new(), dir);
         session
     }
 
@@ -968,14 +958,25 @@ mod tests {
     }
 
     #[test]
-    fn open_library_seeds_starters_and_persists_edits_across_reopen() {
+    fn open_library_starts_clean_and_persists_edits_across_reopen() {
         let guard = temp_lib_dir("persist");
         let dir = guard.0.clone();
 
         {
             let mut session = Session::open_library(dir.clone());
-            assert_eq!(session.notebooks.len(), 6);
+            assert!(session.notebooks.is_empty());
+            assert!(session.prefs.library_folders.is_empty());
+            assert!(session.prefs.library_folder_colors.is_empty());
+            assert!(session.prefs.library_tag_colors.is_empty());
             assert!(!session.has_dirty_notebooks());
+
+            session
+                .execute("notebook.create", &json!({ "title": "First Draft" }))
+                .unwrap();
+            session
+                .execute("notebook.create", &json!({ "title": "Second Notes" }))
+                .unwrap();
+            assert_eq!(session.notebooks.len(), 2);
 
             // Select second notebook, rename it, draw a stroke, and create a new one.
             assert!(session.switch_notebook(1));
@@ -1003,23 +1004,24 @@ mod tests {
                     &json!({ "preset": "MidnightSlate", "title": "Night Calculus" }),
                 )
                 .unwrap();
-            assert_eq!(session.notebooks.len(), 7);
+            assert_eq!(session.notebooks.len(), 3);
 
             // Delete the first notebook and ensure deletion persists on disk too.
             session
                 .execute("notebook.delete", &json!({ "index": 0 }))
                 .unwrap();
-            assert_eq!(session.notebooks.len(), 6);
+            assert_eq!(session.notebooks.len(), 2);
         }
 
-        // Reopen from the same directory: deleted starter stays deleted, edits & created book survive.
+        // Reopen from the same directory: deleted book stays deleted, edits & created books survive.
         let reopened = Session::open_library(dir);
-        assert_eq!(reopened.notebooks.len(), 6);
+        assert_eq!(reopened.notebooks.len(), 2);
         let titles: Vec<&str> = reopened
             .notebooks
             .iter()
             .map(|d| d.title.as_str())
             .collect();
+        assert!(!titles.contains(&"First Draft"));
         assert!(titles.contains(&"Organic Chemistry"));
         assert!(titles.contains(&"Night Calculus"));
 
@@ -1312,6 +1314,9 @@ mod tests {
     fn dirty_snapshots_and_matching_error_rollback_work_cleanly() {
         let dir = temp_lib_dir("dirty_snapshots");
         let mut session = Session::open_library(dir.0.clone());
+        session
+            .execute("notebook.create", &json!({ "title": "Scratch" }))
+            .unwrap();
         session.save_library().unwrap();
         assert!(session.take_dirty_notebook_snapshots().unwrap().is_empty());
 
@@ -1344,6 +1349,9 @@ mod tests {
     fn trash_cannot_be_deleted_manually_and_expires_automatically() {
         let dir = temp_lib_dir("trash_auto_expire");
         let mut session = Session::open_library(dir.0.clone());
+        session
+            .execute("notebook.create", &json!({ "title": "Disposable Notes" }))
+            .unwrap();
 
         session
             .execute("notebook.delete", &json!({ "index": 0 }))
@@ -1424,6 +1432,8 @@ mod tests {
         let dir = temp_lib_dir("library_org_persist");
         {
             let mut s = Session::open_library(dir.0.clone());
+            s.execute("notebook.create", &json!({ "title": "Calculus Notes" }))
+                .unwrap();
             s.execute(
                 "library.folder.create",
                 &json!({ "path": "University/Semester1/Calculus" }),
@@ -1549,7 +1559,10 @@ mod tests {
                 page_index: 0,
             });
             doc.sync_active_to_pages();
-            s.notebooks.push(Arc::new(doc));
+            let arc_doc = Arc::new(doc);
+            s.notebooks.push(Arc::clone(&arc_doc));
+            s.active_notebook = s.notebooks.len().saturating_sub(1);
+            s.doc = arc_doc;
             s.library.push_slot(None, true, s.notebooks.len());
             s.save_library().unwrap();
         }
@@ -1779,6 +1792,13 @@ mod tests {
         assert_eq!(empty_reopen.doc.page_count(), 1);
     }
 
+    fn assert_clean_empty_library(session: &Session) {
+        assert!(session.notebooks.is_empty());
+        assert!(session.prefs.library_folders.is_empty());
+        assert!(session.prefs.library_folder_colors.is_empty());
+        assert!(session.prefs.library_tag_colors.is_empty());
+    }
+
     fn assert_starter_prefs_seeded(session: &Session) {
         assert_eq!(session.notebooks.len(), 6);
         for (folder, _) in STARTER_FOLDERS {
@@ -1834,10 +1854,16 @@ mod tests {
             }
         }
 
-        let guard = temp_lib_dir("starter_demo_prefs");
+        // Disk / Desktop libraries start completely clean (no demo folders, tags, or notebooks).
+        let guard = temp_lib_dir("clean_disk_library");
         let reopened = Session::open_library(guard.0.clone());
-        assert_starter_prefs_seeded(&reopened);
+        assert_clean_empty_library(&reopened);
 
+        let desktop_guard = temp_lib_dir("clean_desktop_library");
+        let desktop_session = Session::open_desktop_library(desktop_guard.0.clone());
+        assert_clean_empty_library(&desktop_session);
+
+        // Only the WebAssembly browser demo keeps starter folders, tag colors, and notebooks.
         let web_session = Session::open_web_cache(None);
         assert_starter_prefs_seeded(&web_session);
     }

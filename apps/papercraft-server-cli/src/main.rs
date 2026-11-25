@@ -908,7 +908,7 @@ mod tests {
             pc1.apply_sync_outcome(outcome1).unwrap();
             assert_eq!(pc1.sync_status_summary().pending_changes, 0);
 
-            // PC2 logs in fresh and pulls without duplicating starters.
+            // PC2 logs in fresh and pulls cleanly without duplicating notebooks.
             let mut pc2 = Session::open_desktop_library(pc2_dir.0.clone());
             let auth2 = client
                 .login(

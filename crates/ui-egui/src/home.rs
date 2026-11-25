@@ -4222,4 +4222,111 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn empty_clean_desktop_library_renders_without_demo_clutter_in_light_and_dark_themes() {
+        fn collect_all(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push_str(text.galley.text());
+                    out.push('\n');
+                }
+                egui::Shape::Vec(items) => {
+                    for item in items {
+                        collect_all(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "papercraft_ui_empty_desktop_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        struct TempDirGuard(std::path::PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = TempDirGuard(dir.clone());
+
+        let mut app = PaperCraftApp::new(
+            papercraft_engine::Session::open_desktop_library(dir),
+            crate::PlatformHooks::default(),
+        );
+        assert!(app.session.notebooks.is_empty());
+        assert!(app.session.prefs.library_folders.is_empty());
+        assert!(app.session.prefs.library_tag_colors.is_empty());
+
+        for theme in [
+            papercraft_doc::UiTheme::Light,
+            papercraft_doc::UiTheme::Dark,
+        ] {
+            app.session
+                .execute("theme.set", &json!({ "theme": theme }))
+                .unwrap();
+            for view_mode in [LibraryViewMode::Grid, LibraryViewMode::List] {
+                app.session
+                    .execute("library.setViewPrefs", &json!({ "view_mode": view_mode }))
+                    .unwrap();
+                let ctx = egui::Context::default();
+                let viewport = Vec2::new(1280.0, 800.0);
+                let mut metrics = HomeMetrics {
+                    header_rect: Rect::NOTHING,
+                    sidebar_rect: None,
+                    content_rect: Rect::NOTHING,
+                    folder_tile_rects: Vec::new(),
+                    card_rects: Vec::new(),
+                    create_card_rect: None,
+                    first_card_actions_rect: Rect::NOTHING,
+                };
+                let mut rendered_text = String::new();
+                for step in 0..3 {
+                    let raw = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, viewport)),
+                        time: Some(f64::from(step) * 0.05),
+                        predicted_dt: 0.05,
+                        ..Default::default()
+                    };
+                    let out = ctx.run_ui(raw, |ui| {
+                        crate::theme::apply_visuals(ui.ctx(), theme);
+                        metrics = show_inner(&mut app, ui);
+                    });
+                    rendered_text.clear();
+                    for clipped in &out.shapes {
+                        collect_all(&clipped.shape, &mut rendered_text);
+                    }
+                    out.drop_without_applying_deltas();
+                }
+
+                assert!(
+                    metrics.card_rects.is_empty(),
+                    "expected zero notebook cards on fresh desktop ({theme:?}, {view_mode:?})"
+                );
+                assert!(
+                    metrics.create_card_rect.is_some(),
+                    "expected New Notebook affordance on fresh desktop ({theme:?}, {view_mode:?})"
+                );
+                assert!(rendered_text.contains("All Notebooks"));
+                assert!(rendered_text.contains("0 notebooks"));
+                assert!(
+                    rendered_text.contains("New Notebook")
+                        || rendered_text.contains("Create New Notebook...")
+                );
+                for demo in ["Data Structures & Algorithms", "Computer Science", "#exam"] {
+                    assert!(
+                        !rendered_text.contains(demo),
+                        "demo item `{demo}` leaked onto clean desktop ({theme:?}, {view_mode:?}):\n{rendered_text}"
+                    );
+                }
+            }
+        }
+    }
 }
