@@ -1312,6 +1312,55 @@ mod tests {
         let clr = s.execute("page.clear", &serde_json::json!({})).unwrap();
         assert_eq!(clr["clearedImages"], 2);
         assert!(s.doc.images.is_empty());
+
+        // Center placement coordinates center the image on (center_x, center_y), clamp to page bounds,
+        // preserve explicit top-left x/y precedence, and reject non-finite coordinates.
+        let large_png = papercraft_raster::png_encode(120, 60, &[180u8; 120 * 60 * 4]).unwrap();
+        s.execute(
+            "image.insert",
+            &serde_json::json!({ "bytes": large_png, "center_x": 220.0, "center_y": 260.0 }),
+        )
+        .unwrap();
+        let centered = &s.doc.images[0];
+        assert!((centered.center().x - 220.0).abs() < 1e-6);
+        assert!((centered.center().y - 260.0).abs() < 1e-6);
+
+        s.execute(
+            "image.insert",
+            &serde_json::json!({ "bytes": large_png, "center_x": 10.0, "center_y": 15.0 }),
+        )
+        .unwrap();
+        let clamped = &s.doc.images[1];
+        assert!((clamped.x - 0.0).abs() < 1e-6);
+        assert!((clamped.y - 0.0).abs() < 1e-6);
+
+        s.execute(
+            "image.insert",
+            &serde_json::json!({
+                "bytes": large_png,
+                "x": 95.0,
+                "y": 105.0,
+                "center_x": 500.0,
+                "center_y": 500.0,
+            }),
+        )
+        .unwrap();
+        let explicit = &s.doc.images[2];
+        assert!((explicit.x - 95.0).abs() < 1e-6);
+        assert!((explicit.y - 105.0).abs() < 1e-6);
+
+        // Extreme finite coordinates clamp cleanly inside page bounds without producing NaN.
+        let extreme_res = s
+            .execute(
+                "image.insert",
+                &serde_json::json!({ "bytes": large_png, "center_x": 1e308, "center_y": -1e308 }),
+            )
+            .unwrap();
+        let extreme_idx = extreme_res["imageIndex"].as_u64().unwrap() as usize;
+        let extreme = &s.doc.images[extreme_idx];
+        assert!(extreme.x.is_finite() && extreme.y.is_finite());
+        assert!((extreme.x - (f64::from(s.doc.width) - extreme.width)).abs() < 1e-6);
+        assert!((extreme.y - 0.0).abs() < 1e-6);
     }
 
     #[test]

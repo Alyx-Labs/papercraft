@@ -601,6 +601,297 @@ fn draw_styled_icon_button(
     }
 }
 
+const SIDEBAR_EDGE_HEIGHT: f32 = 28.0;
+const SIDEBAR_EDGE_MIN_WIDTH: f32 = 36.0;
+const SIDEBAR_EDGE_BAR_W: f32 = 3.0;
+const SIDEBAR_EDGE_PAD_OUTER: f32 = 9.0;
+const SIDEBAR_EDGE_ICON_DIM: f32 = 14.0;
+const SIDEBAR_EDGE_ICON_GAP: f32 = 5.0;
+const SIDEBAR_EDGE_CHEVRON_GAP: f32 = 4.0;
+const SIDEBAR_EDGE_CHEVRON_DIM: f32 = 12.0;
+const SIDEBAR_EDGE_PAD_INNER: f32 = 8.0;
+const SIDEBAR_EDGE_FONT_SIZE: f32 = 12.0;
+const SIDEBAR_EDGE_INNER_RADIUS: u8 = 14;
+const SIDEBAR_EDGE_CHROME_WITH_LABEL: f32 = SIDEBAR_EDGE_PAD_OUTER
+    + SIDEBAR_EDGE_ICON_DIM
+    + SIDEBAR_EDGE_ICON_GAP
+    + SIDEBAR_EDGE_CHEVRON_GAP
+    + SIDEBAR_EDGE_CHEVRON_DIM
+    + SIDEBAR_EDGE_PAD_INNER;
+const SIDEBAR_EDGE_CHROME_NO_LABEL: f32 = SIDEBAR_EDGE_PAD_OUTER
+    + SIDEBAR_EDGE_ICON_DIM
+    + SIDEBAR_EDGE_CHEVRON_GAP
+    + SIDEBAR_EDGE_CHEVRON_DIM
+    + SIDEBAR_EDGE_PAD_INNER;
+
+/// Which window edge a flush sidebar drawer pull-tab attaches to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarEdge {
+    Left,
+    Right,
+}
+
+/// Visual and behavioral configuration for [`sidebar_edge_button`].
+#[derive(Clone, Copy, Debug)]
+pub struct SidebarEdgeButtonSpec<'a> {
+    pub edge: SidebarEdge,
+    pub icon: Icon,
+    pub label: &'a str,
+    pub max_width: Option<f32>,
+    pub open: bool,
+    pub enabled: bool,
+}
+
+fn layout_sidebar_edge_button(
+    ui: &egui::Ui,
+    label: &str,
+    max_width: Option<f32>,
+    text_color: Color32,
+) -> (Option<std::sync::Arc<egui::Galley>>, f32) {
+    let max_width = max_width
+        .filter(|w| w.is_finite())
+        .map(|w| w.max(SIDEBAR_EDGE_MIN_WIDTH));
+    let show_label = !label.is_empty()
+        && max_width.is_none_or(|limit| limit >= SIDEBAR_EDGE_CHROME_WITH_LABEL + 12.0);
+    let galley = if show_label {
+        let font = FontId::proportional(SIDEBAR_EDGE_FONT_SIZE);
+        Some(match max_width {
+            Some(limit_w) => {
+                let max_text_w = (limit_w - SIDEBAR_EDGE_CHROME_WITH_LABEL).max(12.0);
+                let mut job = egui::text::LayoutJob::single_section(
+                    label.to_string(),
+                    egui::TextFormat {
+                        font_id: font,
+                        color: text_color,
+                        ..Default::default()
+                    },
+                );
+                job.wrap.max_width = max_text_w;
+                job.wrap.max_rows = 1;
+                job.wrap.break_anywhere = true;
+                job.wrap.overflow_character = Some('…');
+                ui.painter().layout_job(job)
+            }
+            None => ui
+                .painter()
+                .layout_no_wrap(label.to_string(), font, text_color),
+        })
+    } else {
+        None
+    };
+
+    let width = match (max_width, &galley) {
+        (Some(limit_w), Some(galley)) => (SIDEBAR_EDGE_CHROME_WITH_LABEL + galley.size().x)
+            .min(limit_w)
+            .max(SIDEBAR_EDGE_MIN_WIDTH),
+        (Some(limit_w), None) => SIDEBAR_EDGE_CHROME_NO_LABEL
+            .min(limit_w)
+            .max(SIDEBAR_EDGE_MIN_WIDTH),
+        (None, Some(galley)) => {
+            (SIDEBAR_EDGE_CHROME_WITH_LABEL + galley.size().x).max(SIDEBAR_EDGE_MIN_WIDTH)
+        }
+        (None, None) => SIDEBAR_EDGE_CHROME_NO_LABEL.max(SIDEBAR_EDGE_MIN_WIDTH),
+    };
+
+    (galley, width)
+}
+
+/// Measures the rendered width of a [`sidebar_edge_button`].
+pub fn sidebar_edge_button_width(ui: &egui::Ui, label: &str, max_width: Option<f32>) -> f32 {
+    layout_sidebar_edge_button(ui, label, max_width, Color32::BLACK).1
+}
+
+fn paint_sidebar_edge_chrome(
+    painter: &egui::Painter,
+    rect: Rect,
+    edge: SidebarEdge,
+    hover_t: f32,
+    open_t: f32,
+    t: &Tokens,
+) {
+    let closed_fill = crate::motion::lerp_color(t.field_bg, t.accent_soft, hover_t * 0.55);
+    let fill = crate::motion::lerp_color(closed_fill, t.accent_soft, open_t);
+    let closed_stroke = crate::motion::lerp_color(t.border, t.accent.gamma_multiply(0.65), hover_t);
+    let open_stroke = crate::motion::lerp_color(t.accent, t.accent_hover, hover_t * 0.5);
+    let stroke_color = crate::motion::lerp_color(closed_stroke, open_stroke, open_t);
+    let stroke_w = crate::motion::lerp_f32(1.0, 1.35, open_t);
+    let rest_rail = t
+        .text_muted
+        .gamma_multiply(if t.is_dark { 0.42 } else { 0.32 });
+    let closed_rail = crate::motion::lerp_color(rest_rail, t.accent.gamma_multiply(0.85), hover_t);
+    let rail_color = crate::motion::lerp_color(closed_rail, t.accent, open_t);
+
+    let (draw_rect, radii, rail_rect) = match edge {
+        SidebarEdge::Left => (
+            Rect::from_min_max(pos2(rect.left() - 2.0, rect.top()), rect.max),
+            CornerRadius {
+                nw: 0,
+                sw: 0,
+                ne: SIDEBAR_EDGE_INNER_RADIUS,
+                se: SIDEBAR_EDGE_INNER_RADIUS,
+            },
+            Rect::from_min_max(
+                rect.min,
+                pos2(rect.left() + SIDEBAR_EDGE_BAR_W, rect.bottom()),
+            ),
+        ),
+        SidebarEdge::Right => (
+            Rect::from_min_max(rect.min, pos2(rect.right() + 2.0, rect.bottom())),
+            CornerRadius {
+                nw: SIDEBAR_EDGE_INNER_RADIUS,
+                sw: SIDEBAR_EDGE_INNER_RADIUS,
+                ne: 0,
+                se: 0,
+            },
+            Rect::from_min_max(
+                pos2(rect.right() - SIDEBAR_EDGE_BAR_W, rect.top()),
+                rect.max,
+            ),
+        ),
+    };
+
+    let clipped = painter.with_clip_rect(painter.clip_rect().intersect(rect));
+    clipped.rect_filled(draw_rect, radii, fill);
+    clipped.rect_stroke(
+        draw_rect,
+        radii,
+        Stroke::new(stroke_w, stroke_color),
+        StrokeKind::Inside,
+    );
+    clipped.rect_filled(rail_rect, CornerRadius::ZERO, rail_color);
+}
+
+struct SidebarEdgeContentDraw<'a> {
+    rect: Rect,
+    spec: &'a SidebarEdgeButtonSpec<'a>,
+    galley: Option<&'a std::sync::Arc<egui::Galley>>,
+    hover_t: f32,
+    open_t: f32,
+}
+
+fn paint_sidebar_edge_contents(
+    painter: &egui::Painter,
+    draw: &SidebarEdgeContentDraw<'_>,
+    t: &Tokens,
+) {
+    let rect = draw.rect;
+    let spec = draw.spec;
+    let cy = rect.center().y;
+    let foreground = if !spec.enabled {
+        t.text_muted.gamma_multiply(0.55)
+    } else {
+        crate::motion::lerp_color(t.text, t.accent, draw.open_t)
+    };
+    let chevron_color = if !spec.enabled {
+        t.text_muted.gamma_multiply(0.45)
+    } else {
+        let rest_chev = crate::motion::lerp_color(t.text_muted, t.accent, draw.hover_t);
+        crate::motion::lerp_color(rest_chev, t.accent, draw.open_t)
+    };
+
+    let (chevron_icon, nudge_x) = match (spec.edge, spec.open) {
+        (SidebarEdge::Left, false) => (Icon::NextPage, 1.5 * draw.hover_t),
+        (SidebarEdge::Left, true) => (Icon::PrevPage, -1.5 * draw.hover_t),
+        (SidebarEdge::Right, false) => (Icon::PrevPage, -1.5 * draw.hover_t),
+        (SidebarEdge::Right, true) => (Icon::NextPage, 1.5 * draw.hover_t),
+    };
+
+    let (icon_rect, chevron_rect, text_clip_max_x) = match spec.edge {
+        SidebarEdge::Left => {
+            let icon_cx = rect.left() + SIDEBAR_EDGE_PAD_OUTER + SIDEBAR_EDGE_ICON_DIM * 0.5;
+            let chevron_cx =
+                rect.right() - SIDEBAR_EDGE_PAD_INNER - SIDEBAR_EDGE_CHEVRON_DIM * 0.5 + nudge_x;
+            let icon_rect =
+                Rect::from_center_size(pos2(icon_cx, cy), Vec2::splat(SIDEBAR_EDGE_ICON_DIM));
+            let chevron_rect =
+                Rect::from_center_size(pos2(chevron_cx, cy), Vec2::splat(SIDEBAR_EDGE_CHEVRON_DIM));
+            let clip_max_x = (rect.right() - SIDEBAR_EDGE_PAD_INNER - SIDEBAR_EDGE_CHEVRON_DIM
+                + nudge_x.min(0.0)
+                - 2.0)
+                .max(icon_rect.right());
+            (icon_rect, chevron_rect, clip_max_x)
+        }
+        SidebarEdge::Right => {
+            let chevron_cx =
+                rect.left() + SIDEBAR_EDGE_PAD_INNER + SIDEBAR_EDGE_CHEVRON_DIM * 0.5 + nudge_x;
+            let icon_cx = rect.left()
+                + SIDEBAR_EDGE_PAD_INNER
+                + SIDEBAR_EDGE_CHEVRON_DIM
+                + SIDEBAR_EDGE_CHEVRON_GAP
+                + SIDEBAR_EDGE_ICON_DIM * 0.5;
+            let chevron_rect =
+                Rect::from_center_size(pos2(chevron_cx, cy), Vec2::splat(SIDEBAR_EDGE_CHEVRON_DIM));
+            let icon_rect =
+                Rect::from_center_size(pos2(icon_cx, cy), Vec2::splat(SIDEBAR_EDGE_ICON_DIM));
+            let clip_max_x = (rect.right() - SIDEBAR_EDGE_PAD_OUTER + 2.0).max(icon_rect.right());
+            (icon_rect, chevron_rect, clip_max_x)
+        }
+    };
+
+    let content_painter = painter.with_clip_rect(painter.clip_rect().intersect(rect));
+    paint_icon(&content_painter, icon_rect, spec.icon, foreground);
+    if let Some(galley) = draw.galley {
+        let text_x = icon_rect.right() + SIDEBAR_EDGE_ICON_GAP;
+        let text_pos = pos2(text_x, cy - galley.size().y * 0.5);
+        let text_clip = Rect::from_min_max(
+            pos2(text_x - 1.0, rect.top()),
+            pos2(text_clip_max_x, rect.bottom()),
+        );
+        let text_painter = painter.with_clip_rect(painter.clip_rect().intersect(text_clip));
+        text_painter.galley_with_override_text_color(text_pos, (*galley).clone(), foreground);
+    }
+    paint_icon(&content_painter, chevron_rect, chevron_icon, chevron_color);
+}
+
+/// Flush-to-edge sidebar pull-tab toggle button with docked anchor rail,
+/// rounded inner half-pill end, optional truncated label, and directional chevron.
+pub fn sidebar_edge_button(
+    ui: &mut egui::Ui,
+    spec: SidebarEdgeButtonSpec<'_>,
+    t: &Tokens,
+) -> Response {
+    let base_color = if !spec.enabled {
+        t.text_muted.gamma_multiply(0.55)
+    } else {
+        t.text
+    };
+    let (galley, width) = layout_sidebar_edge_button(ui, spec.label, spec.max_width, base_color);
+
+    let sense = if spec.enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, SIDEBAR_EDGE_HEIGHT), sense);
+    if ui.is_rect_visible(rect) {
+        let hovered = spec.enabled && response.hovered();
+        let hover_t = crate::motion::hover_factor(ui.ctx(), response.id.with("hov"), hovered);
+        let open_t = if spec.enabled {
+            crate::motion::hover_factor(ui.ctx(), response.id.with("open"), spec.open)
+        } else {
+            0.0
+        };
+        let painter = ui.painter();
+        paint_sidebar_edge_chrome(painter, rect, spec.edge, hover_t, open_t, t);
+        paint_sidebar_edge_contents(
+            painter,
+            &SidebarEdgeContentDraw {
+                rect,
+                spec: &spec,
+                galley: galley.as_ref(),
+                hover_t,
+                open_t,
+            },
+            t,
+        );
+    }
+    if spec.enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
 /// Layout strategy for [`segmented_switch`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SwitchLayout {
@@ -1118,8 +1409,9 @@ pub fn section_card_header(ui: &mut egui::Ui, icon: Icon, title: &str, subtitle:
 #[cfg(test)]
 mod tests {
     use super::{
-        Icon, SwitchLayout, SwitchOption, max_width_icon_button, max_width_icon_button_width,
-        paint_icon, segmented_switch, toggle_switch, toggle_switch_row,
+        Icon, SidebarEdge, SidebarEdgeButtonSpec, SwitchLayout, SwitchOption,
+        max_width_icon_button, max_width_icon_button_width, paint_icon, segmented_switch,
+        sidebar_edge_button, sidebar_edge_button_width, toggle_switch, toggle_switch_row,
     };
     use egui::{Color32, Pos2, RawInput, Rect, Vec2, epaint::Primitive};
 
@@ -1712,6 +2004,99 @@ mod tests {
                 value,
                 "expected toggle_switch_row click to turn switch back on"
             );
+        }
+    }
+
+    #[test]
+    fn sidebar_edge_button_matches_measured_width_truncates_and_handles_hostile_inputs() {
+        for (edge, theme, open) in [
+            (SidebarEdge::Left, papercraft_doc::UiTheme::Dark, true),
+            (SidebarEdge::Left, papercraft_doc::UiTheme::Light, false),
+            (SidebarEdge::Right, papercraft_doc::UiTheme::Dark, false),
+            (SidebarEdge::Right, papercraft_doc::UiTheme::Light, true),
+        ] {
+            let t = crate::theme::Tokens::for_theme(theme);
+            let max_w = Some(148.0_f32);
+            let run_case = |label: &str, cap: Option<f32>| -> (Rect, f32, String) {
+                let ctx = egui::Context::default();
+                let raw = RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 80.0))),
+                    ..Default::default()
+                };
+                let mut btn_rect = Rect::NOTHING;
+                let mut measured_w = 0.0_f32;
+                let out = ctx.run_ui(raw, |ui| {
+                    btn_rect = sidebar_edge_button(
+                        ui,
+                        SidebarEdgeButtonSpec {
+                            edge,
+                            icon: if edge == SidebarEdge::Left {
+                                Icon::Notebook
+                            } else {
+                                Icon::Settings
+                            },
+                            label,
+                            max_width: cap,
+                            open,
+                            enabled: true,
+                        },
+                        &t,
+                    )
+                    .rect;
+                    measured_w = sidebar_edge_button_width(ui, label, cap);
+                });
+                let galleys = collect_galleys(&out.shapes);
+                let rendered = galleys
+                    .first()
+                    .map(|g| galley_rendered_text(g))
+                    .unwrap_or_default();
+                out.drop_without_applying_deltas();
+                (btn_rect, measured_w, rendered)
+            };
+
+            let (math_rect, math_measured, math_text) = run_case("Math", max_w);
+            assert!(
+                (math_rect.width() - math_measured).abs() < 0.01,
+                "drawn width {} != measured width {}",
+                math_rect.width(),
+                math_measured
+            );
+            assert!(
+                math_rect.width() < 90.0,
+                "expected short label 'Math' to stay below 90px, got {:.1}",
+                math_rect.width()
+            );
+            assert_eq!(math_text, "Math");
+
+            let (settings_rect, settings_measured, settings_text) = run_case("Settings", None);
+            assert!((settings_rect.width() - settings_measured).abs() < 0.01);
+            assert_eq!(settings_text, "Settings");
+
+            let long = "Differential Calculus & Linear Algebra Study Notes";
+            let (long_rect, long_measured, long_text) = run_case(long, max_w);
+            assert!((long_rect.width() - long_measured).abs() < 0.01);
+            assert!(long_rect.width() <= 148.01 && long_rect.width() > 120.0);
+            assert!(
+                long_text.ends_with('…'),
+                "expected truncated text to end with ellipsis, got {long_text:?}"
+            );
+
+            // Empty label and hostile max_width values never panic and remain bounded.
+            let (empty_rect, _, empty_text) = run_case("", max_w);
+            assert!((empty_rect.width() - 47.0).abs() < 0.01);
+            assert!(empty_text.is_empty());
+
+            let (neg_rect, _, neg_text) = run_case("Math", Some(-10.0));
+            assert!((neg_rect.width() - 36.0).abs() < 0.01);
+            assert!(neg_text.is_empty());
+
+            let (nan_rect, _, nan_text) = run_case("Math", Some(f32::NAN));
+            assert!(nan_rect.width().is_finite() && nan_rect.width() >= 36.0);
+            assert_eq!(nan_text, "Math");
+
+            let (inf_rect, _, inf_text) = run_case("Math", Some(f32::INFINITY));
+            assert!(inf_rect.width().is_finite() && inf_rect.width() >= 36.0);
+            assert_eq!(inf_text, "Math");
         }
     }
 }

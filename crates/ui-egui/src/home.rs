@@ -12,8 +12,8 @@ use std::sync::Arc;
 use crate::PaperCraftApp;
 use crate::customization_modals::{paint_hardcover_book_cover, paint_paper_preview_colors};
 use crate::icons::{
-    Icon, SwitchLayout, SwitchOption, compact_icon_button, icon_button, paint_icon,
-    segmented_switch,
+    Icon, SidebarEdge, SidebarEdgeButtonSpec, SwitchLayout, SwitchOption, compact_icon_button,
+    icon_button, paint_icon, segmented_switch, sidebar_edge_button,
 };
 use crate::library_folders::{
     FolderNode, LibraryAction, LibraryScope, NotebookDragPayload, SIDEBAR_MIN_VIEWPORT,
@@ -72,7 +72,8 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> HomeMetr
     let t = Tokens::for_theme(app.session.prefs.theme);
     let header_rect = draw_home_header(app, ui, &t);
     let min_viewport_for_sidebar = if app.view.inspector_open {
-        SIDEBAR_MIN_VIEWPORT.max(crate::STANDARD_SIDEBAR_WIDTH * 2.0 + 280.0)
+        SIDEBAR_MIN_VIEWPORT
+            .max(crate::STANDARD_SIDEBAR_WIDTH + crate::inspector::DEFAULT_INSPECTOR_WIDTH + 280.0)
     } else {
         SIDEBAR_MIN_VIEWPORT
     };
@@ -432,12 +433,16 @@ fn draw_home_settings_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tok
     } else {
         "Settings (Shortcut: S)\nPen shortcuts, studio appearance, system info, and app updates."
     };
-    if compact_icon_button(
+    if sidebar_edge_button(
         ui,
-        Icon::Settings,
-        Some("Settings"),
-        app.view.inspector_open,
-        true,
+        SidebarEdgeButtonSpec {
+            edge: SidebarEdge::Right,
+            icon: Icon::Settings,
+            label: "Settings",
+            max_width: None,
+            open: app.view.inspector_open,
+            enabled: true,
+        },
         t,
     )
     .on_hover_text(settings_tip)
@@ -501,7 +506,12 @@ fn draw_home_open_pcraft_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &
 fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> Rect {
     let frame = egui::Frame::new()
         .fill(t.toolbar_bg)
-        .inner_margin(Margin::symmetric(12, 8))
+        .inner_margin(Margin {
+            left: 12,
+            right: 0,
+            top: 8,
+            bottom: 8,
+        })
         .stroke(Stroke::new(1.0, t.border));
 
     egui::Panel::top("papercraft_home_header")
@@ -537,17 +547,26 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
                     });
                 });
                 ui.add_space(6.0);
-                crate::theme::studio_wrapped_row(
-                    ui,
-                    Vec2::new(6.0, 6.0),
-                    HEADER_ROW_HEIGHT,
-                    |ui| {
-                        draw_search_input(app, ui, t);
-                        draw_account_sync_pill(app, ui, t);
-                        draw_home_open_pcraft_button(app, ui, t);
-                        draw_home_package_button(app, ui, t);
-                    },
-                );
+                egui::Frame::NONE
+                    .inner_margin(Margin {
+                        left: 0,
+                        right: 12,
+                        top: 0,
+                        bottom: 0,
+                    })
+                    .show(ui, |ui| {
+                        crate::theme::studio_wrapped_row(
+                            ui,
+                            Vec2::new(6.0, 6.0),
+                            HEADER_ROW_HEIGHT,
+                            |ui| {
+                                draw_search_input(app, ui, t);
+                                draw_account_sync_pill(app, ui, t);
+                                draw_home_open_pcraft_button(app, ui, t);
+                                draw_home_package_button(app, ui, t);
+                            },
+                        );
+                    });
             }
         })
         .response
@@ -2591,6 +2610,7 @@ mod tests {
         assert_eq!(app.view.screen, crate::AppScreen::Editor);
 
         let ctx = egui::Context::default();
+        let mut lib_btn_pos = None;
         for _ in 0..2 {
             let raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
@@ -2600,11 +2620,27 @@ mod tests {
                 crate::theme::apply_light_visuals(ui.ctx());
                 crate::toolbar::show(&mut app, ui);
             });
+            fn find_label_center(shape: &egui::Shape, target: &str, out: &mut Option<Pos2>) {
+                match shape {
+                    egui::Shape::Text(text) if text.galley.text() == target => {
+                        *out = Some(text.visual_bounding_rect().center());
+                    }
+                    egui::Shape::Vec(items) => {
+                        for item in items {
+                            find_label_center(item, target, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for clipped in &out.shapes {
+                find_label_center(&clipped.shape, "Library", &mut lib_btn_pos);
+            }
             out.drop_without_applying_deltas();
         }
 
-        // Click the left-most Library button in the editor toolbar.
-        let lib_btn_pos = pos2(44.0, 22.0);
+        // Click the Library button (positioned right of the Notebook sidebar edge button).
+        let lib_btn_pos = lib_btn_pos.expect("expected 'Library' button in editor toolbar");
         for (pressed, time) in [(true, 0.1), (false, 0.2)] {
             let raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
@@ -3139,22 +3175,22 @@ mod tests {
         assert!(m_narrow.content_rect.right() <= narrow.x + 0.5);
         assert!(m_narrow.content_rect.width() >= 400.0);
 
-        // Responsive check when Settings drawer is open on Home:
-        // - At 840px (min desktop), both left Library sidebar and Settings fit beside a 280px grid.
-        // - At 780px, Library collapses into Browse so Settings keeps full 280px beside a 500px grid.
+        // Responsive check when Settings drawer (372px) is open on Home:
+        // - At 940px (min desktop), both left Library sidebar (280px) and Settings (372px) fit beside a 288px grid.
+        // - At 880px, Library collapses into Browse so Settings keeps full 372px beside a 508px grid.
         // - At 480px, Home header and content stay inside the remaining space without overflowing.
         app.view.inspector_open = true;
-        let m_840 = run_home_frames(&mut app, Vec2::new(840.0, 640.0), 4);
-        assert!(m_840.sidebar_rect.is_some());
-        assert!((m_840.sidebar_rect.unwrap().width() - crate::STANDARD_SIDEBAR_WIDTH).abs() <= 0.5);
-        assert!(m_840.content_rect.width() >= 220.0);
+        let m_940 = run_home_frames(&mut app, Vec2::new(940.0, 640.0), 4);
+        assert!(m_940.sidebar_rect.is_some());
+        assert!((m_940.sidebar_rect.unwrap().width() - crate::STANDARD_SIDEBAR_WIDTH).abs() <= 0.5);
+        assert!(m_940.content_rect.width() >= 220.0);
 
-        let m_780 = run_home_frames(&mut app, Vec2::new(780.0, 640.0), 4);
+        let m_880 = run_home_frames(&mut app, Vec2::new(880.0, 640.0), 4);
         assert!(
-            m_780.sidebar_rect.is_none(),
-            "at 780px with Settings open, left sidebar should collapse to Browse"
+            m_880.sidebar_rect.is_none(),
+            "at 880px with Settings open, left sidebar should collapse to Browse"
         );
-        assert!(m_780.content_rect.width() >= 420.0);
+        assert!(m_880.content_rect.width() >= 420.0);
 
         let m_480_settings = run_home_frames(&mut app, Vec2::new(480.0, 640.0), 4);
         assert!(m_480_settings.sidebar_rect.is_none());
@@ -3863,12 +3899,18 @@ mod tests {
             !header_texts.iter().any(|(label, _)| label == "Theme"),
             "home header should use standardized 'Settings' button instead of 'Theme' modal"
         );
-        let settings_pos = header_texts
+        let settings_text_rect = header_texts
             .iter()
             .find(|(label, _)| label == "Settings")
             .expect("expected 'Settings' button in home header")
-            .1
-            .center();
+            .1;
+        assert!(
+            header_rect.right() - settings_text_rect.right() <= 20.0,
+            "expected Settings edge tab near header right ({:.1}), got text right {:.1}",
+            header_rect.right(),
+            settings_text_rect.right()
+        );
+        let settings_pos = settings_text_rect.center();
 
         for (pressed, time) in [(true, 0.05), (false, 0.10)] {
             let raw = egui::RawInput {

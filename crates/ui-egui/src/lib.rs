@@ -2715,6 +2715,9 @@ fn looks_like_raster_image_path(_path: &std::path::Path) -> bool {
 
 impl PaperCraftApp {
     pub(crate) fn active_camera_viewport(&self) -> Option<(egui::Rect, f32, [f64; 2])> {
+        if self.view.fit_requested {
+            return None;
+        }
         let rect = self.view.last_canvas_rect?;
         if !(rect.is_finite() && rect.width() > 1.0 && rect.height() > 1.0) {
             return None;
@@ -2762,7 +2765,12 @@ impl PaperCraftApp {
             self.view.image_insert_error = Some(msg);
             return false;
         }
-        let payload = json!({ "base64_bytes": base64_encode_bytes(bytes) });
+        let center = self.camera_center_page_point();
+        let payload = json!({
+            "base64_bytes": base64_encode_bytes(bytes),
+            "center_x": center.x,
+            "center_y": center.y,
+        });
         match self.session.execute("image.insert", &payload) {
             Ok(result) => {
                 canvas::commit_pending_text(self);
@@ -3296,13 +3304,15 @@ pub(crate) fn close_profile_screen(app: &mut PaperCraftApp) {
     app.view.screen = target;
 }
 
-/// Standardized width shared by all lateral sidebars (Library, Pages, and Settings)
-/// so left and right panels keep uniform proportions across Home and Editor.
+/// Standardized width shared by the left navigation sidebars (Library and Pages)
+/// across Home and Editor; the right Settings drawer keeps its wider `DEFAULT_INSPECTOR_WIDTH`.
 pub(crate) const STANDARD_SIDEBAR_WIDTH: f32 = 280.0;
 
 /// Minimum viewport width at which interactive Editor drawer toggles keep both
-/// left and right sidebars open simultaneously instead of auto-collapsing the opposite one.
-pub(crate) const DUAL_SIDEBAR_MIN_VIEWPORT: f32 = STANDARD_SIDEBAR_WIDTH * 2.0 + 184.0;
+/// left (`STANDARD_SIDEBAR_WIDTH`) and right (`DEFAULT_INSPECTOR_WIDTH`) sidebars
+/// open simultaneously instead of auto-collapsing the opposite one.
+pub(crate) const DUAL_SIDEBAR_MIN_VIEWPORT: f32 =
+    STANDARD_SIDEBAR_WIDTH + inspector::DEFAULT_INSPECTOR_WIDTH + 184.0;
 
 /// Clamps a fixed side-panel width to available horizontal space, shrinking
 /// symmetrically when both left and right panels share a narrow viewport so
@@ -3584,12 +3594,13 @@ mod tests {
     }
 
     #[test]
-    fn home_pages_and_settings_sidebars_share_standardized_width_and_adapt_responsively() {
+    fn home_pages_and_settings_sidebars_keep_expected_widths_and_adapt_responsively() {
         let mut app = PaperCraftApp::default();
         app.view.inspector_open = true;
         let ctx = egui::Context::default();
 
-        // 1. On desktop Home (1280x800), left Library sidebar and right Settings drawer share STANDARD_SIDEBAR_WIDTH.
+        // 1. On desktop Home (1280x800), left Library sidebar uses STANDARD_SIDEBAR_WIDTH (280px)
+        //    while the right Settings drawer keeps its wider DEFAULT_INSPECTOR_WIDTH (372px).
         let mut home_left = egui::Rect::NOTHING;
         let mut home_right = egui::Rect::NOTHING;
         for f in 0..3 {
@@ -3628,10 +3639,9 @@ mod tests {
             out.drop_without_applying_deltas();
         }
         assert!((home_left.width() - STANDARD_SIDEBAR_WIDTH).abs() <= 0.5);
-        assert!((home_right.width() - STANDARD_SIDEBAR_WIDTH).abs() <= 0.5);
-        assert!((home_left.width() - home_right.width()).abs() <= 0.5);
+        assert!((home_right.width() - inspector::DEFAULT_INSPECTOR_WIDTH).abs() <= 0.5);
 
-        // 2. Opening a notebook in Editor keeps the exact same left and right sidebar widths (280px).
+        // 2. Opening a notebook in Editor keeps Library/Pages matched at 280px and Settings at 372px.
         open_notebook_in_editor(&mut app, 0);
         app.view.motion.screen = motion::ScreenTransition::new(AppScreen::Editor);
         app.view.pages_sidebar_open = true;
@@ -3660,7 +3670,7 @@ mod tests {
             out.drop_without_applying_deltas();
         }
         assert!((ed_left.width() - home_left.width()).abs() <= 0.5);
-        assert!((ed_right.width() - ed_left.width()).abs() <= 0.5);
+        assert!((ed_right.width() - home_right.width()).abs() <= 0.5);
 
         // 3. On a narrow 600px Editor viewport with both panels open, both shrink equally and keep >= 180px canvas.
         let narrow_ctx = egui::Context::default();
@@ -4019,6 +4029,131 @@ mod tests {
         assert_eq!(app.session.doc.images.len(), 2);
         assert!(app.session.execute("edit.undo", &json!({})).is_ok());
         assert_eq!(app.session.doc.images.len(), 3);
+    }
+
+    #[test]
+    fn inserting_image_centers_at_active_camera_viewport_not_page_center() {
+        let png = papercraft_raster::png_encode(120, 80, &[220u8; 120 * 80 * 4]).unwrap();
+        let hook_png = png.clone();
+        let clip_png = png.clone();
+
+        let hooks = PlatformHooks {
+            pick_image_file: Some(Box::new(move || {
+                Some(PickedOpenFile::Bytes {
+                    name: "picked.png".to_string(),
+                    bytes: hook_png.clone(),
+                })
+            })),
+            clipboard_image: Some(Box::new(move || {
+                Some(ClipboardImagePayload::EncodedBytes(clip_png.clone()))
+            })),
+            ..PlatformHooks::default()
+        };
+
+        let mut app = PaperCraftApp::new(Session::default(), hooks);
+        open_notebook_in_editor(&mut app, 0);
+        app.view.motion.screen = motion::ScreenTransition::new(AppScreen::Editor);
+
+        let ctx = egui::Context::default();
+        let viewport = egui::vec2(1280.0, 800.0);
+        for frame in 0..3 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                time: Some(f64::from(frame) * 0.08 + 0.08),
+                predicted_dt: 0.08,
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| app.show_ui(ui));
+            out.drop_without_applying_deltas();
+        }
+
+        // Zoom in and pan so the camera center rests over the upper-left quadrant,
+        // far away from the geometric page center (page_w * 0.5, page_h * 0.5).
+        app.view.fit_requested = false;
+        app.view.motion.camera_glide = None;
+        app.view.zoom = 1.8;
+        let canvas_rect = app.view.last_canvas_rect.expect("canvas rect recorded");
+        let target_page = papercraft_geom::Point::new(220.0, 260.0);
+        app.view.pan = [
+            f64::from(canvas_rect.center().x) - target_page.x * 1.8,
+            f64::from(canvas_rect.center().y) - target_page.y * 1.8,
+        ];
+        let expected_center = app.camera_center_page_point();
+        assert!((expected_center.x - target_page.x).abs() < 1.0);
+        assert!((expected_center.y - target_page.y).abs() < 1.0);
+
+        let page_cx = f64::from(app.session.doc.width) * 0.5;
+        let page_cy = f64::from(app.session.doc.height) * 0.5;
+
+        // 1. File picker insertion centers at focused viewport.
+        assert!(trigger_open_image_dialog(&mut app));
+        let picked = &app.session.doc.images[0];
+        let picked_center = picked.center();
+        assert!(
+            (picked_center.x - expected_center.x).abs() < 1.0
+                && (picked_center.y - expected_center.y).abs() < 1.0,
+            "expected picked image centered near camera {expected_center:?}, got {picked_center:?}"
+        );
+        assert!(
+            (picked_center.x - page_cx).abs() > 100.0 && (picked_center.y - page_cy).abs() > 100.0,
+            "picked image should not be placed at geometric page center ({page_cx}, {page_cy})"
+        );
+
+        // 2. Pan to lower-right quadrant and verify clipboard paste + dropped file follow focus.
+        let target_page_2 = papercraft_geom::Point::new(980.0, 1340.0);
+        app.view.zoom = 2.2;
+        app.view.pan = [
+            f64::from(canvas_rect.center().x) - target_page_2.x * 2.2,
+            f64::from(canvas_rect.center().y) - target_page_2.y * 2.2,
+        ];
+        let expected_center_2 = app.camera_center_page_point();
+        assert!(trigger_paste_image(&mut app, &[]));
+        let pasted_center = app.session.doc.images[1].center();
+        assert!(
+            (pasted_center.x - expected_center_2.x).abs() < 1.0
+                && (pasted_center.y - expected_center_2.y).abs() < 1.0,
+            "expected pasted image centered near camera {expected_center_2:?}, got {pasted_center:?}"
+        );
+
+        // 3. Dropped image file follows active focus as well (on native synchronous drop path).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            #[derive(Debug)]
+            struct TestDroppedFile {
+                path: std::path::PathBuf,
+                bytes: Vec<u8>,
+            }
+            impl egui::DroppedFile for TestDroppedFile {
+                fn path(&self) -> &std::path::Path {
+                    &self.path
+                }
+                fn bytes(&self) -> Result<Vec<u8>, String> {
+                    Ok(self.bytes.clone())
+                }
+            }
+            let dropped_file: egui::DroppedFileHandle = std::sync::Arc::new(TestDroppedFile {
+                path: std::path::PathBuf::from("photo.png"),
+                bytes: png,
+            });
+            let dropped_raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                time: Some(0.4),
+                predicted_dt: 0.08,
+                dropped_files: vec![dropped_file],
+                ..Default::default()
+            };
+            let out = ctx.run_ui(dropped_raw, |ui| app.show_ui(ui));
+            out.drop_without_applying_deltas();
+            assert_eq!(app.session.doc.images.len(), 3);
+            let dropped_center = app.session.doc.images[2].center();
+            assert!(
+                (dropped_center.x - expected_center_2.x).abs() < 1.0
+                    && (dropped_center.y - expected_center_2.y).abs() < 1.0,
+                "expected dropped image centered near camera {expected_center_2:?}, got {dropped_center:?}"
+            );
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = png;
     }
 
     #[test]

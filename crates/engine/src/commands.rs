@@ -668,6 +668,10 @@ struct InsertImageParams {
     #[serde(default)]
     y: Option<f64>,
     #[serde(default)]
+    center_x: Option<f64>,
+    #[serde(default)]
+    center_y: Option<f64>,
+    #[serde(default)]
     width: Option<f64>,
     #[serde(default)]
     height: Option<f64>,
@@ -1900,7 +1904,15 @@ fn resolve_image_placement(
     p: &InsertImageParams,
     id: &str,
 ) -> Result<(f64, f64, f64, f64), EngineError> {
-    for opt in [p.x, p.y, p.width, p.height, p.angle_degrees] {
+    for opt in [
+        p.x,
+        p.y,
+        p.center_x,
+        p.center_y,
+        p.width,
+        p.height,
+        p.angle_degrees,
+    ] {
         if opt.is_some_and(|value| !value.is_finite()) {
             return Err(invalid(id, "image geometry values must be finite"));
         }
@@ -1938,8 +1950,14 @@ fn resolve_image_placement(
     };
     let max_x = (page_w - width).max(0.0);
     let max_y = (page_h - height).max(0.0);
-    let x = p.x.unwrap_or((page_w - width) * 0.5).clamp(0.0, max_x);
-    let y = p.y.unwrap_or((page_h - height) * 0.5).clamp(0.0, max_y);
+    let default_x = p
+        .center_x
+        .map_or((page_w - width) * 0.5, |cx| cx - width * 0.5);
+    let default_y = p
+        .center_y
+        .map_or((page_h - height) * 0.5, |cy| cy - height * 0.5);
+    let x = p.x.unwrap_or(default_x).clamp(0.0, max_x);
+    let y = p.y.unwrap_or(default_y).clamp(0.0, max_y);
     Ok((x, y, width, height))
 }
 

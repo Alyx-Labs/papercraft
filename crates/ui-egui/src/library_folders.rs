@@ -27,7 +27,7 @@ use crate::icons::{Icon, compact_icon_button, paint_icon};
 use crate::modal::{self, ActiveModal};
 use crate::theme::{Tokens, to_color32};
 
-/// Fixed width of the Library navigation sidebar (standardized with Pages and Settings sidebars).
+/// Fixed width of the Library navigation sidebar (standardized with the Pages sidebar).
 pub(crate) const SIDEBAR_WIDTH: f32 = crate::STANDARD_SIDEBAR_WIDTH;
 /// Below this window width the sidebar collapses into a "Browse" menu button.
 pub(crate) const SIDEBAR_MIN_VIEWPORT: f32 = 760.0;

@@ -38,6 +38,7 @@ fn panic_hunt_all_commands_resist_adversarial_inputs() {
         json!({ "theme": "Dark" }),
         json!({ "theme": "NeonUltraViolet" }),
         json!({ "bytes": [1, 2, 3, 4], "x": 1e38, "y": -1e38 }),
+        json!({ "bytes": [1, 2, 3, 4], "center_x": 1e308, "center_y": -1e308 }),
         json!({ "base64_bytes": "not!valid!base64" }),
         json!({ "targets": [{ "kind": "image", "index": 999999 }] }),
         json!({

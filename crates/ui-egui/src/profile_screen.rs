@@ -15,8 +15,8 @@ use crate::account_modal::{
     render_signed_in_server_card, render_signed_in_transfer_section, trigger_test_connection,
 };
 use crate::icons::{
-    Icon, SwitchLayout, SwitchOption, compact_icon_button, icon_button, paint_icon,
-    segmented_switch,
+    Icon, SidebarEdge, SidebarEdgeButtonSpec, SwitchLayout, SwitchOption, icon_button, paint_icon,
+    segmented_switch, sidebar_edge_button,
 };
 use crate::modal::{primary_action_button, secondary_action_button};
 use crate::sync_worker::trigger_manual_sync;
@@ -73,7 +73,12 @@ fn draw_profile_header(
 ) {
     let frame = egui::Frame::new()
         .fill(t.toolbar_bg)
-        .inner_margin(Margin::symmetric(12, 8))
+        .inner_margin(Margin {
+            left: 12,
+            right: 0,
+            top: 8,
+            bottom: 8,
+        })
         .stroke(Stroke::new(1.0, t.border));
 
     egui::Panel::top("papercraft_profile_header")
@@ -118,12 +123,16 @@ fn draw_profile_header(
                     ui.set_height(HEADER_ROW_HEIGHT);
                     ui.spacing_mut().item_spacing.x = 6.0;
 
-                    if compact_icon_button(
+                    if sidebar_edge_button(
                         ui,
-                        Icon::Settings,
-                        Some("Settings"),
-                        app.view.inspector_open,
-                        true,
+                        SidebarEdgeButtonSpec {
+                            edge: SidebarEdge::Right,
+                            icon: Icon::Settings,
+                            label: "Settings",
+                            max_width: None,
+                            open: app.view.inspector_open,
+                            enabled: true,
+                        },
                         t,
                     )
                     .on_hover_text(

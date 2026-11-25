@@ -16,10 +16,10 @@ use crate::color_picker::{
     ColorPopoverMode, format_color_label, paint_checkerboard_circle, same_rgb, same_rgba,
 };
 use crate::icons::{
-    Icon, SquareButtonSpec, SwitchLayout, SwitchOption, compact_icon_button,
-    compact_icon_button_width, icon_button, max_width_icon_button, max_width_icon_button_width,
-    paint_icon, segmented_switch, segmented_switch_width, sized_icon_button, tray_icon_button,
-    tray_icon_button_width,
+    Icon, SidebarEdge, SidebarEdgeButtonSpec, SquareButtonSpec, SwitchLayout, SwitchOption,
+    compact_icon_button, compact_icon_button_width, icon_button, paint_icon, segmented_switch,
+    segmented_switch_width, sidebar_edge_button, sidebar_edge_button_width, sized_icon_button,
+    tray_icon_button, tray_icon_button_width,
 };
 use crate::theme::{Tokens, to_color32};
 
@@ -28,9 +28,12 @@ const CONTEXT_TRAY_ROW_HEIGHT: f32 = 32.0;
 const CONTEXT_TRAY_TILE_SIZE: f32 = 26.0;
 const CONTEXT_TRAY_CORNER_RADIUS: u8 = 11;
 const ZONE_ITEM_SPACING: f32 = 2.0;
+const EDGE_TAB_NEIGHBOR_GAP: f32 = 6.0;
 const DIVIDER_WIDTH: f32 = 8.0;
-const NOTEBOOK_PILL_MAX_WIDTH: f32 = 132.0;
+const NOTEBOOK_PILL_MAX_WIDTH: f32 = 148.0;
 const ZOOM_PILL_WIDTH: f32 = 38.0;
+const RIGHT_UTILITIES_WIDTH: f32 =
+    28.0 * 7.0 + ZOOM_PILL_WIDTH + DIVIDER_WIDTH * 2.0 + ZONE_ITEM_SPACING * 9.0;
 const RULER_ANGLE_CONTROL_WIDTH: f32 = 62.0;
 const SHAPE_CURVE_CONTROL_WIDTH: f32 = 84.0;
 const PATH_SIZE_SLIDER_WIDTH: f32 = 126.0;
@@ -218,9 +221,9 @@ fn pen_icon(kind: PenKind) -> Icon {
 }
 
 fn measure_left_zone(ui: &egui::Ui, notebook_title: &str) -> f32 {
+    let notebook_w = sidebar_edge_button_width(ui, notebook_title, Some(NOTEBOOK_PILL_MAX_WIDTH));
     let lib_w = compact_icon_button_width(ui, "Library");
-    let notebook_w = max_width_icon_button_width(ui, notebook_title, NOTEBOOK_PILL_MAX_WIDTH);
-    lib_w + notebook_w + ZONE_ITEM_SPACING
+    notebook_w + EDGE_TAB_NEIGHBOR_GAP + lib_w
 }
 
 fn measure_center_zone(ui: &egui::Ui) -> f32 {
@@ -231,11 +234,7 @@ fn measure_center_zone(ui: &egui::Ui) -> f32 {
 }
 
 fn measure_right_zone(ui: &egui::Ui) -> f32 {
-    let history_w = 28.0 * 3.0;
-    let zoom_w = 28.0 + ZOOM_PILL_WIDTH + 28.0;
-    let end_w = 28.0 + 28.0 + compact_icon_button_width(ui, "Settings");
-    let widgets = 11.0;
-    history_w + DIVIDER_WIDTH + zoom_w + DIVIDER_WIDTH + end_w + (widgets - 1.0) * ZONE_ITEM_SPACING
+    RIGHT_UTILITIES_WIDTH + EDGE_TAB_NEIGHBOR_GAP + sidebar_edge_button_width(ui, "Settings", None)
 }
 
 fn hairline_divider_sized(ui: &mut egui::Ui, row_height: f32, t: &Tokens) {
@@ -829,16 +828,8 @@ fn no_color_dot_sized(
         .on_hover_text(tooltip)
 }
 
-fn draw_left_zone(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+fn draw_left_zone(app: &mut PaperCraftApp, ui: &mut egui::Ui, max_notebook_w: f32, t: &Tokens) {
     ui.spacing_mut().item_spacing.x = ZONE_ITEM_SPACING;
-
-    if compact_icon_button(ui, Icon::Library, Some("Library"), false, true, t)
-        .on_hover_text("Return to Notebooks Home (Shortcut: H)")
-        .clicked()
-    {
-        crate::return_to_home(app);
-        return;
-    }
 
     let nb_active = app.view.pages_sidebar_open;
     let tip = if nb_active {
@@ -852,13 +843,16 @@ fn draw_left_zone(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
             app.session.doc.title
         )
     };
-    if max_width_icon_button(
+    if sidebar_edge_button(
         ui,
-        Icon::Notebook,
-        &app.session.doc.title,
-        NOTEBOOK_PILL_MAX_WIDTH,
-        nb_active,
-        true,
+        SidebarEdgeButtonSpec {
+            edge: SidebarEdge::Left,
+            icon: Icon::Notebook,
+            label: &app.session.doc.title,
+            max_width: Some(max_notebook_w),
+            open: nb_active,
+            enabled: true,
+        },
         t,
     )
     .on_hover_text(tip)
@@ -871,6 +865,15 @@ fn draw_left_zone(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
                 app.view.inspector_open = false;
             }
         }
+    }
+
+    ui.add_space((EDGE_TAB_NEIGHBOR_GAP - ZONE_ITEM_SPACING).max(0.0));
+
+    if compact_icon_button(ui, Icon::Library, Some("Library"), false, true, t)
+        .on_hover_text("Return to Notebooks Home (Shortcut: H)")
+        .clicked()
+    {
+        crate::return_to_home(app);
     }
 }
 
@@ -3921,7 +3924,7 @@ fn draw_zoom_percent_pill(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens
     }
 }
 
-fn draw_right_zone(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+fn draw_right_utility_controls(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     ui.spacing_mut().item_spacing.x = ZONE_ITEM_SPACING;
     let can_undo = app.session.history.can_undo();
     let can_redo = app.session.history.can_redo();
@@ -4034,7 +4037,9 @@ fn draw_right_zone(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     if sync_resp.on_hover_text(sync_tip).clicked() {
         crate::open_profile_screen(app);
     }
+}
 
+fn draw_settings_edge_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     #[cfg(not(target_arch = "wasm32"))]
     let has_update = app.updater.has_actionable_update();
     #[cfg(target_arch = "wasm32")]
@@ -4045,19 +4050,23 @@ fn draw_right_zone(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     } else {
         "Settings (Shortcut: S)\nPen shortcuts, studio appearance, and system info."
     };
-    let settings_resp = compact_icon_button(
+    let settings_resp = sidebar_edge_button(
         ui,
-        Icon::Settings,
-        Some("Settings"),
-        app.view.inspector_open,
-        true,
+        SidebarEdgeButtonSpec {
+            edge: SidebarEdge::Right,
+            icon: Icon::Settings,
+            label: "Settings",
+            max_width: None,
+            open: app.view.inspector_open,
+            enabled: true,
+        },
         t,
     )
     .on_hover_text(settings_tip);
     if has_update && ui.is_rect_visible(settings_resp.rect) {
         let dot_c = egui::pos2(
-            settings_resp.rect.right() - 4.0,
-            settings_resp.rect.top() + 4.0,
+            settings_resp.rect.right() - 7.0,
+            settings_resp.rect.top() + 5.5,
         );
         ui.painter().circle_filled(dot_c, 4.0, t.toolbar_bg);
         ui.painter().circle_filled(dot_c, 3.0, t.accent);
@@ -5029,7 +5038,12 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> egui::Re
     let t = Tokens::for_theme(app.session.prefs.theme);
     let frame = egui::Frame::new()
         .fill(t.toolbar_bg)
-        .inner_margin(egui::Margin::symmetric(12, 8))
+        .inner_margin(egui::Margin {
+            left: 0,
+            right: 0,
+            top: 8,
+            bottom: 8,
+        })
         .stroke(Stroke::new(1.0, t.border));
 
     egui::Panel::top("papercraft_toolbar")
@@ -5047,40 +5061,64 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> egui::Re
                     ui.spacing_mut().item_spacing = Vec2::new(ZONE_ITEM_SPACING, 0.0);
                     let row_left = ui.cursor().left();
 
-                    draw_left_zone(app, ui, &t);
+                    draw_left_zone(app, ui, NOTEBOOK_PILL_MAX_WIDTH, &t);
 
                     let ideal_center_x = row_left + (avail_w - center_w) * 0.5;
-                    let min_center_x = ui.cursor().left() + min_gap;
+                    let min_center_x =
+                        (ui.cursor().left() - ZONE_ITEM_SPACING).max(row_left) + min_gap;
                     let max_center_x = row_left + avail_w - right_w - center_w - min_gap;
                     let target_center_x =
                         ideal_center_x.clamp(min_center_x, max_center_x.max(min_center_x));
-                    let left_gap =
-                        (target_center_x - ui.cursor().left() - ZONE_ITEM_SPACING).max(0.0);
-                    let _ = ui.allocate_exact_size(Vec2::new(left_gap, 1.0), Sense::hover());
+                    let left_gap = (target_center_x - ui.cursor().left()).max(0.0);
+                    ui.add_space(left_gap);
 
                     draw_center_zone(app, ui, &t);
 
-                    let right_gap =
-                        ((row_left + avail_w - right_w) - ui.cursor().left() - ZONE_ITEM_SPACING)
-                            .max(0.0);
-                    let _ = ui.allocate_exact_size(Vec2::new(right_gap, 1.0), Sense::hover());
-
-                    draw_right_zone(app, ui, &t);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.set_height(TOOLBAR_ROW_HEIGHT);
+                        ui.spacing_mut().item_spacing = Vec2::new(ZONE_ITEM_SPACING, 0.0);
+                        draw_settings_edge_button(app, ui, &t);
+                        ui.add_space((EDGE_TAB_NEIGHBOR_GAP - ZONE_ITEM_SPACING).max(0.0));
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(RIGHT_UTILITIES_WIDTH, TOOLBAR_ROW_HEIGHT),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                draw_right_utility_controls(app, ui, &t);
+                            },
+                        );
+                    });
                 });
             } else {
-                crate::theme::studio_wrapped_row(
-                    ui,
-                    Vec2::new(ZONE_ITEM_SPACING, 6.0),
-                    TOOLBAR_ROW_HEIGHT,
-                    |ui| {
-                        ui.set_min_height(TOOLBAR_ROW_HEIGHT);
-                        draw_left_zone(app, ui, &t);
-                        hairline_divider(ui, &t);
-                        draw_center_zone(app, ui, &t);
-                        hairline_divider(ui, &t);
-                        draw_right_zone(app, ui, &t);
-                    },
-                );
+                let lib_w = compact_icon_button_width(ui, "Library");
+                let settings_w = sidebar_edge_button_width(ui, "Settings", None);
+                let max_nb_w = (avail_w - lib_w - settings_w - EDGE_TAB_NEIGHBOR_GAP - 12.0)
+                    .clamp(64.0, NOTEBOOK_PILL_MAX_WIDTH);
+                ui.horizontal(|ui| {
+                    ui.set_height(TOOLBAR_ROW_HEIGHT);
+                    ui.spacing_mut().item_spacing = Vec2::new(ZONE_ITEM_SPACING, 0.0);
+                    draw_left_zone(app, ui, max_nb_w, &t);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.set_height(TOOLBAR_ROW_HEIGHT);
+                        ui.spacing_mut().item_spacing = Vec2::new(ZONE_ITEM_SPACING, 0.0);
+                        draw_settings_edge_button(app, ui, &t);
+                    });
+                });
+                ui.add_space(6.0);
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(12, 0))
+                    .show(ui, |ui| {
+                        crate::theme::studio_wrapped_row(
+                            ui,
+                            Vec2::new(ZONE_ITEM_SPACING, 6.0),
+                            TOOLBAR_ROW_HEIGHT,
+                            |ui| {
+                                ui.set_min_height(TOOLBAR_ROW_HEIGHT);
+                                draw_center_zone(app, ui, &t);
+                                hairline_divider(ui, &t);
+                                draw_right_utility_controls(app, ui, &t);
+                            },
+                        );
+                    });
             }
         })
         .response
@@ -6152,10 +6190,10 @@ mod tests {
                 };
                 let out = ctx.run_ui(raw, |ui| {
                     crate::theme::apply_light_visuals(ui.ctx());
-                    pill_w = max_width_icon_button_width(
+                    pill_w = sidebar_edge_button_width(
                         ui,
                         &app.session.doc.title,
-                        NOTEBOOK_PILL_MAX_WIDTH,
+                        Some(NOTEBOOK_PILL_MAX_WIDTH),
                     );
                     rect = show_inner(app, ui);
                 });
@@ -6221,6 +6259,179 @@ mod tests {
                 .any(|row| row.starts_with("Math") && row.ends_with('…')),
             "expected long notebook title to truncate with ellipsis, got {long_rows:?}"
         );
+    }
+
+    #[test]
+    fn sidebar_edge_buttons_are_flush_and_notebook_precedes_library() {
+        let mut app = PaperCraftApp::default();
+        crate::open_notebook_in_editor(&mut app, 0);
+        app.session
+            .execute("notebook.rename", &json!({ "title": "Calculus Notes" }))
+            .unwrap();
+
+        let render_toolbar = |app: &mut PaperCraftApp, width: f32, height: f32| {
+            let ctx = egui::Context::default();
+            let mut header_rect = egui::Rect::NOTHING;
+            let mut texts: Vec<(String, egui::Rect)> = Vec::new();
+            let mut edge_tabs: Vec<egui::Rect> = Vec::new();
+            for step in 0..2 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(width, height),
+                    )),
+                    time: Some(f64::from(step) * 0.05),
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(raw, |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    header_rect = show_inner(app, ui);
+                });
+                texts.clear();
+                edge_tabs.clear();
+                fn scan(
+                    shape: &egui::Shape,
+                    header: egui::Rect,
+                    texts: &mut Vec<(String, egui::Rect)>,
+                    tabs: &mut Vec<egui::Rect>,
+                ) {
+                    match shape {
+                        egui::Shape::Text(text) => {
+                            let r = text.visual_bounding_rect();
+                            if header.contains(r.center()) {
+                                texts.push((text.galley.text().to_string(), r));
+                            }
+                        }
+                        egui::Shape::Rect(rs)
+                            if (rs.rect.height() - TOOLBAR_ROW_HEIGHT).abs() <= 0.5
+                                && (rs.corner_radius.ne >= 10 || rs.corner_radius.nw >= 10) =>
+                        {
+                            tabs.push(rs.rect);
+                        }
+                        egui::Shape::Vec(items) => {
+                            for item in items {
+                                scan(item, header, texts, tabs);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for clipped in &out.shapes {
+                    scan(&clipped.shape, header_rect, &mut texts, &mut edge_tabs);
+                }
+                out.drop_without_applying_deltas();
+            }
+            (ctx, header_rect, texts, edge_tabs)
+        };
+
+        let (ctx, header_rect, texts, edge_tabs) = render_toolbar(&mut app, 1280.0, 800.0);
+        let nb_rect = texts
+            .iter()
+            .find(|(label, _)| label == "Calculus Notes")
+            .expect("notebook edge button label")
+            .1;
+        let lib_rect = texts
+            .iter()
+            .find(|(label, _)| label == "Library")
+            .expect("Library button label")
+            .1;
+        let settings_rect = texts
+            .iter()
+            .find(|(label, _)| label == "Settings")
+            .expect("Settings edge button label")
+            .1;
+
+        assert!(
+            nb_rect.center().x < lib_rect.center().x,
+            "expected Notebook edge button ({:.1}) to the left of Library ({:.1})",
+            nb_rect.center().x,
+            lib_rect.center().x
+        );
+
+        let left_tab = edge_tabs
+            .iter()
+            .min_by(|a, b| a.left().total_cmp(&b.left()))
+            .copied()
+            .expect("left sidebar edge tab rect");
+        let right_tab = edge_tabs
+            .iter()
+            .max_by(|a, b| a.right().total_cmp(&b.right()))
+            .copied()
+            .expect("right sidebar edge tab rect");
+        assert!(
+            (left_tab.left() - header_rect.left()).abs() <= 2.5,
+            "expected left edge tab flush to header left ({:.1}), got {:.1}",
+            header_rect.left(),
+            left_tab.left()
+        );
+        assert!(
+            (right_tab.right() - header_rect.right()).abs() <= 2.5,
+            "expected right edge tab flush to header right ({:.1}), got {:.1}",
+            header_rect.right(),
+            right_tab.right()
+        );
+
+        let click_at = |pt: egui::Pos2, app: &mut PaperCraftApp| {
+            for (pressed, time) in [(true, 0.20), (false, 0.25)] {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(1280.0, 800.0),
+                    )),
+                    time: Some(time),
+                    events: vec![
+                        egui::Event::PointerMoved(pt),
+                        egui::Event::PointerButton {
+                            pos: pt,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(raw, |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    let _ = show_inner(app, ui);
+                });
+                out.drop_without_applying_deltas();
+            }
+        };
+
+        let was_pages_open = app.view.pages_sidebar_open;
+        click_at(nb_rect.center(), &mut app);
+        assert_ne!(app.view.pages_sidebar_open, was_pages_open);
+
+        let was_inspector_open = app.view.inspector_open;
+        click_at(settings_rect.center(), &mut app);
+        assert_ne!(app.view.inspector_open, was_inspector_open);
+
+        // Narrow viewport wraps below, while top row keeps edge buttons flush left/right.
+        let (_, narrow_header, narrow_texts, narrow_tabs) = render_toolbar(&mut app, 840.0, 560.0);
+        assert!(narrow_header.height() > 48.0);
+        let narrow_nb = narrow_texts
+            .iter()
+            .find(|(label, _)| label.starts_with("Calculus"))
+            .expect("narrow notebook label")
+            .1;
+        let narrow_lib = narrow_texts
+            .iter()
+            .find(|(label, _)| label == "Library")
+            .expect("narrow Library label")
+            .1;
+        assert!(narrow_nb.center().x < narrow_lib.center().x);
+        let narrow_left = narrow_tabs
+            .iter()
+            .min_by(|a, b| a.left().total_cmp(&b.left()))
+            .copied()
+            .expect("narrow left edge tab");
+        let narrow_right = narrow_tabs
+            .iter()
+            .max_by(|a, b| a.right().total_cmp(&b.right()))
+            .copied()
+            .expect("narrow right edge tab");
+        assert!((narrow_left.left() - narrow_header.left()).abs() <= 2.5);
+        assert!((narrow_right.right() - narrow_header.right()).abs() <= 2.5);
     }
 
     #[test]
@@ -6792,7 +7003,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         let t = Tokens::for_theme(app.session.prefs.theme);
-        let viewport_w = 1040.0_f32; // canvas = 1040 - 280 - 280 = 480px (wraps compactly with open sidebars)
+        let viewport_w = 1040.0_f32; // canvas = 1040 - 280 - 372 = 388px (wraps compactly with open sidebars)
         let mut tray_rect_opt = None;
         for frame in 0..4 {
             let raw = egui::RawInput {

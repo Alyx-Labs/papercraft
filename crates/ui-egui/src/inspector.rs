@@ -1198,7 +1198,7 @@ pub(crate) fn title_to_default_filename(title: &str, ext: &str) -> String {
     }
 }
 
-pub(crate) const DEFAULT_INSPECTOR_WIDTH: f32 = crate::STANDARD_SIDEBAR_WIDTH;
+pub(crate) const DEFAULT_INSPECTOR_WIDTH: f32 = 372.0;
 
 pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
     let _ = show_inner(app, ui);
@@ -1214,7 +1214,7 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
 
     let frame = Frame::new()
         .fill(t.panel_bg)
-        .inner_margin(Margin::same(10))
+        .inner_margin(Margin::same(12))
         .stroke(Stroke::new(1.0, t.border));
 
     let rect = crate::fixed_side_panel(
