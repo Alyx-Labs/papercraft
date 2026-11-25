@@ -3991,6 +3991,11 @@ fn draw_right_utility_controls(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &T
         }
     }
 
+    draw_sync_profile_button(app, ui, t);
+}
+
+/// Renders the `36x36` Profile & Cloud Sync icon button with a live connection status dot.
+pub(crate) fn draw_sync_profile_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     let acct_active = app.view.screen == crate::AppScreen::Profile
         || app.view.active_modal == Some(crate::modal::ActiveModal::AccountSync);
     let summary = app.session.sync_status_summary();
@@ -4002,8 +4007,12 @@ fn draw_right_utility_controls(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &T
         t.text_muted
     };
     let sync_tip = if summary.viewing_cloud {
+        let handle = summary
+            .username
+            .as_deref()
+            .map_or_else(String::new, |u| format!(" · @{u}"));
         format!(
-            "Profile & Cloud Sync ({})\nStatus: {} ({cloud_pending} waiting to sync)\nServer: {}",
+            "Profile: {}{handle}\nStatus: {} ({cloud_pending} waiting to sync)\nServer: {}\nClick to open Profile & Cloud Sync.",
             summary.workspace_badge_text(),
             state_label,
             summary.server_url

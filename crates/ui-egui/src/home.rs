@@ -12,8 +12,9 @@ use std::sync::Arc;
 use crate::PaperCraftApp;
 use crate::customization_modals::{paint_hardcover_book_cover, paint_paper_preview_colors};
 use crate::icons::{
-    Icon, SidebarEdge, SidebarEdgeButtonSpec, SwitchLayout, SwitchOption, compact_icon_button,
-    icon_button, paint_icon, segmented_switch, sidebar_edge_button,
+    Icon, SidebarEdge, SidebarEdgeButtonSpec, SidebarEdgeSize, SwitchLayout, SwitchOption,
+    TOOLBAR_CONTROL_HEIGHT, compact_icon_button, icon_button, paint_icon, segmented_switch,
+    sidebar_edge_button_sized, toolbar_icon_button,
 };
 use crate::library_folders::{
     FolderNode, LibraryAction, LibraryScope, NotebookDragPayload, SIDEBAR_MIN_VIEWPORT,
@@ -25,7 +26,9 @@ use crate::modal::{self, ActiveModal};
 use crate::pages_sidebar::paint_thumbnail_strokes_cached;
 use crate::theme::Tokens;
 
-const HEADER_ROW_HEIGHT: f32 = 28.0;
+const HEADER_ROW_HEIGHT: f32 = TOOLBAR_CONTROL_HEIGHT;
+const UTILITY_BAR_ROW_HEIGHT: f32 = 28.0;
+const BRAND_BADGE_SIZE: f32 = 28.0;
 const MIN_CARD_WIDTH: f32 = 232.0;
 const CARD_HEIGHT: f32 = 272.0;
 const CARD_MARGIN: i8 = 12;
@@ -390,7 +393,7 @@ fn brand_logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
 }
 
 fn draw_home_brand(ui: &mut egui::Ui, show_subtitle: bool, t: &Tokens) {
-    let (badge_rect, _) = ui.allocate_exact_size(Vec2::splat(HEADER_ROW_HEIGHT), Sense::hover());
+    let (badge_rect, _) = ui.allocate_exact_size(Vec2::splat(BRAND_BADGE_SIZE), Sense::hover());
     if let Some(logo_tex) = brand_logo_texture(ui.ctx()) {
         egui::Image::new(egui::load::SizedTexture::new(
             logo_tex.id(),
@@ -433,16 +436,17 @@ fn draw_home_settings_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tok
     } else {
         "Settings (Shortcut: S)\nPen shortcuts, studio appearance, system info, and app updates."
     };
-    if sidebar_edge_button(
+    if sidebar_edge_button_sized(
         ui,
         SidebarEdgeButtonSpec {
             edge: SidebarEdge::Right,
             icon: Icon::Settings,
-            label: "Settings",
+            label: "",
             max_width: None,
             open: app.view.inspector_open,
             enabled: true,
         },
+        SidebarEdgeSize::Toolbar,
         t,
     )
     .on_hover_text(settings_tip)
@@ -456,8 +460,8 @@ fn draw_home_settings_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tok
 }
 
 fn draw_home_package_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
-    let pkg_resp = icon_button(ui, Icon::Library, Some("Package"), false, true, t).on_hover_text(
-        "Export or import a complete backup package (.pcraftpkg) with all saves and notebooks",
+    let pkg_resp = toolbar_icon_button(ui, Icon::Library, None, false, true, t).on_hover_text(
+        "Package Backup — export or import a complete backup (.pcraftpkg) with all saves and notebooks",
     );
     let mut export_pkg = false;
     let mut import_pkg = false;
@@ -495,8 +499,8 @@ fn draw_home_package_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Toke
 }
 
 fn draw_home_open_pcraft_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
-    if icon_button(ui, Icon::Export, Some("Open .pcraft"), false, true, t)
-        .on_hover_text("Open a .pcraft notebook file from disk (Ctrl+O)")
+    if toolbar_icon_button(ui, Icon::FolderOpen, None, false, true, t)
+        .on_hover_text("Open .pcraft notebook file from disk (Ctrl+O)")
         .clicked()
     {
         app.trigger_open_notebook_dialog();
@@ -531,7 +535,7 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
                         draw_home_settings_button(app, ui, t);
                         draw_home_package_button(app, ui, t);
                         draw_home_open_pcraft_button(app, ui, t);
-                        draw_account_sync_pill(app, ui, t);
+                        crate::toolbar::draw_sync_profile_button(app, ui, t);
                         draw_search_input(app, ui, t);
                     });
                 });
@@ -561,7 +565,7 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
                             HEADER_ROW_HEIGHT,
                             |ui| {
                                 draw_search_input(app, ui, t);
-                                draw_account_sync_pill(app, ui, t);
+                                crate::toolbar::draw_sync_profile_button(app, ui, t);
                                 draw_home_open_pcraft_button(app, ui, t);
                                 draw_home_package_button(app, ui, t);
                             },
@@ -571,111 +575,6 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
         })
         .response
         .rect
-}
-
-fn truncate_label(raw: &str, max_chars: usize) -> String {
-    let mut chars = raw.chars();
-    let collected: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{collected}…")
-    } else {
-        collected
-    }
-}
-
-fn draw_account_sync_pill(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
-    let summary = app.session.sync_status_summary();
-    let cloud_pending = app.session.cloud_pending_changes_count();
-    let (state_text, cloud_dot) = crate::account_modal::status_badge_style(summary.connection, t);
-    let (icon, label, dot_color) = if summary.viewing_cloud {
-        let short = truncate_label(&summary.workspace_badge_text(), 18);
-        (Icon::Account, short, cloud_dot)
-    } else {
-        let prof = summary
-            .active_local_profile_name
-            .as_deref()
-            .unwrap_or("Personal");
-        let short = truncate_label(prof, 12);
-        (Icon::Inbox, format!("Local · {short}"), t.text_muted)
-    };
-
-    let font = egui::FontId::proportional(12.0);
-    let galley = ui.painter().layout_no_wrap(label, font, t.text);
-    let icon_dim = 14.0_f32;
-    let width = 10.0 + icon_dim + 6.0 + galley.size().x + 8.0 + 7.0 + 10.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, HEADER_ROW_HEIGHT), Sense::click());
-
-    if ui.is_rect_visible(rect) {
-        let active = app.view.screen == crate::AppScreen::Profile
-            || app.view.active_modal == Some(ActiveModal::AccountSync);
-        let hover_t = crate::motion::hover_factor(ui.ctx(), resp.id.with("hov"), resp.hovered());
-        let active_t = crate::motion::hover_factor(ui.ctx(), resp.id.with("act"), active);
-        let fill = crate::motion::lerp_color(t.field_bg, t.accent_soft, hover_t.max(active_t));
-        let stroke = crate::motion::lerp_color(t.border, t.accent, active_t);
-        let p = ui.painter();
-        p.rect(
-            rect,
-            CornerRadius::same(7),
-            fill,
-            egui::Stroke::new(1.0, stroke),
-            egui::StrokeKind::Inside,
-        );
-        let ir = Rect::from_center_size(
-            pos2(rect.left() + 10.0 + icon_dim * 0.5, rect.center().y),
-            Vec2::splat(icon_dim),
-        );
-        paint_icon(p, ir, icon, t.text);
-        let gx = ir.right() + 6.0;
-        p.galley(
-            pos2(gx, rect.center().y - galley.size().y * 0.5),
-            galley,
-            t.text,
-        );
-        let dot_c = pos2(rect.right() - 12.5, rect.center().y);
-        p.circle_filled(dot_c, 3.5, dot_color);
-    }
-
-    let tip = if summary.viewing_cloud {
-        let handle = summary
-            .username
-            .as_deref()
-            .map_or_else(String::new, |u| format!(" · @{u}"));
-        format!(
-            "Profile: {}{handle}\nStatus: {} ({cloud_pending} waiting to sync)\nServer: {}\nClick to open Profile & Cloud Sync.",
-            summary.workspace_badge_text(),
-            state_text,
-            summary.server_url
-        )
-    } else if summary.signed_in {
-        let prof = summary
-            .active_local_profile_name
-            .as_deref()
-            .unwrap_or("Personal");
-        let cloud_acct = summary
-            .email
-            .as_deref()
-            .or(summary.username.as_deref())
-            .unwrap_or("connected account");
-        format!(
-            "Workspace: Local Only ({prof})\nCloud account ({cloud_acct}) is connected separately.\nClick to open Profile & Workspaces."
-        )
-    } else {
-        let prof = summary
-            .active_local_profile_name
-            .as_deref()
-            .unwrap_or("Personal");
-        format!(
-            "Workspace: Local Only ({prof})\nStored only on this device. Click to open Profile, manage local profiles, or connect Cloud Sync."
-        )
-    };
-
-    if resp
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(tip)
-        .clicked()
-    {
-        crate::open_profile_screen(app);
-    }
 }
 
 fn draw_search_input(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
@@ -704,22 +603,23 @@ fn draw_search_input(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     );
 
     let p = ui.painter();
-    p.rect_filled(box_rect, CornerRadius::same(7), t.field_bg);
-    p.rect_stroke(box_rect, CornerRadius::same(7), stroke, StrokeKind::Inside);
+    p.rect_filled(box_rect, CornerRadius::same(9), t.field_bg);
+    p.rect_stroke(box_rect, CornerRadius::same(9), stroke, StrokeKind::Inside);
 
-    let inner_rect = box_rect.shrink2(Vec2::new(9.0, 2.0));
+    let inner_rect = box_rect.shrink2(Vec2::new(10.0, 2.0));
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(inner_rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    child.spacing_mut().item_spacing.x = 6.0;
+    child.spacing_mut().item_spacing.x = 7.0;
 
-    let (icon_rect, _) = child.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+    let search_icon_dim = 17.0_f32;
+    let (icon_rect, _) = child.allocate_exact_size(Vec2::splat(search_icon_dim), Sense::hover());
     paint_icon(child.painter(), icon_rect, Icon::Search, t.text_muted);
 
-    let clear_slot_w = 16.0_f32;
-    let text_w = (inner_rect.width() - 14.0 - clear_slot_w - 12.0).max(60.0);
+    let clear_slot_w = 18.0_f32;
+    let text_w = (inner_rect.width() - search_icon_dim - clear_slot_w - 14.0).max(60.0);
     child.add(
         egui::TextEdit::singleline(&mut app.view.library_search)
             .id(edit_id)
@@ -1169,7 +1069,7 @@ fn draw_library_utility_bar(
 
     if ui.available_width() >= 540.0 {
         ui.horizontal(|ui| {
-            ui.set_height(HEADER_ROW_HEIGHT);
+            ui.set_height(UTILITY_BAR_ROW_HEIGHT);
             draw_left(app, ui);
             if !show_trash {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2715,15 +2615,15 @@ mod tests {
         crate::open_notebook_in_editor(&mut app, 1);
         let short_tb = run_toolbar(&mut app);
         assert!(
-            home_metrics.header_rect.height() <= 48.0,
-            "home header should stay compact (<= 48px), got {:.1}",
+            home_metrics.header_rect.height() >= 48.0 && home_metrics.header_rect.height() <= 56.0,
+            "home header should match enlarged toolbar height, got {:.1}",
             home_metrics.header_rect.height()
         );
         assert!(
-            short_tb.height() > home_metrics.header_rect.height() && short_tb.height() <= 56.0,
-            "editor toolbar ({:.1}) should be larger than home header ({:.1}) for bigger icons",
-            short_tb.height(),
-            home_metrics.header_rect.height()
+            (home_metrics.header_rect.height() - short_tb.height()).abs() <= 1.0,
+            "home header ({:.1}) and editor toolbar ({:.1}) heights must match",
+            home_metrics.header_rect.height(),
+            short_tb.height()
         );
 
         crate::open_notebook_in_editor(&mut app, 2);
@@ -3865,6 +3765,7 @@ mod tests {
 
         let mut header_rect = Rect::NOTHING;
         let mut header_texts: Vec<(String, Rect)> = Vec::new();
+        let mut right_edge_tab = None;
         for _ in 0..2 {
             let raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, viewport)),
@@ -3875,7 +3776,13 @@ mod tests {
                 header_rect = show_inner(&mut app, ui).header_rect;
             });
             header_texts.clear();
-            fn visit(shape: &egui::Shape, header: Rect, out: &mut Vec<(String, Rect)>) {
+            right_edge_tab = None;
+            fn visit(
+                shape: &egui::Shape,
+                header: Rect,
+                out: &mut Vec<(String, Rect)>,
+                edge_tab: &mut Option<Rect>,
+            ) {
                 match shape {
                     egui::Shape::Text(text) => {
                         let r = text.visual_bounding_rect();
@@ -3883,16 +3790,28 @@ mod tests {
                             out.push((text.galley.text().to_string(), r));
                         }
                     }
+                    egui::Shape::Rect(rs)
+                        if header.contains(rs.rect.center())
+                            && (rs.rect.height() - HEADER_ROW_HEIGHT).abs() <= 0.5
+                            && rs.corner_radius.nw >= 14 =>
+                    {
+                        *edge_tab = Some(rs.rect);
+                    }
                     egui::Shape::Vec(items) => {
                         for item in items {
-                            visit(item, header, out);
+                            visit(item, header, out, edge_tab);
                         }
                     }
                     _ => {}
                 }
             }
             for clipped in &out.shapes {
-                visit(&clipped.shape, header_rect, &mut header_texts);
+                visit(
+                    &clipped.shape,
+                    header_rect,
+                    &mut header_texts,
+                    &mut right_edge_tab,
+                );
             }
             out.drop_without_applying_deltas();
         }
@@ -3906,27 +3825,26 @@ mod tests {
             "home header must display 'Paper Craft' brand wordmark, got {header_texts:?}"
         );
         assert!(
-            !header_texts
+            header_texts
                 .iter()
-                .any(|(label, _)| label == "New Notebook" || label == "Import PDF"),
-            "home header must not contain 'New Notebook' or 'Import PDF' buttons, got {header_texts:?}"
+                .any(|(label, _)| label == "Notebooks Library"),
+            "home header must keep 'Notebooks Library' subtitle next to logo, got {header_texts:?}"
         );
         assert!(
-            !header_texts.iter().any(|(label, _)| label == "Theme"),
-            "home header should use standardized 'Settings' button instead of 'Theme' modal"
+            !header_texts.iter().any(|(label, _)| matches!(
+                label.as_str(),
+                "New Notebook" | "Import PDF" | "Theme" | "Package" | "Open .pcraft" | "Settings"
+            )),
+            "home header buttons must be icon-only without text labels, got {header_texts:?}"
         );
-        let settings_text_rect = header_texts
-            .iter()
-            .find(|(label, _)| label == "Settings")
-            .expect("expected 'Settings' button in home header")
-            .1;
+        let settings_tab_rect = right_edge_tab.expect("expected Settings edge tab in home header");
         assert!(
-            header_rect.right() - settings_text_rect.right() <= 20.0,
-            "expected Settings edge tab near header right ({:.1}), got text right {:.1}",
+            (header_rect.right() - settings_tab_rect.right()).abs() <= 2.5,
+            "expected Settings edge tab flush to header right ({:.1}), got {:.1}",
             header_rect.right(),
-            settings_text_rect.right()
+            settings_tab_rect.right()
         );
-        let settings_pos = settings_text_rect.center();
+        let settings_pos = settings_tab_rect.center();
 
         for (pressed, time) in [(true, 0.05), (false, 0.10)] {
             let raw = egui::RawInput {
@@ -4073,24 +3991,38 @@ mod tests {
 
     #[test]
     fn home_header_shows_active_workspace_indicator_and_notebook_sync_badges() {
-        fn collect_all(shape: &egui::Shape, out: &mut String) {
+        fn collect_all(
+            shape: &egui::Shape,
+            out: &mut String,
+            dot_colors: &mut Vec<Color32>,
+            header: Rect,
+        ) {
             match shape {
                 egui::Shape::Text(text) => {
                     out.push_str(text.galley.text());
                     out.push('\n');
                 }
+                egui::Shape::Circle(circle)
+                    if header.contains(circle.center) && (circle.radius - 3.0).abs() <= 0.4 =>
+                {
+                    dot_colors.push(circle.fill);
+                }
                 egui::Shape::Vec(items) => {
                     for item in items {
-                        collect_all(item, out);
+                        collect_all(item, out, dot_colors, header);
                     }
                 }
                 _ => {}
             }
         }
 
-        fn render_home_text(ctx: &egui::Context, app: &mut PaperCraftApp) -> String {
+        fn render_home_snapshot(
+            ctx: &egui::Context,
+            app: &mut PaperCraftApp,
+        ) -> (String, Vec<Color32>) {
             let viewport = Vec2::new(1280.0, 800.0);
             let mut text = String::new();
+            let mut dots = Vec::new();
             for step in 0..3 {
                 let raw = egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, viewport)),
@@ -4100,24 +4032,34 @@ mod tests {
                 };
                 let out = ctx.run_ui(raw, |ui| {
                     crate::theme::apply_light_visuals(ui.ctx());
-                    let _ = show_inner(app, ui);
+                    let m = show_inner(app, ui);
+                    text.clear();
+                    dots.clear();
+                    let _ = m.header_rect;
                 });
+                let header_bounds = Rect::from_min_size(Pos2::ZERO, Vec2::new(viewport.x, 56.0));
                 text.clear();
+                dots.clear();
                 for clipped in &out.shapes {
-                    collect_all(&clipped.shape, &mut text);
+                    collect_all(&clipped.shape, &mut text, &mut dots, header_bounds);
                 }
                 out.drop_without_applying_deltas();
             }
-            text
+            (text, dots)
         }
 
         let ctx = egui::Context::default();
         let mut app = PaperCraftApp::default();
+        let t = Tokens::for_theme(app.session.prefs.theme);
 
-        let local_text = render_home_text(&ctx, &mut app);
+        let (local_text, local_dots) = render_home_snapshot(&ctx, &mut app);
         assert!(
-            local_text.contains("Local · Personal"),
-            "missing Local · Personal pill in:\n{local_text}"
+            !local_text.contains("Local · Personal"),
+            "home sync button should be icon-only without pill text:\n{local_text}"
+        );
+        assert!(
+            local_dots.contains(&t.text_muted),
+            "expected muted local status dot on header sync button, got {local_dots:?}"
         );
         assert!(
             local_text.contains("Local only"),
@@ -4148,10 +4090,18 @@ mod tests {
             .execute("notebook.create", &json!({ "title": "Cloud Notes" }))
             .unwrap();
 
-        let cloud_text = render_home_text(&ctx, &mut app);
+        let (cloud_text, cloud_dots) = render_home_snapshot(&ctx, &mut app);
+        let (_, expected_cloud_dot) = crate::account_modal::status_badge_style(
+            app.session.sync_status_summary().connection,
+            &t,
+        );
         assert!(
-            cloud_text.contains("alex@example.com"),
-            "missing email workspace badge in:\n{cloud_text}"
+            !cloud_text.contains("alex@example.com"),
+            "home sync button should be icon-only without email text:\n{cloud_text}"
+        );
+        assert!(
+            cloud_dots.contains(&expected_cloud_dot),
+            "expected cloud status dot ({expected_cloud_dot:?}) on header sync button, got {cloud_dots:?}"
         );
         assert!(
             cloud_text.contains("Waiting to sync"),
