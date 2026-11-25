@@ -35,6 +35,7 @@ pub mod theme;
 pub mod toolbar;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod update_modal;
+pub mod welcome_modal;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -922,7 +923,9 @@ impl PaperCraftApp {
             server_url: session.server_url().to_string(),
             ..Default::default()
         };
-        let initial_modal = if session.needs_initial_nickname() {
+        let initial_modal = if session.should_show_welcome_banner() {
+            Some(modal::ActiveModal::WelcomeBanner)
+        } else if session.needs_initial_nickname() {
             Some(modal::ActiveModal::FirstAccessNickname)
         } else {
             None
@@ -933,7 +936,8 @@ impl PaperCraftApp {
             export_path_stem: inspector::title_to_export_stem(&session.doc.title),
             account,
             active_modal: initial_modal,
-            first_access_focus_pending: initial_modal.is_some(),
+            first_access_focus_pending: initial_modal
+                == Some(modal::ActiveModal::FirstAccessNickname),
             ..Default::default()
         };
         let mut stylus = stylus::Stylus::default();
@@ -1581,6 +1585,13 @@ impl PaperCraftApp {
 
             let is_pdf = is_pdf_path(path);
             if is_pdf {
+                if self.view.screen == AppScreen::Editor && self.session.is_read_only() {
+                    self.session.last_export_status = Some(
+                        "Read-Only mode is active — unlock the notebook to insert files."
+                            .to_string(),
+                    );
+                    continue;
+                }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     let path_buf = path.to_path_buf();
@@ -1619,6 +1630,13 @@ impl PaperCraftApp {
             #[cfg(not(target_arch = "wasm32"))]
             if let Ok(bytes) = file.bytes() {
                 if papercraft_doc::looks_like_pdf_bytes(&bytes) {
+                    if self.view.screen == AppScreen::Editor && self.session.is_read_only() {
+                        self.session.last_export_status = Some(
+                            "Read-Only mode is active — unlock the notebook to insert files."
+                                .to_string(),
+                        );
+                        continue;
+                    }
                     let _ = self.import_pdf_from_picked(
                         PickedOpenFile::Bytes {
                             name: "Imported.pdf".to_string(),
@@ -1632,13 +1650,27 @@ impl PaperCraftApp {
                         bytes,
                     });
                 } else if self.view.screen == AppScreen::Editor {
-                    let _ = self.insert_image_from_bytes(&bytes);
+                    if self.session.is_read_only() {
+                        self.session.last_export_status = Some(
+                            "Read-Only mode is active — unlock the notebook to insert files."
+                                .to_string(),
+                        );
+                    } else {
+                        let _ = self.insert_image_from_bytes(&bytes);
+                    }
                 }
             } else if self.view.screen == AppScreen::Editor
                 && (is_supported_image_path(path) || looks_like_raster_image_path(path))
                 && let Ok(bytes) = std::fs::read(path)
             {
-                let _ = self.insert_image_from_bytes(&bytes);
+                if self.session.is_read_only() {
+                    self.session.last_export_status = Some(
+                        "Read-Only mode is active — unlock the notebook to insert files."
+                            .to_string(),
+                    );
+                } else {
+                    let _ = self.insert_image_from_bytes(&bytes);
+                }
             }
         }
     }
@@ -1681,6 +1713,10 @@ impl PaperCraftApp {
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 if self.view.active_modal == Some(modal::ActiveModal::FirstAccessNickname) {
+                    return;
+                }
+                if self.view.active_modal == Some(modal::ActiveModal::WelcomeBanner) {
+                    welcome_modal::dismiss(self);
                     return;
                 }
                 if self.view.tag_edit_index.is_some() {
@@ -1856,6 +1892,7 @@ impl PaperCraftApp {
     }
 
     fn execute_keyboard_shortcut(&mut self, ctx: &egui::Context, action: KeyboardShortcutAction) {
+        let editor_read_only = self.view.screen == AppScreen::Editor && self.session.is_read_only();
         match action {
             KeyboardShortcutAction::OpenNotebookDialog => {
                 let _ = self.trigger_open_notebook_dialog();
@@ -1876,47 +1913,65 @@ impl PaperCraftApp {
                 let _ = self.handle_editor_escape_shortcut();
             }
             KeyboardShortcutAction::ActivateSelectTool => {
-                activate_select_tool(self);
+                if !editor_read_only {
+                    activate_select_tool(self);
+                }
             }
             KeyboardShortcutAction::Undo => {
-                self.view.selection_drag = None;
-                let _ = self.session.execute("edit.undo", &json!({}));
+                if !editor_read_only {
+                    self.view.selection_drag = None;
+                    let _ = self.session.execute("edit.undo", &json!({}));
+                }
             }
             KeyboardShortcutAction::Redo => {
-                self.view.selection_drag = None;
-                let _ = self.session.execute("edit.redo", &json!({}));
+                if !editor_read_only {
+                    self.view.selection_drag = None;
+                    let _ = self.session.execute("edit.redo", &json!({}));
+                }
             }
             KeyboardShortcutAction::RequestPaste => {
-                self.view.paste_requested = true;
+                if !editor_read_only {
+                    self.view.paste_requested = true;
+                }
             }
             KeyboardShortcutAction::DuplicateSelection => {
-                let _ = duplicate_selection(self);
+                if !editor_read_only {
+                    let _ = duplicate_selection(self);
+                }
             }
             KeyboardShortcutAction::CopySelection { cut } => {
-                let _ = copy_selection(self, Some(ctx), cut);
+                if !(cut && editor_read_only) {
+                    let _ = copy_selection(self, Some(ctx), cut);
+                }
             }
             KeyboardShortcutAction::DeleteSelection => {
-                let _ = delete_selection(self);
+                if !editor_read_only {
+                    let _ = delete_selection(self);
+                }
             }
             KeyboardShortcutAction::SelectTool(tool) => {
-                canvas::commit_pending_text(self);
-                self.view.text_insert_mode = false;
-                self.view.clear_selection();
-                self.view.text_style_open = false;
-                self.view.shape_insert_mode = false;
-                self.view.shape_drag_start = None;
-                self.view.shape_drag_end = None;
-                self.view.shape_drag_touch_id = None;
-                let _ = self
-                    .session
-                    .execute("tool.select", &json!({ "tool": tool }));
+                if !editor_read_only {
+                    canvas::commit_pending_text(self);
+                    self.view.text_insert_mode = false;
+                    self.view.clear_selection();
+                    self.view.text_style_open = false;
+                    self.view.shape_insert_mode = false;
+                    self.view.shape_drag_start = None;
+                    self.view.shape_drag_end = None;
+                    self.view.shape_drag_touch_id = None;
+                    let _ = self
+                        .session
+                        .execute("tool.select", &json!({ "tool": tool }));
+                }
             }
             KeyboardShortcutAction::AdjustPenSize(delta) => {
-                let kind = self.session.active_pen_kind();
-                let next = (self.session.pen(kind).size + delta).clamp(0.5, 80.0);
-                let _ = self
-                    .session
-                    .execute("pen.setSettings", &json!({ "kind": kind, "size": next }));
+                if !editor_read_only {
+                    let kind = self.session.active_pen_kind();
+                    let next = (self.session.pen(kind).size + delta).clamp(0.5, 80.0);
+                    let _ = self
+                        .session
+                        .execute("pen.setSettings", &json!({ "kind": kind, "size": next }));
+                }
             }
             KeyboardShortcutAction::ToggleInspector => {
                 self.view.inspector_open = !self.view.inspector_open;
@@ -2282,13 +2337,14 @@ impl PaperCraftApp {
         if !can_use_canvas_clipboard {
             return;
         }
+        let read_only = self.session.is_read_only();
         if events.iter().any(|e| matches!(e, egui::Event::Copy)) {
             let _ = copy_selection(self, Some(ctx), false);
         }
-        if events.iter().any(|e| matches!(e, egui::Event::Cut)) {
+        if !read_only && events.iter().any(|e| matches!(e, egui::Event::Cut)) {
             let _ = copy_selection(self, Some(ctx), true);
         }
-        if paste_triggered {
+        if !read_only && paste_triggered {
             let _ = trigger_paste_on_page(self, events);
         }
     }
@@ -2378,7 +2434,8 @@ impl PaperCraftApp {
 
         let allow_shortcuts = self.view.screen == AppScreen::Editor
             && self.view.active_modal.is_none()
-            && !self.view.text_editing;
+            && !self.view.text_editing
+            && !self.session.is_read_only();
         let allow_instant_actions = allow_shortcuts && !ctx.egui_wants_keyboard_input();
 
         let outcome = self.stylus.evaluate_button_shortcuts(
@@ -3214,6 +3271,9 @@ pub(crate) fn duplicate_selection(app: &mut PaperCraftApp) -> bool {
 }
 
 pub(crate) fn trigger_paste_on_page(app: &mut PaperCraftApp, events: &[egui::Event]) -> bool {
+    if app.session.is_read_only() {
+        return false;
+    }
     let has_paste_image_event = events
         .iter()
         .any(|event| matches!(event, egui::Event::PasteImage(_)));
@@ -3269,6 +3329,9 @@ pub(crate) fn trigger_paste_on_page(app: &mut PaperCraftApp, events: &[egui::Eve
 }
 
 pub(crate) fn delete_selection(app: &mut PaperCraftApp) -> bool {
+    if app.session.is_read_only() {
+        return false;
+    }
     let objects = if !app.view.selected_objects.is_empty() {
         app.view.selected_objects.clone()
     } else if let Some(obj) = app.view.selected_object {

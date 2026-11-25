@@ -327,6 +327,11 @@ const COMMANDS: &[CommandSpec] = &[
         description: "Switch between the Select arrow, FountainPen, BallPen, BrushPen, Highlighter, and Eraser",
     },
     CommandSpec {
+        id: "editor.setReadOnly",
+        label: "Toggle Read-Only Mode",
+        description: "Lock or unlock editing for the active notebook while keeping navigation, zoom, and export available",
+    },
+    CommandSpec {
         id: "pen.setSettings",
         label: "Update Pen Settings",
         description: "Configure size, color, opacity, nib geometry, pressure, or taper for a pen",
@@ -515,6 +520,11 @@ const COMMANDS: &[CommandSpec] = &[
         id: "profile.completeFirstAccess",
         label: "Complete First-Access Local Nickname",
         description: "Set the local user nickname on initial application launch",
+    },
+    CommandSpec {
+        id: "profile.dismissWelcomeBanner",
+        label: "Dismiss Welcome Banner",
+        description: "Mark the first-launch welcome banner as seen for this installation",
     },
     CommandSpec {
         id: "profile.create",
@@ -1205,7 +1215,48 @@ fn parse_optional_params<T: Default + for<'de> Deserialize<'de>>(
     parse_params(id, params)
 }
 
+fn is_active_doc_edit_command(id: &str) -> bool {
+    matches!(
+        id,
+        "stroke.draw"
+            | "text.insert"
+            | "text.update"
+            | "stroke.update"
+            | "shape.insert"
+            | "shape.update"
+            | "image.insert"
+            | "image.update"
+            | "selection.transform"
+            | "selection.update"
+            | "selection.delete"
+            | "stroke.erase"
+            | "stroke.recognizeShape"
+            | "text.toggleCheckbox"
+            | "selection.paste"
+            | "selection.duplicate"
+            | "element.place"
+            | "edit.undo"
+            | "edit.redo"
+            | "page.clear"
+            | "page.setTemplate"
+            | "page.add"
+            | "page.duplicate"
+            | "page.remove"
+            | "page.move"
+            | "page.setBookmark"
+            | "page.rotate"
+            | "page.setSize"
+            | "page.applyTemplateAll"
+            | "page.batchDuplicate"
+            | "page.batchRemove"
+            | "notebook.rename"
+    )
+}
+
 pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value, EngineError> {
+    if session.is_read_only() && is_active_doc_edit_command(id) {
+        return Err(invalid(id, "notebook is in read-only mode"));
+    }
     let prev_rev = session.revision;
     let result = match id {
         "stroke.draw" => cmd_stroke_draw(session, id, params),
@@ -1267,6 +1318,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
         "export.svg" => cmd_export_svg(session, id, params),
         "export.pdf" => cmd_export_pdf(session, id, params),
         "tool.select" => cmd_select_tool(session, id, params),
+        "editor.setReadOnly" => cmd_editor_set_read_only(session, id, params),
         "pen.setSettings" => cmd_set_pen_settings(session, id, params),
         "pen.setSmoothing" => cmd_set_smoothing(session, id, params),
         "pen.setPressureCurve" => cmd_set_pressure_curve(session, id, params),
@@ -1300,6 +1352,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
         "sync.transferNotebook" => cmd_sync_transfer_notebook(session, id, params),
         "sync.migrateLocalAccount" => cmd_sync_migrate_local_account(session, id, params),
         "profile.completeFirstAccess" => cmd_profile_complete_first_access(session, id, params),
+        "profile.dismissWelcomeBanner" => cmd_profile_dismiss_welcome_banner(session),
         "profile.create" => cmd_profile_create(session, id, params),
         "profile.rename" => cmd_profile_rename(session, id, params),
         "profile.switch" => cmd_profile_switch(session, id, params),
@@ -1328,6 +1381,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
                 id,
                 "page.select"
                     | "notebook.select"
+                    | "editor.setReadOnly"
                     | "theme.set"
                     | "stylus.setButtons"
                     | "stylus.setInputMode"
@@ -1339,6 +1393,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
                     | "styleFavorite.apply"
                     | "profile.create"
                     | "profile.completeFirstAccess"
+                    | "profile.dismissWelcomeBanner"
                     | "profile.rename"
                     | "profile.switch"
                     | "profile.delete"
@@ -3201,6 +3256,9 @@ fn cmd_page_transfer(
     let source_pages = source_doc.resolved_pages();
     let selected = validate_page_selection(id, &p.pages, source_pages.len())?;
     let move_pages = p.move_pages.unwrap_or(false);
+    if move_pages && session.is_read_only() {
+        return Err(invalid(id, "source notebook is in read-only mode"));
+    }
     if move_pages && selected.len() >= source_pages.len() {
         return Err(invalid(
             id,
@@ -3212,6 +3270,9 @@ fn cmd_page_transfer(
         Some(target_idx) => {
             if target_idx >= session.notebooks.len() {
                 return Err(invalid(id, "target notebook index out of bounds"));
+            }
+            if session.is_notebook_read_only(target_idx) {
+                return Err(invalid(id, "target notebook is in read-only mode"));
             }
             if move_pages && target_idx == session.active_notebook {
                 return Err(invalid(id, "cannot move pages into the same notebook"));
@@ -3462,6 +3523,9 @@ fn cmd_notebook_set_metadata(
     let Some(existing_arc) = session.notebooks.get(idx).cloned() else {
         return Err(invalid(id, "notebook index out of bounds"));
     };
+    if session.is_notebook_read_only(idx) {
+        return Err(invalid(id, "notebook is in read-only mode"));
+    }
     let mut next = (*existing_arc).clone();
     if let Some(ref raw_folder) = p.folder_path {
         next.folder_path = sanitize_folder_path(raw_folder);
@@ -3527,6 +3591,9 @@ fn cmd_notebook_merge(
     }
     if p.source_index == p.target_index {
         return Err(invalid(id, "source and target notebooks must be different"));
+    }
+    if session.is_notebook_read_only(p.target_index) {
+        return Err(invalid(id, "target notebook is in read-only mode"));
     }
     let source_doc = (*session.notebooks[p.source_index]).clone();
     let mut target_doc = (*session.notebooks[p.target_index]).clone();
@@ -4663,6 +4730,9 @@ impl Session {
         replace_active: bool,
         persist_now: bool,
     ) -> Result<Value, EngineError> {
+        if (prepared.mode == PdfImportMode::InsertPages || replace_active) && self.is_read_only() {
+            return Err(invalid("pdf.import", "notebook is in read-only mode"));
+        }
         match prepared.mode {
             PdfImportMode::NewNotebook => {
                 commit_pdf_as_notebook(self, "pdf.import", prepared, replace_active, persist_now)
@@ -5070,6 +5140,31 @@ fn cmd_export_pdf(session: &mut Session, id: &str, params: &Value) -> Result<Val
     let written = write_export_bytes(id, p.path.as_deref(), &pdf)?;
     session.last_export_status = Some(format!("Exported {page_count}-page PDF to `{written}`."));
     Ok(json!({ "path": written, "bytes": pdf.len(), "pageCount": page_count }))
+}
+
+#[derive(Deserialize)]
+struct SetReadOnlyParams {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    read_only: Option<bool>,
+}
+
+fn cmd_editor_set_read_only(
+    session: &mut Session,
+    id: &str,
+    params: &Value,
+) -> Result<Value, EngineError> {
+    let target = if params.is_null() {
+        !session.is_read_only()
+    } else {
+        let p: SetReadOnlyParams = parse_params(id, params)?;
+        p.enabled
+            .or(p.read_only)
+            .unwrap_or_else(|| !session.is_read_only())
+    };
+    let active = session.set_read_only(target);
+    Ok(json!({ "read_only": active }))
 }
 
 fn cmd_select_tool(session: &mut Session, id: &str, params: &Value) -> Result<Value, EngineError> {
@@ -6257,6 +6352,14 @@ fn cmd_profile_complete_first_access(
     Ok(json!({
         "localProfileId": prof.local_profile_id,
         "nickname": prof.nickname,
+        "needsInitialNickname": session.needs_initial_nickname(),
+    }))
+}
+
+fn cmd_profile_dismiss_welcome_banner(session: &mut Session) -> Result<Value, EngineError> {
+    session.dismiss_welcome_banner();
+    Ok(json!({
+        "welcomeBannerSeen": !session.should_show_welcome_banner(),
         "needsInitialNickname": session.needs_initial_nickname(),
     }))
 }

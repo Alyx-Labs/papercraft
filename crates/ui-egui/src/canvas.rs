@@ -1352,10 +1352,11 @@ fn screen_pos_hits_ruler_body_or_handle(app: &PaperCraftApp, screen_pos: Pos2) -
 }
 
 fn handle_finger_pan(app: &mut PaperCraftApp, ui: &mut egui::Ui, resp: &egui::Response) {
-    let allow_finger_pan = app.session.prefs.stylus_only_drawing
+    let read_only = app.session.is_read_only();
+    let allow_finger_pan = (app.session.prefs.stylus_only_drawing || read_only)
         && !app.view.text_editing
         && !app.view.text_insert_mode
-        && app.session.active_tool != ToolKind::Select
+        && (read_only || app.session.active_tool != ToolKind::Select)
         && app.view.ruler_drag_mode.is_none()
         && !app.stylus.is_pen_in_proximity()
         && !has_active_live(app);
@@ -1444,7 +1445,12 @@ fn handle_pan_and_zoom(app: &mut PaperCraftApp, ui: &mut egui::Ui, resp: &egui::
             || resp.dragged_by(egui::PointerButton::Secondary)
             || resp.dragged_by(egui::PointerButton::Middle));
 
-    if mid_drag || space_drag || stylus_pan_drag {
+    let read_only_pan = app.session.is_read_only() && resp.dragged_by(egui::PointerButton::Primary);
+
+    if !ui.input(|i| i.focused) {
+        app.view.pan_dragging = false;
+        clear_finger_pan(app);
+    } else if mid_drag || space_drag || stylus_pan_drag || read_only_pan {
         clear_finger_pan(app);
         cancel_camera_glide(app);
         let delta = ui.input(|i| i.pointer.delta());
@@ -2532,6 +2538,30 @@ fn handle_drawing_input(app: &mut PaperCraftApp, ui: &mut egui::Ui, resp: &egui:
         return;
     }
 
+    if app.session.is_read_only() {
+        clear_ruler_drag(app);
+        app.view.text_insert_mode = false;
+        app.view.text_editing = false;
+        app.view.shape_insert_mode = false;
+        app.view.shape_drag_start = None;
+        app.view.shape_drag_end = None;
+        app.view.shape_drag_touch_id = None;
+        app.view.clear_selection();
+        if has_active_live(app) {
+            cancel_active_stroke(app);
+        }
+        if resp.clicked()
+            && !app.view.pan_dragging
+            && let Some(screen_pos) = resp.interact_pointer_pos()
+            && can_start_on_canvas(ui, resp, screen_pos)
+            && let Some(url) =
+                link_at_screen_pos(app, &ui.painter_at(resp.rect), screen_pos, page_affine(app))
+        {
+            let _ = crate::open_external_url(app, ui.ctx(), &url);
+        }
+        return;
+    }
+
     if app.view.text_editing || app.view.text_insert_mode {
         if has_active_live(app) {
             finish_active_stroke(app);
@@ -3149,6 +3179,18 @@ fn update_canvas_cursor_icon(app: &PaperCraftApp, ui: &egui::Ui, resp: &egui::Re
             .is_some_and(|screen_pos| screen_pos_hits_ruler_body_or_handle(app, screen_pos));
     let icon = if app.view.pan_dragging || app.view.finger_pan_engaged {
         egui::CursorIcon::Grabbing
+    } else if app.session.is_read_only() {
+        if ui
+            .input(|i| i.pointer.hover_pos())
+            .and_then(|pos| {
+                link_at_screen_pos(app, &ui.painter_at(resp.rect), pos, page_affine(app))
+            })
+            .is_some()
+        {
+            egui::CursorIcon::PointingHand
+        } else {
+            egui::CursorIcon::Grab
+        }
     } else if space_held || stylus_pan_held {
         egui::CursorIcon::Grab
     } else if app.view.ruler_drag_mode.is_some() {
@@ -8743,6 +8785,9 @@ fn draw_cursor_and_tether(
     t: &Tokens,
 ) {
     if app.view.pan_dragging
+        || app.view.finger_pan_engaged
+        || app.view.ruler_drag_mode.is_some()
+        || app.session.is_read_only()
         || (!app.view.text_editing
             && (ui.input(|i| i.key_down(egui::Key::Space)) || app.stylus.pan_held()))
     {
@@ -14226,6 +14271,81 @@ mod tests {
     }
 
     #[test]
+    fn read_only_mode_blocks_drawing_and_pans_with_primary_drag() {
+        let ctx = egui::Context::default();
+        let mut app = setup_editor_app(&ctx);
+        app.session
+            .execute(
+                "editor.setReadOnly",
+                &serde_json::json!({ "enabled": true }),
+            )
+            .unwrap();
+        let initial_pan = app.view.pan;
+
+        let run_frame_out = |app: &mut PaperCraftApp, time: f64, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+                time: Some(time),
+                predicted_dt: 0.016,
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |ui| app.show_ui(ui))
+        };
+
+        // Hover over canvas in Read-Only mode displays the Grab cursor instead of hiding it.
+        let out_hover = run_frame_out(
+            &mut app,
+            0.016,
+            vec![egui::Event::PointerMoved(pos2(600.0, 400.0))],
+        );
+        assert_eq!(
+            out_hover.platform_output.cursor_icon,
+            egui::CursorIcon::Grab
+        );
+        out_hover.drop_without_applying_deltas();
+
+        // Drag with Primary mouse/pointer -> pans viewport and never commits ink strokes.
+        run_editor_frame(
+            &ctx,
+            &mut app,
+            0.032,
+            vec![egui::Event::PointerButton {
+                pos: pos2(600.0, 400.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let out_drag = run_frame_out(
+            &mut app,
+            0.048,
+            vec![egui::Event::PointerMoved(pos2(655.0, 435.0))],
+        );
+        assert_eq!(
+            out_drag.platform_output.cursor_icon,
+            egui::CursorIcon::Grabbing
+        );
+        out_drag.drop_without_applying_deltas();
+        run_editor_frame(
+            &ctx,
+            &mut app,
+            0.064,
+            vec![egui::Event::PointerButton {
+                pos: pos2(655.0, 435.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+
+        assert!((app.view.pan[0] - (initial_pan[0] + 55.0)).abs() < 0.5);
+        assert!((app.view.pan[1] - (initial_pan[1] + 35.0)).abs() < 0.5);
+        assert_eq!(app.session.doc.strokes.len(), 0);
+        assert!(app.session.live_stroke.is_none());
+    }
+
+    #[test]
     fn web_ordered_pen_touch_events_commit_single_stroke_without_initial_dot() {
         let ctx = egui::Context::default();
         let mut app = setup_editor_app(&ctx);
@@ -14962,5 +15082,134 @@ mod tests {
         assert!(app.stylus.is_ignored_touch(palm));
         assert_eq!(app.session.doc.strokes.len(), 1);
         assert_eq!(app.session.doc.strokes[0].raw_points.len(), 3);
+    }
+
+    #[test]
+    fn reentering_canvas_after_grab_and_pointer_gone_syncs_hidden_cursor_and_clears_focus_pan() {
+        fn run_raw(
+            ctx: &egui::Context,
+            app: &mut PaperCraftApp,
+            time: f64,
+            focused: bool,
+            events: Vec<egui::Event>,
+        ) -> (egui::CursorIcon, Option<egui::CustomCursorImage>) {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+                    time: Some(time),
+                    predicted_dt: 0.016,
+                    focused,
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.show_ui(ui),
+            );
+            let cursor_icon = out.platform_output.cursor_icon;
+            let cursor_image = out.platform_output.cursor_image.clone();
+            out.drop_without_applying_deltas();
+            (cursor_icon, cursor_image)
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = setup_editor_app(&ctx);
+
+        // 1. Hovering canvas with a writing tool hides the OS cursor (`CursorIcon::None`).
+        let (icon_canvas, img_canvas) = run_raw(
+            &ctx,
+            &mut app,
+            0.016,
+            true,
+            vec![egui::Event::PointerMoved(pos2(640.0, 400.0))],
+        );
+        assert_eq!(icon_canvas, egui::CursorIcon::None);
+        let first_blank_rgba = if cfg!(target_os = "windows") {
+            let img =
+                img_canvas.expect("Windows should emit blank cursor image for CursorIcon::None");
+            assert_eq!(img.size, [16, 16]);
+            assert_eq!(img.hotspot, [0, 0]);
+            assert_eq!(img.rgba.len(), 16 * 16 * 4);
+            assert!(img.rgba.iter().all(|&b| b == 0));
+            Some(img.rgba)
+        } else {
+            assert!(img_canvas.is_none());
+            None
+        };
+
+        // 2a. Holding Space + pressing Primary shows Grab and clears any custom blank image.
+        let (icon_grab, img_grab) = run_raw(
+            &ctx,
+            &mut app,
+            0.032,
+            true,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::Space,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: pos2(640.0, 400.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(icon_grab, egui::CursorIcon::Grab);
+        assert!(img_grab.is_none());
+
+        // 2b. Dragging while holding Space shows Grabbing and activates pan dragging.
+        let (icon_grabbing, img_grabbing) = run_raw(
+            &ctx,
+            &mut app,
+            0.048,
+            true,
+            vec![egui::Event::PointerMoved(pos2(660.0, 410.0))],
+        );
+        assert_eq!(icon_grabbing, egui::CursorIcon::Grabbing);
+        assert!(img_grabbing.is_none());
+        assert!(app.view.pan_dragging);
+
+        // 3. Leaving window & losing focus clears stuck pan drag and restores non-None cursor.
+        let (icon_outside, img_outside) =
+            run_raw(&ctx, &mut app, 0.064, false, vec![egui::Event::PointerGone]);
+        assert_ne!(icon_outside, egui::CursorIcon::None);
+        assert!(img_outside.is_none());
+        assert!(!app.view.pan_dragging);
+        assert!(app.view.finger_pan_touch_id.is_none());
+
+        // 4. Re-entering canvas while regaining focus returns to `CursorIcon::None` and re-emits
+        // the exact same cached blank cursor image on Windows.
+        let (icon_reenter, img_reenter) = run_raw(
+            &ctx,
+            &mut app,
+            0.080,
+            true,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::Space,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: pos2(680.0, 420.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(pos2(680.0, 420.0)),
+            ],
+        );
+        assert_eq!(icon_reenter, egui::CursorIcon::None);
+        if let Some(first_rgba) = first_blank_rgba {
+            let img = img_reenter.expect("Windows should re-emit blank cursor image on re-entry");
+            assert!(std::sync::Arc::ptr_eq(&first_rgba, &img.rgba));
+        } else {
+            assert!(img_reenter.is_none());
+        }
     }
 }

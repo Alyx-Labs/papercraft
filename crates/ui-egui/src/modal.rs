@@ -31,6 +31,7 @@ pub enum ActiveModal {
     TagColor,
     AppUpdate,
     KeyboardShortcuts,
+    WelcomeBanner,
 }
 
 struct DialogSpec {
@@ -64,7 +65,7 @@ const NOTEBOOK_SECTION_STEPS: &[ModalStepSpec] = &[
 ];
 
 impl ActiveModal {
-    const fn id_tag(self) -> u8 {
+    pub(crate) const fn id_tag(self) -> u8 {
         match self {
             Self::Export => 1,
             Self::NewNotebook => 2,
@@ -82,6 +83,7 @@ impl ActiveModal {
             Self::TagColor => 13,
             Self::AppUpdate => 16,
             Self::KeyboardShortcuts => 17,
+            Self::WelcomeBanner => 18,
         }
     }
 
@@ -199,18 +201,25 @@ impl ActiveModal {
                 width: 860.0,
                 min_body_height: 0.0,
             },
+            Self::WelcomeBanner => DialogSpec {
+                icon: Icon::Notebook,
+                title: "Study deeper with PaperCraft",
+                subtitle: "Built for calm, distraction-free daily study:",
+                width: 700.0,
+                min_body_height: 0.0,
+            },
         }
     }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
-struct ModalMetrics {
-    modal_rect: egui::Rect,
-    close_btn_rect: egui::Rect,
-    body_rect: egui::Rect,
-    footer_rect: egui::Rect,
-    inner_margin: f32,
+pub(crate) struct ModalMetrics {
+    pub(crate) modal_rect: egui::Rect,
+    pub(crate) close_btn_rect: egui::Rect,
+    pub(crate) body_rect: egui::Rect,
+    pub(crate) footer_rect: egui::Rect,
+    pub(crate) inner_margin: f32,
 }
 
 /// Opens `target`, initializing its draft fields cleanly from active session state.
@@ -308,7 +317,8 @@ pub(crate) fn open(app: &mut PaperCraftApp, target: ActiveModal) {
         | ActiveModal::TagColor
         | ActiveModal::SyncConflict
         | ActiveModal::AppUpdate
-        | ActiveModal::KeyboardShortcuts => {}
+        | ActiveModal::KeyboardShortcuts
+        | ActiveModal::WelcomeBanner => {}
         ActiveModal::FirstAccessNickname => {
             app.view.first_access_error = None;
             app.view.first_access_focus_pending = true;
@@ -612,6 +622,13 @@ fn show_inner_with_motion(
             crate::shortcuts_modal::render_body,
             crate::shortcuts_modal::render_footer,
         ),
+        ActiveModal::WelcomeBanner => crate::welcome_modal::show(
+            app,
+            ui,
+            motion.eased,
+            motion.backdrop_eased,
+            motion.interactive,
+        ),
     }
 }
 
@@ -651,7 +668,8 @@ fn modal_steps(active: ActiveModal) -> Option<&'static [ModalStepSpec]> {
         | ActiveModal::FolderColor
         | ActiveModal::TagColor
         | ActiveModal::AppUpdate
-        | ActiveModal::KeyboardShortcuts => None,
+        | ActiveModal::KeyboardShortcuts
+        | ActiveModal::WelcomeBanner => None,
     }
 }
 
@@ -1192,11 +1210,7 @@ pub(crate) fn primary_action_button(
     t: &Tokens,
 ) -> egui::Response {
     let fill = if enabled { t.accent } else { t.border };
-    let text_color = if enabled {
-        Color32::WHITE
-    } else {
-        t.text_muted
-    };
+    let text_color = if enabled { t.on_accent } else { t.text_muted };
     let btn = egui::Button::new(
         egui::RichText::new(label)
             .size(12.0)
@@ -1403,7 +1417,7 @@ fn draw_dialog_stepper(
                         egui::Align2::CENTER_CENTER,
                         (idx + 1).to_string(),
                         egui::FontId::proportional(10.5),
-                        Color32::WHITE,
+                        t.on_accent,
                     );
                 } else if is_completed {
                     ui.painter()
@@ -1462,7 +1476,7 @@ pub(crate) fn step_action_button(
     let text_color = if !enabled {
         t.text_muted
     } else if primary {
-        Color32::WHITE
+        t.on_accent
     } else {
         t.text
     };

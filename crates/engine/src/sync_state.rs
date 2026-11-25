@@ -395,6 +395,23 @@ impl Session {
         self.sync.global.needs_initial_nickname
     }
 
+    /// Returns `true` when the first-launch welcome banner has not yet been dismissed
+    /// on a persisted Desktop or Web workspace.
+    pub fn should_show_welcome_banner(&self) -> bool {
+        self.is_sync_persistence_enabled() && !self.sync.global.welcome_banner_seen
+    }
+
+    /// Marks the first-launch welcome banner as seen and persists global workspace state.
+    pub fn dismiss_welcome_banner(&mut self) {
+        if self.sync.global.welcome_banner_seen {
+            return;
+        }
+        self.sync.global.welcome_banner_seen = true;
+        self.sync_persist_global_state();
+        self.save_current_web_bundle();
+        self.bump_revision();
+    }
+
     pub fn offline_edits_pending(&self) -> bool {
         self.sync.manifest.offline_edits_pending
     }
@@ -3470,6 +3487,32 @@ mod tests {
         let reopened = Session::open_desktop_library(dir.0.clone());
         assert!(!reopened.needs_initial_nickname());
         assert_eq!(reopened.active_local_profile().unwrap().nickname, "Bruno");
+    }
+
+    #[test]
+    fn welcome_banner_shows_once_on_persisted_desktop_and_web_sessions() {
+        let ephemeral = Session::default();
+        assert!(!ephemeral.should_show_welcome_banner());
+
+        let dir = temp_dir("welcome_banner");
+        let mut desktop = Session::open_desktop_library(dir.0.clone());
+        assert!(desktop.should_show_welcome_banner());
+        desktop
+            .execute("profile.dismissWelcomeBanner", &json!({}))
+            .unwrap();
+        assert!(!desktop.should_show_welcome_banner());
+
+        let reopened_desktop = Session::open_desktop_library(dir.0.clone());
+        assert!(!reopened_desktop.should_show_welcome_banner());
+
+        let mut web = Session::open_web_cache(None);
+        assert!(web.should_show_welcome_banner());
+        web.execute("profile.dismissWelcomeBanner", &json!({}))
+            .unwrap();
+        assert!(!web.should_show_welcome_banner());
+        let saved_web = web.export_web_cache_json().unwrap();
+        let reopened_web = Session::open_web_cache(Some(&saved_web));
+        assert!(!reopened_web.should_show_welcome_banner());
     }
 
     #[test]

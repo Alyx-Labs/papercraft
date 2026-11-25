@@ -42,4 +42,6 @@ Additional Lucide `1.72.0` outline assets for writing tools, shape styling, sele
 - `github.svg` (`Icon::GitHub`, vendored from `lucide-static` `0.577.0`, ISC license, as brand icons were removed in Lucide `1.0`) — discreet repository link icon in the Home library sidebar footer
 - `circle-question-mark.svg` (`Icon::Help`) — minimalist bottom-right keyboard shortcuts modal trigger button
 - `keyboard.svg` (`Icon::Keyboard`) — Keyboard Shortcuts modal header icon
+- `lock.svg` (`Icon::Lock`) — Read-Only mode locked indicator in the editor toolbar
+- `lock-open.svg` (`Icon::LockOpen`) — Read-Only mode unlocked indicator in the editor toolbar
 

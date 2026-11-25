@@ -903,6 +903,8 @@ pub(crate) fn render_notebook_settings_footer(
     let mut save_clicked = false;
     let mut add_page_clicked = false;
 
+    let writable = !app.session.is_read_only();
+
     ui.horizontal(|ui| {
         if tab == 0 {
             if danger_action_button(ui, "Move to Trash", true, t)
@@ -925,10 +927,12 @@ pub(crate) fn render_notebook_settings_footer(
                 app.view.transfer_merge_delete_source = false;
                 modal::open(app, modal::ActiveModal::TransferPages);
             }
-        } else if secondary_action_button(ui, "+ Add Page with Style", true, t)
-            .on_hover_text(
-                "Insert a new page right after the active page using the selected size, orientation, and paper style",
-            )
+        } else if secondary_action_button(ui, "+ Add Page with Style", writable, t)
+            .on_hover_text(if writable {
+                "Insert a new page right after the active page using the selected size, orientation, and paper style"
+            } else {
+                "Disabled in Read-Only mode"
+            })
             .clicked()
         {
             add_page_clicked = true;
@@ -936,7 +940,7 @@ pub(crate) fn render_notebook_settings_footer(
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            if primary_action_button(ui, save_label, true, t).clicked() {
+            if primary_action_button(ui, save_label, writable, t).clicked() {
                 save_clicked = true;
             }
             if secondary_action_button(ui, "Cancel", true, t).clicked() {

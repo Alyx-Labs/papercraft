@@ -164,15 +164,44 @@ pub fn icon_button(
     enabled: bool,
     t: &Tokens,
 ) -> Response {
+    draw_icon_button(ui, icon, label, selected, enabled, false, t)
+}
+
+/// Top-header variant of [`icon_button`] using header contrast tokens.
+pub fn header_icon_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: Option<&str>,
+    selected: bool,
+    enabled: bool,
+    t: &Tokens,
+) -> Response {
+    draw_icon_button(ui, icon, label, selected, enabled, true, t)
+}
+
+fn draw_icon_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: Option<&str>,
+    selected: bool,
+    enabled: bool,
+    on_header: bool,
+    t: &Tokens,
+) -> Response {
     let icon_dim = 15.0_f32;
     let height = 28.0_f32;
     let pad_left = 9.0_f32;
     let gap = 6.0_f32;
     let pad_right = 10.0_f32;
-    let base_color = if enabled {
-        t.text
+    let (rest_fg, muted_fg) = if on_header {
+        (t.header_fg, t.header_fg_muted)
     } else {
-        t.text_muted.gamma_multiply(0.55)
+        (t.text, t.text_muted)
+    };
+    let base_color = if enabled {
+        rest_fg
+    } else {
+        muted_fg.gamma_multiply(0.55)
     };
 
     let label = label.filter(|txt| !txt.is_empty());
@@ -200,13 +229,42 @@ pub fn icon_button(
         } else {
             0.0
         };
-        let rest_fill = lerp_color(t.field_bg, t.border.gamma_multiply(0.45), hover_t);
-        let fill = lerp_color(rest_fill, t.accent_soft, select_t);
-        let rest_stroke = lerp_color(t.border, t.text_muted.gamma_multiply(0.5), hover_t);
-        let stroke_color = lerp_color(rest_stroke, t.accent, select_t);
+        let (rest_fill_base, hov_fill, act_fill, rest_s, hov_s, act_s, act_fg) = if on_header {
+            (
+                if t.is_dark {
+                    t.field_bg
+                } else {
+                    Color32::TRANSPARENT
+                },
+                t.header_control_hover,
+                t.header_active_bg,
+                t.header_border,
+                t.header_fg_muted.gamma_multiply(0.65),
+                if t.is_dark {
+                    t.accent
+                } else {
+                    t.header_active_bg
+                },
+                t.header_active_fg,
+            )
+        } else {
+            (
+                t.field_bg,
+                t.border.gamma_multiply(0.45),
+                t.accent_soft,
+                t.border,
+                t.text_muted.gamma_multiply(0.5),
+                t.accent,
+                t.accent,
+            )
+        };
+        let rest_fill = lerp_color(rest_fill_base, hov_fill, hover_t);
+        let fill = lerp_color(rest_fill, act_fill, select_t);
+        let rest_stroke = lerp_color(rest_s, hov_s, hover_t);
+        let stroke_color = lerp_color(rest_stroke, act_s, select_t);
         let stroke = Stroke::new(lerp_f32(1.0, 1.5, select_t), stroke_color);
         let foreground = if enabled {
-            lerp_color(t.text, t.accent, select_t)
+            lerp_color(rest_fg, act_fg, select_t)
         } else {
             base_color
         };
@@ -457,7 +515,7 @@ pub fn toggle_switch(
         let alpha = if enabled { 1.0 } else { 0.55 };
         let track_fill = lerp_color(t.field_bg, t.accent, anim_t).gamma_multiply(alpha);
         let track_stroke = lerp_color(t.border, t.accent, anim_t).gamma_multiply(alpha);
-        let knob_fill = lerp_color(t.text_muted, Color32::WHITE, anim_t).gamma_multiply(alpha);
+        let knob_fill = lerp_color(t.text_muted, t.on_accent, anim_t).gamma_multiply(alpha);
 
         let p = ui.painter();
         p.rect(

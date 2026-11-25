@@ -74,14 +74,14 @@ fn draw_profile_header(
     t: &Tokens,
 ) {
     let frame = egui::Frame::new()
-        .fill(t.toolbar_bg)
+        .fill(t.header_bg)
         .inner_margin(Margin {
             left: 12,
             right: 0,
             top: 8,
             bottom: 8,
         })
-        .stroke(Stroke::new(1.0, t.border));
+        .stroke(Stroke::new(1.0, t.header_border));
 
     egui::Panel::top("papercraft_profile_header")
         .frame(frame)
@@ -93,19 +93,19 @@ fn draw_profile_header(
                 let (badge_rect, _) =
                     ui.allocate_exact_size(Vec2::splat(HEADER_BADGE_SIZE), Sense::hover());
                 ui.painter()
-                    .rect_filled(badge_rect, CornerRadius::same(7), t.accent_soft);
+                    .rect_filled(badge_rect, CornerRadius::same(7), t.header_active_bg);
                 paint_icon(
                     ui.painter(),
                     badge_rect.shrink(6.0),
                     Icon::Account,
-                    t.accent,
+                    t.header_active_fg,
                 );
 
                 ui.label(
                     egui::RichText::new("Profile & Cloud Sync")
                         .size(14.5)
                         .strong()
-                        .color(t.text),
+                        .color(t.header_fg),
                 );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -138,11 +138,11 @@ fn draw_profile_header(
 
                     let in_flight = app.session.is_sync_in_flight();
                     let can_sync = summary.signed_in && summary.viewing_cloud && !in_flight;
-                    let (state_label, cloud_dot) = status_badge_style(summary.connection, t);
+                    let (state_label, _) = status_badge_style(summary.connection, t);
                     let dot_color = if summary.viewing_cloud {
-                        cloud_dot
+                        crate::account_modal::header_status_dot_color(summary.connection, t)
                     } else {
-                        t.text_muted
+                        t.header_fg_muted
                     };
                     let sync_tip = if summary.viewing_cloud {
                         if in_flight {
@@ -167,7 +167,7 @@ fn draw_profile_header(
                             sync_resp.rect.right() - 6.5,
                             sync_resp.rect.bottom() - 6.5,
                         );
-                        ui.painter().circle_filled(dot_c, 4.2, t.toolbar_bg);
+                        ui.painter().circle_filled(dot_c, 4.2, t.header_bg);
                         ui.painter().circle_filled(dot_c, 3.0, dot_color);
                     }
                     if sync_resp.on_hover_text(sync_tip).clicked() {

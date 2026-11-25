@@ -181,7 +181,7 @@ pub(crate) fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> TabStripOutput
     sync_open_tabs(app);
     let t = Tokens::for_theme(app.session.prefs.theme);
     let frame = egui::Frame::new()
-        .fill(t.canvas_bg)
+        .fill(t.tab_strip_bg)
         .inner_margin(egui::Margin {
             left: 6,
             right: 6,
@@ -218,7 +218,7 @@ pub(crate) fn paint_active_tab_bridge(ui: &egui::Ui, out: &TabStripOutput, t: &T
     let y = out.rect.bottom();
     let bridge = Rect::from_min_max(pos2(left + 1.0, y - 1.0), pos2(right - 1.0, y + 1.0));
     ui.painter()
-        .rect_filled(bridge, CornerRadius::ZERO, t.toolbar_bg);
+        .rect_filled(bridge, CornerRadius::ZERO, t.header_bg);
 }
 
 fn tab_corner_radius() -> CornerRadius {
@@ -235,14 +235,14 @@ fn paint_tab_chrome(painter: &egui::Painter, rect: Rect, active: bool, hover_t: 
         painter.rect(
             rect,
             tab_corner_radius(),
-            t.toolbar_bg,
-            Stroke::new(1.0, t.border),
+            t.header_bg,
+            Stroke::new(1.0, t.header_border),
             StrokeKind::Inside,
         );
     } else if hover_t > 0.01 {
         let fill = crate::motion::lerp_color(
             Color32::TRANSPARENT,
-            t.toolbar_bg.gamma_multiply(0.6),
+            t.header_bg.gamma_multiply(0.72),
             hover_t,
         );
         painter.rect_filled(
@@ -259,7 +259,7 @@ fn paint_separator(painter: &egui::Painter, x: f32, cy: f32, t: &Tokens) {
             pos2(x, cy - SEPARATOR_HALF_H),
             pos2(x, cy + SEPARATOR_HALF_H),
         ],
-        Stroke::new(1.0, t.border),
+        Stroke::new(1.0, t.header_border),
     );
 }
 
@@ -309,9 +309,13 @@ fn draw_home_tab(
     );
     paint_tab_chrome(ui.painter(), home_rect, on_home, home_hover_t, t);
     let home_fg = if on_home {
-        t.accent
+        if t.is_dark {
+            t.accent
+        } else {
+            t.header_active_bg
+        }
     } else {
-        crate::motion::lerp_color(t.text_muted, t.text, home_hover_t)
+        crate::motion::lerp_color(t.tab_strip_fg_muted, t.tab_strip_fg, home_hover_t)
     };
     paint_icon(
         ui.painter(),
@@ -341,7 +345,7 @@ fn draw_new_tab_button(
             CornerRadius::same(8),
             crate::motion::lerp_color(
                 Color32::TRANSPARENT,
-                t.toolbar_bg.gamma_multiply(0.75),
+                t.header_bg.gamma_multiply(0.75),
                 new_hover_t,
             ),
         );
@@ -350,7 +354,7 @@ fn draw_new_tab_button(
         ui.painter(),
         Rect::from_center_size(new_rect.center(), Vec2::splat(TAB_ICON_DIM)),
         Icon::Plus,
-        crate::motion::lerp_color(t.text_muted, t.text, new_hover_t),
+        crate::motion::lerp_color(t.tab_strip_fg_muted, t.tab_strip_fg, new_hover_t),
     );
     new_resp.clicked().then_some(TabAction::NewNotebook)
 }
@@ -419,7 +423,7 @@ fn draw_notebook_tab(
         cover_rect,
         spec.cover,
         None,
-        t.border,
+        t.header_border,
     );
 
     let text_left = cover_rect.right() + TAB_COVER_GAP;
@@ -430,9 +434,9 @@ fn draw_notebook_tab(
     };
     if text_right - text_left >= 16.0 {
         let text_color = if active {
-            t.text
+            t.header_fg
         } else {
-            crate::motion::lerp_color(t.text_muted, t.text, hover_t)
+            crate::motion::lerp_color(t.tab_strip_fg_muted, t.tab_strip_fg, hover_t)
         };
         let galley = tab_title_galley(ui, spec.title, text_right - text_left, text_color);
         let text_pos = pos2(text_left, rect.center().y - galley.size().y * 0.5);
@@ -447,10 +451,15 @@ fn draw_notebook_tab(
             ui.painter().rect_filled(
                 close_rect,
                 CornerRadius::same(6),
-                t.border.gamma_multiply(0.7),
+                t.header_border.gamma_multiply(0.7),
             );
         }
-        let close_fg = if close_hovered { t.text } else { t.text_muted };
+        let (close_rest, close_hov) = if active {
+            (t.header_fg_muted, t.header_fg)
+        } else {
+            (t.tab_strip_fg_muted, t.tab_strip_fg)
+        };
+        let close_fg = if close_hovered { close_hov } else { close_rest };
         paint_icon(
             ui.painter(),
             Rect::from_center_size(close_rect.center(), Vec2::splat(TAB_CLOSE_ICON_DIM)),

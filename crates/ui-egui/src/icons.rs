@@ -106,6 +106,8 @@ pub enum Icon {
     Home,
     Help,
     Keyboard,
+    Lock,
+    LockOpen,
 }
 
 /// Load the local outline SVG assigned to a semantic icon.
@@ -206,6 +208,8 @@ fn icon_svg(icon: Icon) -> &'static str {
         Icon::Home => include_str!("../assets/icons/lucide/house.svg"),
         Icon::Help => include_str!("../assets/icons/lucide/circle-question-mark.svg"),
         Icon::Keyboard => include_str!("../assets/icons/lucide/keyboard.svg"),
+        Icon::Lock => include_str!("../assets/icons/lucide/lock.svg"),
+        Icon::LockOpen => include_str!("../assets/icons/lucide/lock-open.svg"),
     }
 }
 
@@ -273,6 +277,7 @@ struct ButtonStyle {
     pad_left: f32,
     gap: f32,
     pad_right: f32,
+    on_header: bool,
 }
 
 impl ButtonStyle {
@@ -287,6 +292,7 @@ impl ButtonStyle {
             pad_left: 9.0,
             gap: 6.0,
             pad_right: 10.0,
+            on_header: false,
         }
     }
 
@@ -301,6 +307,7 @@ impl ButtonStyle {
             pad_left: 7.0,
             gap: 4.5,
             pad_right: 8.0,
+            on_header: false,
         }
     }
 
@@ -315,6 +322,7 @@ impl ButtonStyle {
             pad_left: 8.5,
             gap: 5.5,
             pad_right: 9.5,
+            on_header: false,
         }
     }
 
@@ -329,6 +337,7 @@ impl ButtonStyle {
             pad_left: 9.0,
             gap: 6.0,
             pad_right: 10.0,
+            on_header: true,
         }
     }
 
@@ -353,6 +362,7 @@ impl ButtonStyle {
             pad_left: 9.0,
             gap: 6.0,
             pad_right: 10.0,
+            on_header: false,
         }
     }
 }
@@ -580,10 +590,15 @@ fn draw_styled_icon_button(
 ) -> Response {
     let icon_dim = style.icon_dim;
     let height = style.height;
-    let base_color = if !enabled {
-        t.text_muted.gamma_multiply(0.55)
+    let (text_rest, text_muted_base) = if style.on_header {
+        (t.header_fg, t.header_fg_muted)
     } else {
-        t.text
+        (t.text, t.text_muted)
+    };
+    let base_color = if !enabled {
+        text_muted_base.gamma_multiply(0.55)
+    } else {
+        text_rest
     };
 
     let (galley, width) = layout_button_label_and_width(ui, label, style, base_color);
@@ -604,17 +619,45 @@ fn draw_styled_icon_button(
         } else {
             0.0
         };
-        let rest_fill =
-            crate::motion::lerp_color(Color32::TRANSPARENT, t.border.gamma_multiply(0.45), hover_t);
-        let fill = crate::motion::lerp_color(rest_fill, t.accent_soft, select_t);
-        let rest_stroke =
-            crate::motion::lerp_color(t.border, t.text_muted.gamma_multiply(0.5), hover_t);
-        let stroke_color = crate::motion::lerp_color(rest_stroke, t.accent, select_t);
+        let (hover_fill, active_fill, rest_stroke_base, hover_stroke, active_stroke, active_fg) =
+            if style.on_header {
+                let rest_s = if t.is_dark {
+                    t.header_border
+                } else {
+                    Color32::TRANSPARENT
+                };
+                let act_s = if t.is_dark {
+                    t.accent
+                } else {
+                    t.header_active_bg
+                };
+                (
+                    t.header_control_hover,
+                    t.header_active_bg,
+                    rest_s,
+                    t.header_border,
+                    act_s,
+                    t.header_active_fg,
+                )
+            } else {
+                (
+                    t.border.gamma_multiply(0.45),
+                    t.accent_soft,
+                    t.border,
+                    t.text_muted.gamma_multiply(0.5),
+                    t.accent,
+                    t.accent,
+                )
+            };
+        let rest_fill = crate::motion::lerp_color(Color32::TRANSPARENT, hover_fill, hover_t);
+        let fill = crate::motion::lerp_color(rest_fill, active_fill, select_t);
+        let rest_stroke = crate::motion::lerp_color(rest_stroke_base, hover_stroke, hover_t);
+        let stroke_color = crate::motion::lerp_color(rest_stroke, active_stroke, select_t);
         let stroke = Stroke::new(crate::motion::lerp_f32(1.0, 1.5, select_t), stroke_color);
         let foreground = if !enabled {
             base_color
         } else {
-            crate::motion::lerp_color(t.text, t.accent, select_t)
+            crate::motion::lerp_color(text_rest, active_fg, select_t)
         };
         painter.rect_filled(rect, CornerRadius::same(style.corner_radius), fill);
         painter.rect_stroke(
@@ -810,28 +853,62 @@ pub fn sidebar_edge_button_sized_width(
     layout_sidebar_edge_button(ui, label, max_width, Color32::BLACK, &size.metrics()).1
 }
 
-fn paint_sidebar_edge_chrome(
-    painter: &egui::Painter,
+struct SidebarEdgeChromeDraw<'a> {
     rect: Rect,
     edge: SidebarEdge,
     hover_t: f32,
     open_t: f32,
-    m: &EdgeMetrics,
+    on_header: bool,
+    m: &'a EdgeMetrics,
+}
+
+fn paint_sidebar_edge_chrome(
+    painter: &egui::Painter,
+    chrome: &SidebarEdgeChromeDraw<'_>,
     t: &Tokens,
 ) {
-    let closed_fill = crate::motion::lerp_color(t.field_bg, t.accent_soft, hover_t * 0.55);
-    let fill = crate::motion::lerp_color(closed_fill, t.accent_soft, open_t);
-    let closed_stroke = crate::motion::lerp_color(t.border, t.accent.gamma_multiply(0.65), hover_t);
-    let open_stroke = crate::motion::lerp_color(t.accent, t.accent_hover, hover_t * 0.5);
+    let rect = chrome.rect;
+    let hover_t = chrome.hover_t;
+    let open_t = chrome.open_t;
+    let m = chrome.m;
+    let (closed_fill, active_fill, closed_stroke, open_stroke, rest_rail, active_rail) =
+        if chrome.on_header {
+            let act_accent = if t.is_dark {
+                t.accent
+            } else {
+                t.header_active_bg
+            };
+            (
+                crate::motion::lerp_color(t.header_track_bg, t.header_control_hover, hover_t),
+                t.header_active_bg,
+                crate::motion::lerp_color(
+                    t.header_border,
+                    t.header_fg_muted.gamma_multiply(0.65),
+                    hover_t,
+                ),
+                crate::motion::lerp_color(act_accent, t.accent_hover, hover_t * 0.5),
+                t.header_fg_muted.gamma_multiply(0.45),
+                act_accent,
+            )
+        } else {
+            (
+                crate::motion::lerp_color(t.field_bg, t.accent_soft, hover_t * 0.55),
+                t.accent_soft,
+                crate::motion::lerp_color(t.border, t.accent.gamma_multiply(0.65), hover_t),
+                crate::motion::lerp_color(t.accent, t.accent_hover, hover_t * 0.5),
+                t.text_muted
+                    .gamma_multiply(if t.is_dark { 0.42 } else { 0.32 }),
+                t.accent,
+            )
+        };
+    let fill = crate::motion::lerp_color(closed_fill, active_fill, open_t);
     let stroke_color = crate::motion::lerp_color(closed_stroke, open_stroke, open_t);
     let stroke_w = crate::motion::lerp_f32(1.0, 1.35, open_t);
-    let rest_rail = t
-        .text_muted
-        .gamma_multiply(if t.is_dark { 0.42 } else { 0.32 });
-    let closed_rail = crate::motion::lerp_color(rest_rail, t.accent.gamma_multiply(0.85), hover_t);
-    let rail_color = crate::motion::lerp_color(closed_rail, t.accent, open_t);
+    let closed_rail =
+        crate::motion::lerp_color(rest_rail, active_rail.gamma_multiply(0.85), hover_t);
+    let rail_color = crate::motion::lerp_color(closed_rail, active_rail, open_t);
 
-    let (draw_rect, radii, rail_rect) = match edge {
+    let (draw_rect, radii, rail_rect) = match chrome.edge {
         SidebarEdge::Left => (
             Rect::from_min_max(pos2(rect.left() - 2.0, rect.top()), rect.max),
             CornerRadius {
@@ -871,6 +948,7 @@ struct SidebarEdgeContentDraw<'a> {
     galley: Option<&'a std::sync::Arc<egui::Galley>>,
     hover_t: f32,
     open_t: f32,
+    on_header: bool,
     m: EdgeMetrics,
 }
 
@@ -883,16 +961,26 @@ fn paint_sidebar_edge_contents(
     let rect = draw.rect;
     let spec = draw.spec;
     let cy = rect.center().y;
-    let foreground = if !spec.enabled {
-        t.text_muted.gamma_multiply(0.55)
+    let (rest_fg, muted_fg, open_fg, chev_hover_fg) = if draw.on_header {
+        (
+            t.header_fg,
+            t.header_fg_muted,
+            t.header_active_fg,
+            if t.is_dark { t.accent } else { t.header_fg },
+        )
     } else {
-        crate::motion::lerp_color(t.text, t.accent, draw.open_t)
+        (t.text, t.text_muted, t.accent, t.accent)
+    };
+    let foreground = if !spec.enabled {
+        muted_fg.gamma_multiply(0.55)
+    } else {
+        crate::motion::lerp_color(rest_fg, open_fg, draw.open_t)
     };
     let chevron_color = if !spec.enabled {
-        t.text_muted.gamma_multiply(0.45)
+        muted_fg.gamma_multiply(0.45)
     } else {
-        let rest_chev = crate::motion::lerp_color(t.text_muted, t.accent, draw.hover_t);
-        crate::motion::lerp_color(rest_chev, t.accent, draw.open_t)
+        let rest_chev = crate::motion::lerp_color(muted_fg, chev_hover_fg, draw.hover_t);
+        crate::motion::lerp_color(rest_chev, open_fg, draw.open_t)
     };
 
     let (chevron_icon, nudge_x) = match (spec.edge, spec.open) {
@@ -958,8 +1046,15 @@ pub fn sidebar_edge_button_sized(
     t: &Tokens,
 ) -> Response {
     let m = size.metrics();
+    let on_header = matches!(size, SidebarEdgeSize::Toolbar);
     let base_color = if !spec.enabled {
-        t.text_muted.gamma_multiply(0.55)
+        if on_header {
+            t.header_fg_muted.gamma_multiply(0.55)
+        } else {
+            t.text_muted.gamma_multiply(0.55)
+        }
+    } else if on_header {
+        t.header_fg
     } else {
         t.text
     };
@@ -981,7 +1076,18 @@ pub fn sidebar_edge_button_sized(
             0.0
         };
         let painter = ui.painter();
-        paint_sidebar_edge_chrome(painter, rect, spec.edge, hover_t, open_t, &m, t);
+        paint_sidebar_edge_chrome(
+            painter,
+            &SidebarEdgeChromeDraw {
+                rect,
+                edge: spec.edge,
+                hover_t,
+                open_t,
+                on_header,
+                m: &m,
+            },
+            t,
+        );
         paint_sidebar_edge_contents(
             painter,
             &SidebarEdgeContentDraw {
@@ -990,6 +1096,7 @@ pub fn sidebar_edge_button_sized(
                 galley: galley.as_ref(),
                 hover_t,
                 open_t,
+                on_header,
                 m,
             },
             t,
@@ -1313,12 +1420,40 @@ pub fn segmented_switch(
     }
 
     if ui.is_rect_visible(track_rect) {
+        let on_header = matches!(layout, SwitchLayout::Toolbar);
+        let (track_bg, track_border, active_fill, active_border, fg_muted, fg_rest, active_fg) =
+            if on_header {
+                let act_border = if t.is_dark {
+                    t.accent
+                } else {
+                    t.header_active_bg
+                };
+                (
+                    t.header_track_bg,
+                    t.header_border,
+                    t.header_active_bg,
+                    act_border,
+                    t.header_fg_muted,
+                    t.header_fg,
+                    t.header_active_fg,
+                )
+            } else {
+                (
+                    t.toolbar_bg,
+                    t.border,
+                    t.accent_soft,
+                    t.accent,
+                    t.text_muted,
+                    t.text,
+                    t.accent,
+                )
+            };
         let p = ui.painter();
         p.rect(
             track_rect,
             CornerRadius::same(track_radius),
-            t.toolbar_bg,
-            Stroke::new(1.0, t.border),
+            track_bg,
+            Stroke::new(1.0, track_border),
             StrokeKind::Inside,
         );
 
@@ -1330,11 +1465,12 @@ pub fn segmented_switch(
                 hovered_flags[idx] && !is_active,
             );
             if opt.enabled && hover_t > 0.02 {
-                p.rect_filled(
-                    seg_rects[idx],
-                    CornerRadius::same(pill_radius),
-                    t.border.gamma_multiply(0.35 * hover_t),
-                );
+                let hov_fill = if on_header {
+                    t.header_control_hover.gamma_multiply(hover_t)
+                } else {
+                    t.border.gamma_multiply(0.35 * hover_t)
+                };
+                p.rect_filled(seg_rects[idx], CornerRadius::same(pill_radius), hov_fill);
             }
         }
 
@@ -1361,8 +1497,8 @@ pub fn segmented_switch(
             p.rect(
                 pill_rect,
                 CornerRadius::same(pill_radius),
-                t.accent_soft,
-                Stroke::new(1.2, t.accent),
+                active_fill,
+                Stroke::new(1.2, active_border),
                 StrokeKind::Inside,
             );
         }
@@ -1370,7 +1506,7 @@ pub fn segmented_switch(
         for (idx, opt) in options.iter().enumerate() {
             let is_active = active == Some(idx);
             let fg = if !opt.enabled {
-                t.text_muted.gamma_multiply(0.55)
+                fg_muted.gamma_multiply(0.55)
             } else {
                 let select_t =
                     crate::motion::hover_factor(ui.ctx(), track_id.with(("sel", idx)), is_active);
@@ -1379,9 +1515,10 @@ pub fn segmented_switch(
                     track_id.with(("hov", idx)),
                     hovered_flags[idx] && !is_active,
                 );
-                let rest_fg = crate::motion::lerp_color(t.text_muted, t.text, 0.35);
-                let hovered_fg = crate::motion::lerp_color(rest_fg, t.text, hover_t);
-                crate::motion::lerp_color(hovered_fg, t.accent, select_t)
+                let mix = if on_header { 0.7 } else { 0.35 };
+                let rest_fg = crate::motion::lerp_color(fg_muted, fg_rest, mix);
+                let hovered_fg = crate::motion::lerp_color(rest_fg, fg_rest, hover_t);
+                crate::motion::lerp_color(hovered_fg, active_fg, select_t)
             };
             paint_switch_segment_content(
                 p,
@@ -1444,7 +1581,7 @@ pub fn toggle_switch(
         let track_stroke =
             crate::motion::lerp_color(t.border, t.accent, anim_t).gamma_multiply(alpha);
         let knob_fill =
-            crate::motion::lerp_color(t.text_muted, Color32::WHITE, anim_t).gamma_multiply(alpha);
+            crate::motion::lerp_color(t.text_muted, t.on_accent, anim_t).gamma_multiply(alpha);
 
         let p = ui.painter();
         p.rect(
@@ -1635,6 +1772,8 @@ mod tests {
             (Icon::Text, "Text"),
             (Icon::GitHub, "GitHub"),
             (Icon::Home, "Home"),
+            (Icon::Lock, "Lock"),
+            (Icon::LockOpen, "LockOpen"),
         ]
     }
 

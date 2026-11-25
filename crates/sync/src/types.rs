@@ -108,6 +108,8 @@ pub struct GlobalSyncState {
     #[serde(default)]
     pub needs_initial_nickname: bool,
     #[serde(default)]
+    pub welcome_banner_seen: bool,
+    #[serde(default)]
     pub client_id: String,
 }
 
@@ -121,6 +123,7 @@ impl GlobalSyncState {
             active_local_profile_id: String::new(),
             active_workspace: None,
             needs_initial_nickname: false,
+            welcome_banner_seen: false,
             client_id: uuid::Uuid::new_v4().to_string(),
         }
     }

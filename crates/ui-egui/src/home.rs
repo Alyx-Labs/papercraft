@@ -28,7 +28,7 @@ use crate::theme::Tokens;
 
 const HEADER_ROW_HEIGHT: f32 = TOOLBAR_CONTROL_HEIGHT;
 const UTILITY_BAR_ROW_HEIGHT: f32 = 28.0;
-const BRAND_BADGE_SIZE: f32 = 28.0;
+const BRAND_BADGE_SIZE: f32 = HEADER_ROW_HEIGHT;
 const MIN_CARD_WIDTH: f32 = 232.0;
 const CARD_HEIGHT: f32 = 272.0;
 const CARD_MARGIN: i8 = 12;
@@ -400,33 +400,39 @@ fn draw_home_brand(ui: &mut egui::Ui, show_subtitle: bool, t: &Tokens) {
             logo_tex.id(),
             logo_tex.size_vec2(),
         ))
-        .corner_radius(CornerRadius::same(7))
+        .uv(Rect::from_min_max(pos2(0.045, 0.06), pos2(0.955, 0.97)))
+        .corner_radius(CornerRadius::same(9))
         .paint_at(ui, badge_rect);
-        ui.painter().rect_stroke(
-            badge_rect,
-            CornerRadius::same(7),
-            Stroke::new(1.0, crate::theme::brand_badge_border_color()),
-            StrokeKind::Inside,
-        );
     } else {
         ui.painter()
-            .rect_filled(badge_rect, CornerRadius::same(7), t.accent_soft);
+            .rect_filled(badge_rect, CornerRadius::same(9), t.header_active_bg);
         paint_icon(
             ui.painter(),
-            badge_rect.shrink(6.5),
+            badge_rect.shrink(8.0),
             Icon::Library,
-            t.accent,
+            t.header_active_fg,
         );
     }
 
     ui.add_space(2.0);
     ui.add(egui::Label::new(crate::theme::brand_wordmark_job(16.5, t)).selectable(false));
     if show_subtitle {
-        ui.separator();
+        let (sep_rect, _) =
+            ui.allocate_exact_size(Vec2::new(7.0, HEADER_ROW_HEIGHT), Sense::hover());
+        if ui.is_rect_visible(sep_rect) {
+            let x = sep_rect.center().x;
+            ui.painter().line_segment(
+                [
+                    pos2(x, sep_rect.top() + 8.0),
+                    pos2(x, sep_rect.bottom() - 8.0),
+                ],
+                Stroke::new(1.0, t.header_border),
+            );
+        }
         ui.label(
             RichText::new("Notebooks Library")
                 .size(12.5)
-                .color(t.text_muted),
+                .color(t.header_fg_muted),
         );
     }
 }
@@ -510,14 +516,14 @@ fn draw_home_open_pcraft_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &
 
 fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> Rect {
     let frame = egui::Frame::new()
-        .fill(t.toolbar_bg)
+        .fill(t.header_bg)
         .inner_margin(Margin {
             left: 12,
             right: 0,
             top: 8,
             bottom: 8,
         })
-        .stroke(Stroke::new(1.0, t.border));
+        .stroke(Stroke::new(1.0, t.header_border));
 
     egui::Panel::top("papercraft_home_header")
         .frame(frame)
@@ -596,11 +602,19 @@ fn draw_search_input(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
         edit_id.with("hov_t"),
         box_resp.hovered() && !has_focus,
     );
-    let rest_stroke =
-        crate::motion::lerp_color(t.border, t.text_muted.gamma_multiply(0.5), hover_t);
+    let rest_stroke = crate::motion::lerp_color(
+        t.header_border,
+        t.header_fg_muted.gamma_multiply(0.7),
+        hover_t,
+    );
+    let focus_stroke = if t.is_dark {
+        t.accent
+    } else {
+        t.header_active_bg
+    };
     let stroke = Stroke::new(
         crate::motion::lerp_f32(1.0, 1.5, focus_t),
-        crate::motion::lerp_color(rest_stroke, t.accent, focus_t),
+        crate::motion::lerp_color(rest_stroke, focus_stroke, focus_t),
     );
 
     let p = ui.painter();
@@ -2126,7 +2140,7 @@ fn draw_card_title_and_meta(
 
 fn draw_card_open_pill(ui: &mut egui::Ui, hover_t: f32, t: &Tokens) -> egui::Response {
     let fill = crate::motion::lerp_color(t.accent_soft, t.accent, hover_t);
-    let text_color = crate::motion::lerp_color(t.accent, Color32::WHITE, hover_t);
+    let text_color = crate::motion::lerp_color(t.accent, t.on_accent, hover_t);
     let btn = egui::Button::new(RichText::new("Open").size(11.5).strong().color(text_color))
         .fill(fill)
         .stroke(Stroke::NONE)
@@ -2200,7 +2214,7 @@ fn draw_create_notebook_card(
             child.painter(),
             badge_rect.shrink(11.0),
             Icon::Plus,
-            crate::motion::lerp_color(t.accent, Color32::WHITE, hover_t),
+            crate::motion::lerp_color(t.accent, t.on_accent, hover_t),
         );
 
         child.add_space(12.0);
@@ -2505,13 +2519,14 @@ mod tests {
     }
 
     #[test]
-    fn toolbar_library_button_returns_from_editor_to_home() {
+    fn toolbar_read_only_button_replaces_library_return_and_toggles_lock() {
         let mut app = PaperCraftApp::default();
         crate::open_notebook_in_editor(&mut app, 0);
         assert_eq!(app.view.screen, crate::AppScreen::Editor);
+        assert!(!app.session.is_read_only());
 
         let ctx = egui::Context::default();
-        let mut lib_btn_pos = None;
+        let mut lock_btn_pos = None;
         let row_h = crate::icons::TOOLBAR_CONTROL_HEIGHT;
         for _ in 0..2 {
             let raw = egui::RawInput {
@@ -2522,7 +2537,7 @@ mod tests {
                 crate::theme::apply_light_visuals(ui.ctx());
                 crate::toolbar::show(&mut app, ui);
             });
-            // Locate the square 36x36 Library icon button right of the left edge tab.
+            // Locate the square 36x36 Read-Only lock button right of the left edge tab.
             let mut square_btns = Vec::new();
             fn find_left_squares(shape: &egui::Shape, row_h: f32, out: &mut Vec<Rect>) {
                 match shape {
@@ -2545,37 +2560,46 @@ mod tests {
             for clipped in &out.shapes {
                 find_left_squares(&clipped.shape, row_h, &mut square_btns);
             }
-            lib_btn_pos = square_btns
+            lock_btn_pos = square_btns
                 .into_iter()
                 .min_by(|a, b| a.left().total_cmp(&b.left()))
                 .map(|r| r.center());
             out.drop_without_applying_deltas();
         }
 
-        let lib_btn_pos = lib_btn_pos.expect("expected icon-only Library button in editor toolbar");
-        for (pressed, time) in [(true, 0.1), (false, 0.2)] {
-            let raw = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
-                time: Some(time),
-                events: vec![
-                    egui::Event::PointerMoved(lib_btn_pos),
-                    egui::Event::PointerButton {
-                        pos: lib_btn_pos,
-                        button: egui::PointerButton::Primary,
-                        pressed,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..Default::default()
-            };
-            let out = ctx.run_ui(raw, |ui| {
-                crate::theme::apply_light_visuals(ui.ctx());
-                crate::toolbar::show(&mut app, ui);
-            });
-            out.drop_without_applying_deltas();
-        }
+        let lock_btn_pos =
+            lock_btn_pos.expect("expected icon-only Read-Only button in editor toolbar");
+        let click_lock = |t_base: f64, app: &mut PaperCraftApp| {
+            for (pressed, time) in [(true, t_base), (false, t_base + 0.1)] {
+                let raw = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
+                    time: Some(time),
+                    events: vec![
+                        egui::Event::PointerMoved(lock_btn_pos),
+                        egui::Event::PointerButton {
+                            pos: lock_btn_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(raw, |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    crate::toolbar::show(app, ui);
+                });
+                out.drop_without_applying_deltas();
+            }
+        };
 
-        assert_eq!(app.view.screen, crate::AppScreen::Home);
+        click_lock(0.1, &mut app);
+        assert!(app.session.is_read_only());
+        assert_eq!(app.view.screen, crate::AppScreen::Editor);
+
+        click_lock(0.3, &mut app);
+        assert!(!app.session.is_read_only());
+        assert_eq!(app.view.screen, crate::AppScreen::Editor);
     }
 
     #[test]
@@ -3767,6 +3791,8 @@ mod tests {
         let mut header_rect = Rect::NOTHING;
         let mut header_texts: Vec<(String, Rect)> = Vec::new();
         let mut right_edge_tab = None;
+        let mut logo_tex_id = None;
+        let mut logo_rect = None;
         for _ in 0..2 {
             let raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, viewport)),
@@ -3778,11 +3804,15 @@ mod tests {
             });
             header_texts.clear();
             right_edge_tab = None;
+            logo_tex_id = brand_logo_texture(&ctx).map(|t| t.id());
+            logo_rect = None;
             fn visit(
                 shape: &egui::Shape,
                 header: Rect,
+                logo_tex_id: Option<egui::TextureId>,
                 out: &mut Vec<(String, Rect)>,
                 edge_tab: &mut Option<Rect>,
+                logo_rect: &mut Option<Rect>,
             ) {
                 match shape {
                     egui::Shape::Text(text) => {
@@ -3792,15 +3822,27 @@ mod tests {
                         }
                     }
                     egui::Shape::Rect(rs)
+                        if logo_tex_id.is_some_and(|id| rs.fill_texture_id() == id)
+                            && header.contains(rs.rect.center()) =>
+                    {
+                        *logo_rect = Some(rs.rect);
+                    }
+                    egui::Shape::Rect(rs)
                         if header.contains(rs.rect.center())
                             && (rs.rect.height() - HEADER_ROW_HEIGHT).abs() <= 0.5
                             && rs.corner_radius.nw >= 14 =>
                     {
                         *edge_tab = Some(rs.rect);
                     }
+                    egui::Shape::Mesh(mesh)
+                        if logo_tex_id.is_some_and(|id| mesh.texture_id == id)
+                            && header.contains(mesh.calc_bounds().center()) =>
+                    {
+                        *logo_rect = Some(mesh.calc_bounds());
+                    }
                     egui::Shape::Vec(items) => {
                         for item in items {
-                            visit(item, header, out, edge_tab);
+                            visit(item, header, logo_tex_id, out, edge_tab, logo_rect);
                         }
                     }
                     _ => {}
@@ -3810,17 +3852,27 @@ mod tests {
                 visit(
                     &clipped.shape,
                     header_rect,
+                    logo_tex_id,
                     &mut header_texts,
                     &mut right_edge_tab,
+                    &mut logo_rect,
                 );
             }
             out.drop_without_applying_deltas();
         }
 
+        assert_eq!(BRAND_BADGE_SIZE, HEADER_ROW_HEIGHT);
         assert!(
-            brand_logo_texture(&ctx).is_some(),
+            logo_tex_id.is_some(),
             "expected embedded PaperCraft brand logo texture to load"
         );
+        let logo_bounds = logo_rect.expect("expected brand logo mesh inside home header");
+        assert!((logo_bounds.width() - HEADER_ROW_HEIGHT).abs() <= 0.5);
+        assert!((logo_bounds.height() - HEADER_ROW_HEIGHT).abs() <= 0.5);
+        if let Some(edge_r) = right_edge_tab {
+            assert!((logo_bounds.top() - edge_r.top()).abs() <= 0.5);
+            assert!((logo_bounds.bottom() - edge_r.bottom()).abs() <= 0.5);
+        }
         assert!(
             header_texts.iter().any(|(label, _)| label == "Paper Craft"),
             "home header must display 'Paper Craft' brand wordmark, got {header_texts:?}"
@@ -4059,7 +4111,7 @@ mod tests {
             "home sync button should be icon-only without pill text:\n{local_text}"
         );
         assert!(
-            local_dots.contains(&t.text_muted),
+            local_dots.contains(&t.header_fg_muted),
             "expected muted local status dot on header sync button, got {local_dots:?}"
         );
         assert!(
@@ -4092,7 +4144,7 @@ mod tests {
             .unwrap();
 
         let (cloud_text, cloud_dots) = render_home_snapshot(&ctx, &mut app);
-        let (_, expected_cloud_dot) = crate::account_modal::status_badge_style(
+        let expected_cloud_dot = crate::account_modal::header_status_dot_color(
             app.session.sync_status_summary().connection,
             &t,
         );
@@ -4112,15 +4164,10 @@ mod tests {
 
     #[test]
     fn brand_wordmark_uses_display_font_and_blue_craft_in_light_and_dark_themes() {
+        let brand_cyan = Color32::from_rgb(0x82, 0xCA, 0xF2);
         for (theme, expected_craft_color) in [
-            (
-                papercraft_doc::UiTheme::Dark,
-                Color32::from_rgb(0x82, 0xCA, 0xF2),
-            ),
-            (
-                papercraft_doc::UiTheme::Light,
-                Color32::from_rgb(0x0A, 0x72, 0xB5),
-            ),
+            (papercraft_doc::UiTheme::Dark, brand_cyan),
+            (papercraft_doc::UiTheme::Light, brand_cyan),
         ] {
             let mut app = PaperCraftApp::default();
             app.session
@@ -4182,7 +4229,11 @@ mod tests {
             assert_eq!(
                 wordmark_sections,
                 vec![
-                    ("Paper ".to_string(), expected_family.clone(), tokens.text),
+                    (
+                        "Paper ".to_string(),
+                        expected_family.clone(),
+                        tokens.header_fg
+                    ),
                     ("Craft".to_string(), expected_family, expected_craft_color),
                 ],
                 "unexpected header wordmark styling for {theme:?}"

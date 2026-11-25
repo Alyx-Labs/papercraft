@@ -237,7 +237,7 @@ fn measure_right_zone(ui: &egui::Ui) -> f32 {
         + sidebar_edge_button_sized_width(ui, "", None, SidebarEdgeSize::Toolbar)
 }
 
-fn hairline_divider_sized(ui: &mut egui::Ui, row_height: f32, t: &Tokens) {
+fn hairline_divider_with_color(ui: &mut egui::Ui, row_height: f32, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(DIVIDER_WIDTH, row_height), Sense::hover());
     if ui.is_rect_visible(rect) {
         let x = rect.center().x;
@@ -247,13 +247,17 @@ fn hairline_divider_sized(ui: &mut egui::Ui, row_height: f32, t: &Tokens) {
                 egui::pos2(x, rect.top() + pad_y),
                 egui::pos2(x, rect.bottom() - pad_y),
             ],
-            Stroke::new(1.0, t.border),
+            Stroke::new(1.0, color),
         );
     }
 }
 
+fn hairline_divider_sized(ui: &mut egui::Ui, row_height: f32, t: &Tokens) {
+    hairline_divider_with_color(ui, row_height, t.border);
+}
+
 fn hairline_divider(ui: &mut egui::Ui, t: &Tokens) {
-    hairline_divider_sized(ui, TOOLBAR_ROW_HEIGHT, t);
+    hairline_divider_with_color(ui, TOOLBAR_ROW_HEIGHT, t.header_border);
 }
 
 fn draw_size_tile_bg(
@@ -871,11 +875,35 @@ fn draw_left_zone(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
 
     ui.add_space((EDGE_TAB_NEIGHBOR_GAP - ZONE_ITEM_SPACING).max(0.0));
 
-    if toolbar_icon_button(ui, Icon::Library, None, false, true, t)
-        .on_hover_text("Return to Notebooks Home (Shortcut: H)")
+    let read_only = app.session.is_read_only();
+    let (lock_icon, lock_tip) = if read_only {
+        (
+            Icon::Lock,
+            "Read-Only Mode (Active)\nEditing is blocked for this notebook. Click to unlock.",
+        )
+    } else {
+        (
+            Icon::LockOpen,
+            "Read-Only Mode\nClick to lock this notebook and block accidental edits.",
+        )
+    };
+    if toolbar_icon_button(ui, lock_icon, None, read_only, true, t)
+        .on_hover_text(lock_tip)
         .clicked()
     {
-        crate::return_to_home(app);
+        let next = !read_only;
+        if next {
+            clear_overlay_tools(app, true);
+            app.view.ruler_active = false;
+            clear_ruler_drag(app);
+            app.view.elements_popover_open = false;
+            app.view.pages_select_mode = false;
+            app.view.selected_page_indices.clear();
+            app.view.pages_drag_source = None;
+        }
+        let _ = app
+            .session
+            .execute("editor.setReadOnly", &json!({ "enabled": next }));
     }
 }
 
@@ -984,10 +1012,13 @@ fn toggle_text_insert_tool(app: &mut PaperCraftApp) {
 
 fn draw_tool_section(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     ui.spacing_mut().item_spacing.x = ZONE_ITEM_SPACING;
+    let read_only = app.session.is_read_only();
     let overlay_tool =
         app.view.text_insert_mode || app.view.text_editing || app.view.shape_insert_mode;
     let text_active = app.view.text_insert_mode || app.view.text_editing;
-    let active_idx = if app.view.shape_insert_mode {
+    let active_idx = if read_only {
+        None
+    } else if app.view.shape_insert_mode {
         Some(9)
     } else if text_active {
         Some(8)
@@ -1006,14 +1037,41 @@ fn draw_tool_section(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
         None
     };
 
-    let pen_tip = |kind: PenKind, key: &str| {
-        format!("{} (Shortcut: {key})\n{}", kind.label(), kind.description())
+    let tool_tip = |normal: &str| -> String {
+        if read_only {
+            "Read-Only Mode is active — click the lock button in the top-left corner to edit."
+                .to_string()
+        } else {
+            normal.to_string()
+        }
     };
+    let pen_tip = |kind: PenKind, key: &str| {
+        tool_tip(&format!(
+            "{} (Shortcut: {key})\n{}",
+            kind.label(),
+            kind.description()
+        ))
+    };
+    let select_tip = tool_tip(
+        "Select (Shortcut: V)\nSelect and move objects with rectangle or freeform lasso, resize, rotate, copy, or duplicate.",
+    );
     let fountain_tip = pen_tip(PenKind::FountainPen, "1");
     let ball_tip = pen_tip(PenKind::BallPen, "2");
     let brush_tip = pen_tip(PenKind::BrushPen, "3");
     let pencil_tip = pen_tip(PenKind::Pencil, "6");
     let hl_tip = pen_tip(PenKind::Highlighter, "4");
+    let eraser_tip = tool_tip(
+        "Eraser (Shortcut: 5)\nRemove whole strokes, slice paths, or filter to highlighter marks only.",
+    );
+    let laser_tip = tool_tip(
+        "Laser Pointer (Shortcut: 7)\nTemporary fading spotlight or trail for presentations (never saved to the page).",
+    );
+    let text_tip = tool_tip(
+        "Text Box\nClick anywhere on the page to write formatted rich text, lists, and links.",
+    );
+    let shape_tip = tool_tip(
+        "Shapes\nDraw lines, rectangles, ellipses, triangles, arrows, or polygons with fill and dashed styles.",
+    );
 
     let select_icon = if app.session.active_tool == ToolKind::Select && app.view.freeform_lasso_mode
     {
@@ -1021,47 +1079,43 @@ fn draw_tool_section(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     } else {
         Icon::Select
     };
+    let tools_enabled = !read_only;
     let options = [
-        SwitchOption::new(
-            Some(select_icon),
-            None,
-            "Select (Shortcut: V)\nSelect and move objects with rectangle or freeform lasso, resize, rotate, copy, or duplicate.",
-            true,
-        ),
+        SwitchOption::new(Some(select_icon), None, &select_tip, tools_enabled),
         SwitchOption::new(
             Some(pen_icon(PenKind::FountainPen)),
             None,
             &fountain_tip,
-            true,
-        ),
-        SwitchOption::new(Some(pen_icon(PenKind::BallPen)), None, &ball_tip, true),
-        SwitchOption::new(Some(pen_icon(PenKind::BrushPen)), None, &brush_tip, true),
-        SwitchOption::new(Some(pen_icon(PenKind::Pencil)), None, &pencil_tip, true),
-        SwitchOption::new(Some(pen_icon(PenKind::Highlighter)), None, &hl_tip, true),
-        SwitchOption::new(
-            Some(Icon::Eraser),
-            None,
-            "Eraser (Shortcut: 5)\nRemove whole strokes, slice paths, or filter to highlighter marks only.",
-            true,
+            tools_enabled,
         ),
         SwitchOption::new(
-            Some(Icon::LaserPointer),
+            Some(pen_icon(PenKind::BallPen)),
             None,
-            "Laser Pointer (Shortcut: 7)\nTemporary fading spotlight or trail for presentations (never saved to the page).",
-            true,
+            &ball_tip,
+            tools_enabled,
         ),
         SwitchOption::new(
-            Some(Icon::Text),
+            Some(pen_icon(PenKind::BrushPen)),
             None,
-            "Text Box\nClick anywhere on the page to write formatted rich text, lists, and links.",
-            true,
+            &brush_tip,
+            tools_enabled,
         ),
         SwitchOption::new(
-            Some(Icon::ShapeTool),
+            Some(pen_icon(PenKind::Pencil)),
             None,
-            "Shapes\nDraw lines, rectangles, ellipses, triangles, arrows, or polygons with fill and dashed styles.",
-            true,
+            &pencil_tip,
+            tools_enabled,
         ),
+        SwitchOption::new(
+            Some(pen_icon(PenKind::Highlighter)),
+            None,
+            &hl_tip,
+            tools_enabled,
+        ),
+        SwitchOption::new(Some(Icon::Eraser), None, &eraser_tip, tools_enabled),
+        SwitchOption::new(Some(Icon::LaserPointer), None, &laser_tip, tools_enabled),
+        SwitchOption::new(Some(Icon::Text), None, &text_tip, tools_enabled),
+        SwitchOption::new(Some(Icon::ShapeTool), None, &shape_tip, tools_enabled),
     ];
 
     let (clicked, _) = segmented_switch(
@@ -1076,45 +1130,54 @@ fn draw_tool_section(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
         clear_overlay_tools(app, false);
         let _ = app.session.execute("tool.select", &json!({ "tool": tool }));
     };
-    match clicked {
-        Some(0) => crate::activate_select_tool(app),
-        Some(1) => select_engine_tool(app, pen_tool_name(PenKind::FountainPen)),
-        Some(2) => select_engine_tool(app, pen_tool_name(PenKind::BallPen)),
-        Some(3) => select_engine_tool(app, pen_tool_name(PenKind::BrushPen)),
-        Some(4) => select_engine_tool(app, pen_tool_name(PenKind::Pencil)),
-        Some(5) => select_engine_tool(app, pen_tool_name(PenKind::Highlighter)),
-        Some(6) => select_engine_tool(app, "Eraser"),
-        Some(7) => select_engine_tool(app, "LaserPointer"),
-        Some(8) => toggle_text_insert_tool(app),
-        Some(9) => {
-            crate::canvas::commit_pending_text(app);
-            app.view.shape_insert_mode = !app.view.shape_insert_mode;
-            app.view.text_insert_mode = false;
-            app.view.clear_selection();
-            app.view.text_style_open = false;
-            app.view.smoothing_popover_open = false;
-            clear_ruler_drag(app);
-            app.view.shape_drag_start = None;
-            app.view.shape_drag_end = None;
-            app.view.shape_drag_touch_id = None;
-            app.view.color_picker.close();
+    if !read_only {
+        match clicked {
+            Some(0) => crate::activate_select_tool(app),
+            Some(1) => select_engine_tool(app, pen_tool_name(PenKind::FountainPen)),
+            Some(2) => select_engine_tool(app, pen_tool_name(PenKind::BallPen)),
+            Some(3) => select_engine_tool(app, pen_tool_name(PenKind::BrushPen)),
+            Some(4) => select_engine_tool(app, pen_tool_name(PenKind::Pencil)),
+            Some(5) => select_engine_tool(app, pen_tool_name(PenKind::Highlighter)),
+            Some(6) => select_engine_tool(app, "Eraser"),
+            Some(7) => select_engine_tool(app, "LaserPointer"),
+            Some(8) => toggle_text_insert_tool(app),
+            Some(9) => {
+                crate::canvas::commit_pending_text(app);
+                app.view.shape_insert_mode = !app.view.shape_insert_mode;
+                app.view.text_insert_mode = false;
+                app.view.clear_selection();
+                app.view.text_style_open = false;
+                app.view.smoothing_popover_open = false;
+                clear_ruler_drag(app);
+                app.view.shape_drag_start = None;
+                app.view.shape_drag_end = None;
+                app.view.shape_drag_touch_id = None;
+                app.view.color_picker.close();
+            }
+            _ => {}
         }
-        _ => {}
     }
 
-    if toolbar_icon_button(ui, Icon::Ruler, None, app.view.ruler_active, true, t)
-        .on_hover_text(
-            "Ruler — draw near either long edge to make a straight line; drag the middle to move it, the round handle to rotate, or set an exact angle in the context tray",
-        )
-        .clicked()
+    if toolbar_icon_button(
+        ui,
+        Icon::Ruler,
+        None,
+        !read_only && app.view.ruler_active,
+        tools_enabled,
+        t,
+    )
+    .on_hover_text(tool_tip(
+        "Ruler — draw near either long edge to make a straight line; drag the middle to move it, the round handle to rotate, or set an exact angle in the context tray",
+    ))
+    .clicked()
     {
         toggle_ruler_tool(app);
     }
 
-    if toolbar_icon_button(ui, Icon::Image, None, false, true, t)
-        .on_hover_text(
+    if toolbar_icon_button(ui, Icon::Image, None, false, tools_enabled, t)
+        .on_hover_text(tool_tip(
             "Insert image from file (PNG, JPEG, WebP, GIF, BMP, ICO, TIFF) — or paste with Ctrl+V",
-        )
+        ))
         .clicked()
     {
         crate::canvas::commit_pending_text(app);
@@ -1125,11 +1188,13 @@ fn draw_tool_section(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
         ui,
         Icon::Sticker,
         None,
-        app.view.elements_popover_open,
-        true,
+        !read_only && app.view.elements_popover_open,
+        tools_enabled,
         t,
     )
-    .on_hover_text("Stickers & Elements — stamp AI stickers or your saved notes and figures");
+    .on_hover_text(tool_tip(
+        "Stickers & Elements — stamp AI stickers or your saved notes and figures",
+    ));
     if sticker_resp.clicked() {
         crate::canvas::commit_pending_text(app);
         app.view.smoothing_popover_open = false;
@@ -1928,6 +1993,9 @@ fn active_channel_color(info: ShapeChannelInfo) -> (Option<Color>, bool) {
 }
 
 fn color_dock_mode(app: &PaperCraftApp) -> Option<ColorDockMode> {
+    if app.session.is_read_only() {
+        return None;
+    }
     if app.view.text_insert_mode || app.view.text_editing {
         return Some(ColorDockMode::TextInsert);
     }
@@ -3897,10 +3965,13 @@ fn draw_zoom_percent_pill(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens
     );
     if ui.is_rect_visible(rect) {
         let hover_t = crate::motion::hover_factor(ui.ctx(), resp.id.with("hov"), resp.hovered());
-        let fill =
-            crate::motion::lerp_color(Color32::TRANSPARENT, t.border.gamma_multiply(0.45), hover_t);
-        let stroke_c =
-            crate::motion::lerp_color(t.border, t.text_muted.gamma_multiply(0.55), hover_t);
+        let fill = crate::motion::lerp_color(Color32::TRANSPARENT, t.header_control_hover, hover_t);
+        let stroke_c = crate::motion::lerp_color(
+            t.header_border,
+            t.header_fg_muted.gamma_multiply(0.7),
+            hover_t,
+        );
+        let text_c = crate::motion::lerp_color(t.header_fg_muted, t.header_fg, hover_t);
         let p = ui.painter();
         p.rect_filled(rect, CornerRadius::same(9), fill);
         p.rect_stroke(
@@ -3910,12 +3981,12 @@ fn draw_zoom_percent_pill(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens
             StrokeKind::Inside,
         );
         let label = format!("{:.0}%", app.view.zoom * 100.0);
-        let galley = p.layout_no_wrap(label, FontId::monospace(12.0), t.text_muted);
+        let galley = p.layout_no_wrap(label, FontId::monospace(12.0), text_c);
         let pos = egui::pos2(
             rect.center().x - galley.size().x * 0.5,
             rect.center().y - galley.size().y * 0.5,
         );
-        p.galley(pos, galley, t.text_muted);
+        p.galley(pos, galley, text_c);
     }
     if resp
         .on_hover_text("Current zoom — click to reset and fit entire page in view")
@@ -3928,34 +3999,46 @@ fn draw_zoom_percent_pill(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens
 
 fn draw_right_utility_controls(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     ui.spacing_mut().item_spacing.x = ZONE_ITEM_SPACING;
-    let can_undo = app.session.history.can_undo();
-    let can_redo = app.session.history.can_redo();
+    let read_only = app.session.is_read_only();
+    let can_undo = !read_only && app.session.history.can_undo();
+    let can_redo = !read_only && app.session.history.can_redo();
     if toolbar_icon_button(ui, Icon::Undo, None, false, can_undo, t)
-        .on_hover_text("Undo last edit (Ctrl+Z)")
+        .on_hover_text(if read_only {
+            "Undo is disabled in Read-Only mode"
+        } else {
+            "Undo last edit (Ctrl+Z)"
+        })
         .clicked()
     {
         let _ = app.session.execute("edit.undo", &json!({}));
     }
     if toolbar_icon_button(ui, Icon::Redo, None, false, can_redo, t)
-        .on_hover_text("Redo undone edit (Ctrl+Y or Ctrl+Shift+Z)")
+        .on_hover_text(if read_only {
+            "Redo is disabled in Read-Only mode"
+        } else {
+            "Redo undone edit (Ctrl+Y or Ctrl+Shift+Z)"
+        })
         .clicked()
     {
         let _ = app.session.execute("edit.redo", &json!({}));
     }
+    let has_content = !app.session.doc.strokes.is_empty()
+        || !app.session.doc.texts.is_empty()
+        || !app.session.doc.shapes.is_empty()
+        || !app.session.doc.images.is_empty();
     if toolbar_icon_button(
         ui,
         Icon::ClearPage,
         None,
         false,
-        !app.session.doc.strokes.is_empty()
-            || !app.session.doc.texts.is_empty()
-            || !app.session.doc.shapes.is_empty()
-            || !app.session.doc.images.is_empty(),
+        !read_only && has_content,
         t,
     )
-    .on_hover_text(
-        "Clear all ink, inserted text, images, and shapes from active page (can be undone)",
-    )
+    .on_hover_text(if read_only {
+        "Clear page is disabled in Read-Only mode"
+    } else {
+        "Clear all ink, inserted text, images, and shapes from active page (can be undone)"
+    })
     .clicked()
     {
         let _ = app.session.execute("page.clear", &json!({}));
@@ -4000,11 +4083,11 @@ pub(crate) fn draw_sync_profile_button(app: &mut PaperCraftApp, ui: &mut egui::U
         || app.view.active_modal == Some(crate::modal::ActiveModal::AccountSync);
     let summary = app.session.sync_status_summary();
     let cloud_pending = app.session.cloud_pending_changes_count();
-    let (state_label, cloud_dot) = crate::account_modal::status_badge_style(summary.connection, t);
+    let (state_label, _) = crate::account_modal::status_badge_style(summary.connection, t);
     let dot_color = if summary.viewing_cloud {
-        cloud_dot
+        crate::account_modal::header_status_dot_color(summary.connection, t)
     } else {
-        t.text_muted
+        t.header_fg_muted
     };
     let sync_tip = if summary.viewing_cloud {
         let handle = summary
@@ -4042,7 +4125,7 @@ pub(crate) fn draw_sync_profile_button(app: &mut PaperCraftApp, ui: &mut egui::U
     let sync_resp = toolbar_icon_button(ui, Icon::Sync, None, acct_active, true, t);
     if ui.is_rect_visible(sync_resp.rect) {
         let dot_c = egui::pos2(sync_resp.rect.right() - 6.5, sync_resp.rect.bottom() - 6.5);
-        ui.painter().circle_filled(dot_c, 4.2, t.toolbar_bg);
+        ui.painter().circle_filled(dot_c, 4.2, t.header_bg);
         ui.painter().circle_filled(dot_c, 3.0, dot_color);
     }
     if sync_resp.on_hover_text(sync_tip).clicked() {
@@ -4080,8 +4163,13 @@ fn draw_settings_edge_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tok
             settings_resp.rect.right() - 7.0,
             settings_resp.rect.top() + 6.5,
         );
-        ui.painter().circle_filled(dot_c, 4.2, t.toolbar_bg);
-        ui.painter().circle_filled(dot_c, 3.0, t.accent);
+        let badge_dot = if t.is_dark {
+            t.accent
+        } else {
+            t.header_active_bg
+        };
+        ui.painter().circle_filled(dot_c, 4.2, t.header_bg);
+        ui.painter().circle_filled(dot_c, 3.0, badge_dot);
     }
     if settings_resp.clicked() {
         app.view.inspector_open = !app.view.inspector_open;
@@ -4431,6 +4519,9 @@ fn push_text_insert_controls(
 }
 
 fn context_tray_mode(app: &PaperCraftApp) -> Option<ContextTrayMode> {
+    if app.session.is_read_only() {
+        return None;
+    }
     if app.view.text_insert_mode || app.view.text_editing {
         return Some(ContextTrayMode::TextInsert);
     }
@@ -5049,14 +5140,14 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
 pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> egui::Rect {
     let t = Tokens::for_theme(app.session.prefs.theme);
     let frame = egui::Frame::new()
-        .fill(t.toolbar_bg)
+        .fill(t.header_bg)
         .inner_margin(egui::Margin {
             left: 0,
             right: 0,
             top: 8,
             bottom: 8,
         })
-        .stroke(Stroke::new(1.0, t.border));
+        .stroke(Stroke::new(1.0, t.header_border));
 
     egui::Panel::top("papercraft_toolbar")
         .frame(frame)
@@ -5134,6 +5225,10 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> egui::Re
 }
 
 pub(crate) fn show_elements_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
+    if app.session.is_read_only() {
+        app.view.elements_popover_open = false;
+        return;
+    }
     if !app.view.elements_popover_open {
         return;
     }
@@ -5695,6 +5790,10 @@ fn draw_smoothing_strength_slider(
 }
 
 pub(crate) fn show_smoothing_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
+    if app.session.is_read_only() {
+        app.view.smoothing_popover_open = false;
+        return;
+    }
     if !app.view.smoothing_popover_open {
         return;
     }
@@ -6249,7 +6348,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_edge_buttons_are_flush_and_notebook_precedes_library() {
+    fn sidebar_edge_buttons_are_flush_and_notebook_precedes_read_only() {
         let mut app = PaperCraftApp::default();
         crate::open_notebook_in_editor(&mut app, 0);
         app.session
@@ -6331,7 +6430,7 @@ mod tests {
         assert!(
             !texts.iter().any(|(label, _)| matches!(
                 label.as_str(),
-                "Calculus Notes" | "Library" | "Settings"
+                "Calculus Notes" | "Library" | "Read-Only" | "Settings"
             )),
             "expected icon-only toolbar buttons without text labels, got {texts:?}"
         );
@@ -6346,17 +6445,17 @@ mod tests {
             .max_by(|a, b| a.right().total_cmp(&b.right()))
             .copied()
             .expect("right sidebar edge tab rect");
-        let lib_rect = square_btns
+        let read_only_rect = square_btns
             .iter()
             .filter(|r| r.left() > left_tab.right())
             .min_by(|a, b| a.left().total_cmp(&b.left()))
             .copied()
-            .expect("Library icon button right of left edge tab");
+            .expect("Read-Only lock button right of left edge tab");
         assert!(
-            left_tab.center().x < lib_rect.center().x,
-            "expected Notebook edge button ({:.1}) to the left of Library ({:.1})",
+            left_tab.center().x < read_only_rect.center().x,
+            "expected Notebook edge button ({:.1}) to the left of Read-Only ({:.1})",
             left_tab.center().x,
-            lib_rect.center().x
+            read_only_rect.center().x
         );
         assert!(
             (left_tab.left() - header_rect.left()).abs() <= 2.5,
@@ -6397,6 +6496,12 @@ mod tests {
                 out.drop_without_applying_deltas();
             }
         };
+
+        assert!(!app.session.is_read_only());
+        click_at(read_only_rect.center(), &mut app);
+        assert!(app.session.is_read_only());
+        click_at(read_only_rect.center(), &mut app);
+        assert!(!app.session.is_read_only());
 
         let was_pages_open = app.view.pages_sidebar_open;
         click_at(left_tab.center(), &mut app);

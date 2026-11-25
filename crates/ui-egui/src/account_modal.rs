@@ -3840,6 +3840,21 @@ pub(crate) fn status_badge_style(
     }
 }
 
+/// High-contrast sync status dot color intended for top application headers.
+pub(crate) fn header_status_dot_color(state: SyncConnectionState, t: &Tokens) -> Color32 {
+    if t.is_dark {
+        status_badge_style(state, t).1
+    } else {
+        match state {
+            SyncConnectionState::SignedOut => t.header_fg_muted,
+            SyncConnectionState::Offline => Color32::from_rgb(0xFB, 0xBF, 0x24),
+            SyncConnectionState::Syncing => Color32::from_rgb(0x82, 0xCA, 0xF2),
+            SyncConnectionState::Synced => Color32::from_rgb(0x4A, 0xDE, 0x80),
+            SyncConnectionState::Error => Color32::from_rgb(0xF8, 0x71, 0x71),
+        }
+    }
+}
+
 /// Returns badge text and semantic color tokens for per-notebook sync indicators.
 pub(crate) fn notebook_status_badge_style(
     status: EntitySyncStatus,

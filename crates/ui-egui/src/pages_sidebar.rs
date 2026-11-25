@@ -303,6 +303,7 @@ fn draw_pages_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> 
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let nb_settings_open = app.view.active_modal == Some(ActiveModal::NotebookSettings);
+                let editable = !app.session.is_read_only();
                 let btn_label = if header_w >= 200.0 {
                     Some("Notebook Settings")
                 } else if header_w >= 145.0 {
@@ -315,13 +316,14 @@ fn draw_pages_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> 
                     Icon::Settings,
                     btn_label,
                     nb_settings_open,
-                    true,
+                    editable,
                     t,
                 )
-                .on_hover_text(
-                    "Customize notebook details, cover, tags, page size, and paper style",
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(if editable {
+                    "Customize notebook details, cover, tags, page size, and paper style"
+                } else {
+                    "Notebook settings are disabled in Read-Only mode"
+                })
                 .clicked()
                 {
                     modal::open(app, ActiveModal::NotebookSettings);
@@ -811,7 +813,7 @@ fn paint_page_tile_sheet(
                 ui.painter(),
                 check_rect.shrink(2.5),
                 Icon::Check,
-                Color32::WHITE,
+                t.on_accent,
             );
         }
     }
@@ -1152,8 +1154,11 @@ fn draw_page_tile(
         t,
     );
 
-    let can_drag =
-        !app.view.pages_select_mode && !app.view.pages_bookmarked_only && args.total_pages > 1;
+    let read_only = app.session.is_read_only();
+    let can_drag = !read_only
+        && !app.view.pages_select_mode
+        && !app.view.pages_bookmarked_only
+        && args.total_pages > 1;
     let sense = if can_drag {
         egui::Sense::click_and_drag()
     } else {
@@ -1327,7 +1332,9 @@ fn draw_page_tile_footer(
     let mut label_resp = None;
     ui.horizontal(|ui| {
         ui.set_width(ui.available_width());
-        let has_move_arrows = selected && !app.view.pages_bookmarked_only && total_pages > 1;
+        let read_only = app.session.is_read_only();
+        let has_move_arrows =
+            !read_only && selected && !app.view.pages_bookmarked_only && total_pages > 1;
         let right_reserve = if has_move_arrows { 54.0 } else { 20.0 };
         let label_max_w = (ui.available_width() - right_reserve).max(28.0);
         ui.allocate_ui_with_layout(
@@ -1350,8 +1357,12 @@ fn draw_page_tile_footer(
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            let (bm_rect, bm_resp) =
-                ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+            let bm_sense = if read_only {
+                egui::Sense::hover()
+            } else {
+                egui::Sense::click()
+            };
+            let (bm_rect, bm_resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), bm_sense);
             bookmark_rect = bm_rect;
             if page.bookmarked {
                 let pill_fill = crate::motion::lerp_color(t.danger_bg, t.danger_border, 0.35);
@@ -1362,7 +1373,7 @@ fn draw_page_tile_footer(
                     egui::Stroke::new(1.0, t.danger_border),
                     egui::StrokeKind::Inside,
                 );
-            } else if bm_resp.hovered() {
+            } else if !read_only && bm_resp.hovered() {
                 ui.painter().rect_filled(
                     bm_rect,
                     egui::CornerRadius::same(4),
@@ -1371,20 +1382,28 @@ fn draw_page_tile_footer(
             }
             let bm_color = if page.bookmarked {
                 t.danger_fg
-            } else if bm_resp.hovered() {
+            } else if !read_only && bm_resp.hovered() {
                 t.text
             } else {
-                t.text_muted.gamma_multiply(0.75)
+                t.text_muted
+                    .gamma_multiply(if read_only { 0.45 } else { 0.75 })
             };
             paint_icon(ui.painter(), bm_rect.shrink(2.0), Icon::Bookmark, bm_color);
+            let bm_resp = if read_only {
+                bm_resp
+            } else {
+                bm_resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+            };
             if bm_resp
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(if page.bookmarked {
+                .on_hover_text(if read_only {
+                    "Bookmarks are locked in Read-Only mode"
+                } else if page.bookmarked {
                     "Remove bookmark"
                 } else {
                     "Bookmark this page"
                 })
                 .clicked()
+                && !read_only
             {
                 sub_action_taken = true;
                 let _ = app
@@ -1521,6 +1540,7 @@ fn draw_batch_selection_footer(
             ui.add_space(5.0);
 
             let btn_h = 26.0;
+            let editable = !app.session.is_read_only();
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.columns(2, |cols| {
                 if sidebar_action_button(
@@ -1528,11 +1548,15 @@ fn draw_batch_selection_footer(
                     Icon::Duplicate,
                     "Duplicate",
                     ActionTone::Neutral,
-                    has_sel,
+                    editable && has_sel,
                     btn_h,
                     t,
                 )
-                .on_hover_text("Duplicate all selected pages")
+                .on_hover_text(if editable {
+                    "Duplicate all selected pages"
+                } else {
+                    "Disabled in Read-Only mode"
+                })
                 .clicked()
                 {
                     crate::canvas::commit_pending_text(app);
@@ -1548,11 +1572,15 @@ fn draw_batch_selection_footer(
                     Icon::RotateCw,
                     "Rotate 90°",
                     ActionTone::Neutral,
-                    has_sel,
+                    editable && has_sel,
                     btn_h,
                     t,
                 )
-                .on_hover_text("Rotate selected pages 90° clockwise")
+                .on_hover_text(if editable {
+                    "Rotate selected pages 90° clockwise"
+                } else {
+                    "Disabled in Read-Only mode"
+                })
                 .clicked()
                 {
                     crate::canvas::commit_pending_text(app);
@@ -1572,11 +1600,15 @@ fn draw_batch_selection_footer(
                     Icon::Transfer,
                     "Transfer",
                     ActionTone::Neutral,
-                    has_sel,
+                    editable && has_sel,
                     btn_h,
                     t,
                 )
-                .on_hover_text("Move or copy selected pages to another or new notebook")
+                .on_hover_text(if editable {
+                    "Move or copy selected pages to another or new notebook"
+                } else {
+                    "Disabled in Read-Only mode"
+                })
                 .clicked()
                 {
                     app.view.transfer_pages_list = selected.clone();
@@ -1607,7 +1639,9 @@ fn draw_batch_selection_footer(
                 1 => "Remove 1 Page".to_string(),
                 n => format!("Remove {n} Pages"),
             };
-            let remove_tip = if !has_sel {
+            let remove_tip = if !editable {
+                "Disabled in Read-Only mode".to_string()
+            } else if !has_sel {
                 "Select one or more pages above to remove them".to_string()
             } else if !can_delete {
                 "At least one page must remain in the notebook".to_string()
@@ -1619,7 +1653,7 @@ fn draw_batch_selection_footer(
                 Icon::Trash,
                 &remove_label,
                 ActionTone::Danger,
-                can_delete,
+                editable && can_delete,
                 btn_h,
                 t,
             )
@@ -2894,6 +2928,7 @@ fn draw_footer_expandable_options(
     ui.add_space(5.0);
 
     let btn_h = 26.0;
+    let editable = !app.session.is_read_only();
     ui.spacing_mut().item_spacing.x = 6.0;
     ui.columns(2, |cols| {
         if sidebar_action_button(
@@ -2901,13 +2936,15 @@ fn draw_footer_expandable_options(
             Icon::Paper,
             "Insert PDF",
             ActionTone::Neutral,
-            true,
+            editable,
             btn_h,
             t,
         )
-        .on_hover_text(format!(
-            "Browse for a PDF file and insert its pages after Page {page_num}"
-        ))
+        .on_hover_text(if editable {
+            format!("Browse for a PDF file and insert its pages after Page {page_num}")
+        } else {
+            "Disabled in Read-Only mode".to_string()
+        })
         .clicked()
         {
             app.trigger_import_pdf_dialog(crate::PdfImportTarget::InsertIntoActive);
@@ -2918,11 +2955,15 @@ fn draw_footer_expandable_options(
             Icon::Duplicate,
             "Duplicate",
             ActionTone::Neutral,
-            true,
+            editable,
             btn_h,
             t,
         )
-        .on_hover_text(format!("Create a copy of Page {page_num} right after it"))
+        .on_hover_text(if editable {
+            format!("Create a copy of Page {page_num} right after it")
+        } else {
+            "Disabled in Read-Only mode".to_string()
+        })
         .clicked()
         {
             crate::canvas::commit_pending_text(app);
@@ -2939,11 +2980,15 @@ fn draw_footer_expandable_options(
             Icon::RotateCw,
             "Rotate 90°",
             ActionTone::Neutral,
-            true,
+            editable,
             btn_h,
             t,
         )
-        .on_hover_text(format!("Rotate Page {page_num} 90° clockwise"))
+        .on_hover_text(if editable {
+            format!("Rotate Page {page_num} 90° clockwise")
+        } else {
+            "Disabled in Read-Only mode".to_string()
+        })
         .clicked()
         {
             crate::canvas::commit_pending_text(app);
@@ -2959,13 +3004,15 @@ fn draw_footer_expandable_options(
             Icon::Transfer,
             "Transfer",
             ActionTone::Neutral,
-            true,
+            editable,
             btn_h,
             t,
         )
-        .on_hover_text(format!(
-            "Copy or move Page {page_num} to another or new notebook"
-        ))
+        .on_hover_text(if editable {
+            format!("Copy or move Page {page_num} to another or new notebook")
+        } else {
+            "Disabled in Read-Only mode".to_string()
+        })
         .clicked()
         {
             app.view.transfer_pages_list = vec![active_idx];
@@ -2975,8 +3022,10 @@ fn draw_footer_expandable_options(
     });
 
     ui.add_space(4.0);
-    let can_remove = total_pages > 1;
-    let remove_tip = if can_remove {
+    let can_remove = editable && total_pages > 1;
+    let remove_tip = if !editable {
+        "Disabled in Read-Only mode".to_string()
+    } else if can_remove {
         format!("Delete Page {page_num} from this notebook")
     } else {
         "A notebook must keep at least one page".to_string()
@@ -3025,16 +3074,21 @@ fn draw_footer_primary_bar(
             egui::vec2(add_w, btn_h),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
+                let editable = !app.session.is_read_only();
                 if sidebar_action_button(
                     ui,
                     Icon::AddPage,
                     "Add Page",
                     ActionTone::Accent,
-                    true,
+                    editable,
                     btn_h,
                     t,
                 )
-                .on_hover_text(format!("Insert a new blank page after Page {page_num}"))
+                .on_hover_text(if editable {
+                    format!("Insert a new blank page after Page {page_num}")
+                } else {
+                    "Read-Only Mode is active — unlock to add pages".to_string()
+                })
                 .clicked()
                 {
                     crate::canvas::commit_pending_text(app);

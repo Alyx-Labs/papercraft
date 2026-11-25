@@ -252,7 +252,7 @@ fn paint_preset_mini_sheet(
     let is_dark_paper = u16::from(bg.r()) + u16::from(bg.g()) + u16::from(bg.b()) < 380;
     let ratio_color = if selected {
         if is_dark_paper {
-            egui::Color32::from_rgb(0x93, 0xC5, 0xFD)
+            egui::Color32::from_rgb(0x82, 0xCA, 0xF2)
         } else {
             t.accent
         }

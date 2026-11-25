@@ -46,9 +46,9 @@ fn render_window_with_update_status(
     egui::Panel::top("bnc_srv_header")
         .frame(
             egui::Frame::new()
-                .fill(t.toolbar_bg)
+                .fill(t.header_bg)
                 .inner_margin(Margin::symmetric(16, 12))
-                .stroke(Stroke::new(1.0, t.border)),
+                .stroke(Stroke::new(1.0, t.header_border)),
         )
         .show(ui, |ui| {
             render_header(ctrl, ui, t, &mut actions);
@@ -142,14 +142,24 @@ fn render_header(
         ui.spacing_mut().item_spacing.x = 10.0;
 
         let (badge_rect, _) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::hover());
+        let badge_border = if t.is_dark {
+            t.accent.gamma_multiply(0.45)
+        } else {
+            t.header_active_bg
+        };
         ui.painter().rect(
             badge_rect,
             CornerRadius::same(9),
-            t.accent_soft,
-            Stroke::new(1.0, t.accent.gamma_multiply(0.45)),
+            t.header_active_bg,
+            Stroke::new(1.0, badge_border),
             egui::StrokeKind::Inside,
         );
-        paint_icon(ui.painter(), badge_rect.shrink(8.0), Icon::Server, t.accent);
+        paint_icon(
+            ui.painter(),
+            badge_rect.shrink(8.0),
+            Icon::Server,
+            t.header_active_fg,
+        );
 
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
@@ -157,18 +167,18 @@ fn render_header(
                 egui::RichText::new("PaperCraft Server")
                     .size(15.5)
                     .strong()
-                    .color(t.text),
+                    .color(t.header_fg),
             );
             ui.label(
                 egui::RichText::new("Personal sync server in your system tray")
                     .size(11.5)
-                    .color(t.text_muted),
+                    .color(t.header_fg_muted),
             );
         });
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            if icon_button(ui, Icon::ChevronDown, Some("Hide"), false, true, t)
+            if crate::icons::header_icon_button(ui, Icon::ChevronDown, Some("Hide"), false, true, t)
                 .on_hover_text("Hide this window to the system tray (server stays running)")
                 .clicked()
             {
@@ -179,7 +189,7 @@ fn render_header(
                 UiTheme::Light => (Icon::Moon, UiTheme::Dark, "Switch to Dark theme"),
                 UiTheme::Dark => (Icon::Sun, UiTheme::Light, "Switch to Light theme"),
             };
-            if icon_button(ui, theme_icon, None, false, true, t)
+            if crate::icons::header_icon_button(ui, theme_icon, None, false, true, t)
                 .on_hover_text(theme_tip)
                 .clicked()
             {
@@ -2177,11 +2187,7 @@ fn primary_button(
                 t.toolbar_bg
             },
             border: if enabled { t.accent } else { t.border },
-            fg: if enabled {
-                Color32::WHITE
-            } else {
-                t.text_muted
-            },
+            fg: if enabled { t.on_accent } else { t.text_muted },
         },
         enabled,
     )

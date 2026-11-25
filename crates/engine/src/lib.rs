@@ -26,6 +26,7 @@ pub use papercraft_compose::{
 pub use papercraft_format::looks_like_package_bytes;
 pub use sync_state::{AuthWorkspaceMode, LocalMigrationSummary, LocalNotebookEntry};
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use papercraft_doc::{
@@ -146,6 +147,7 @@ pub struct Session {
     pub live_eraser: Option<LiveEraser>,
     pub clipboard: Option<PageSelectionClipboard>,
     pub prefs: UserStudioConfig,
+    pub read_only_notebooks: HashSet<String>,
     pub(crate) library: library::LibraryState,
     pub(crate) sync: sync_state::SessionSyncState,
 }
@@ -187,6 +189,7 @@ impl Session {
             live_eraser: None,
             clipboard: None,
             prefs: UserStudioConfig::default(),
+            read_only_notebooks: HashSet::new(),
             library: library::LibraryState {
                 slot_files: vec![None],
                 slot_dirty: vec![false],
@@ -225,6 +228,47 @@ impl Session {
         &mut self.pens[kind.index()]
     }
 
+    fn read_only_key(doc: &Document, index: usize) -> String {
+        if doc.id.is_empty() {
+            format!("__slot_{index}")
+        } else {
+            doc.id.clone()
+        }
+    }
+
+    /// Returns `true` when the active notebook is locked against edits.
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.read_only_notebooks
+            .contains(&Self::read_only_key(&self.doc, self.active_notebook))
+    }
+
+    /// Returns `true` when the notebook at `index` is locked against edits.
+    #[must_use]
+    pub fn is_notebook_read_only(&self, index: usize) -> bool {
+        if index == self.active_notebook {
+            return self.is_read_only();
+        }
+        self.notebooks.get(index).is_some_and(|doc| {
+            self.read_only_notebooks
+                .contains(&Self::read_only_key(doc, index))
+        })
+    }
+
+    /// Locks or unlocks editing for the active notebook and returns the updated state.
+    pub fn set_read_only(&mut self, read_only: bool) -> bool {
+        let key = Self::read_only_key(&self.doc, self.active_notebook);
+        if read_only {
+            self.cancel_live_stroke();
+            self.cancel_live_eraser();
+            self.read_only_notebooks.insert(key);
+            true
+        } else {
+            self.read_only_notebooks.remove(&key);
+            false
+        }
+    }
+
     pub(crate) fn apply_pen_size_preferences(&mut self) {
         let sizes = self.prefs.pen_sizes;
         let smoothings = self.prefs.pen_smoothings.clone();
@@ -261,6 +305,9 @@ impl Session {
     pub fn begin_live_stroke(&mut self, sample: StrokeSample) {
         self.cancel_live_stroke();
         self.cancel_live_eraser();
+        if self.is_read_only() {
+            return;
+        }
         let pen = self.active_pen().sanitized();
         let straight_line = self.is_straight_line_active(pen.kind);
         let s = sample.sanitized();
@@ -439,6 +486,9 @@ impl Session {
     /// Completes the live draw stroke, committing either a snapped [`GeometricShape`] or an [`InkStroke`].
     pub fn finish_live_stroke_with_shape(&mut self) -> Option<FinishedLiveDraw> {
         let mut live = self.live_stroke.take()?;
+        if self.is_read_only() {
+            return None;
+        }
         if let Some(shape) = live.recognized_shape {
             let clean = shape.sanitized();
             if self.doc.shapes.len() < MAX_PAGE_SHAPES {
@@ -539,7 +589,7 @@ impl Session {
     pub fn begin_live_eraser(&mut self, pt: Point) {
         self.cancel_live_stroke();
         self.cancel_live_eraser();
-        if !pt.is_finite() {
+        if self.is_read_only() || !pt.is_finite() {
             return;
         }
         let radius = f64::from((self.eraser_size * 0.5).clamp(1.0, 80.0));
@@ -573,6 +623,9 @@ impl Session {
         let Some(live) = self.live_eraser.take() else {
             return false;
         };
+        if self.is_read_only() {
+            return false;
+        }
         if live.modified {
             self.history.record("Erase", live.snapshot_before);
             let now = papercraft_sync_protocol::now_unix_ms();
@@ -2571,5 +2624,73 @@ mod tests {
             restored.prefs.palette_by_id(&pid).unwrap().ink_colors[0],
             translucent
         );
+    }
+
+    #[test]
+    fn read_only_mode_blocks_mutations_and_tracks_active_notebook() {
+        let mut s = Session::default();
+        assert!(!s.is_read_only());
+
+        // Locking via engine command blocks stroke, page, undo, and live stroke mutations.
+        let lock_res = s
+            .execute(
+                "editor.setReadOnly",
+                &serde_json::json!({ "enabled": true }),
+            )
+            .unwrap();
+        assert_eq!(lock_res["read_only"], serde_json::json!(true));
+        assert!(s.is_read_only());
+
+        s.begin_live_stroke(StrokeSample::from_xy_pressure(40.0, 40.0, 0.8));
+        assert!(s.live_stroke.is_none());
+        s.begin_live_eraser(Point::new(40.0, 40.0));
+        assert!(s.live_eraser.is_none());
+
+        assert!(s.execute("page.add", &serde_json::json!({})).is_err());
+        assert!(
+            s.execute(
+                "stroke.draw",
+                &serde_json::json!({ "points": [{ "x": 10.0, "y": 10.0, "pressure": 0.5 }] })
+            )
+            .is_err()
+        );
+        assert!(
+            s.execute(
+                "text.insert",
+                &serde_json::json!({ "text": "Locked", "x": 100.0, "y": 100.0 })
+            )
+            .is_err()
+        );
+        assert!(
+            s.execute(
+                "notebook.rename",
+                &serde_json::json!({ "title": "Should Fail" })
+            )
+            .is_err()
+        );
+        assert!(s.execute("edit.undo", &serde_json::json!({})).is_err());
+        assert_eq!(s.doc.page_count(), 1);
+        assert!(s.doc.strokes.is_empty());
+
+        // Creating/switching to a second notebook keeps read-only scoped to the locked notebook.
+        s.execute(
+            "notebook.create",
+            &serde_json::json!({ "title": "Editable Second" }),
+        )
+        .unwrap();
+        assert!(!s.is_read_only());
+        assert!(s.execute("page.add", &serde_json::json!({})).is_ok());
+        assert_eq!(s.doc.page_count(), 2);
+
+        // Returning to notebook 0 preserves its lock; toggling without params unlocks it.
+        s.execute("notebook.select", &serde_json::json!({ "index": 0 }))
+            .unwrap();
+        assert!(s.is_read_only());
+        let unlock_res = s
+            .execute("editor.setReadOnly", &serde_json::json!({}))
+            .unwrap();
+        assert_eq!(unlock_res["read_only"], serde_json::json!(false));
+        assert!(!s.is_read_only());
+        assert!(s.execute("page.add", &serde_json::json!({})).is_ok());
     }
 }

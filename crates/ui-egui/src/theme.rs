@@ -23,7 +23,19 @@ pub struct Tokens {
     pub accent: Color32,
     pub accent_hover: Color32,
     pub accent_soft: Color32,
+    pub on_accent: Color32,
     pub field_bg: Color32,
+    pub tab_strip_bg: Color32,
+    pub tab_strip_fg: Color32,
+    pub tab_strip_fg_muted: Color32,
+    pub header_bg: Color32,
+    pub header_border: Color32,
+    pub header_fg: Color32,
+    pub header_fg_muted: Color32,
+    pub header_track_bg: Color32,
+    pub header_control_hover: Color32,
+    pub header_active_bg: Color32,
+    pub header_active_fg: Color32,
     pub danger_fg: Color32,
     pub danger_border: Color32,
     pub danger_bg: Color32,
@@ -46,16 +58,28 @@ impl Tokens {
     pub fn light() -> Self {
         Self {
             is_dark: false,
-            toolbar_bg: Color32::from_rgb(0xF6, 0xF7, 0xFA),
-            panel_bg: Color32::from_rgb(0xFA, 0xFB, 0xFD),
-            canvas_bg: Color32::from_rgb(0xE4, 0xE7, 0xEE),
-            border: Color32::from_rgb(0xD8, 0xDD, 0xE6),
-            text: Color32::from_rgb(0x1E, 0x22, 0x2B),
-            text_muted: Color32::from_rgb(0x62, 0x6A, 0x79),
-            accent: Color32::from_rgb(0x28, 0x66, 0xE8),
-            accent_hover: Color32::from_rgb(0x1E, 0x57, 0xD4),
-            accent_soft: Color32::from_rgb(0xE3, 0xEC, 0xFC),
+            toolbar_bg: Color32::from_rgb(0xEE, 0xF6, 0xFA),
+            panel_bg: Color32::from_rgb(0xF8, 0xFB, 0xFD),
+            canvas_bg: Color32::from_rgb(0xE3, 0xED, 0xF4),
+            border: Color32::from_rgb(0xCE, 0xE0, 0xEB),
+            text: Color32::from_rgb(0x13, 0x20, 0x2B),
+            text_muted: Color32::from_rgb(0x51, 0x67, 0x79),
+            accent: Color32::from_rgb(0x0C, 0x6F, 0xA6),
+            accent_hover: Color32::from_rgb(0x09, 0x59, 0x85),
+            accent_soft: Color32::from_rgb(0xDF, 0xF1, 0xFC),
+            on_accent: Color32::WHITE,
             field_bg: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            tab_strip_bg: Color32::from_rgb(0x0D, 0x43, 0x63),
+            tab_strip_fg: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            tab_strip_fg_muted: Color32::from_rgb(0xBF, 0xE2, 0xF6),
+            header_bg: Color32::from_rgb(0x13, 0x5A, 0x84),
+            header_border: Color32::from_rgb(0x26, 0x72, 0x9E),
+            header_fg: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            header_fg_muted: Color32::from_rgb(0xCB, 0xE8, 0xF8),
+            header_track_bg: Color32::from_rgb(0x0E, 0x4A, 0x6E),
+            header_control_hover: Color32::from_rgb(0x1B, 0x6E, 0x9E),
+            header_active_bg: Color32::from_rgb(0x82, 0xCA, 0xF2),
+            header_active_fg: Color32::from_rgb(0x09, 0x32, 0x4A),
             danger_fg: Color32::from_rgb(0xB4, 0x28, 0x28),
             danger_border: Color32::from_rgb(0xE4, 0xBE, 0xBE),
             danger_bg: Color32::from_rgb(0xFD, 0xF5, 0xF5),
@@ -70,16 +94,28 @@ impl Tokens {
     pub fn dark() -> Self {
         Self {
             is_dark: true,
-            toolbar_bg: Color32::from_rgb(0x1B, 0x1E, 0x26),
-            panel_bg: Color32::from_rgb(0x15, 0x18, 0x1F),
-            canvas_bg: Color32::from_rgb(0x0F, 0x11, 0x17),
-            border: Color32::from_rgb(0x2E, 0x34, 0x40),
-            text: Color32::from_rgb(0xED, 0xF0, 0xF6),
-            text_muted: Color32::from_rgb(0x9A, 0xA3, 0xB5),
-            accent: Color32::from_rgb(0x3B, 0x76, 0xEC),
-            accent_hover: Color32::from_rgb(0x52, 0x89, 0xF5),
-            accent_soft: Color32::from_rgb(0x1F, 0x32, 0x54),
-            field_bg: Color32::from_rgb(0x22, 0x26, 0x31),
+            toolbar_bg: Color32::from_rgb(0x27, 0x2B, 0x32),
+            panel_bg: Color32::from_rgb(0x20, 0x23, 0x29),
+            canvas_bg: Color32::from_rgb(0x19, 0x1B, 0x20),
+            border: Color32::from_rgb(0x3E, 0x45, 0x52),
+            text: Color32::from_rgb(0xEF, 0xF2, 0xF7),
+            text_muted: Color32::from_rgb(0xA3, 0xAC, 0xB9),
+            accent: Color32::from_rgb(0x82, 0xCA, 0xF2),
+            accent_hover: Color32::from_rgb(0x9F, 0xD7, 0xF7),
+            accent_soft: Color32::from_rgb(0x1F, 0x3A, 0x4A),
+            on_accent: Color32::from_rgb(0x09, 0x24, 0x34),
+            field_bg: Color32::from_rgb(0x2F, 0x34, 0x3D),
+            tab_strip_bg: Color32::from_rgb(0x19, 0x1B, 0x20),
+            tab_strip_fg: Color32::from_rgb(0xEF, 0xF2, 0xF7),
+            tab_strip_fg_muted: Color32::from_rgb(0xA3, 0xAC, 0xB9),
+            header_bg: Color32::from_rgb(0x27, 0x2B, 0x32),
+            header_border: Color32::from_rgb(0x3E, 0x45, 0x52),
+            header_fg: Color32::from_rgb(0xEF, 0xF2, 0xF7),
+            header_fg_muted: Color32::from_rgb(0xA3, 0xAC, 0xB9),
+            header_track_bg: Color32::from_rgb(0x27, 0x2B, 0x32),
+            header_control_hover: Color32::from_rgb(0x33, 0x38, 0x42),
+            header_active_bg: Color32::from_rgb(0x1F, 0x3A, 0x4A),
+            header_active_fg: Color32::from_rgb(0x82, 0xCA, 0xF2),
             danger_fg: Color32::from_rgb(0xF0, 0x7A, 0x7A),
             danger_border: Color32::from_rgb(0x5E, 0x31, 0x36),
             danger_bg: Color32::from_rgb(0x2D, 0x1C, 0x20),
@@ -146,7 +182,7 @@ pub fn apply_visuals(ctx: &egui::Context, theme: UiTheme) {
     visuals.widgets.active.bg_fill = t.accent;
     visuals.widgets.active.weak_bg_fill = t.accent;
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, t.accent);
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, t.on_accent);
     visuals.widgets.active.corner_radius = control_radius;
 
     visuals.widgets.open.bg_fill = t.accent_soft;
@@ -251,18 +287,9 @@ pub(crate) fn studio_wrapped_row<R>(
     )
 }
 
-/// Sky/azure brand blue used for the `"Craft"` accent in the `"Paper Craft"` wordmark.
-pub(crate) fn brand_craft_color(t: &Tokens) -> Color32 {
-    if t.is_dark {
-        Color32::from_rgb(0x82, 0xCA, 0xF2)
-    } else {
-        Color32::from_rgb(0x0A, 0x72, 0xB5)
-    }
-}
-
-/// Subtle sky-blue frame stroke around the Paper Craft mascot badge.
-pub(crate) fn brand_badge_border_color() -> Color32 {
-    Color32::from_rgba_unmultiplied(0x82, 0xCA, 0xF3, 178)
+/// Brand sky-cyan used for the `"Craft"` accent in the `"Paper Craft"` header wordmark.
+pub(crate) fn brand_craft_color(_t: &Tokens) -> Color32 {
+    Color32::from_rgb(0x82, 0xCA, 0xF2)
 }
 
 /// Builds the single-line `"Paper Craft"` header wordmark in the display font (`Bricolage Grotesque`).
@@ -270,7 +297,7 @@ pub(crate) fn brand_wordmark_job(font_size: f32, t: &Tokens) -> egui::text::Layo
     let family = egui::FontFamily::Name(crate::BRAND_DISPLAY_FAMILY.into());
     let base = egui::TextFormat {
         font_id: egui::FontId::new(font_size, family),
-        color: t.text,
+        color: t.header_fg,
         extra_letter_spacing: -0.25,
         ..Default::default()
     };
@@ -353,6 +380,60 @@ mod tests {
         assert!(channel_sum(light.canvas_bg) > channel_sum(light.text));
         assert!(channel_sum(dark.panel_bg) < channel_sum(dark.text));
         assert!(channel_sum(dark.canvas_bg) < channel_sum(dark.text));
+    }
+
+    fn relative_luminance(c: Color32) -> f32 {
+        fn channel(v: u8) -> f32 {
+            let s = f32::from(v) / 255.0;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+    }
+
+    fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+        let la = relative_luminance(a);
+        let lb = relative_luminance(b);
+        let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn cyan_scale_and_header_hierarchy_meet_contrast_targets() {
+        let light = Tokens::for_theme(UiTheme::Light);
+        let dark = Tokens::for_theme(UiTheme::Dark);
+        let brand_cyan = Color32::from_rgb(0x82, 0xCA, 0xF2);
+
+        assert_eq!(super::brand_craft_color(&light), brand_cyan);
+        assert_eq!(super::brand_craft_color(&dark), brand_cyan);
+        assert_eq!(light.header_active_bg, brand_cyan);
+        assert_eq!(dark.accent, brand_cyan);
+
+        // Two-tier Light header hierarchy: darkest cyan tab strip -> one step lighter active header.
+        assert!(relative_luminance(light.header_bg) > relative_luminance(light.tab_strip_bg));
+        assert!(contrast_ratio(light.tab_strip_fg, light.tab_strip_bg) >= 7.0);
+        assert!(contrast_ratio(light.tab_strip_fg_muted, light.tab_strip_bg) >= 4.5);
+        assert!(contrast_ratio(light.header_fg, light.header_bg) >= 6.0);
+        assert!(contrast_ratio(light.header_fg_muted, light.header_bg) >= 4.5);
+        assert!(contrast_ratio(light.header_active_fg, light.header_active_bg) >= 4.5);
+        assert!(contrast_ratio(super::brand_craft_color(&light), light.header_bg) >= 3.0);
+
+        // Light body cyan scale readability.
+        assert!(contrast_ratio(light.accent, light.field_bg) >= 4.5);
+        assert!(contrast_ratio(light.accent, light.toolbar_bg) >= 4.5);
+        assert!(contrast_ratio(light.accent, light.accent_soft) >= 4.5);
+        assert!(contrast_ratio(light.on_accent, light.accent) >= 4.5);
+        assert!(contrast_ratio(light.text, light.panel_bg) >= 7.0);
+
+        // Dark charcoal surfaces and brand cyan accents.
+        assert!(contrast_ratio(dark.text, dark.panel_bg) >= 7.0);
+        assert!(contrast_ratio(dark.text_muted, dark.panel_bg) >= 4.5);
+        assert!(contrast_ratio(dark.accent, dark.toolbar_bg) >= 7.0);
+        assert!(contrast_ratio(dark.on_accent, dark.accent) >= 7.0);
+        assert!(contrast_ratio(dark.header_active_fg, dark.header_active_bg) >= 4.5);
     }
 
     #[test]

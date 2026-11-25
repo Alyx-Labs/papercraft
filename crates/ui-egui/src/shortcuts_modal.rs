@@ -1,6 +1,6 @@
 //! Minimalist bottom-right shortcuts trigger button and single-page Keyboard Shortcuts modal.
 
-use egui::{Color32, CornerRadius, FontId, Rect, RichText, Sense, Stroke, StrokeKind, Vec2, pos2};
+use egui::{CornerRadius, FontId, Rect, RichText, Sense, Stroke, StrokeKind, Vec2, pos2};
 use papercraft_doc::PenKind;
 use papercraft_engine::ToolKind;
 
@@ -480,7 +480,7 @@ fn draw_shortcut_row(
     }
 
     let font = FontId::proportional(11.0);
-    let key_fg = if highlighted { Color32::WHITE } else { t.text };
+    let key_fg = if highlighted { t.on_accent } else { t.text };
     let key_galleys: Vec<(std::sync::Arc<egui::Galley>, f32)> = entry
         .keys
         .iter()
