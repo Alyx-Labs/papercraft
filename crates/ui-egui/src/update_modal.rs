@@ -35,6 +35,17 @@ pub(crate) fn render_body(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens
             );
         }
         UpdateStatus::UpToDate { latest_version } => {
+            let is_ahead = app
+                .updater
+                .config()
+                .is_some_and(|cfg| cfg.current_version > latest_version);
+            let subtitle = if is_ahead {
+                format!(
+                    "Running v{current_ver} — newer than the latest published release (v{latest_version})."
+                )
+            } else {
+                format!("Running v{current_ver} (latest published release: v{latest_version}).")
+            };
             draw_status_box(
                 ui,
                 t.success_bg,
@@ -42,7 +53,7 @@ pub(crate) fn render_body(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens
                 t.success_fg,
                 Icon::CheckCircle,
                 "PaperCraft is up to date",
-                &format!("Running v{current_ver} (latest published release: v{latest_version})."),
+                &subtitle,
                 false,
                 t,
             );

@@ -87,3 +87,60 @@ impl fmt::Display for UpdateError {
 }
 
 impl Error for UpdateError {}
+
+/// Formats a human-readable "up to date" status line, clarifying when the running build
+/// is newer than the latest published GitHub release.
+#[must_use]
+pub fn format_up_to_date_status(
+    app_label: Option<&str>,
+    current: Option<&SemVer>,
+    latest: &SemVer,
+) -> String {
+    let is_ahead = current.is_some_and(|cur| cur > latest);
+    match (app_label, is_ahead) {
+        (Some(label), true) => {
+            format!("{label} is up to date — newer than latest published release (v{latest}).")
+        }
+        (Some(label), false) => format!("{label} is up to date (latest: v{latest})."),
+        (None, true) => format!("Up to date — newer than latest published release (v{latest})."),
+        (None, false) => format!("Up to date (latest: v{latest})."),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_up_to_date_status_distinguishes_equal_ahead_and_unknown() {
+        let v021 = SemVer::parse("0.2.1").unwrap();
+        let v022 = SemVer::parse("0.2.2").unwrap();
+
+        assert_eq!(
+            format_up_to_date_status(None, Some(&v021), &v021),
+            "Up to date (latest: v0.2.1)."
+        );
+        assert_eq!(
+            format_up_to_date_status(None, Some(&v022), &v021),
+            "Up to date — newer than latest published release (v0.2.1)."
+        );
+        assert_eq!(
+            format_up_to_date_status(None, None, &v021),
+            "Up to date (latest: v0.2.1)."
+        );
+
+        assert_eq!(
+            format_up_to_date_status(Some("PaperCraft Server"), Some(&v021), &v021),
+            "PaperCraft Server is up to date (latest: v0.2.1)."
+        );
+        assert_eq!(
+            format_up_to_date_status(Some("PaperCraft Server"), Some(&v022), &v021),
+            "PaperCraft Server is up to date — newer than latest published release (v0.2.1)."
+        );
+        assert_eq!(
+            format_up_to_date_status(Some("PaperCraft Server"), None, &v021),
+            "PaperCraft Server is up to date (latest: v0.2.1)."
+        );
+    }
+}

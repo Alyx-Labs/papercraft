@@ -2680,15 +2680,17 @@ fn rasterize_thumbnail_shapes(
             if closed && let Some(fc) = fill {
                 rasterize_polygon_fill(&mut image.pixels, tex_size, &pts, fc);
             }
-            rasterize_thumb_polyline(
-                &mut image.pixels,
-                tex_size,
-                &pts,
-                closed,
-                radius,
-                color,
-                shape.line_style,
-            );
+            if shape.color.a > 0.0 && color.a() > 0 {
+                rasterize_thumb_polyline(
+                    &mut image.pixels,
+                    tex_size,
+                    &pts,
+                    closed,
+                    radius,
+                    color,
+                    shape.line_style,
+                );
+            }
         }
     }
 }

@@ -328,16 +328,30 @@ fn draw_popover_header(
 
 fn render_wildcard_mode(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     let target = app.view.color_picker.target;
-    let (title, subtitle) = match target {
-        PaletteTarget::Ink => (
-            "Custom Color",
-            "Standalone color for all pens — independent of palettes.",
-        ),
-        PaletteTarget::Highlighter => (
-            "Highlighter Custom Color",
-            "Standalone highlighter color — independent of palettes.",
-        ),
-    };
+    let (title, subtitle) =
+        if crate::toolbar::is_shape_color_context(app) && target == PaletteTarget::Ink {
+            match app.view.shape_color_target {
+                crate::ShapeColorTarget::Border => (
+                    "Shape Border Color",
+                    "Custom outline color for shapes — independent of palettes.",
+                ),
+                crate::ShapeColorTarget::Fill => (
+                    "Shape Fill Color",
+                    "Custom interior fill color for shapes — independent of palettes.",
+                ),
+            }
+        } else {
+            match target {
+                PaletteTarget::Ink => (
+                    "Custom Color",
+                    "Standalone color for all pens — independent of palettes.",
+                ),
+                PaletteTarget::Highlighter => (
+                    "Highlighter Custom Color",
+                    "Standalone highlighter color — independent of palettes.",
+                ),
+            }
+        };
     let (_, close_clicked) = draw_popover_header(ui, title, subtitle, None, t);
     if close_clicked {
         app.view.color_picker.close();
@@ -1580,16 +1594,9 @@ fn apply_color_to_target(app: &mut PaperCraftApp, color: Color) {
         crate::toolbar::apply_draft_text_color(app, color);
         return;
     }
-    if app.view.shape_insert_mode {
-        let active_kind = app.session.active_pen_kind();
-        if PaletteTarget::for_pen(active_kind) == app.view.color_picker.target {
-            let _ = app.session.execute(
-                "pen.setSettings",
-                &json!({
-                    "kind": active_kind,
-                    "color": color,
-                }),
-            );
+    if crate::toolbar::is_shape_color_context(app) {
+        if app.view.color_picker.target == PaletteTarget::Ink {
+            crate::toolbar::apply_shape_color_from_dock(app, Some(color));
         }
         return;
     }

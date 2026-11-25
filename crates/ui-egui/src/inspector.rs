@@ -582,7 +582,11 @@ fn draw_app_updates_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens)
                 ("Checking for new releases...".to_string(), t.accent)
             }
             UpdateStatus::UpToDate { latest_version } => (
-                format!("Up to date (latest: v{latest_version})."),
+                papercraft_updater::format_up_to_date_status(
+                    None,
+                    app.updater.config().map(|cfg| &cfg.current_version),
+                    latest_version,
+                ),
                 t.success_fg,
             ),
             UpdateStatus::Available(u) => (

@@ -2589,11 +2589,9 @@ fn handle_shape_input(
         let max_y = f64::from(app.session.doc.height);
         let start = [start[0].clamp(0.0, max_x), start[1].clamp(0.0, max_y)];
         let end = [end[0].clamp(0.0, max_x), end[1].clamp(0.0, max_y)];
-        let pen_color = app.session.active_pen().color;
-        let fill_color = app
-            .view
-            .shape_fill_enabled
-            .then(|| pen_color.with_alpha(app.view.shape_fill_opacity.clamp(0.15, 0.95)));
+        let border_color = crate::toolbar::effective_shape_insert_border(app)
+            .unwrap_or(papercraft_color::Color::TRANSPARENT);
+        let fill_color = crate::toolbar::effective_shape_insert_fill(app);
         let mut params = serde_json::json!({
             "kind": app.view.selected_shape_kind,
             "x1": start[0],
@@ -2602,6 +2600,7 @@ fn handle_shape_input(
             "y2": end[1],
             "angle_degrees": app.view.shape_angle_degrees,
             "curve": app.view.shape_curve,
+            "color": border_color,
             "line_style": app.view.shape_line_style,
         });
         if let Some(fill) = fill_color {
@@ -7590,14 +7589,16 @@ fn emit_shape_outline<S: ShapeSink>(
         {
             sink.push_shape(fill_shape);
         }
-        emit_polyline_with_style(
-            sink,
-            &screen_points,
-            closed,
-            stroke_w,
-            color,
-            shape.line_style,
-        );
+        if color.a() > 0 {
+            emit_polyline_with_style(
+                sink,
+                &screen_points,
+                closed,
+                stroke_w,
+                color,
+                shape.line_style,
+            );
+        }
     }
 }
 
@@ -7690,12 +7691,16 @@ fn paint_committed_shapes(app: &mut PaperCraftApp, p: &egui::Painter, xf: Affine
             }
         }
         let shape = item.as_ref().sanitized();
-        let color = eff_paper_color.resolve_ink_color(
-            app.session.prefs.theme,
-            auto_contrast,
-            shape.color,
-            false,
-        );
+        let color = if shape.color.a > 0.0 {
+            eff_paper_color.resolve_ink_color(
+                app.session.prefs.theme,
+                auto_contrast,
+                shape.color,
+                false,
+            )
+        } else {
+            papercraft_color::Color::TRANSPARENT
+        };
         let fill = shape.fill_color.map(|fc| {
             let resolved = eff_paper_color.resolve_ink_color(
                 app.session.prefs.theme,
@@ -7750,11 +7755,10 @@ fn paint_shape_preview(
         pos2(bottom_right.x as f32, bottom_right.y as f32),
     );
     let pen = app.session.active_pen();
-    let fill_color = app.view.shape_fill_enabled.then(|| {
-        pen.color
-            .with_alpha(app.view.shape_fill_opacity.clamp(0.15, 0.95))
-    });
-    let shape = GeometricShape {
+    let eff_border = crate::toolbar::effective_shape_insert_border(app);
+    let fill_color = crate::toolbar::effective_shape_insert_fill(app);
+    let (auto_contrast, eff_paper_color) = crate::effective_doc_ink_context(app);
+    let mut shape = GeometricShape {
         kind: app.view.selected_shape_kind,
         x1: start[0],
         y1: start[1],
@@ -7762,19 +7766,25 @@ fn paint_shape_preview(
         y2: end[1],
         angle_degrees: app.view.shape_angle_degrees,
         curve: app.view.shape_curve,
-        color: pen.color,
+        color: eff_border.unwrap_or(papercraft_color::Color::TRANSPARENT),
         width: pen.size,
         fill_color,
         line_style: app.view.shape_line_style,
         points: Vec::new(),
     };
-    let (auto_contrast, eff_paper_color) = crate::effective_doc_ink_context(app);
-    let color = eff_paper_color.resolve_ink_color(
-        app.session.prefs.theme,
-        auto_contrast,
-        shape.color,
-        false,
-    );
+    let preview_border = if let Some(border) = eff_border {
+        to_color32(eff_paper_color.resolve_ink_color(
+            app.session.prefs.theme,
+            auto_contrast,
+            border,
+            false,
+        ))
+    } else if fill_color.is_none() {
+        shape.line_style = papercraft_doc::ShapeLineStyle::Dashed;
+        Color32::from_rgba_unmultiplied(128, 128, 128, 140)
+    } else {
+        Color32::TRANSPARENT
+    };
     let fill = shape.fill_color.map(|fc| {
         to_color32(eff_paper_color.resolve_ink_color(
             app.session.prefs.theme,
@@ -7788,7 +7798,7 @@ fn paint_shape_preview(
         &shape,
         xf,
         app.view.zoom,
-        to_color32(color),
+        preview_border,
         fill,
     );
 }

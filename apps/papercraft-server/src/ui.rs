@@ -847,13 +847,14 @@ fn render_update_status_details(
             render_update_ready_box(update, ui, t, actions);
         }
         UpdateStatus::UpToDate { latest_version } => {
+            let msg = papercraft_updater::format_up_to_date_status(
+                Some("PaperCraft Server"),
+                ctrl.updater.config().map(|cfg| &cfg.current_version),
+                latest_version,
+            );
             ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(format!(
-                    "PaperCraft Server is up to date (latest: v{latest_version})."
-                ))
-                .size(11.0)
-                .color(t.success_fg),
+            ui.add(
+                egui::Label::new(egui::RichText::new(msg).size(11.0).color(t.success_fg)).wrap(),
             );
         }
         UpdateStatus::NoPlatformAsset { latest_version, .. } => {

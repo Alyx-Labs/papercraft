@@ -2257,7 +2257,11 @@ fn cmd_update_selection(
             "selection must contain between 1 and 8192 objects",
         ));
     }
-    if p.color.is_none() && p.shape_kind.is_none() {
+    let has_shape_style = p.shape_kind.is_some()
+        || p.fill_color.is_some()
+        || p.clear_fill.unwrap_or(false)
+        || p.line_style.is_some();
+    if p.color.is_none() && !has_shape_style {
         return Err(invalid(
             id,
             "provide a shared color or shape format to apply",
@@ -2288,7 +2292,7 @@ fn cmd_update_selection(
                 "a selected object no longer exists on the active page",
             ));
         }
-        if p.shape_kind.is_some() && !matches!(target, TransformTarget::Shape { .. }) {
+        if has_shape_style && !matches!(target, TransformTarget::Shape { .. }) {
             return Err(invalid(
                 id,
                 "shape format can only be applied to geometric shapes",

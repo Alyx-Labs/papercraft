@@ -1044,11 +1044,11 @@ fn append_svg_shapes(out: &mut String, shapes: &[std::sync::Arc<GeometricShape>]
             continue;
         }
         let color = shape.color.sanitized();
-        let opacity = if color.a < 0.995 {
-            format!(" stroke-opacity=\"{:.3}\"", color.a)
-        } else {
-            String::new()
-        };
+        let has_fill = shape.is_closed() && shape.fill_color.is_some_and(|fill| fill.a > 0.0);
+        let has_stroke = color.a > 0.0;
+        if !has_fill && !has_stroke {
+            continue;
+        }
         let fill_attr = if shape.is_closed()
             && let Some(fill) = shape.fill_color
             && fill.a > 0.0
@@ -1061,20 +1061,29 @@ fn append_svg_shapes(out: &mut String, shapes: &[std::sync::Arc<GeometricShape>]
         } else {
             " fill=\"none\"".to_string()
         };
-        let dash_attr = match shape.line_style.dash_pattern(shape.width) {
-            Some((d, g)) => format!(
-                " stroke-dasharray=\"{} {}\"",
-                fmt_number(f64::from(d)),
-                fmt_number(f64::from(g))
-            ),
-            None => String::new(),
+        let stroke_attrs = if has_stroke {
+            let opacity = if color.a < 0.995 {
+                format!(" stroke-opacity=\"{:.3}\"", color.a)
+            } else {
+                String::new()
+            };
+            let dash_attr = match shape.line_style.dash_pattern(shape.width) {
+                Some((d, g)) => format!(
+                    " stroke-dasharray=\"{} {}\"",
+                    fmt_number(f64::from(d)),
+                    fmt_number(f64::from(g))
+                ),
+                None => String::new(),
+            };
+            format!(
+                " stroke=\"{}\" stroke-width=\"{}\"{opacity}{dash_attr}",
+                color_hex(color),
+                fmt_number(f64::from(shape.width))
+            )
+        } else {
+            " stroke=\"none\"".to_string()
         };
-        let _ = writeln!(
-            out,
-            "    <path d=\"{path}\"{fill_attr} stroke=\"{}\" stroke-width=\"{}\"{opacity}{dash_attr}/>",
-            color_hex(color),
-            fmt_number(f64::from(shape.width))
-        );
+        let _ = writeln!(out, "    <path d=\"{path}\"{fill_attr}{stroke_attrs}/>");
     }
     let _ = writeln!(out, "  </g>");
 }
@@ -1326,23 +1335,25 @@ fn append_pdf_shapes(
             append_pdf_shape_paths(out, &segments);
             out.push_str("f\nQ\n");
         }
-        out.push_str("q\n");
-        if shape.color.a < 0.995 {
-            let state = register_pdf_state(states, false, shape.color.a);
-            let _ = writeln!(out, "/GS{state} gs");
+        if shape.color.a > 0.0 {
+            out.push_str("q\n");
+            if shape.color.a < 0.995 {
+                let state = register_pdf_state(states, false, shape.color.a);
+                let _ = writeln!(out, "/GS{state} gs");
+            }
+            let dash_cmd = match shape.line_style.dash_pattern(shape.width) {
+                Some((d, g)) => format!("[{d:.2} {g:.2}] 0 d "),
+                None => String::new(),
+            };
+            let _ = writeln!(
+                out,
+                "{} RG {:.3} w 1 J 1 j {dash_cmd}",
+                color_rgb_pdf(shape.color),
+                shape.width
+            );
+            append_pdf_shape_paths(out, &segments);
+            out.push_str("S\nQ\n");
         }
-        let dash_cmd = match shape.line_style.dash_pattern(shape.width) {
-            Some((d, g)) => format!("[{d:.2} {g:.2}] 0 d "),
-            None => String::new(),
-        };
-        let _ = writeln!(
-            out,
-            "{} RG {:.3} w 1 J 1 j {dash_cmd}",
-            color_rgb_pdf(shape.color),
-            shape.width
-        );
-        append_pdf_shape_paths(out, &segments);
-        out.push_str("S\nQ\n");
     }
 }
 
@@ -2625,6 +2636,58 @@ mod tests {
         assert!(svg.contains("font-family=\"monospace\""));
         assert!(svg.contains("font-size=\"30\""));
         assert!(svg.contains("fill=\"#DC2626\""));
+
+        let pdf = export_notebook_pdf(&doc);
+        let parsed =
+            hayro::hayro_syntax::Pdf::new(Arc::new(pdf)).expect("generated PDF should parse");
+        assert_eq!(parsed.pages().len(), 1);
+    }
+
+    #[test]
+    fn borderless_filled_shape_omits_stroke_in_cpu_svg_and_pdf() {
+        use papercraft_color::Color;
+        use papercraft_doc::{GeometricShape, ShapeKind};
+
+        let mut doc = Document::new(400, 400);
+        doc.paper_color = PaperColor::PureWhite;
+        doc.shapes.push(Arc::new(GeometricShape {
+            kind: ShapeKind::Rectangle,
+            x1: 80.0,
+            y1: 80.0,
+            x2: 240.0,
+            y2: 200.0,
+            color: Color::TRANSPARENT,
+            width: 4.0,
+            fill_color: Some(Color::from_rgba8(0xEF, 0x44, 0x44, 255)),
+            ..GeometricShape::default()
+        }));
+        doc.sync_active_to_pages();
+
+        let surface = crate::render_document(&doc, None);
+        // Interior is filled red.
+        let inner = surface.pixel_u8(160, 140);
+        assert!(
+            inner[0] > 220 && inner[1] < 90 && inner[2] < 90,
+            "got {inner:?}"
+        );
+        // Outside edge (4px border extends to x=78..82) stays pure white paper when borderless.
+        assert_eq!(surface.pixel_u8(78, 140), [255, 255, 255, 255]);
+
+        let svg = render_document_svg(&doc);
+        assert!(svg.contains("fill=\"#EF4444\""), "svg={svg}");
+        assert!(svg.contains("stroke=\"none\""), "svg={svg}");
+
+        let mut pdf_stream = String::new();
+        let mut states = Vec::new();
+        append_pdf_shapes(&mut pdf_stream, &doc.shapes, &mut states);
+        assert!(pdf_stream.contains(" rg\n"), "pdf_stream={pdf_stream}");
+        assert!(pdf_stream.contains("f\n"), "pdf_stream={pdf_stream}");
+        assert!(!pdf_stream.contains(" RG "), "pdf_stream={pdf_stream}");
+        assert!(!pdf_stream.contains("S\n"), "pdf_stream={pdf_stream}");
+        assert!(
+            states.is_empty(),
+            "opaque fill + transparent border needs no alpha ExtGState"
+        );
 
         let pdf = export_notebook_pdf(&doc);
         let parsed =

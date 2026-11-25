@@ -68,6 +68,7 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
 }
 
 pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> HomeMetrics {
+    app.install_rich_fonts_if_needed(ui.ctx());
     let t = Tokens::for_theme(app.session.prefs.theme);
     let header_rect = draw_home_header(app, ui, &t);
     let show_sidebar = ui.available_width() >= SIDEBAR_MIN_VIEWPORT;
@@ -387,11 +388,17 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
                 let (badge_rect, _) =
                     ui.allocate_exact_size(Vec2::splat(HEADER_ROW_HEIGHT), Sense::hover());
                 if let Some(logo_tex) = brand_logo_texture(ui.ctx()) {
-                    ui.painter().image(
+                    egui::Image::new(egui::load::SizedTexture::new(
                         logo_tex.id(),
+                        logo_tex.size_vec2(),
+                    ))
+                    .corner_radius(CornerRadius::same(7))
+                    .paint_at(ui, badge_rect);
+                    ui.painter().rect_stroke(
                         badge_rect,
-                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                        Color32::WHITE,
+                        CornerRadius::same(7),
+                        Stroke::new(1.0, crate::theme::brand_badge_border_color()),
+                        StrokeKind::Inside,
                     );
                 } else {
                     ui.painter()
@@ -405,11 +412,8 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
                 }
 
                 ui.add_space(2.0);
-                ui.label(
-                    RichText::new("PaperCraft")
-                        .size(14.5)
-                        .strong()
-                        .color(t.text),
+                ui.add(
+                    egui::Label::new(crate::theme::brand_wordmark_job(16.5, t)).selectable(false),
                 );
                 if ui.available_width() >= 920.0 {
                     ui.separator();
@@ -3617,6 +3621,10 @@ mod tests {
             "expected embedded PaperCraft brand logo texture to load"
         );
         assert!(
+            header_texts.iter().any(|(label, _)| label == "Paper Craft"),
+            "home header must display 'Paper Craft' brand wordmark, got {header_texts:?}"
+        );
+        assert!(
             !header_texts
                 .iter()
                 .any(|(label, _)| label == "New Notebook" || label == "Import PDF"),
@@ -3862,5 +3870,85 @@ mod tests {
             cloud_text.contains("Waiting to sync"),
             "missing Waiting to sync badge in:\n{cloud_text}"
         );
+    }
+
+    #[test]
+    fn brand_wordmark_uses_display_font_and_blue_craft_in_light_and_dark_themes() {
+        for (theme, expected_craft_color) in [
+            (
+                papercraft_doc::UiTheme::Dark,
+                Color32::from_rgb(0x82, 0xCA, 0xF2),
+            ),
+            (
+                papercraft_doc::UiTheme::Light,
+                Color32::from_rgb(0x0A, 0x72, 0xB5),
+            ),
+        ] {
+            let mut app = PaperCraftApp::default();
+            app.session
+                .execute("theme.set", &json!({ "theme": theme }))
+                .unwrap();
+            let ctx = egui::Context::default();
+            let viewport = Vec2::new(1280.0, 800.0);
+            let mut header_rect = Rect::NOTHING;
+            let mut wordmark_sections: Vec<(String, egui::FontFamily, Color32)> = Vec::new();
+            for _ in 0..2 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, viewport)),
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(raw, |ui| {
+                    crate::theme::apply_visuals(ui.ctx(), theme);
+                    header_rect = show_inner(&mut app, ui).header_rect;
+                });
+                wordmark_sections.clear();
+                fn find_wordmark(
+                    shape: &egui::Shape,
+                    header: Rect,
+                    out: &mut Vec<(String, egui::FontFamily, Color32)>,
+                ) {
+                    match shape {
+                        egui::Shape::Text(text)
+                            if header.contains(text.visual_bounding_rect().center())
+                                && text.galley.text() == "Paper Craft" =>
+                        {
+                            let raw_text = text.galley.job.text.as_str();
+                            for sec in &text.galley.job.sections {
+                                if let Some(slice) =
+                                    raw_text.get(sec.byte_range.start.0..sec.byte_range.end.0)
+                                {
+                                    out.push((
+                                        slice.to_string(),
+                                        sec.format.font_id.family.clone(),
+                                        sec.format.color,
+                                    ));
+                                }
+                            }
+                        }
+                        egui::Shape::Vec(items) => {
+                            for item in items {
+                                find_wordmark(item, header, out);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for clipped in &out.shapes {
+                    find_wordmark(&clipped.shape, header_rect, &mut wordmark_sections);
+                }
+                out.drop_without_applying_deltas();
+            }
+
+            let expected_family = egui::FontFamily::Name(crate::BRAND_DISPLAY_FAMILY.into());
+            let tokens = Tokens::for_theme(theme);
+            assert_eq!(
+                wordmark_sections,
+                vec![
+                    ("Paper ".to_string(), expected_family.clone(), tokens.text),
+                    ("Craft".to_string(), expected_family, expected_craft_color),
+                ],
+                "unexpected header wordmark styling for {theme:?}"
+            );
+        }
     }
 }

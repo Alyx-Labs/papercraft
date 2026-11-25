@@ -2162,6 +2162,37 @@ mod tests {
         assert_eq!(s.active_tool, ToolKind::Pen(PenKind::FountainPen));
         assert_eq!(s.active_pen().color, papercraft_color::INK_PALETTE[1].color);
         assert_eq!(s.active_pen().color.to_hex(), "#0052FF");
+
+        assert!((s.pen(PenKind::FountainPen).size - 2.2).abs() < 1e-5);
+        assert_eq!(
+            s.pen(PenKind::FountainPen).color,
+            papercraft_color::INK_PALETTE[1].color
+        );
+
+        assert!((s.pen(PenKind::BallPen).size - 2.2).abs() < 1e-5);
+        assert_eq!(
+            s.pen(PenKind::BallPen).color,
+            papercraft_color::INK_PALETTE[2].color
+        );
+
+        assert!((s.pen(PenKind::BrushPen).size - 2.2).abs() < 1e-5);
+        assert_eq!(
+            s.pen(PenKind::BrushPen).color,
+            papercraft_color::INK_PALETTE[1].color
+        );
+
+        assert!((s.pen(PenKind::Highlighter).size - 14.0).abs() < 1e-5);
+        assert_eq!(
+            s.pen(PenKind::Highlighter).color,
+            papercraft_color::HIGHLIGHTER_PALETTE[0].color
+        );
+
+        assert!((s.pen(PenKind::Pencil).size - 1.6).abs() < 1e-5);
+        assert_eq!(
+            s.pen(PenKind::Pencil).color,
+            papercraft_color::Color::from_rgba8(0x6A, 0x6A, 0x6A, 0xFF)
+        );
+        assert_eq!(s.pen(PenKind::Pencil).color.to_hex(), "#6A6A6A");
     }
 
     #[test]

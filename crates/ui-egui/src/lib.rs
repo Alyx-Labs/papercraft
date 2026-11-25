@@ -92,6 +92,14 @@ pub enum SelectedObject {
     Image(usize),
 }
 
+/// Target channel when adjusting geometric shape colors in the floating color dock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShapeColorTarget {
+    #[default]
+    Border,
+    Fill,
+}
+
 #[derive(Clone, Debug)]
 pub enum SelectionDragMode {
     Marquee {
@@ -380,7 +388,11 @@ pub struct ViewState {
     pub account: account_modal::AccountDraftState,
     pub last_ctx_zoom: Option<f32>,
     pub freeform_lasso_mode: bool,
+    pub shape_color_target: ShapeColorTarget,
+    pub shape_border_enabled: bool,
+    pub shape_border_color: Option<papercraft_color::Color>,
     pub shape_fill_enabled: bool,
+    pub shape_fill_color: Option<papercraft_color::Color>,
     pub shape_fill_opacity: f32,
     pub shape_line_style: papercraft_doc::ShapeLineStyle,
     pub laser_trail_mode: bool,
@@ -556,7 +568,11 @@ impl Default for ViewState {
             account: account_modal::AccountDraftState::default(),
             last_ctx_zoom: None,
             freeform_lasso_mode: false,
+            shape_color_target: ShapeColorTarget::Border,
+            shape_border_enabled: true,
+            shape_border_color: None,
             shape_fill_enabled: false,
+            shape_fill_color: None,
             shape_fill_opacity: 0.22,
             shape_line_style: papercraft_doc::ShapeLineStyle::Solid,
             laser_trail_mode: true,
@@ -874,6 +890,10 @@ impl Default for PaperCraftApp {
         Self::new(Session::default(), PlatformHooks::default())
     }
 }
+
+pub(crate) const BRAND_DISPLAY_FAMILY: &str = "BrandDisplay";
+pub(crate) const BRAND_DISPLAY_BOLD_TTF: &[u8] =
+    include_bytes!("../assets/fonts/BricolageGrotesque-Bold.ttf");
 
 impl PaperCraftApp {
     pub fn new(session: Session, mut hooks: PlatformHooks) -> Self {
@@ -1996,11 +2016,15 @@ impl PaperCraftApp {
         }
     }
 
-    fn install_rich_fonts_if_needed(&mut self, ctx: &egui::Context) {
+    pub(crate) fn install_rich_fonts_if_needed(&mut self, ctx: &egui::Context) {
         if self.view.rich_fonts_installed {
             return;
         }
         let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "bricolage_bold".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_static(BRAND_DISPLAY_BOLD_TTF)),
+        );
         fonts.font_data.insert(
             "roboto_regular".to_owned(),
             std::sync::Arc::new(egui::FontData::from_static(
@@ -2035,6 +2059,12 @@ impl PaperCraftApp {
             .get(&egui::FontFamily::Monospace)
             .cloned()
             .unwrap_or_default();
+        let mut brand_list = vec!["bricolage_bold".to_owned()];
+        brand_list.extend(prop_fallback.iter().cloned());
+        fonts.families.insert(
+            egui::FontFamily::Name(BRAND_DISPLAY_FAMILY.into()),
+            brand_list,
+        );
         for (name, primary) in [
             ("RichSansRegular", "roboto_regular"),
             ("RichSansBold", "roboto_bold"),

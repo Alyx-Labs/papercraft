@@ -3967,7 +3967,7 @@ impl PenSettings {
     pub fn pencil() -> Self {
         Self {
             kind: PenKind::Pencil,
-            color: INK_PALETTE[0].color,
+            color: Color::from_rgba8(0x6A, 0x6A, 0x6A, 0xFF),
             size: 2.8,
             opacity: 0.78,
             hardness: 0.72,
@@ -7608,7 +7608,7 @@ impl Default for UserStudioConfig {
 }
 
 impl UserStudioConfig {
-    pub const DEFAULT_PEN_SIZES: [f32; 5] = [2.2, 2.2, 2.2, 14.0, 2.8];
+    pub const DEFAULT_PEN_SIZES: [f32; 5] = [2.2, 2.2, 2.2, 14.0, 1.6];
     pub const DEFAULT_UI_SCALE: f32 = 1.0;
     pub const MIN_UI_SCALE: f32 = 0.5;
     pub const MAX_UI_SCALE: f32 = 2.5;
@@ -9022,6 +9022,7 @@ mod tests {
 
         let pencil = PenSettings::pencil().sanitized();
         assert_eq!(pencil.kind, PenKind::Pencil);
+        assert_eq!(pencil.color, Color::from_rgba8(0x6A, 0x6A, 0x6A, 0xFF));
         assert!((pencil.pressure_opacity_min - 0.35).abs() < 1e-5);
         assert_eq!(PaletteTarget::for_pen(PenKind::Pencil), PaletteTarget::Ink);
         assert_eq!(PenPreset::for_kind(PenKind::Pencil).len(), 2);

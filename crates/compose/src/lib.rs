@@ -453,27 +453,29 @@ fn draw_shape(surface: &mut Surface, item: &GeometricShape) {
         fill_polygon_scanline(surface, fill_pts, fill);
     }
 
-    let dash = shape.line_style.dash_pattern(shape.width);
-    for (points, closed) in segments {
-        if points.len() < 2 {
-            continue;
-        }
-        if let Some((dash_len, gap_len)) = dash {
-            draw_dashed_polyline(
-                surface,
-                &points,
-                closed,
-                shape.color,
-                f64::from(shape.width),
-                f64::from(dash_len),
-                f64::from(gap_len),
-            );
-        } else {
-            for pair in points.windows(2) {
-                surface.draw_line_aa(pair[0], pair[1], shape.color, f64::from(shape.width));
+    if shape.color.a > 0.0 {
+        let dash = shape.line_style.dash_pattern(shape.width);
+        for (points, closed) in segments {
+            if points.len() < 2 {
+                continue;
             }
-            if closed && let (Some(first), Some(last)) = (points.first(), points.last()) {
-                surface.draw_line_aa(*last, *first, shape.color, f64::from(shape.width));
+            if let Some((dash_len, gap_len)) = dash {
+                draw_dashed_polyline(
+                    surface,
+                    &points,
+                    closed,
+                    shape.color,
+                    f64::from(shape.width),
+                    f64::from(dash_len),
+                    f64::from(gap_len),
+                );
+            } else {
+                for pair in points.windows(2) {
+                    surface.draw_line_aa(pair[0], pair[1], shape.color, f64::from(shape.width));
+                }
+                if closed && let (Some(first), Some(last)) = (points.first(), points.last()) {
+                    surface.draw_line_aa(*last, *first, shape.color, f64::from(shape.width));
+                }
             }
         }
     }

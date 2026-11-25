@@ -251,6 +251,38 @@ pub(crate) fn studio_wrapped_row<R>(
     )
 }
 
+/// Sky/azure brand blue used for the `"Craft"` accent in the `"Paper Craft"` wordmark.
+pub(crate) fn brand_craft_color(t: &Tokens) -> Color32 {
+    if t.is_dark {
+        Color32::from_rgb(0x82, 0xCA, 0xF2)
+    } else {
+        Color32::from_rgb(0x0A, 0x72, 0xB5)
+    }
+}
+
+/// Subtle sky-blue frame stroke around the Paper Craft mascot badge.
+pub(crate) fn brand_badge_border_color() -> Color32 {
+    Color32::from_rgba_unmultiplied(0x82, 0xCA, 0xF3, 178)
+}
+
+/// Builds the single-line `"Paper Craft"` header wordmark in the display font (`Bricolage Grotesque`).
+pub(crate) fn brand_wordmark_job(font_size: f32, t: &Tokens) -> egui::text::LayoutJob {
+    let family = egui::FontFamily::Name(crate::BRAND_DISPLAY_FAMILY.into());
+    let base = egui::TextFormat {
+        font_id: egui::FontId::new(font_size, family),
+        color: t.text,
+        extra_letter_spacing: -0.25,
+        ..Default::default()
+    };
+    let mut craft = base.clone();
+    craft.color = brand_craft_color(t);
+
+    let mut job = egui::text::LayoutJob::default();
+    job.append("Paper ", 0.0, base);
+    job.append("Craft", 0.0, craft);
+    job
+}
+
 /// Applies the Light studio palette cleanly (used by theme-neutral unit tests).
 #[cfg(test)]
 pub fn apply_light_visuals(ctx: &egui::Context) {

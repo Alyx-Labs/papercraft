@@ -259,6 +259,9 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
 
 struct ButtonStyle {
     max_width: Option<f32>,
+    height: f32,
+    min_width: f32,
+    corner_radius: u8,
     icon_dim: f32,
     font_size: f32,
     pad_left: f32,
@@ -270,6 +273,9 @@ impl ButtonStyle {
     const fn standard(max_width: Option<f32>) -> Self {
         Self {
             max_width,
+            height: 28.0,
+            min_width: 28.0,
+            corner_radius: 7,
             icon_dim: 15.0,
             font_size: 12.5,
             pad_left: 9.0,
@@ -281,11 +287,52 @@ impl ButtonStyle {
     const fn compact() -> Self {
         Self {
             max_width: None,
+            height: 28.0,
+            min_width: 28.0,
+            corner_radius: 7,
             icon_dim: 14.0,
             font_size: 11.8,
             pad_left: 7.0,
             gap: 4.5,
             pad_right: 8.0,
+        }
+    }
+
+    const fn tray_compact() -> Self {
+        Self {
+            max_width: None,
+            height: 32.0,
+            min_width: 32.0,
+            corner_radius: 8,
+            icon_dim: 16.0,
+            font_size: 13.0,
+            pad_left: 8.5,
+            gap: 5.5,
+            pad_right: 9.5,
+        }
+    }
+
+    fn square(size: f32, icon_dim: f32, corner_radius: u8) -> Self {
+        let safe_size = if size.is_finite() {
+            size.clamp(16.0, 96.0)
+        } else {
+            28.0
+        };
+        let safe_icon = if icon_dim.is_finite() {
+            icon_dim.clamp(10.0, safe_size)
+        } else {
+            16.0
+        };
+        Self {
+            max_width: None,
+            height: safe_size,
+            min_width: safe_size,
+            corner_radius,
+            icon_dim: safe_icon,
+            font_size: 12.5,
+            pad_left: 9.0,
+            gap: 6.0,
+            pad_right: 10.0,
         }
     }
 }
@@ -297,11 +344,12 @@ fn layout_button_label_and_width(
     text_color: Color32,
 ) -> (Option<std::sync::Arc<egui::Galley>>, f32) {
     let icon_dim = style.icon_dim;
+    let min_width = style.min_width;
     let chrome_w = style.pad_left + icon_dim + style.gap + style.pad_right;
     let max_width = style
         .max_width
         .filter(|w| w.is_finite())
-        .map(|w| w.max(28.0));
+        .map(|w| w.max(min_width));
     let label = label.filter(|txt| !txt.is_empty());
     let galley = label.map(|txt| {
         let font = FontId::proportional(style.font_size);
@@ -329,10 +377,10 @@ fn layout_button_label_and_width(
     });
 
     let width = match (max_width, &galley) {
-        (Some(limit_w), Some(galley)) => (chrome_w + galley.size().x).min(limit_w).max(28.0),
-        (Some(limit_w), None) => 28.0_f32.min(limit_w),
-        (None, Some(galley)) => (chrome_w + galley.size().x).max(28.0),
-        (None, None) => 28.0,
+        (Some(limit_w), Some(galley)) => (chrome_w + galley.size().x).min(limit_w).max(min_width),
+        (Some(limit_w), None) => min_width.min(limit_w),
+        (None, Some(galley)) => (chrome_w + galley.size().x).max(min_width),
+        (None, None) => min_width,
     };
 
     (galley, width)
@@ -341,6 +389,17 @@ fn layout_button_label_and_width(
 /// Measures the rendered width of a [`compact_icon_button`] with `label`.
 pub fn compact_icon_button_width(ui: &egui::Ui, label: &str) -> f32 {
     layout_button_label_and_width(ui, Some(label), &ButtonStyle::compact(), Color32::BLACK).1
+}
+
+/// Measures the rendered width of a [`tray_icon_button`] with `label`.
+pub fn tray_icon_button_width(ui: &egui::Ui, label: &str) -> f32 {
+    layout_button_label_and_width(
+        ui,
+        Some(label),
+        &ButtonStyle::tray_compact(),
+        Color32::BLACK,
+    )
+    .1
 }
 
 /// Measures the rendered width of a [`max_width_icon_button`] with `label` and `max_width`.
@@ -370,6 +429,34 @@ pub fn icon_button(
     draw_styled_icon_button(ui, icon, label, selected, enabled, &style, t)
 }
 
+/// Dimensions for [`sized_icon_button`].
+#[derive(Clone, Copy, Debug)]
+pub struct SquareButtonSpec {
+    pub size: f32,
+    pub icon_dim: f32,
+    pub corner_radius: u8,
+}
+
+/// Tactile icon-only square button with configurable outer size, icon size, and corner radius.
+pub fn sized_icon_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    spec: SquareButtonSpec,
+    selected: bool,
+    enabled: bool,
+    t: &Tokens,
+) -> Response {
+    draw_styled_icon_button(
+        ui,
+        icon,
+        None,
+        selected,
+        enabled,
+        &ButtonStyle::square(spec.size, spec.icon_dim, spec.corner_radius),
+        t,
+    )
+}
+
 /// Compact tactile toolbar button used for denser segmented controls.
 pub fn compact_icon_button(
     ui: &mut egui::Ui,
@@ -386,6 +473,26 @@ pub fn compact_icon_button(
         selected,
         enabled,
         &ButtonStyle::compact(),
+        t,
+    )
+}
+
+/// Tactile button scaled proportionally (`32.0` px tall) for the floating context tray.
+pub fn tray_icon_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: Option<&str>,
+    selected: bool,
+    enabled: bool,
+    t: &Tokens,
+) -> Response {
+    draw_styled_icon_button(
+        ui,
+        icon,
+        label,
+        selected,
+        enabled,
+        &ButtonStyle::tray_compact(),
         t,
     )
 }
@@ -422,7 +529,7 @@ fn draw_styled_icon_button(
     t: &Tokens,
 ) -> Response {
     let icon_dim = style.icon_dim;
-    let height = 28.0_f32;
+    let height = style.height;
     let base_color = if !enabled {
         t.text_muted.gamma_multiply(0.55)
     } else {
@@ -459,8 +566,13 @@ fn draw_styled_icon_button(
         } else {
             crate::motion::lerp_color(t.text, t.accent, select_t)
         };
-        painter.rect_filled(rect, CornerRadius::same(7), fill);
-        painter.rect_stroke(rect, CornerRadius::same(7), stroke, StrokeKind::Inside);
+        painter.rect_filled(rect, CornerRadius::same(style.corner_radius), fill);
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(style.corner_radius),
+            stroke,
+            StrokeKind::Inside,
+        );
 
         let icon_rect = match &galley {
             Some(galley) => {
@@ -494,8 +606,58 @@ fn draw_styled_icon_button(
 pub enum SwitchLayout {
     /// Inline compact switch (`28.0` px tall) hugging its segment labels and icons.
     Compact,
+    /// Inline floating-tray switch (`32.0` px tall) proportionally scaled for the context tray.
+    TrayCompact,
     /// Full-width switch dividing `ui.available_width()` equally across all segments (`32.0` px tall).
     EqualWidth,
+}
+
+struct SwitchMetrics {
+    track_h: f32,
+    track_radius: u8,
+    pill_radius: u8,
+    font_size: f32,
+    icon_dim: f32,
+    pad_x: f32,
+    gap: f32,
+    equal_width: bool,
+}
+
+impl SwitchLayout {
+    const fn metrics(self) -> SwitchMetrics {
+        match self {
+            Self::Compact => SwitchMetrics {
+                track_h: 28.0,
+                track_radius: 7,
+                pill_radius: 5,
+                font_size: 11.8,
+                icon_dim: 14.0,
+                pad_x: 7.0,
+                gap: 4.5,
+                equal_width: false,
+            },
+            Self::TrayCompact => SwitchMetrics {
+                track_h: 32.0,
+                track_radius: 8,
+                pill_radius: 6,
+                font_size: 13.0,
+                icon_dim: 16.0,
+                pad_x: 8.5,
+                gap: 5.5,
+                equal_width: false,
+            },
+            Self::EqualWidth => SwitchMetrics {
+                track_h: 32.0,
+                track_radius: 8,
+                pill_radius: 6,
+                font_size: 12.0,
+                icon_dim: 14.0,
+                pad_x: 7.0,
+                gap: 4.5,
+                equal_width: true,
+            },
+        }
+    }
 }
 
 /// One mutually exclusive option rendered inside [`segmented_switch`].
@@ -531,23 +693,22 @@ struct MeasuredSegment {
 fn measure_switch_segment(
     ui: &egui::Ui,
     opt: &SwitchOption<'_>,
-    font_size: f32,
+    metrics: &SwitchMetrics,
     seg_h: f32,
 ) -> MeasuredSegment {
-    let icon_dim = 14.0_f32;
-    let pad_x = 7.0_f32;
-    let gap = 4.5_f32;
     let galley = opt.label.filter(|txt| !txt.is_empty()).map(|txt| {
         ui.painter().layout_no_wrap(
             txt.to_string(),
-            FontId::proportional(font_size),
+            FontId::proportional(metrics.font_size),
             Color32::WHITE,
         )
     });
     let compact_width = match (opt.icon.is_some(), &galley) {
-        (true, Some(g)) => (pad_x + icon_dim + gap + g.size().x + pad_x).max(seg_h),
+        (true, Some(g)) => {
+            (metrics.pad_x + metrics.icon_dim + metrics.gap + g.size().x + metrics.pad_x).max(seg_h)
+        }
         (true, None) => seg_h,
-        (false, Some(g)) => (pad_x + 2.0 + g.size().x + pad_x + 2.0).max(34.0),
+        (false, Some(g)) => (metrics.pad_x + 2.0 + g.size().x + metrics.pad_x + 2.0).max(34.0),
         (false, None) => seg_h,
     };
     MeasuredSegment {
@@ -561,10 +722,11 @@ fn paint_switch_segment_content(
     seg_rect: Rect,
     icon: Option<Icon>,
     galley: Option<&std::sync::Arc<egui::Galley>>,
+    metrics: &SwitchMetrics,
     fg: Color32,
 ) {
-    let icon_dim = 14.0_f32;
-    let gap = 4.5_f32;
+    let icon_dim = metrics.icon_dim;
+    let gap = metrics.gap;
     let cy = seg_rect.center().y;
     match (icon, galley) {
         (Some(icon), Some(g)) => {
@@ -594,17 +756,16 @@ fn paint_switch_segment_content(
 fn compute_switch_track_width(
     ui: &egui::Ui,
     measured: &[MeasuredSegment],
-    layout: SwitchLayout,
+    metrics: &SwitchMetrics,
     track_pad: f32,
     gaps_total: f32,
 ) -> f32 {
     let n = measured.len();
-    match layout {
-        SwitchLayout::Compact => {
-            let sum_w: f32 = measured.iter().map(|m| m.compact_width).sum();
-            track_pad * 2.0 + sum_w + gaps_total
-        }
-        SwitchLayout::EqualWidth => ui.available_width().max(n as f32 * 44.0),
+    if metrics.equal_width {
+        ui.available_width().max(n as f32 * 44.0)
+    } else {
+        let sum_w: f32 = measured.iter().map(|m| m.compact_width).sum();
+        track_pad * 2.0 + sum_w + gaps_total
     }
 }
 
@@ -617,19 +778,16 @@ pub fn segmented_switch_width(
     if options.is_empty() {
         return 0.0;
     }
-    let (track_h, font_size) = match layout {
-        SwitchLayout::Compact => (28.0_f32, 11.8_f32),
-        SwitchLayout::EqualWidth => (32.0_f32, 12.0_f32),
-    };
+    let metrics = layout.metrics();
     let track_pad = 2.0_f32;
     let seg_gap = 2.0_f32;
-    let seg_h = track_h - track_pad * 2.0;
+    let seg_h = metrics.track_h - track_pad * 2.0;
     let measured: Vec<MeasuredSegment> = options
         .iter()
-        .map(|opt| measure_switch_segment(ui, opt, font_size, seg_h))
+        .map(|opt| measure_switch_segment(ui, opt, &metrics, seg_h))
         .collect();
     let gaps_total = seg_gap * options.len().saturating_sub(1) as f32;
-    compute_switch_track_width(ui, &measured, layout, track_pad, gaps_total)
+    compute_switch_track_width(ui, &measured, &metrics, track_pad, gaps_total)
 }
 
 /// Renders an animated segmented switch for 2, 3, or more mutually exclusive options.
@@ -649,22 +807,22 @@ pub fn segmented_switch(
         return (None, empty_resp);
     }
 
-    let (track_h, track_radius, pill_radius, font_size) = match layout {
-        SwitchLayout::Compact => (28.0_f32, 7_u8, 5_u8, 11.8_f32),
-        SwitchLayout::EqualWidth => (32.0_f32, 8_u8, 6_u8, 12.0_f32),
-    };
+    let metrics = layout.metrics();
+    let track_h = metrics.track_h;
+    let track_radius = metrics.track_radius;
+    let pill_radius = metrics.pill_radius;
     let track_pad = 2.0_f32;
     let seg_gap = 2.0_f32;
     let seg_h = track_h - track_pad * 2.0;
 
     let measured: Vec<MeasuredSegment> = options
         .iter()
-        .map(|opt| measure_switch_segment(ui, opt, font_size, seg_h))
+        .map(|opt| measure_switch_segment(ui, opt, &metrics, seg_h))
         .collect();
 
     let n = options.len();
     let gaps_total = seg_gap * n.saturating_sub(1) as f32;
-    let track_w = compute_switch_track_width(ui, &measured, layout, track_pad, gaps_total);
+    let track_w = compute_switch_track_width(ui, &measured, &metrics, track_pad, gaps_total);
     let equal_seg_w = (track_w - track_pad * 2.0 - gaps_total).max(20.0) / n as f32;
 
     let track_id = ui.make_persistent_id(id_salt);
@@ -675,9 +833,10 @@ pub fn segmented_switch(
     let mut x = track_rect.left() + track_pad;
     let seg_top = track_rect.top() + track_pad;
     for item in &measured {
-        let w = match layout {
-            SwitchLayout::Compact => item.compact_width,
-            SwitchLayout::EqualWidth => equal_seg_w,
+        let w = if metrics.equal_width {
+            equal_seg_w
+        } else {
+            item.compact_width
         };
         seg_rects.push(Rect::from_min_size(pos2(x, seg_top), Vec2::new(w, seg_h)));
         x += w + seg_gap;
@@ -781,6 +940,7 @@ pub fn segmented_switch(
                 seg_rects[idx],
                 opt.icon,
                 measured[idx].galley.as_ref(),
+                &metrics,
                 fg,
             );
         }
