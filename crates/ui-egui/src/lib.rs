@@ -2384,6 +2384,7 @@ impl PaperCraftApp {
                 && let Err(err) = sync_fn(true)
             {
                 log::warn!("Startup Desktop shortcut sync failed: {err}");
+                self.view.desktop_shortcut_feedback = Some((true, err));
             }
         }
         if self.updater.poll() {
@@ -2405,11 +2406,11 @@ impl PaperCraftApp {
         let _ = self
             .session
             .execute("updates.setDesktopShortcut", &json!({ "enabled": enabled }));
-        if let Some(sync_fn) = self.hooks.sync_desktop_shortcut.as_mut() {
-            match sync_fn(enabled) {
-                Ok(msg) => self.view.desktop_shortcut_feedback = Some((false, msg)),
-                Err(err) => self.view.desktop_shortcut_feedback = Some((true, err)),
-            }
+        self.view.desktop_shortcut_feedback = None;
+        if let Some(sync_fn) = self.hooks.sync_desktop_shortcut.as_mut()
+            && let Err(err) = sync_fn(enabled)
+        {
+            self.view.desktop_shortcut_feedback = Some((true, err));
         }
     }
 

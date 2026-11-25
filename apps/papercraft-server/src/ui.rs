@@ -851,16 +851,9 @@ fn render_desktop_shortcut_section(ctrl: &mut ServerController, ui: &mut egui::U
         )
         .wrap(),
     );
-    if let Some((is_err, ref msg)) = ctrl.desktop_shortcut_feedback {
+    if let Some((true, ref msg)) = ctrl.desktop_shortcut_feedback {
         ui.add_space(4.0);
-        ui.add(
-            egui::Label::new(egui::RichText::new(msg).size(11.0).color(if is_err {
-                t.danger_fg
-            } else {
-                t.success_fg
-            }))
-            .wrap(),
-        );
+        ui.add(egui::Label::new(egui::RichText::new(msg).size(11.0).color(t.danger_fg)).wrap());
     }
 }
 
@@ -889,16 +882,9 @@ fn render_autostart_section(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &
         )
         .wrap(),
     );
-    if let Some((is_err, ref msg)) = ctrl.autostart_feedback {
+    if let Some((true, ref msg)) = ctrl.autostart_feedback {
         ui.add_space(4.0);
-        ui.add(
-            egui::Label::new(egui::RichText::new(msg).size(11.0).color(if is_err {
-                t.danger_fg
-            } else {
-                t.success_fg
-            }))
-            .wrap(),
-        );
+        ui.add(egui::Label::new(egui::RichText::new(msg).size(11.0).color(t.danger_fg)).wrap());
     }
 }
 
@@ -2775,7 +2761,7 @@ mod tests {
             }],
         );
         assert!(!ctrl.draft_settings.auto_create_desktop_shortcut);
-        assert!(find_rect(&shapes_off, "Server shortcut removed (mock).").is_some());
+        assert!(find_rect(&shapes_off, "Server shortcut removed (mock).").is_none());
 
         let pos_on = find_rect(&shapes_off, "Create Desktop shortcut automatically")
             .unwrap()
@@ -2804,7 +2790,7 @@ mod tests {
             }],
         );
         assert!(ctrl.draft_settings.auto_create_desktop_shortcut);
-        assert!(find_rect(&shapes_on, "Server shortcut ready (mock).").is_some());
+        assert!(find_rect(&shapes_on, "Server shortcut ready (mock).").is_none());
         assert_eq!(*calls.lock().unwrap(), vec![false, true]);
 
         let (reloaded, warning) = crate::settings::ServerControlSettings::load_or_init(&cfg_path);
@@ -2907,7 +2893,7 @@ mod tests {
             }],
         );
         assert!(!ctrl.draft_settings.launch_at_login);
-        assert!(find_rect(&shapes_off, "Startup launch removed (mock).").is_some());
+        assert!(find_rect(&shapes_off, "Startup launch removed (mock).").is_none());
 
         let pos_on = find_rect(&shapes_off, "Launch automatically at system startup")
             .unwrap()
@@ -2936,9 +2922,40 @@ mod tests {
             }],
         );
         assert!(ctrl.draft_settings.launch_at_login);
-        assert!(find_rect(&shapes_on, "Startup launch ready (mock).").is_some());
+        assert!(find_rect(&shapes_on, "Startup launch ready (mock).").is_none());
         assert_eq!(*calls.lock().unwrap(), vec![(false, true), (true, true)]);
 
+        // Sync failures still render visibly in error styling.
+        ctrl.set_autostart_sync(Box::new(|_, _| Err("Startup registry locked".to_string())));
+        let autostart_err_pos = find_rect(&shapes_on, "Launch automatically at system startup")
+            .unwrap()
+            .center();
+        let _ = run_frame(
+            &mut ctrl,
+            1.30,
+            vec![
+                egui::Event::PointerMoved(autostart_err_pos),
+                egui::Event::PointerButton {
+                    pos: autostart_err_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let shapes_err = run_frame(
+            &mut ctrl,
+            1.34,
+            vec![egui::Event::PointerButton {
+                pos: autostart_err_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(find_rect(&shapes_err, "Startup registry locked").is_some());
+
+        ctrl.set_launch_at_login_enabled(true);
         let (reloaded, warning) = crate::settings::ServerControlSettings::load_or_init(&cfg_path);
         assert!(warning.is_none());
         assert!(reloaded.launch_at_login);

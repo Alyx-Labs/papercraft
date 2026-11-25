@@ -89,11 +89,20 @@ pub struct ServerController {
     desktop_shortcut_sync: Option<DesktopShortcutSyncFn>,
     pub autostart_feedback: Option<(bool, String)>,
     autostart_sync: Option<AutostartSyncFn>,
+    #[cfg_attr(all(debug_assertions, not(test)), allow(dead_code))]
+    is_first_launch: bool,
 }
 
 impl ServerController {
     pub fn new(config_path: PathBuf, allow_auto_start: bool) -> Self {
-        let (settings, load_warning) = ServerControlSettings::load_or_init(&config_path);
+        let is_first_launch = !config_path.exists();
+        let (settings, mut load_warning) = ServerControlSettings::load_or_init(&config_path);
+        if allow_auto_start
+            && is_first_launch
+            && let Err(err) = settings.save_atomic(&config_path)
+        {
+            load_warning = Some(err);
+        }
         let start_visible = !settings.start_in_tray;
         let auto_start = allow_auto_start && settings.auto_start_server;
         let (server_stopped_tx, server_stopped_rx) = mpsc::channel();
@@ -134,6 +143,7 @@ impl ServerController {
             desktop_shortcut_sync: None,
             autostart_feedback: None,
             autostart_sync: None,
+            is_first_launch,
         };
 
         if auto_start {
@@ -170,11 +180,11 @@ impl ServerController {
     pub fn set_desktop_shortcut_enabled(&mut self, enabled: bool) {
         self.draft_settings.auto_create_desktop_shortcut = enabled;
         self.auto_save_settings();
-        if let Some(sync_fn) = self.desktop_shortcut_sync.as_mut() {
-            match sync_fn(enabled) {
-                Ok(msg) => self.desktop_shortcut_feedback = Some((false, msg)),
-                Err(err) => self.desktop_shortcut_feedback = Some((true, err)),
-            }
+        self.desktop_shortcut_feedback = None;
+        if let Some(sync_fn) = self.desktop_shortcut_sync.as_mut()
+            && let Err(err) = sync_fn(enabled)
+        {
+            self.desktop_shortcut_feedback = Some((true, err));
         }
     }
 
@@ -185,6 +195,7 @@ impl ServerController {
             && let Err(err) = sync_fn(true)
         {
             log::warn!("Startup Desktop shortcut sync failed: {err}");
+            self.desktop_shortcut_feedback = Some((true, err));
         }
     }
 
@@ -195,11 +206,11 @@ impl ServerController {
     pub fn set_launch_at_login_enabled(&mut self, enabled: bool) {
         self.draft_settings.launch_at_login = enabled;
         self.auto_save_settings();
-        if let Some(sync_fn) = self.autostart_sync.as_mut() {
-            match sync_fn(enabled, true) {
-                Ok(msg) => self.autostart_feedback = Some((false, msg)),
-                Err(err) => self.autostart_feedback = Some((true, err)),
-            }
+        self.autostart_feedback = None;
+        if let Some(sync_fn) = self.autostart_sync.as_mut()
+            && let Err(err) = sync_fn(enabled, true)
+        {
+            self.autostart_feedback = Some((true, err));
         }
     }
 
@@ -212,9 +223,10 @@ impl ServerController {
     fn sync_autostart_on_startup_if_enabled_inner(&mut self) {
         if self.draft_settings.launch_at_login
             && let Some(sync_fn) = self.autostart_sync.as_mut()
-            && let Err(err) = sync_fn(true, false)
+            && let Err(err) = sync_fn(true, self.is_first_launch)
         {
             log::warn!("Startup autostart sync failed: {err}");
+            self.autostart_feedback = Some((true, err));
         }
     }
 
@@ -951,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn controller_toggles_desktop_shortcut_persists_and_records_feedback() {
+    fn controller_toggles_desktop_shortcut_persists_and_surfaces_errors_only() {
         use std::sync::{Arc, Mutex};
 
         let dir = temp_dir("desktop_shortcut_ctrl");
@@ -982,10 +994,7 @@ mod tests {
 
         ctrl.set_desktop_shortcut_enabled(false);
         assert!(!ctrl.draft_settings.auto_create_desktop_shortcut);
-        assert_eq!(
-            ctrl.desktop_shortcut_feedback.as_ref(),
-            Some(&(false, "Server shortcut removed (mock).".to_string()))
-        );
+        assert!(ctrl.desktop_shortcut_feedback.is_none());
 
         let (reloaded, warning) = ServerControlSettings::load_or_init(&cfg_path);
         assert!(warning.is_none());
@@ -993,11 +1002,15 @@ mod tests {
 
         ctrl.set_desktop_shortcut_enabled(true);
         assert!(ctrl.draft_settings.auto_create_desktop_shortcut);
+        assert!(ctrl.desktop_shortcut_feedback.is_none());
+        assert_eq!(*calls.lock().unwrap(), vec![false, true]);
+
+        ctrl.set_desktop_shortcut_sync(Box::new(|_| Err("Permission denied".to_string())));
+        ctrl.set_desktop_shortcut_enabled(true);
         assert_eq!(
             ctrl.desktop_shortcut_feedback.as_ref(),
-            Some(&(false, "Server shortcut created (mock).".to_string()))
+            Some(&(true, "Permission denied".to_string()))
         );
-        assert_eq!(*calls.lock().unwrap(), vec![false, true]);
     }
 
     #[test]
@@ -1006,16 +1019,11 @@ mod tests {
 
         let dir = temp_dir("autostart_ctrl");
         let cfg_path = dir.0.join(CONFIG_FILE_NAME);
-        let settings = ServerControlSettings {
-            data_dir: dir.0.join("vault").to_string_lossy().into_owned(),
-            auto_start_server: false,
-            ..ServerControlSettings::default()
-        };
-        settings.save_atomic(&cfg_path).unwrap();
 
         let calls = Arc::new(Mutex::new(Vec::<(bool, bool)>::new()));
         let calls_hook = Arc::clone(&calls);
 
+        // Fresh launch without config file clears any stale OS override and persists defaults.
         let mut ctrl = ServerController::new(cfg_path.clone(), false);
         assert!(ctrl.draft_settings.launch_at_login);
         ctrl.set_autostart_sync(Box::new(move |enabled, clear_override| {
@@ -1031,32 +1039,60 @@ mod tests {
         }));
 
         ctrl.sync_autostart_on_startup_if_enabled_inner();
-        assert_eq!(*calls.lock().unwrap(), vec![(true, false)]);
+        assert_eq!(*calls.lock().unwrap(), vec![(true, true)]);
+        assert!(ctrl.autostart_feedback.is_none());
 
         ctrl.set_launch_at_login_enabled(false);
         assert!(!ctrl.draft_settings.launch_at_login);
-        assert_eq!(
-            ctrl.autostart_feedback.as_ref(),
-            Some(&(false, "Startup launch disabled (mock).".to_string()))
-        );
+        assert!(ctrl.autostart_feedback.is_none());
 
         let (reloaded, warning) = ServerControlSettings::load_or_init(&cfg_path);
         assert!(warning.is_none());
         assert!(!reloaded.launch_at_login);
 
-        // Once disabled by the user, startup sync must not re-enable autostart.
-        ctrl.sync_autostart_on_startup_if_enabled_inner();
-        assert_eq!(*calls.lock().unwrap(), vec![(true, false), (false, true)]);
+        // Subsequent launch respects disabled preference.
+        let mut ctrl2 = ServerController::new(cfg_path.clone(), false);
+        let calls2 = Arc::clone(&calls);
+        ctrl2.set_autostart_sync(Box::new(move |enabled, clear_override| {
+            calls2
+                .lock()
+                .map_err(|err| err.to_string())?
+                .push((enabled, clear_override));
+            Ok(String::new())
+        }));
+        ctrl2.sync_autostart_on_startup_if_enabled_inner();
+        assert_eq!(*calls.lock().unwrap(), vec![(true, true), (false, true)]);
 
         ctrl.set_launch_at_login_enabled(true);
         assert!(ctrl.draft_settings.launch_at_login);
-        assert_eq!(
-            ctrl.autostart_feedback.as_ref(),
-            Some(&(false, "Startup launch enabled (mock).".to_string()))
-        );
+        assert!(ctrl.autostart_feedback.is_none());
         assert_eq!(
             *calls.lock().unwrap(),
-            vec![(true, false), (false, true), (true, true)]
+            vec![(true, true), (false, true), (true, true)]
+        );
+
+        // Subsequent launch when enabled preserves any OS Task Manager disable override.
+        let mut ctrl3 = ServerController::new(cfg_path, false);
+        let calls3 = Arc::clone(&calls);
+        ctrl3.set_autostart_sync(Box::new(move |enabled, clear_override| {
+            calls3
+                .lock()
+                .map_err(|err| err.to_string())?
+                .push((enabled, clear_override));
+            Ok(String::new())
+        }));
+        ctrl3.sync_autostart_on_startup_if_enabled_inner();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(true, true), (false, true), (true, true), (true, false)]
+        );
+
+        // Startup/toggle failures surface cleanly in error state.
+        ctrl3.set_autostart_sync(Box::new(|_, _| Err("Registry write denied".to_string())));
+        ctrl3.set_launch_at_login_enabled(true);
+        assert_eq!(
+            ctrl3.autostart_feedback.as_ref(),
+            Some(&(true, "Registry write denied".to_string()))
         );
     }
 }

@@ -740,16 +740,9 @@ fn draw_app_updates_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens)
             )
             .wrap(),
         );
-        if let Some((is_err, ref msg)) = app.view.desktop_shortcut_feedback {
+        if let Some((true, ref msg)) = app.view.desktop_shortcut_feedback {
             ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(msg)
-                        .size(11.0)
-                        .color(if is_err { t.danger_fg } else { t.success_fg }),
-                )
-                .wrap(),
-            );
+            ui.add(egui::Label::new(RichText::new(msg).size(11.0).color(t.danger_fg)).wrap());
         }
 
         ui.add_space(8.0);
@@ -2003,12 +1996,13 @@ mod tests {
         let shapes_off =
             auto_contrast_ui_tests::click_at(&ctx, &mut app, switch_label.center(), &mut time_s);
         assert!(!app.session.prefs.auto_create_desktop_shortcut);
+        assert!(app.view.desktop_shortcut_feedback.is_none());
         assert!(
             auto_contrast_ui_tests::find_text_rect_in_shapes(
                 &shapes_off,
                 "Desktop shortcut removed (mock)."
             )
-            .is_some()
+            .is_none()
         );
 
         let switch_label_off = auto_contrast_ui_tests::find_text_rect_in_shapes(
@@ -2023,14 +2017,37 @@ mod tests {
             &mut time_s,
         );
         assert!(app.session.prefs.auto_create_desktop_shortcut);
+        assert!(app.view.desktop_shortcut_feedback.is_none());
         assert!(
             auto_contrast_ui_tests::find_text_rect_in_shapes(
                 &shapes_on,
                 "Desktop shortcut active (mock)."
             )
-            .is_some()
+            .is_none()
         );
         assert_eq!(*calls.lock().unwrap(), vec![false, true]);
+
+        // Sync failures still render visibly in Settings.
+        app.hooks.sync_desktop_shortcut =
+            Some(Box::new(|_| Err("Desktop folder read-only".to_string())));
+        let switch_label_err = auto_contrast_ui_tests::find_text_rect_in_shapes(
+            &shapes_on,
+            "Create Desktop shortcut automatically",
+        )
+        .expect("Desktop shortcut switch should stay visible");
+        let shapes_err = auto_contrast_ui_tests::click_at(
+            &ctx,
+            &mut app,
+            switch_label_err.center(),
+            &mut time_s,
+        );
+        assert!(
+            auto_contrast_ui_tests::find_text_rect_in_shapes(
+                &shapes_err,
+                "Desktop folder read-only"
+            )
+            .is_some()
+        );
     }
 
     #[test]
