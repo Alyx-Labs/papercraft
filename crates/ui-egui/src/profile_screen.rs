@@ -40,8 +40,10 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
         .frame(egui::Frame::NONE.fill(t.panel_bg))
         .show(ui, |ui| {
             let avail = ui.available_rect_before_wrap();
-            let side_pad = 24.0_f32;
-            let content_w = (avail.width() - side_pad * 2.0).clamp(280.0, MAX_CONTENT_WIDTH);
+            let side_pad = if avail.width() < 420.0 { 12.0 } else { 24.0 };
+            let content_w = (avail.width() - side_pad * 2.0)
+                .clamp(160.0, MAX_CONTENT_WIDTH)
+                .min(avail.width().max(1.0));
             let left = avail.left() + ((avail.width() - content_w) * 0.5).max(side_pad);
             let inner_rect = egui::Rect::from_min_max(
                 egui::pos2(left, avail.top() + 20.0),

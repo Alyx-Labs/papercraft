@@ -27,8 +27,8 @@ use crate::icons::{Icon, compact_icon_button, paint_icon};
 use crate::modal::{self, ActiveModal};
 use crate::theme::{Tokens, to_color32};
 
-/// Fixed width of the Library navigation sidebar.
-pub(crate) const SIDEBAR_WIDTH: f32 = 236.0;
+/// Fixed width of the Library navigation sidebar (standardized with Pages and Settings sidebars).
+pub(crate) const SIDEBAR_WIDTH: f32 = crate::STANDARD_SIDEBAR_WIDTH;
 /// Below this window width the sidebar collapses into a "Browse" menu button.
 pub(crate) const SIDEBAR_MIN_VIEWPORT: f32 = 760.0;
 /// Maximum characters allowed in a single folder name.
@@ -1042,7 +1042,7 @@ fn paint_more_slot(ui: &egui::Ui, slot: MoreSlot, t: &Tokens) -> f32 {
 }
 
 fn nav_row(ui: &mut egui::Ui, spec: &NavRowSpec<'_>, t: &Tokens) -> NavRowResponse {
-    let width = ui.available_width().max(120.0);
+    let width = ui.available_width().max(1.0);
     let (rect, row) = ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::click());
     let accepts_drop = spec.drop == DropKind::Accept;
     let drag_over = accepts_drop && row.dnd_hover_payload::<NotebookDragPayload>().is_some();
@@ -1177,7 +1177,7 @@ fn nav_row(ui: &mut egui::Ui, spec: &NavRowSpec<'_>, t: &Tokens) -> NavRowRespon
 }
 
 fn section_header(ui: &mut egui::Ui, title: &str, add_tooltip: Option<&str>, t: &Tokens) -> bool {
-    let width = ui.available_width().max(120.0);
+    let width = ui.available_width().max(1.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::hover());
     let galley =
         ui.painter()
@@ -1309,10 +1309,11 @@ pub(crate) fn show_sidebar_panel(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: 
         .fill(t.toolbar_bg)
         .stroke(Stroke::new(1.0, t.border))
         .inner_margin(Margin::symmetric(10, 12));
-    crate::fixed_side_panel(
+    crate::fixed_side_panel_with_peer(
         ui,
         egui::Panel::left("papercraft_home_library_sidebar").drag_to_open(false),
         SIDEBAR_WIDTH,
+        app.view.inspector_open,
         frame,
     )
     .show(ui, |ui| {
@@ -1996,7 +1997,8 @@ pub(crate) fn draw_browse_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: 
     let label = format!("{}  ▾", scope.title());
     let resp = compact_icon_button(ui, scope.icon(), Some(&label), true, true, t)
         .on_hover_text("Browse folders, favorites, tags, and Trash");
-    egui::Popup::menu(&resp).width(250.0).show(|ui| {
+    let popup_w = SIDEBAR_WIDTH.min((ui.ctx().content_rect().width() - 16.0).max(200.0));
+    egui::Popup::menu(&resp).width(popup_w).show(|ui| {
         draw_library_nav(app, ui, t, NavMode::Popup);
     });
 }

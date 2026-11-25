@@ -14,7 +14,7 @@ use crate::inspector::card_frame;
 use crate::modal::{self, ActiveModal};
 use crate::theme::{Tokens, to_color32};
 
-pub(crate) const DEFAULT_SIDEBAR_WIDTH: f32 = 276.0;
+pub(crate) const DEFAULT_SIDEBAR_WIDTH: f32 = crate::STANDARD_SIDEBAR_WIDTH;
 const COLLAPSED_FOOTER_HEIGHT_ESTIMATE: f32 = 80.0;
 const EXPANDED_DRAWER_HEIGHT_ESTIMATE: f32 = 121.0;
 const BATCH_FOOTER_HEIGHT_ESTIMATE: f32 = 163.0;
@@ -102,10 +102,11 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> SidebarM
         .fill(t.panel_bg)
         .stroke(egui::Stroke::new(1.0, t.border))
         .inner_margin(egui::Margin::same(10));
-    if let Some(panel_resp) = crate::fixed_side_panel(
+    if let Some(panel_resp) = crate::fixed_side_panel_with_peer(
         ui,
         egui::Panel::left("papercraft_pages_sidebar").drag_to_open(false),
         DEFAULT_SIDEBAR_WIDTH,
+        app.view.inspector_open,
         frame,
     )
     .show_collapsible(ui, &mut panel_open, |ui| {
@@ -283,6 +284,7 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> SidebarM
 
 fn draw_pages_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> egui::Rect {
     let bookmark_count = app.session.doc.bookmarked_page_count();
+    let header_w = ui.available_width();
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
 
@@ -301,10 +303,17 @@ fn draw_pages_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> 
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let nb_settings_open = app.view.active_modal == Some(ActiveModal::NotebookSettings);
+                let btn_label = if header_w >= 200.0 {
+                    Some("Notebook Settings")
+                } else if header_w >= 145.0 {
+                    Some("Settings")
+                } else {
+                    None
+                };
                 if compact_icon_button(
                     ui,
                     Icon::Settings,
-                    Some("Notebook Settings"),
+                    btn_label,
                     nb_settings_open,
                     true,
                     t,
@@ -530,8 +539,8 @@ fn draw_thumbnail_grid(
     let avail_w = ui.available_width();
     let col_gap = ui.spacing().item_spacing.x;
     let item_spacing_y = ui.spacing().item_spacing.y;
-    let col_w = ((avail_w - col_gap).max(104.0)) * 0.5;
-    let sheet_w = (col_w - 14.0).clamp(52.0, 128.0);
+    let col_w = ((avail_w - col_gap).max(16.0)) * 0.5;
+    let sheet_w = (col_w - 14.0).clamp(16.0, 128.0);
     let row_gap = 6.0 + item_spacing_y;
 
     let cached_chrome_h = ui
@@ -752,7 +761,7 @@ fn paint_page_tile_sheet(
     batch_selected: bool,
     t: &Tokens,
 ) {
-    let avail_w = ui.available_width().clamp(52.0, 128.0);
+    let avail_w = ui.available_width().clamp(16.0, 128.0);
     let aspect = (page.height.max(1) as f32) / (page.width.max(1) as f32);
     let sheet_w = avail_w;
     let sheet_h = if aspect.is_finite() {
@@ -1449,11 +1458,21 @@ fn draw_batch_selection_footer(
 
             ui.horizontal(|ui| {
                 ui.set_height(28.0);
-                ui.label(
-                    egui::RichText::new(format!("{count} selected"))
-                        .size(13.0)
-                        .strong()
-                        .color(t.text),
+                let label_w = (ui.available_width() - 108.0).max(28.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(label_w, 28.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("{count} selected"))
+                                    .size(13.0)
+                                    .strong()
+                                    .color(t.text),
+                            )
+                            .truncate(),
+                        );
+                    },
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
@@ -2751,20 +2770,51 @@ fn draw_active_page_footer(
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 0.0;
 
-            ui.horizontal(|ui| {
-                ui.set_height(28.0);
-                ui.label(
-                    egui::RichText::new(format!("Page {page_num}"))
-                        .size(13.0)
-                        .strong()
-                        .color(t.text),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (pr, nr) = draw_page_stepper(app, ui, ctx.active_idx, total_pages, t);
-                    prev_rect = pr;
-                    next_rect = nr;
+            if ui.available_width() >= 165.0 {
+                ui.horizontal(|ui| {
+                    ui.set_height(28.0);
+                    let label_w = (ui.available_width() - 118.0).max(28.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(label_w, 28.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("Page {page_num}"))
+                                        .size(13.0)
+                                        .strong()
+                                        .color(t.text),
+                                )
+                                .truncate(),
+                            );
+                        },
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (pr, nr) = draw_page_stepper(app, ui, ctx.active_idx, total_pages, t);
+                        prev_rect = pr;
+                        next_rect = nr;
+                    });
                 });
-            });
+            } else {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("Page {page_num}"))
+                            .size(13.0)
+                            .strong()
+                            .color(t.text),
+                    )
+                    .truncate(),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.set_height(28.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (pr, nr) = draw_page_stepper(app, ui, ctx.active_idx, total_pages, t);
+                        prev_rect = pr;
+                        next_rect = nr;
+                    });
+                });
+            }
 
             if ctx.expand_t > 0.001 {
                 cur_drawer_h = (ctx.natural_drawer_h * ctx.expand_t).max(0.0);
@@ -2964,8 +3014,8 @@ fn draw_footer_primary_bar(
     let btn_h = 26.0;
     let toggle_w = 28.0;
     let gap = 6.0;
-    let total_w = ui.available_width().max(toggle_w + gap + 48.0);
-    let add_w = (total_w - toggle_w - gap).max(48.0);
+    let total_w = ui.available_width().max(toggle_w + gap + 16.0);
+    let add_w = (total_w - toggle_w - gap).max(16.0);
     let mut toggle_rect = egui::Rect::NOTHING;
 
     ui.horizontal(|ui| {
@@ -3284,7 +3334,7 @@ fn sidebar_action_button(
     height: f32,
     t: &Tokens,
 ) -> egui::Response {
-    let width = ui.available_width().max(48.0);
+    let width = ui.available_width().max(1.0);
     let sense = if enabled {
         egui::Sense::click()
     } else {

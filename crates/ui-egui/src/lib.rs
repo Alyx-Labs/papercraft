@@ -1898,9 +1898,19 @@ impl PaperCraftApp {
             }
             KeyboardShortcutAction::ToggleInspector => {
                 self.view.inspector_open = !self.view.inspector_open;
+                if self.view.inspector_open
+                    && ctx.content_rect().width() < DUAL_SIDEBAR_MIN_VIEWPORT
+                {
+                    self.view.pages_sidebar_open = false;
+                }
             }
             KeyboardShortcutAction::TogglePagesSidebar => {
                 self.view.pages_sidebar_open = !self.view.pages_sidebar_open;
+                if self.view.pages_sidebar_open
+                    && ctx.content_rect().width() < DUAL_SIDEBAR_MIN_VIEWPORT
+                {
+                    self.view.inspector_open = false;
+                }
             }
             KeyboardShortcutAction::ReturnToHome => {
                 return_to_home(self);
@@ -3286,20 +3296,65 @@ pub(crate) fn close_profile_screen(app: &mut PaperCraftApp) {
     app.view.screen = target;
 }
 
-/// Clamps a fixed side-panel width to the currently available horizontal space so
-/// non-resizable panels keep their default width without overflowing narrow viewports.
-pub(crate) fn fixed_side_panel_width(ui: &egui::Ui, default_width: f32) -> f32 {
+/// Standardized width shared by all lateral sidebars (Library, Pages, and Settings)
+/// so left and right panels keep uniform proportions across Home and Editor.
+pub(crate) const STANDARD_SIDEBAR_WIDTH: f32 = 280.0;
+
+/// Minimum viewport width at which interactive Editor drawer toggles keep both
+/// left and right sidebars open simultaneously instead of auto-collapsing the opposite one.
+pub(crate) const DUAL_SIDEBAR_MIN_VIEWPORT: f32 = STANDARD_SIDEBAR_WIDTH * 2.0 + 184.0;
+
+/// Clamps a fixed side-panel width to available horizontal space, shrinking
+/// symmetrically when both left and right panels share a narrow viewport so
+/// neither sidebar starves the opposite panel or the central workspace.
+pub(crate) fn responsive_side_panel_width(
+    ui: &egui::Ui,
+    default_width: f32,
+    peer_open: bool,
+) -> f32 {
     let target = if default_width.is_finite() {
         default_width.max(0.0)
     } else {
         0.0
     };
     let avail = ui.available_rect_before_wrap().width();
-    if avail.is_nan() {
-        target
-    } else {
-        target.min(avail.max(0.0))
+    if !avail.is_finite() {
+        return target;
     }
+    let avail = avail.max(0.0);
+    let content_w = ui.ctx().content_rect().width();
+    let total_w = if content_w.is_finite() && content_w > 0.0 {
+        content_w.max(avail)
+    } else {
+        avail
+    };
+    let taken_by_peer = (total_w - avail).max(0.0);
+    let dual_active = peer_open || taken_by_peer > 0.5;
+    let min_center = if dual_active {
+        (total_w * 0.30).clamp(80.0, 184.0).min(total_w * 0.5)
+    } else {
+        (total_w * 0.35).clamp(80.0, 184.0).min(total_w * 0.5)
+    };
+    let budget = if peer_open && taken_by_peer <= 0.5 {
+        // First of two active sidebars: reserve half of the non-center budget.
+        (total_w - min_center).max(0.0) * 0.5
+    } else {
+        // Only active sidebar, or second sidebar subtracting space already taken.
+        (total_w - min_center - taken_by_peer).max(0.0)
+    };
+    target.min(budget.min(avail)).max(0.0)
+}
+
+/// Builds a non-resizable side panel locked to `default_width` (clamped responsively).
+pub(crate) fn fixed_side_panel_with_peer(
+    ui: &egui::Ui,
+    panel: egui::Panel,
+    default_width: f32,
+    peer_open: bool,
+    frame: egui::Frame,
+) -> egui::Panel {
+    let width = responsive_side_panel_width(ui, default_width, peer_open);
+    panel.resizable(false).exact_size(width).frame(frame)
 }
 
 /// Builds a non-resizable side panel locked to `default_width` (clamped to available space).
@@ -3309,8 +3364,7 @@ pub(crate) fn fixed_side_panel(
     default_width: f32,
     frame: egui::Frame,
 ) -> egui::Panel {
-    let width = fixed_side_panel_width(ui, default_width);
-    panel.resizable(false).exact_size(width).frame(frame)
+    fixed_side_panel_with_peer(ui, panel, default_width, false, frame)
 }
 
 /// Helper used by tests to inspect default pen kind without importing engine internals.
@@ -3513,7 +3567,8 @@ mod tests {
             }
         }
 
-        // Narrow viewport narrower than combined default widths must not panic.
+        // Narrow viewport narrower than combined default widths clamps both sidebars
+        // without panicking or leaving full 280px panels overflowing the screen.
         let narrow_ctx = egui::Context::default();
         let (l_narrow, r_narrow, _) = run_editor_frame(
             &narrow_ctx,
@@ -3522,8 +3577,144 @@ mod tests {
             0.1,
             Vec::new(),
         );
+        assert!(l_narrow.width() < pages_sidebar::DEFAULT_SIDEBAR_WIDTH);
+        assert!(r_narrow.width() < inspector::DEFAULT_INSPECTOR_WIDTH);
         assert!(l_narrow.width() <= 320.0);
         assert!(r_narrow.width() <= 320.0);
+    }
+
+    #[test]
+    fn home_pages_and_settings_sidebars_share_standardized_width_and_adapt_responsively() {
+        let mut app = PaperCraftApp::default();
+        app.view.inspector_open = true;
+        let ctx = egui::Context::default();
+
+        // 1. On desktop Home (1280x800), left Library sidebar and right Settings drawer share STANDARD_SIDEBAR_WIDTH.
+        let mut home_left = egui::Rect::NOTHING;
+        let mut home_right = egui::Rect::NOTHING;
+        for f in 0..3 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(f as f64 * 0.08 + 0.1),
+                predicted_dt: 0.08,
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                let home_m = home::show_inner(&mut app, ui);
+                home_left = home_m.sidebar_rect.expect("Home sidebar must be visible");
+            });
+            out.drop_without_applying_deltas();
+        }
+        // Verify right Settings drawer width on Home separately via direct panel render at 1280x800.
+        let right_ctx = egui::Context::default();
+        for f in 0..3 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(f as f64 * 0.08 + 0.1),
+                predicted_dt: 0.08,
+                ..Default::default()
+            };
+            let out = right_ctx.run_ui(raw, |ui| {
+                theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                home_right = inspector::show_inner(&mut app, ui);
+            });
+            out.drop_without_applying_deltas();
+        }
+        assert!((home_left.width() - STANDARD_SIDEBAR_WIDTH).abs() <= 0.5);
+        assert!((home_right.width() - STANDARD_SIDEBAR_WIDTH).abs() <= 0.5);
+        assert!((home_left.width() - home_right.width()).abs() <= 0.5);
+
+        // 2. Opening a notebook in Editor keeps the exact same left and right sidebar widths (280px).
+        open_notebook_in_editor(&mut app, 0);
+        app.view.motion.screen = motion::ScreenTransition::new(AppScreen::Editor);
+        app.view.pages_sidebar_open = true;
+        app.view.inspector_open = true;
+
+        let ed_ctx = egui::Context::default();
+        let mut ed_left = egui::Rect::NOTHING;
+        let mut ed_right = egui::Rect::NOTHING;
+        for f in 0..4 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(f as f64 * 0.08 + 0.1),
+                predicted_dt: 0.08,
+                ..Default::default()
+            };
+            let out = ed_ctx.run_ui(raw, |ui| {
+                theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                toolbar::show_inner(&mut app, ui);
+                ed_left = pages_sidebar::show_inner(&mut app, ui).panel_rect;
+                ed_right = inspector::show_inner(&mut app, ui);
+                canvas::show(&mut app, ui);
+            });
+            out.drop_without_applying_deltas();
+        }
+        assert!((ed_left.width() - home_left.width()).abs() <= 0.5);
+        assert!((ed_right.width() - ed_left.width()).abs() <= 0.5);
+
+        // 3. On a narrow 600px Editor viewport with both panels open, both shrink equally and keep >= 180px canvas.
+        let narrow_ctx = egui::Context::default();
+        let mut n_left = egui::Rect::NOTHING;
+        let mut n_right = egui::Rect::NOTHING;
+        for f in 0..4 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 700.0),
+                )),
+                time: Some(f as f64 * 0.08 + 0.1),
+                predicted_dt: 0.08,
+                ..Default::default()
+            };
+            let out = narrow_ctx.run_ui(raw, |ui| {
+                theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                toolbar::show_inner(&mut app, ui);
+                n_left = pages_sidebar::show_inner(&mut app, ui).panel_rect;
+                n_right = inspector::show_inner(&mut app, ui);
+                canvas::show(&mut app, ui);
+            });
+            out.drop_without_applying_deltas();
+        }
+        assert!((n_left.width() - n_right.width()).abs() <= 0.5);
+        assert!((n_left.width() - 210.0).abs() <= 0.5);
+        let canvas_w = 600.0 - n_left.width() - n_right.width();
+        assert!(
+            canvas_w >= 179.0,
+            "expected >= 180px canvas, got {canvas_w}"
+        );
+
+        // 4. On a compact viewport (< DUAL_SIDEBAR_MIN_VIEWPORT), keyboard toggle opens one drawer and closes the other.
+        app.view.pages_sidebar_open = true;
+        app.view.inspector_open = false;
+        let compact_ctx = egui::Context::default();
+        let raw_s = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 700.0),
+            )),
+            events: vec![egui::Event::Key {
+                key: egui::Key::S,
+                physical_key: Some(egui::Key::S),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let out = compact_ctx.run_ui(raw_s, |ui| app.show_ui(ui));
+        out.drop_without_applying_deltas();
+        assert!(app.view.inspector_open);
+        assert!(!app.view.pages_sidebar_open);
     }
 
     #[test]

@@ -867,6 +867,9 @@ fn draw_left_zone(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
         app.view.pages_sidebar_open = !app.view.pages_sidebar_open;
         if app.view.pages_sidebar_open {
             app.view.notebook_title_draft = app.session.doc.title.clone();
+            if ui.ctx().content_rect().width() < crate::DUAL_SIDEBAR_MIN_VIEWPORT {
+                app.view.inspector_open = false;
+            }
         }
     }
 }
@@ -4061,6 +4064,11 @@ fn draw_right_zone(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     }
     if settings_resp.clicked() {
         app.view.inspector_open = !app.view.inspector_open;
+        if app.view.inspector_open
+            && ui.ctx().content_rect().width() < crate::DUAL_SIDEBAR_MIN_VIEWPORT
+        {
+            app.view.pages_sidebar_open = false;
+        }
     }
 }
 
@@ -6784,7 +6792,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         let t = Tokens::for_theme(app.session.prefs.theme);
-        let viewport_w = 1040.0_f32; // canvas = 1040 - 276 - 372 = 392px (< ShapeKind segmented_switch width!)
+        let viewport_w = 1040.0_f32; // canvas = 1040 - 280 - 280 = 480px (wraps compactly with open sidebars)
         let mut tray_rect_opt = None;
         for frame in 0..4 {
             let raw = egui::RawInput {

@@ -728,26 +728,46 @@ fn paint_switch_segment_content(
     let icon_dim = metrics.icon_dim;
     let gap = metrics.gap;
     let cy = seg_rect.center().y;
+    let p = painter.with_clip_rect(seg_rect.shrink2(Vec2::new(2.0, 0.0)));
     match (icon, galley) {
         (Some(icon), Some(g)) => {
             let total_w = icon_dim + gap + g.size().x;
-            let start_x = seg_rect.center().x - total_w * 0.5;
-            let icon_rect =
-                Rect::from_center_size(pos2(start_x + icon_dim * 0.5, cy), Vec2::splat(icon_dim));
-            paint_icon(painter, icon_rect, icon, fg);
-            let text_pos = pos2(start_x + icon_dim + gap, cy - g.size().y * 0.5);
-            painter.galley_with_override_text_color(text_pos, g.clone(), fg);
+            if total_w <= seg_rect.width() - 4.0 {
+                let start_x = seg_rect.center().x - total_w * 0.5;
+                let icon_rect = Rect::from_center_size(
+                    pos2(start_x + icon_dim * 0.5, cy),
+                    Vec2::splat(icon_dim),
+                );
+                paint_icon(&p, icon_rect, icon, fg);
+                let text_pos = pos2(start_x + icon_dim + gap, cy - g.size().y * 0.5);
+                p.galley_with_override_text_color(text_pos, g.clone(), fg);
+            } else if g.size().x <= seg_rect.width() - 4.0 {
+                let text_pos = pos2(
+                    seg_rect.center().x - g.size().x * 0.5,
+                    cy - g.size().y * 0.5,
+                );
+                p.galley_with_override_text_color(text_pos, g.clone(), fg);
+            } else {
+                let start_x = seg_rect.left() + 3.0;
+                let icon_rect = Rect::from_center_size(
+                    pos2(start_x + icon_dim * 0.5, cy),
+                    Vec2::splat(icon_dim),
+                );
+                paint_icon(&p, icon_rect, icon, fg);
+                let text_pos = pos2(start_x + icon_dim + gap, cy - g.size().y * 0.5);
+                p.galley_with_override_text_color(text_pos, g.clone(), fg);
+            }
         }
         (Some(icon), None) => {
             let icon_rect = Rect::from_center_size(seg_rect.center(), Vec2::splat(icon_dim));
-            paint_icon(painter, icon_rect, icon, fg);
+            paint_icon(&p, icon_rect, icon, fg);
         }
         (None, Some(g)) => {
             let text_pos = pos2(
                 seg_rect.center().x - g.size().x * 0.5,
                 cy - g.size().y * 0.5,
             );
-            painter.galley_with_override_text_color(text_pos, g.clone(), fg);
+            p.galley_with_override_text_color(text_pos, g.clone(), fg);
         }
         (None, None) => {}
     }
@@ -762,7 +782,7 @@ fn compute_switch_track_width(
 ) -> f32 {
     let n = measured.len();
     if metrics.equal_width {
-        ui.available_width().max(n as f32 * 44.0)
+        ui.available_width().max(n as f32 * 20.0)
     } else {
         let sum_w: f32 = measured.iter().map(|m| m.compact_width).sum();
         track_pad * 2.0 + sum_w + gaps_total
@@ -823,7 +843,14 @@ pub fn segmented_switch(
     let n = options.len();
     let gaps_total = seg_gap * n.saturating_sub(1) as f32;
     let track_w = compute_switch_track_width(ui, &measured, &metrics, track_pad, gaps_total);
-    let equal_seg_w = (track_w - track_pad * 2.0 - gaps_total).max(20.0) / n as f32;
+    let inner_track_w = (track_w - track_pad * 2.0 - gaps_total).max(20.0);
+    let equal_seg_w = inner_track_w / n as f32;
+    let max_compact_w = measured
+        .iter()
+        .map(|m| m.compact_width)
+        .fold(0.0_f32, f32::max);
+    let sum_compact_w: f32 = measured.iter().map(|m| m.compact_width).sum();
+    let use_proportional = metrics.equal_width && max_compact_w > equal_seg_w + 0.5;
 
     let track_id = ui.make_persistent_id(id_salt);
     let (track_rect, track_resp) =
@@ -833,7 +860,15 @@ pub fn segmented_switch(
     let mut x = track_rect.left() + track_pad;
     let seg_top = track_rect.top() + track_pad;
     for item in &measured {
-        let w = if metrics.equal_width {
+        let w = if use_proportional {
+            if sum_compact_w <= inner_track_w {
+                item.compact_width + (inner_track_w - sum_compact_w) / n as f32
+            } else if sum_compact_w > 0.0 {
+                inner_track_w * (item.compact_width / sum_compact_w)
+            } else {
+                equal_seg_w
+            }
+        } else if metrics.equal_width {
             equal_seg_w
         } else {
             item.compact_width
@@ -1072,9 +1107,11 @@ pub fn section_card_header(ui: &mut egui::Ui, icon: Icon, title: &str, subtitle:
     ui.horizontal(|ui| {
         let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
         paint_icon(ui.painter(), icon_rect, icon, t.accent);
-        ui.label(egui::RichText::new(title).size(15.0).strong().color(t.text));
+        ui.add(
+            egui::Label::new(egui::RichText::new(title).size(15.0).strong().color(t.text)).wrap(),
+        );
     });
-    ui.label(egui::RichText::new(subtitle).size(11.5).color(t.text_muted));
+    ui.add(egui::Label::new(egui::RichText::new(subtitle).size(11.5).color(t.text_muted)).wrap());
     ui.add_space(4.0);
 }
 

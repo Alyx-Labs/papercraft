@@ -71,7 +71,12 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> HomeMetr
     app.install_rich_fonts_if_needed(ui.ctx());
     let t = Tokens::for_theme(app.session.prefs.theme);
     let header_rect = draw_home_header(app, ui, &t);
-    let show_sidebar = ui.available_width() >= SIDEBAR_MIN_VIEWPORT;
+    let min_viewport_for_sidebar = if app.view.inspector_open {
+        SIDEBAR_MIN_VIEWPORT.max(crate::STANDARD_SIDEBAR_WIDTH * 2.0 + 280.0)
+    } else {
+        SIDEBAR_MIN_VIEWPORT
+    };
+    let show_sidebar = ui.available_width() >= min_viewport_for_sidebar;
     let sidebar_rect = show_sidebar.then(|| show_sidebar_panel(app, ui, &t));
     crate::inspector::show(app, ui);
 
@@ -267,15 +272,26 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> HomeMetr
 }
 
 fn compute_grid_layout(avail_w: f32) -> HomeGridLayout {
-    let budget = (avail_w - MIN_SIDE_PAD * 2.0 - SCROLLBAR_RESERVE).max(180.0);
+    let avail_w = if avail_w.is_finite() {
+        avail_w.max(0.0)
+    } else {
+        0.0
+    };
+    let min_pad = if avail_w < 320.0 { 12.0 } else { MIN_SIDE_PAD };
+    let max_inner = (avail_w - min_pad * 2.0).max(1.0);
+    let budget = if avail_w < 260.0 {
+        max_inner
+    } else {
+        (avail_w - min_pad * 2.0 - SCROLLBAR_RESERVE).clamp(180.0, max_inner)
+    };
     let cols = ((budget + CARD_GAP) / (MIN_CARD_WIDTH + CARD_GAP))
         .floor()
         .max(1.0) as usize;
     let total_gaps = cols.saturating_sub(1) as f32 * CARD_GAP;
-    let card_w = ((budget - total_gaps) / cols as f32).max(180.0);
+    let card_w = ((budget - total_gaps) / cols as f32).max(1.0);
     let grid_w = cols as f32 * card_w + total_gaps;
-    let content_w = budget.max(grid_w);
-    let raw_pad = ((avail_w - (content_w + SCROLLBAR_RESERVE)) * 0.5).max(MIN_SIDE_PAD);
+    let content_w = budget.max(grid_w).min(avail_w.max(1.0));
+    let raw_pad = ((avail_w - (content_w + SCROLLBAR_RESERVE)) * 0.5).max(min_pad);
     let max_pad = ((avail_w - content_w) * 0.5).max(0.0);
     let side_pad = raw_pad.min(max_pad);
     HomeGridLayout {
@@ -372,6 +388,116 @@ fn brand_logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     Some(tex)
 }
 
+fn draw_home_brand(ui: &mut egui::Ui, show_subtitle: bool, t: &Tokens) {
+    let (badge_rect, _) = ui.allocate_exact_size(Vec2::splat(HEADER_ROW_HEIGHT), Sense::hover());
+    if let Some(logo_tex) = brand_logo_texture(ui.ctx()) {
+        egui::Image::new(egui::load::SizedTexture::new(
+            logo_tex.id(),
+            logo_tex.size_vec2(),
+        ))
+        .corner_radius(CornerRadius::same(7))
+        .paint_at(ui, badge_rect);
+        ui.painter().rect_stroke(
+            badge_rect,
+            CornerRadius::same(7),
+            Stroke::new(1.0, crate::theme::brand_badge_border_color()),
+            StrokeKind::Inside,
+        );
+    } else {
+        ui.painter()
+            .rect_filled(badge_rect, CornerRadius::same(7), t.accent_soft);
+        paint_icon(
+            ui.painter(),
+            badge_rect.shrink(6.5),
+            Icon::Library,
+            t.accent,
+        );
+    }
+
+    ui.add_space(2.0);
+    ui.add(egui::Label::new(crate::theme::brand_wordmark_job(16.5, t)).selectable(false));
+    if show_subtitle {
+        ui.separator();
+        ui.label(
+            RichText::new("Notebooks Library")
+                .size(12.5)
+                .color(t.text_muted),
+        );
+    }
+}
+
+fn draw_home_settings_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    let settings_tip = if cfg!(target_arch = "wasm32") {
+        "Settings (Shortcut: S)\nPen shortcuts, studio appearance, and system info."
+    } else {
+        "Settings (Shortcut: S)\nPen shortcuts, studio appearance, system info, and app updates."
+    };
+    if compact_icon_button(
+        ui,
+        Icon::Settings,
+        Some("Settings"),
+        app.view.inspector_open,
+        true,
+        t,
+    )
+    .on_hover_text(settings_tip)
+    .clicked()
+    {
+        if !app.view.inspector_open {
+            app.view.settings_tab = crate::SettingsTab::Appearance;
+        }
+        app.view.inspector_open = !app.view.inspector_open;
+    }
+}
+
+fn draw_home_package_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    let pkg_resp = icon_button(ui, Icon::Library, Some("Package"), false, true, t).on_hover_text(
+        "Export or import a complete backup package (.pcraftpkg) with all saves and notebooks",
+    );
+    let mut export_pkg = false;
+    let mut import_pkg = false;
+    egui::Popup::menu(&pkg_resp).width(270.0).show(|ui| {
+        if menu_item(
+            ui,
+            Icon::Export,
+            "Export Complete Package (.pcraftpkg)...",
+            true,
+            false,
+            t,
+        )
+        .clicked()
+        {
+            export_pkg = true;
+        }
+        if menu_item(
+            ui,
+            Icon::FolderOpen,
+            "Import Complete Package (.pcraftpkg)...",
+            true,
+            false,
+            t,
+        )
+        .clicked()
+        {
+            import_pkg = true;
+        }
+    });
+    if export_pkg {
+        let _ = app.trigger_export_package_dialog();
+    } else if import_pkg {
+        let _ = app.trigger_import_package_dialog();
+    }
+}
+
+fn draw_home_open_pcraft_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    if icon_button(ui, Icon::Export, Some("Open .pcraft"), false, true, t)
+        .on_hover_text("Open a .pcraft notebook file from disk (Ctrl+O)")
+        .clicked()
+    {
+        app.trigger_open_notebook_dialog();
+    }
+}
+
 fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> Rect {
     let frame = egui::Frame::new()
         .fill(t.toolbar_bg)
@@ -381,126 +507,48 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
     egui::Panel::top("papercraft_home_header")
         .frame(frame)
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.set_height(HEADER_ROW_HEIGHT);
-                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-
-                let (badge_rect, _) =
-                    ui.allocate_exact_size(Vec2::splat(HEADER_ROW_HEIGHT), Sense::hover());
-                if let Some(logo_tex) = brand_logo_texture(ui.ctx()) {
-                    egui::Image::new(egui::load::SizedTexture::new(
-                        logo_tex.id(),
-                        logo_tex.size_vec2(),
-                    ))
-                    .corner_radius(CornerRadius::same(7))
-                    .paint_at(ui, badge_rect);
-                    ui.painter().rect_stroke(
-                        badge_rect,
-                        CornerRadius::same(7),
-                        Stroke::new(1.0, crate::theme::brand_badge_border_color()),
-                        StrokeKind::Inside,
-                    );
-                } else {
-                    ui.painter()
-                        .rect_filled(badge_rect, CornerRadius::same(7), t.accent_soft);
-                    paint_icon(
-                        ui.painter(),
-                        badge_rect.shrink(6.5),
-                        Icon::Library,
-                        t.accent,
-                    );
-                }
-
-                ui.add_space(2.0);
-                ui.add(
-                    egui::Label::new(crate::theme::brand_wordmark_job(16.5, t)).selectable(false),
-                );
-                if ui.available_width() >= 920.0 {
-                    ui.separator();
-                    ui.label(
-                        RichText::new("Notebooks Library")
-                            .size(12.5)
-                            .color(t.text_muted),
-                    );
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let avail_w = ui.available_width();
+            if avail_w >= 760.0 {
+                ui.horizontal(|ui| {
                     ui.set_height(HEADER_ROW_HEIGHT);
-                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                    draw_home_brand(ui, avail_w >= 920.0, t);
 
-                    let settings_tip = if cfg!(target_arch = "wasm32") {
-                        "Settings (Shortcut: S)\nPen shortcuts, studio appearance, and system info."
-                    } else {
-                        "Settings (Shortcut: S)\nPen shortcuts, studio appearance, system info, and app updates."
-                    };
-                    if compact_icon_button(
-                        ui,
-                        Icon::Settings,
-                        Some("Settings"),
-                        app.view.inspector_open,
-                        true,
-                        t,
-                    )
-                    .on_hover_text(settings_tip)
-                    .clicked()
-                    {
-                        if !app.view.inspector_open {
-                            app.view.settings_tab = crate::SettingsTab::Appearance;
-                        }
-                        app.view.inspector_open = !app.view.inspector_open;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.set_height(HEADER_ROW_HEIGHT);
+                        ui.spacing_mut().item_spacing.x = 6.0;
 
-                    let pkg_resp =
-                        icon_button(ui, Icon::Library, Some("Package"), false, true, t)
-                            .on_hover_text(
-                                "Export or import a complete backup package (.pcraftpkg) with all saves and notebooks",
-                            );
-                    let mut export_pkg = false;
-                    let mut import_pkg = false;
-                    egui::Popup::menu(&pkg_resp).width(270.0).show(|ui| {
-                        if menu_item(
-                            ui,
-                            Icon::Export,
-                            "Export Complete Package (.pcraftpkg)...",
-                            true,
-                            false,
-                            t,
-                        )
-                        .clicked()
-                        {
-                            export_pkg = true;
-                        }
-                        if menu_item(
-                            ui,
-                            Icon::FolderOpen,
-                            "Import Complete Package (.pcraftpkg)...",
-                            true,
-                            false,
-                            t,
-                        )
-                        .clicked()
-                        {
-                            import_pkg = true;
-                        }
+                        draw_home_settings_button(app, ui, t);
+                        draw_home_package_button(app, ui, t);
+                        draw_home_open_pcraft_button(app, ui, t);
+                        draw_account_sync_pill(app, ui, t);
+                        draw_search_input(app, ui, t);
                     });
-                    if export_pkg {
-                        let _ = app.trigger_export_package_dialog();
-                    } else if import_pkg {
-                        let _ = app.trigger_import_package_dialog();
-                    }
-
-                    if icon_button(ui, Icon::Export, Some("Open .pcraft"), false, true, t)
-                        .on_hover_text("Open a .pcraft notebook file from disk (Ctrl+O)")
-                        .clicked()
-                    {
-                        app.trigger_open_notebook_dialog();
-                    }
-
-                    draw_account_sync_pill(app, ui, t);
-
-                    draw_search_input(app, ui, t);
                 });
-            });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.set_height(HEADER_ROW_HEIGHT);
+                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                    draw_home_brand(ui, false, t);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.set_height(HEADER_ROW_HEIGHT);
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        draw_home_settings_button(app, ui, t);
+                    });
+                });
+                ui.add_space(6.0);
+                crate::theme::studio_wrapped_row(
+                    ui,
+                    Vec2::new(6.0, 6.0),
+                    HEADER_ROW_HEIGHT,
+                    |ui| {
+                        draw_search_input(app, ui, t);
+                        draw_account_sync_pill(app, ui, t);
+                        draw_home_open_pcraft_button(app, ui, t);
+                        draw_home_package_button(app, ui, t);
+                    },
+                );
+            }
         })
         .response
         .rect
@@ -1493,7 +1541,9 @@ fn draw_notebook_list_row(
     let (cover_rect, _) = child.allocate_exact_size(Vec2::new(30.0, 42.0), Sense::hover());
     paint_hardcover_book_cover(child.painter(), cover_rect, doc.cover, None, t.border);
 
-    let info_w = (inner.width() - 300.0).max(120.0);
+    let info_w = (inner.width() - 300.0)
+        .max(60.0)
+        .min((inner.width() - 40.0).max(60.0));
     let mut info_resp = child
         .allocate_ui_with_layout(
             Vec2::new(info_w, 46.0),
@@ -3017,12 +3067,13 @@ mod tests {
             );
         }
 
-        // At 1920px wide with the 236px Library sidebar: 6 columns fit in the 1684px content area.
+        // At 1920px wide with the 280px Library sidebar: 6 columns fit in the 1640px content area.
         let full_hd = Vec2::new(1920.0, 1080.0);
         let m_hd = run_home_frames(&mut app, full_hd, 2);
         let sidebar_hd = m_hd
             .sidebar_rect
             .expect("sidebar must be visible on wide screen");
+        assert!((sidebar_hd.width() - crate::STANDARD_SIDEBAR_WIDTH).abs() <= 0.5);
         assert_eq!(m_hd.card_rects.len(), 7);
         let row1_y = m_hd.card_rects[0].top();
         let row1_count = m_hd
@@ -3041,43 +3092,43 @@ mod tests {
             "expected symmetric centering beside sidebar at 1920px: left={left_margin}, right={right_margin}"
         );
 
-        // At 1560px wide: 5 fluid columns fill the content budget cleanly without wasted side voids.
-        let wide_1560 = Vec2::new(1560.0, 900.0);
-        let m_1560 = run_home_frames(&mut app, wide_1560, 2);
-        let sidebar_1560 = m_1560
+        // At 1600px wide: 5 fluid columns fill the content budget cleanly without wasted side voids.
+        let wide_1600 = Vec2::new(1600.0, 900.0);
+        let m_1600 = run_home_frames(&mut app, wide_1600, 2);
+        let sidebar_1600 = m_1600
             .sidebar_rect
-            .expect("sidebar must be visible at 1560px");
-        let left_1560 = m_1560.content_rect.left() - sidebar_1560.right();
-        let right_1560 = wide_1560.x - m_1560.content_rect.right();
+            .expect("sidebar must be visible at 1600px");
+        let left_1600 = m_1600.content_rect.left() - sidebar_1600.right();
+        let right_1600 = wide_1600.x - m_1600.content_rect.right();
         assert!(
-            left_1560 >= MIN_SIDE_PAD - 0.5,
-            "expected left side_pad >= {MIN_SIDE_PAD}, got {left_1560}"
+            left_1600 >= MIN_SIDE_PAD - 0.5,
+            "expected left side_pad >= {MIN_SIDE_PAD}, got {left_1600}"
         );
         assert!(
-            (left_1560 - right_1560).abs() <= 1.5,
-            "expected symmetric margins at 1560px: left={left_1560}, right={right_1560}"
+            (left_1600 - right_1600).abs() <= 1.5,
+            "expected symmetric margins at 1600px: left={left_1600}, right={right_1600}"
         );
-        let row1_y_1560 = m_1560.card_rects[0].top();
-        let row1_count_1560 = m_1560
+        let row1_y_1600 = m_1600.card_rects[0].top();
+        let row1_count_1600 = m_1600
             .card_rects
             .iter()
-            .filter(|r| (r.top() - row1_y_1560).abs() <= 1.0)
+            .filter(|r| (r.top() - row1_y_1600).abs() <= 1.0)
             .count();
         assert_eq!(
-            row1_count_1560, 5,
-            "expected 5 columns in row 1 at 1560x900, got {row1_count_1560}"
+            row1_count_1600, 5,
+            "expected 5 columns in row 1 at 1600x900, got {row1_count_1600}"
         );
-        let card_w_1560 = m_1560.card_rects[0].width();
+        let card_w_1600 = m_1600.card_rects[0].width();
         assert!(
-            card_w_1560 >= MIN_CARD_WIDTH - 0.5,
-            "expected expanded card width >= {MIN_CARD_WIDTH} at 1560x900, got {card_w_1560}"
+            card_w_1600 >= MIN_CARD_WIDTH - 0.5,
+            "expected expanded card width >= {MIN_CARD_WIDTH} at 1600x900, got {card_w_1600}"
         );
-        let grid_budget_1560 = (m_1560.content_rect.width() - SCROLLBAR_RESERVE).max(0.0);
-        let row1_span_1560 =
-            row1_count_1560 as f32 * card_w_1560 + (row1_count_1560 - 1) as f32 * CARD_GAP;
+        let grid_budget_1600 = (m_1600.content_rect.width() - SCROLLBAR_RESERVE).max(0.0);
+        let row1_span_1600 =
+            row1_count_1600 as f32 * card_w_1600 + (row1_count_1600 - 1) as f32 * CARD_GAP;
         assert!(
-            (row1_span_1560 - grid_budget_1560).abs() <= 2.0,
-            "expected 5 cards + gaps to fill grid budget edge-to-edge: span={row1_span_1560}, grid_budget={grid_budget_1560}"
+            (row1_span_1600 - grid_budget_1600).abs() <= 2.0,
+            "expected 5 cards + gaps to fill grid budget edge-to-edge: span={row1_span_1600}, grid_budget={grid_budget_1600}"
         );
 
         // Narrow viewport (480px) collapses sidebar into Browse menu and wraps cleanly.
@@ -3087,6 +3138,28 @@ mod tests {
         assert!(m_narrow.content_rect.left() >= 0.0);
         assert!(m_narrow.content_rect.right() <= narrow.x + 0.5);
         assert!(m_narrow.content_rect.width() >= 400.0);
+
+        // Responsive check when Settings drawer is open on Home:
+        // - At 840px (min desktop), both left Library sidebar and Settings fit beside a 280px grid.
+        // - At 780px, Library collapses into Browse so Settings keeps full 280px beside a 500px grid.
+        // - At 480px, Home header and content stay inside the remaining space without overflowing.
+        app.view.inspector_open = true;
+        let m_840 = run_home_frames(&mut app, Vec2::new(840.0, 640.0), 4);
+        assert!(m_840.sidebar_rect.is_some());
+        assert!((m_840.sidebar_rect.unwrap().width() - crate::STANDARD_SIDEBAR_WIDTH).abs() <= 0.5);
+        assert!(m_840.content_rect.width() >= 220.0);
+
+        let m_780 = run_home_frames(&mut app, Vec2::new(780.0, 640.0), 4);
+        assert!(
+            m_780.sidebar_rect.is_none(),
+            "at 780px with Settings open, left sidebar should collapse to Browse"
+        );
+        assert!(m_780.content_rect.width() >= 420.0);
+
+        let m_480_settings = run_home_frames(&mut app, Vec2::new(480.0, 640.0), 4);
+        assert!(m_480_settings.sidebar_rect.is_none());
+        assert!(m_480_settings.header_rect.right() <= 480.5);
+        assert!(m_480_settings.content_rect.right() <= 480.5);
     }
 
     #[test]

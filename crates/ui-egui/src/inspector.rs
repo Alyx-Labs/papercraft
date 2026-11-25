@@ -69,7 +69,36 @@ fn draw_stylus_button_row(
         .inner_margin(Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
+            let draw_badge = |ui: &mut egui::Ui| {
+                Frame::new()
+                    .fill(badge_bg)
+                    .stroke(Stroke::new(1.0, badge_border))
+                    .corner_radius(CornerRadius::same(4))
+                    .inner_margin(Margin::symmetric(6, 2))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(badge_label).size(9.8).color(badge_fg))
+                                .selectable(false),
+                        );
+                    });
+            };
+            if ui.available_width() >= 185.0 {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(spec.title)
+                                .size(12.2)
+                                .strong()
+                                .color(title_color),
+                        )
+                        .selectable(false)
+                        .truncate(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        draw_badge(ui);
+                    });
+                });
+            } else {
                 ui.add(
                     egui::Label::new(
                         RichText::new(spec.title)
@@ -77,24 +106,12 @@ fn draw_stylus_button_row(
                             .strong()
                             .color(title_color),
                     )
-                    .selectable(false),
+                    .selectable(false)
+                    .wrap(),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    Frame::new()
-                        .fill(badge_bg)
-                        .stroke(Stroke::new(1.0, badge_border))
-                        .corner_radius(CornerRadius::same(4))
-                        .inner_margin(Margin::symmetric(6, 2))
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(badge_label).size(9.8).color(badge_fg),
-                                )
-                                .selectable(false),
-                            );
-                        });
-                });
-            });
+                ui.add_space(2.0);
+                draw_badge(ui);
+            }
             ui.add_space(5.0);
             let combo_w = ui.available_width();
             crate::theme::studio_combo_box(ui, spec.id_salt, spec.current.label(), combo_w, |ui| {
@@ -434,23 +451,14 @@ fn draw_app_scale_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
             t,
         );
 
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Current scale").size(12.0).color(t.text));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                if compact_icon_button(ui, Icon::Reset, Some("Reset"), false, !is_default, t)
-                    .on_hover_text("Reset app scale to 100% (Ctrl+0)")
+        let draw_stepper_controls =
+            |ui: &mut egui::Ui, next_scale: &mut Option<f32>| {
+                let at_min = current_scale <= UserStudioConfig::MIN_UI_SCALE + 0.005;
+                if compact_icon_button(ui, Icon::ZoomOut, None, false, !at_min, t)
+                    .on_hover_text("Decrease app scale by 10% (Ctrl+Minus)")
                     .clicked()
                 {
-                    next_scale = Some(UserStudioConfig::DEFAULT_UI_SCALE);
-                }
-
-                let at_max = current_scale >= UserStudioConfig::MAX_UI_SCALE - 0.005;
-                if compact_icon_button(ui, Icon::ZoomIn, None, false, !at_max, t)
-                    .on_hover_text("Increase app scale by 10% (Ctrl+Plus)")
-                    .clicked()
-                {
-                    next_scale = Some(((current_scale + 0.1) * 10.0).round() / 10.0);
+                    *next_scale = Some(((current_scale - 0.1) * 10.0).round() / 10.0);
                 }
 
                 Frame::new()
@@ -475,15 +483,101 @@ fn draw_app_scale_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
                         );
                     });
 
-                let at_min = current_scale <= UserStudioConfig::MIN_UI_SCALE + 0.005;
-                if compact_icon_button(ui, Icon::ZoomOut, None, false, !at_min, t)
-                    .on_hover_text("Decrease app scale by 10% (Ctrl+Minus)")
+                let at_max = current_scale >= UserStudioConfig::MAX_UI_SCALE - 0.005;
+                if compact_icon_button(ui, Icon::ZoomIn, None, false, !at_max, t)
+                    .on_hover_text("Increase app scale by 10% (Ctrl+Plus)")
                     .clicked()
                 {
-                    next_scale = Some(((current_scale - 0.1) * 10.0).round() / 10.0);
+                    *next_scale = Some(((current_scale + 0.1) * 10.0).round() / 10.0);
                 }
+            };
+
+        if ui.available_width() >= 276.0 {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Current scale").size(12.0).color(t.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if compact_icon_button(ui, Icon::Reset, Some("Reset"), false, !is_default, t)
+                        .on_hover_text("Reset app scale to 100% (Ctrl+0)")
+                        .clicked()
+                    {
+                        next_scale = Some(UserStudioConfig::DEFAULT_UI_SCALE);
+                    }
+
+                    let at_max = current_scale >= UserStudioConfig::MAX_UI_SCALE - 0.005;
+                    if compact_icon_button(ui, Icon::ZoomIn, None, false, !at_max, t)
+                        .on_hover_text("Increase app scale by 10% (Ctrl+Plus)")
+                        .clicked()
+                    {
+                        next_scale = Some(((current_scale + 0.1) * 10.0).round() / 10.0);
+                    }
+
+                    Frame::new()
+                        .fill(if is_default {
+                            t.toolbar_bg
+                        } else {
+                            t.accent_soft
+                        })
+                        .stroke(Stroke::new(
+                            1.0,
+                            if is_default { t.border } else { t.accent },
+                        ))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(10, 4))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!("{current_pct}%"))
+                                    .size(12.0)
+                                    .strong()
+                                    .monospace()
+                                    .color(if is_default { t.text } else { t.accent }),
+                            );
+                        });
+
+                    let at_min = current_scale <= UserStudioConfig::MIN_UI_SCALE + 0.005;
+                    if compact_icon_button(ui, Icon::ZoomOut, None, false, !at_min, t)
+                        .on_hover_text("Decrease app scale by 10% (Ctrl+Minus)")
+                        .clicked()
+                    {
+                        next_scale = Some(((current_scale - 0.1) * 10.0).round() / 10.0);
+                    }
+                });
             });
-        });
+        } else {
+            ui.label(RichText::new("Current scale").size(12.0).color(t.text));
+            ui.add_space(4.0);
+            if ui.available_width() >= 192.0 {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    draw_stepper_controls(ui, &mut next_scale);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if compact_icon_button(
+                            ui,
+                            Icon::Reset,
+                            Some("Reset"),
+                            false,
+                            !is_default,
+                            t,
+                        )
+                        .on_hover_text("Reset app scale to 100% (Ctrl+0)")
+                        .clicked()
+                        {
+                            next_scale = Some(UserStudioConfig::DEFAULT_UI_SCALE);
+                        }
+                    });
+                });
+            } else {
+                crate::theme::studio_wrapped_row(ui, Vec2::new(6.0, 4.0), 28.0, |ui| {
+                    draw_stepper_controls(ui, &mut next_scale);
+                    if compact_icon_button(ui, Icon::Reset, Some("Reset"), false, !is_default, t)
+                        .on_hover_text("Reset app scale to 100% (Ctrl+0)")
+                        .clicked()
+                    {
+                        next_scale = Some(UserStudioConfig::DEFAULT_UI_SCALE);
+                    }
+                });
+            }
+        }
 
         ui.add_space(8.0);
         let presets: &[(f32, &str)] = &[
@@ -552,41 +646,52 @@ fn draw_app_updates_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens)
             t,
         );
 
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Installed version").size(12.0).color(t.text));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
+        let draw_version_badges = |ui: &mut egui::Ui| {
+            Frame::new()
+                .fill(t.panel_bg)
+                .stroke(Stroke::new(1.0, t.border))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(8, 3))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("v{current_ver}"))
+                            .size(11.5)
+                            .strong()
+                            .monospace()
+                            .color(t.text),
+                    );
+                });
+            if is_custom_feed {
                 Frame::new()
-                    .fill(t.panel_bg)
-                    .stroke(Stroke::new(1.0, t.border))
+                    .fill(t.accent_soft)
+                    .stroke(Stroke::new(1.0, t.accent))
                     .corner_radius(CornerRadius::same(6))
-                    .inner_margin(Margin::symmetric(8, 3))
+                    .inner_margin(Margin::symmetric(7, 3))
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(format!("v{current_ver}"))
-                                .size(11.5)
+                            RichText::new("Dev feed")
+                                .size(10.5)
                                 .strong()
-                                .monospace()
-                                .color(t.text),
+                                .color(t.accent),
                         );
                     });
-                if is_custom_feed {
-                    Frame::new()
-                        .fill(t.accent_soft)
-                        .stroke(Stroke::new(1.0, t.accent))
-                        .corner_radius(CornerRadius::same(6))
-                        .inner_margin(Margin::symmetric(7, 3))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new("Dev feed")
-                                    .size(10.5)
-                                    .strong()
-                                    .color(t.accent),
-                            );
-                        });
-                }
+            }
+        };
+        if ui.available_width() >= if is_custom_feed { 215.0 } else { 170.0 } {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Installed version").size(12.0).color(t.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    draw_version_badges(ui);
+                });
             });
-        });
+        } else {
+            ui.label(RichText::new("Installed version").size(12.0).color(t.text));
+            ui.add_space(4.0);
+            crate::theme::studio_wrapped_row(ui, Vec2::new(6.0, 4.0), 22.0, |ui| {
+                draw_version_badges(ui);
+            });
+        }
 
         ui.add_space(8.0);
         let mut auto_check = app.session.prefs.auto_check_updates;
@@ -699,8 +804,7 @@ fn draw_app_updates_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens)
         ui.add(egui::Label::new(RichText::new(status_line).size(11.5).color(status_color)).wrap());
 
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
+        crate::theme::studio_wrapped_row(ui, Vec2::new(6.0, 6.0), 28.0, |ui| {
             let check_lbl = if matches!(status, UpdateStatus::Checking { .. }) {
                 "Checking..."
             } else {
@@ -918,36 +1022,67 @@ fn draw_shortcuts_card(ui: &mut egui::Ui, t: &Tokens) {
             ("H", "Return to Notebooks Library home screen"),
             ("Esc", "Close active customization or export modal"),
         ];
+        let avail_w = ui.available_width();
+        let stack_rows = avail_w < 180.0;
+        let key_col_w = (avail_w * 0.45).clamp(74.0, 108.0);
         for (keys, desc) in shortcuts {
-            ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(102.0, 0.0),
-                    egui::Layout::left_to_right(egui::Align::Min),
-                    |ui| {
-                        ui.label(
-                            RichText::new(keys)
-                                .size(10.5)
-                                .monospace()
-                                .strong()
-                                .color(t.accent),
-                        );
-                    },
+            if stack_rows {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(keys)
+                            .size(10.5)
+                            .monospace()
+                            .strong()
+                            .color(t.accent),
+                    )
+                    .wrap(),
                 );
                 ui.add(egui::Label::new(RichText::new(desc).size(11.0).color(t.text_muted)).wrap());
-            });
+                ui.add_space(3.0);
+            } else {
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(key_col_w, 0.0),
+                        egui::Layout::left_to_right(egui::Align::Min),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(keys)
+                                        .size(10.5)
+                                        .monospace()
+                                        .strong()
+                                        .color(t.accent),
+                                )
+                                .wrap(),
+                            );
+                        },
+                    );
+                    ui.add(
+                        egui::Label::new(RichText::new(desc).size(11.0).color(t.text_muted)).wrap(),
+                    );
+                });
+            }
         }
     });
 }
 
 fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, kind: PenKind, t: &Tokens) {
+    let header_w = ui.available_width();
     ui.horizontal(|ui| {
         ui.set_height(28.0);
         let (ir, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
         paint_icon(ui.painter(), ir, Icon::Settings, t.accent);
         ui.label(RichText::new("Settings").size(17.0).strong().color(t.text));
         if app.view.settings_tab == SettingsTab::Pen {
+            let reset_label = if header_w >= 210.0 {
+                Some("Reset Tool")
+            } else if header_w >= 165.0 {
+                Some("Reset")
+            } else {
+                None
+            };
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icon_button(ui, Icon::Reset, Some("Reset Tool"), false, true, t)
+                if icon_button(ui, Icon::Reset, reset_label, false, true, t)
                     .on_hover_text(
                         "Restore factory default settings for the currently selected pen.",
                     )
@@ -966,10 +1101,13 @@ fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, kind: PenKin
             });
         }
     });
-    ui.label(
-        RichText::new("Hardware stylus shortcuts, studio appearance, and system info.")
-            .size(11.5)
-            .color(t.text_muted),
+    ui.add(
+        egui::Label::new(
+            RichText::new("Hardware stylus shortcuts, studio appearance, and system info.")
+                .size(11.5)
+                .color(t.text_muted),
+        )
+        .wrap(),
     );
     ui.add_space(6.0);
 
@@ -1060,7 +1198,7 @@ pub(crate) fn title_to_default_filename(title: &str, ext: &str) -> String {
     }
 }
 
-pub(crate) const DEFAULT_INSPECTOR_WIDTH: f32 = 372.0;
+pub(crate) const DEFAULT_INSPECTOR_WIDTH: f32 = crate::STANDARD_SIDEBAR_WIDTH;
 
 pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
     let _ = show_inner(app, ui);
@@ -1076,7 +1214,7 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
 
     let frame = Frame::new()
         .fill(t.panel_bg)
-        .inner_margin(Margin::same(12))
+        .inner_margin(Margin::same(10))
         .stroke(Stroke::new(1.0, t.border));
 
     let rect = crate::fixed_side_panel(
@@ -1893,5 +2031,95 @@ mod tests {
             .is_some()
         );
         assert_eq!(*calls.lock().unwrap(), vec![false, true]);
+    }
+
+    #[test]
+    fn standardized_and_narrow_inspector_tabs_never_overflow_panel_bounds() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let connected = Arc::new(AtomicBool::new(true));
+        fn collect_text_bounds(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, Rect)> {
+            fn visit(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+                match shape {
+                    egui::Shape::Text(text) => {
+                        out.push((
+                            text.galley.text().to_string(),
+                            text.galley.rect.translate(text.pos.to_vec2()),
+                        ));
+                    }
+                    egui::Shape::Vec(items) => {
+                        for item in items {
+                            visit(item, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for clipped in shapes {
+                visit(&clipped.shape, &mut out);
+            }
+            out
+        }
+
+        for viewport_w in [1280.0_f32, 360.0_f32] {
+            for tab in [
+                SettingsTab::Pen,
+                SettingsTab::Appearance,
+                SettingsTab::System,
+            ] {
+                let ctx = egui::Context::default();
+                let connected_hook = Arc::clone(&connected);
+                let hooks = crate::PlatformHooks {
+                    connected_pen_devices: Some(Box::new(move || {
+                        if connected_hook.load(Ordering::Relaxed) {
+                            vec![crate::stylus::ConnectedStylusInfo {
+                                name: "Pro Pen Digitizer".to_string(),
+                                is_external: true,
+                            }]
+                        } else {
+                            Vec::new()
+                        }
+                    })),
+                    ..crate::PlatformHooks::default()
+                };
+                let mut app = PaperCraftApp::new(papercraft_engine::Session::default(), hooks);
+                if app.last_ctx.is_none() {
+                    app.last_ctx = Some(ctx.clone());
+                }
+                app.view.screen = crate::AppScreen::Editor;
+                app.view.inspector_open = true;
+                app.view.settings_tab = tab;
+
+                let mut panel_rect = Rect::NOTHING;
+                let mut shapes = Vec::new();
+                for f in 0..3 {
+                    let raw = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(viewport_w, 800.0),
+                        )),
+                        time: Some(2.0 + f as f64 * 0.05),
+                        ..Default::default()
+                    };
+                    let out = ctx.run_ui(raw, |ui| {
+                        crate::theme::apply_light_visuals(ui.ctx());
+                        app.poll_connected_stylus_devices(2.0 + f as f64 * 0.05);
+                        panel_rect = show_inner(&mut app, ui);
+                    });
+                    shapes = out.shapes.clone();
+                    out.drop_without_applying_deltas();
+                }
+
+                for (txt, r) in collect_text_bounds(&shapes) {
+                    assert!(
+                        r.left() >= panel_rect.left() - 1.0
+                            && r.right() <= panel_rect.right() + 1.0,
+                        "viewport {viewport_w} tab {tab:?}: text {txt:?} ({r:?}) overflowed panel {panel_rect:?}"
+                    );
+                }
+            }
+        }
     }
 }
