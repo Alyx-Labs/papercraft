@@ -976,89 +976,6 @@ fn draw_system_info_card(app: &PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     });
 }
 
-fn draw_shortcuts_card(ui: &mut egui::Ui, t: &Tokens) {
-    card_frame(t).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        section_card_header(
-            ui,
-            Icon::Info,
-            "Keyboard & Canvas Shortcuts",
-            "Quick keyboard and pointer shortcuts for switching tools and navigating pages.",
-            t,
-        );
-
-        let shortcuts = [
-            (
-                "1 – 7",
-                "Switch Fountain, Ball, Brush, Highlighter, Eraser, Pencil, Laser",
-            ),
-            ("V", "Switch to Select tool (Box marquee or Freeform Lasso)"),
-            ("[ / ]", "Decrease / Increase active nib size"),
-            (
-                "Draw & Hold",
-                "Pause at the end of a stroke to snap shapes or lines",
-            ),
-            (
-                "Ctrl+C / X / V / D",
-                "Copy, cut, paste, or duplicate selected items",
-            ),
-            ("Shift + Drag", "Snap current stroke to a straight line"),
-            ("Space / Middle", "Pan canvas view"),
-            ("Ctrl + Wheel", "Zoom canvas smoothly around cursor"),
-            (
-                "Ctrl + + / - / 0",
-                "Scale app interface larger, smaller, or reset to 100%",
-            ),
-            ("Ctrl+Z / Ctrl+Y", "Undo / Redo stroke or page edits"),
-            ("P", "Open or close Pages sidebar"),
-            ("S", "Open or close this Settings drawer"),
-            ("H", "Return to Notebooks Library home screen"),
-            ("Esc", "Close active customization or export modal"),
-        ];
-        let avail_w = ui.available_width();
-        let stack_rows = avail_w < 180.0;
-        let key_col_w = (avail_w * 0.45).clamp(74.0, 108.0);
-        for (keys, desc) in shortcuts {
-            if stack_rows {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(keys)
-                            .size(10.5)
-                            .monospace()
-                            .strong()
-                            .color(t.accent),
-                    )
-                    .wrap(),
-                );
-                ui.add(egui::Label::new(RichText::new(desc).size(11.0).color(t.text_muted)).wrap());
-                ui.add_space(3.0);
-            } else {
-                ui.horizontal_top(|ui| {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(key_col_w, 0.0),
-                        egui::Layout::left_to_right(egui::Align::Min),
-                        |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(keys)
-                                        .size(10.5)
-                                        .monospace()
-                                        .strong()
-                                        .color(t.accent),
-                                )
-                                .wrap(),
-                            );
-                        },
-                    );
-                    ui.add(
-                        egui::Label::new(RichText::new(desc).size(11.0).color(t.text_muted)).wrap(),
-                    );
-                });
-            }
-        }
-    });
-}
-
 fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, kind: PenKind, t: &Tokens) {
     let header_w = ui.available_width();
     ui.horizontal(|ui| {
@@ -1105,9 +1022,9 @@ fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, kind: PenKin
     ui.add_space(6.0);
 
     let system_tip = if cfg!(target_arch = "wasm32") {
-        "System info and keyboard shortcuts"
+        "System info and workspace diagnostics"
     } else {
-        "System info, app updates, and keyboard shortcuts"
+        "System info and app updates"
     };
     let tabs = [
         (
@@ -1258,8 +1175,6 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
                             ui.add_space(8.0);
                             draw_app_updates_card(app, ui, &t);
                         }
-                        ui.add_space(8.0);
-                        draw_shortcuts_card(ui, &t);
                     }
                 }
             });
@@ -1561,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn system_tab_renders_system_info_app_updates_and_shortcuts_without_telemetry() {
+    fn system_tab_renders_system_info_and_updates_without_shortcuts_or_telemetry() {
         let mut app = PaperCraftApp::default();
         let (_, sys_texts) = render_inspector_tab(&mut app, SettingsTab::System);
         assert!(sys_texts.contains("System Info"));
@@ -1577,7 +1492,7 @@ mod tests {
             assert!(sys_texts.contains("App Updates"));
             assert!(sys_texts.contains("Check for updates automatically on startup"));
         }
-        assert!(sys_texts.contains("Keyboard & Canvas Shortcuts"));
+        assert!(!sys_texts.contains("Keyboard & Canvas Shortcuts"));
         assert!(!sys_texts.contains("Live Stylus Telemetry"));
         assert!(!sys_texts.contains("Hardware Stylus Active"));
         assert!(!sys_texts.contains("Auto-adapt canvas colors to theme"));

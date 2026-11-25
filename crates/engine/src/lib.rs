@@ -1985,11 +1985,14 @@ mod tests {
     #[test]
     fn roadmap_section_4_selection_rich_text_elements_and_favorites_work() {
         let mut s = Session::default();
-        s.execute(
-            "shape.insert",
-            &serde_json::json!({ "kind": "Ellipse", "x1": 180.0, "y1": 180.0, "x2": 300.0, "y2": 300.0 }),
-        )
-        .unwrap();
+        let inserted_shape = s
+            .execute(
+                "shape.insert",
+                &serde_json::json!({ "kind": "Ellipse", "x1": 180.0, "y1": 180.0, "x2": 300.0, "y2": 300.0 }),
+            )
+            .unwrap();
+        assert_eq!(inserted_shape["shapeIndex"], 0);
+        assert_eq!(inserted_shape["shapeCount"], 1);
         s.execute(
             "stroke.draw",
             &serde_json::json!({

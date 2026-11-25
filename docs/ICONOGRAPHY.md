@@ -40,4 +40,6 @@ Additional Lucide `1.72.0` outline assets for writing tools, shape styling, sele
 - `type.svg` (`Icon::Text`) — Text Box insertion tool in the primary canvas toolbar
 - `house.svg` (`Icon::Home`) — Home tab at the left edge of the open-notebook tab strip
 - `github.svg` (`Icon::GitHub`, vendored from `lucide-static` `0.577.0`, ISC license, as brand icons were removed in Lucide `1.0`) — discreet repository link icon in the Home library sidebar footer
+- `circle-question-mark.svg` (`Icon::Help`) — minimalist bottom-right keyboard shortcuts modal trigger button
+- `keyboard.svg` (`Icon::Keyboard`) — Keyboard Shortcuts modal header icon
 

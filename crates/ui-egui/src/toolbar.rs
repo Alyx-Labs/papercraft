@@ -9127,6 +9127,35 @@ mod tests {
             committed_fill,
             papercraft_color::INK_PALETTE[3].color
         ));
+        assert!(!app.view.shape_insert_mode);
+        assert_eq!(app.session.active_tool, ToolKind::Select);
+        assert_eq!(
+            app.view.selected_objects,
+            vec![crate::SelectedObject::Shape(0)]
+        );
+
+        // Context tray and color dock immediately open editing for the inserted shape.
+        for _ in 0..4 {
+            time += 0.08;
+            shapes = step_editor_frame(&ctx, &mut app, viewport, time, 0.08, Vec::new()).0;
+        }
+        let sel_dock_rect = app.view.color_dock.last_rect;
+        let sel_dock_texts = collect_text_boxes_inside(&shapes, sel_dock_rect);
+        let sel_border_pos = sel_dock_texts
+            .iter()
+            .find(|(txt, _)| txt == "Border")
+            .map(|(_, r)| r.center())
+            .expect("Border toggle in Selection color dock after shape insert");
+        let sel_swatch_ocean_pos = egui::pos2(
+            dock_rect.center().x - (COLOR_DOCK_SHAPE_SWATCH_SIZE.x + COLOR_DOCK_ITEM_GAP) * 0.5,
+            swatch_row0_y + COLOR_DOCK_SHAPE_SWATCH_SIZE.y + COLOR_DOCK_ITEM_GAP,
+        );
+        click_at(&ctx, &mut app, &mut time, sel_border_pos);
+        click_at(&ctx, &mut app, &mut time, sel_swatch_ocean_pos);
+        assert!(
+            app.session.doc.shapes[0].color.a > 0.99,
+            "clicking Border swatch right after shape creation must style the new shape directly"
+        );
     }
 
     #[test]

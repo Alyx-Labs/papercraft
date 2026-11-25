@@ -104,6 +104,8 @@ pub enum Icon {
     Text,
     GitHub,
     Home,
+    Help,
+    Keyboard,
 }
 
 /// Load the local outline SVG assigned to a semantic icon.
@@ -202,6 +204,8 @@ fn icon_svg(icon: Icon) -> &'static str {
         Icon::Text => include_str!("../assets/icons/lucide/type.svg"),
         Icon::GitHub => include_str!("../assets/icons/lucide/github.svg"),
         Icon::Home => include_str!("../assets/icons/lucide/house.svg"),
+        Icon::Help => include_str!("../assets/icons/lucide/circle-question-mark.svg"),
+        Icon::Keyboard => include_str!("../assets/icons/lucide/keyboard.svg"),
     }
 }
 

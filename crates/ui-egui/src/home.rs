@@ -92,6 +92,7 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> HomeMetr
         .frame(egui::Frame::NONE.fill(t.panel_bg))
         .show(ui, |ui| {
             let outer_rect = ui.available_rect_before_wrap();
+            app.view.last_home_rect = Some(outer_rect);
             let layout = compute_grid_layout(outer_rect.width());
             let content_left = outer_rect.left() + layout.side_pad;
             let content_right =

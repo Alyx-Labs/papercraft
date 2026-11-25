@@ -6,23 +6,25 @@ use papercraft_sync::{SyncConnectionState, SyncStatusSummary};
 use crate::PaperCraftApp;
 use crate::account_modal::{
     BannerTone, PillIcon, PillStyle, ProfileSection, SignedOutProfileSection, draw_hairline,
-    draw_pill_badge, draw_section_card, draw_status_banner, draw_sync_connection_pill,
-    handle_auth_submit_on_enter, render_account_email_card, render_auth_banners,
-    render_auth_card_contents, render_change_password_card,
-    render_detected_local_accounts_migration_card, render_local_profiles_manager,
-    render_logout_safeguard_actions, render_logout_safeguard_body, render_profile_identity_card,
-    render_server_probe_section, render_session_sign_out_card, render_signed_in_account_card,
-    render_signed_in_server_card, render_signed_in_transfer_section, trigger_test_connection,
+    draw_pill_badge, draw_section_card, draw_status_banner, handle_auth_submit_on_enter,
+    render_account_email_card, render_auth_banners, render_auth_card_contents,
+    render_change_password_card, render_detected_local_accounts_migration_card,
+    render_local_profiles_manager, render_logout_safeguard_actions, render_logout_safeguard_body,
+    render_profile_identity_card, render_server_probe_section, render_session_sign_out_card,
+    render_signed_in_account_card, render_signed_in_server_card, render_signed_in_transfer_section,
+    status_badge_style, trigger_test_connection,
 };
 use crate::icons::{
-    Icon, SidebarEdge, SidebarEdgeButtonSpec, SwitchLayout, SwitchOption, icon_button, paint_icon,
-    segmented_switch, sidebar_edge_button,
+    Icon, SidebarEdge, SidebarEdgeButtonSpec, SidebarEdgeSize, SwitchLayout, SwitchOption,
+    TOOLBAR_CONTROL_HEIGHT, paint_icon, segmented_switch, sidebar_edge_button_sized,
+    toolbar_icon_button,
 };
-use crate::modal::{primary_action_button, secondary_action_button};
+use crate::modal::secondary_action_button;
 use crate::sync_worker::trigger_manual_sync;
 use crate::theme::Tokens;
 
-const HEADER_ROW_HEIGHT: f32 = 28.0;
+const HEADER_ROW_HEIGHT: f32 = TOOLBAR_CONTROL_HEIGHT;
+const HEADER_BADGE_SIZE: f32 = 28.0;
 const MAX_CONTENT_WIDTH: f32 = 940.0;
 const RAIL_WIDTH: f32 = 228.0;
 const COMPACT_BREAKPOINT: f32 = 760.0;
@@ -88,26 +90,13 @@ fn draw_profile_header(
                 ui.set_height(HEADER_ROW_HEIGHT);
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
 
-                let back_label = if app.view.profile_return_screen == crate::AppScreen::Editor {
-                    "Back to Notebook"
-                } else {
-                    "Back to Library"
-                };
-                if icon_button(ui, Icon::PrevPage, Some(back_label), false, true, t)
-                    .on_hover_text("Return (Esc)")
-                    .clicked()
-                {
-                    crate::close_profile_screen(app);
-                }
-
-                ui.separator();
-
-                let (badge_rect, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
+                let (badge_rect, _) =
+                    ui.allocate_exact_size(Vec2::splat(HEADER_BADGE_SIZE), Sense::hover());
                 ui.painter()
                     .rect_filled(badge_rect, CornerRadius::same(7), t.accent_soft);
                 paint_icon(
                     ui.painter(),
-                    badge_rect.shrink(5.5),
+                    badge_rect.shrink(6.0),
                     Icon::Account,
                     t.accent,
                 );
@@ -123,16 +112,17 @@ fn draw_profile_header(
                     ui.set_height(HEADER_ROW_HEIGHT);
                     ui.spacing_mut().item_spacing.x = 6.0;
 
-                    if sidebar_edge_button(
+                    if sidebar_edge_button_sized(
                         ui,
                         SidebarEdgeButtonSpec {
                             edge: SidebarEdge::Right,
                             icon: Icon::Settings,
-                            label: "Settings",
+                            label: "",
                             max_width: None,
                             open: app.view.inspector_open,
                             enabled: true,
                         },
+                        SidebarEdgeSize::Toolbar,
                         t,
                     )
                     .on_hover_text(
@@ -146,48 +136,44 @@ fn draw_profile_header(
                         app.view.inspector_open = !app.view.inspector_open;
                     }
 
-                    if summary.signed_in {
-                        let in_flight = app.session.is_sync_in_flight();
-                        let can_sync = !in_flight && summary.viewing_cloud;
-                        let sync_lbl = if in_flight { "Syncing..." } else { "Sync Now" };
-                        if primary_action_button(ui, sync_lbl, can_sync, t)
-                            .on_hover_text(if summary.viewing_cloud {
-                                format!("Sync cloud workspace ({cloud_pending} pending)")
-                            } else {
-                                "Switch to Cloud Workspace to sync".to_string()
-                            })
-                            .clicked()
-                        {
-                            app.view.account.error_message = None;
-                            app.view.account.status_message = None;
-                            trigger_manual_sync(app, ui.ctx());
-                        }
-                    }
-
-                    if summary.viewing_cloud {
-                        draw_sync_connection_pill(ui, summary.connection, t);
-                    } else if summary.signed_in {
-                        draw_pill_badge(
-                            ui,
-                            PillStyle {
-                                fill: t.toolbar_bg,
-                                border: t.border,
-                                fg: t.text_muted,
-                                icon: PillIcon::Dot,
-                            },
-                            "Viewing Local",
-                        );
+                    let in_flight = app.session.is_sync_in_flight();
+                    let can_sync = summary.signed_in && summary.viewing_cloud && !in_flight;
+                    let (state_label, cloud_dot) = status_badge_style(summary.connection, t);
+                    let dot_color = if summary.viewing_cloud {
+                        cloud_dot
                     } else {
-                        draw_pill_badge(
-                            ui,
-                            PillStyle {
-                                fill: t.toolbar_bg,
-                                border: t.border,
-                                fg: t.text_muted,
-                                icon: PillIcon::Dot,
-                            },
-                            "Local Only",
+                        t.text_muted
+                    };
+                    let sync_tip = if summary.viewing_cloud {
+                        if in_flight {
+                            format!("Syncing cloud workspace...\nServer: {}", summary.server_url)
+                        } else {
+                            format!(
+                                "Sync Now ({state_label}, {cloud_pending} pending)\nServer: {}",
+                                summary.server_url
+                            )
+                        }
+                    } else if summary.signed_in {
+                        "Viewing Local Workspace\nSwitch to Cloud Workspace below to sync."
+                            .to_string()
+                    } else {
+                        "Local Only Workspace\nStored only on this device. Sign in to enable Cloud Sync."
+                            .to_string()
+                    };
+                    let sync_resp =
+                        toolbar_icon_button(ui, Icon::Sync, None, in_flight, can_sync, t);
+                    if ui.is_rect_visible(sync_resp.rect) {
+                        let dot_c = egui::pos2(
+                            sync_resp.rect.right() - 6.5,
+                            sync_resp.rect.bottom() - 6.5,
                         );
+                        ui.painter().circle_filled(dot_c, 4.2, t.toolbar_bg);
+                        ui.painter().circle_filled(dot_c, 3.0, dot_color);
+                    }
+                    if sync_resp.on_hover_text(sync_tip).clicked() {
+                        app.view.account.error_message = None;
+                        app.view.account.status_message = None;
+                        trigger_manual_sync(app, ui.ctx());
                     }
                 });
             });
@@ -1109,5 +1095,152 @@ mod tests {
         assert!(dark_text.contains("PaperCraft Server"));
         assert!(dark_text.contains("standalone local desktop app"));
         assert!(dark_text.contains("github.com/alyxhard/papercraft"));
+    }
+
+    #[test]
+    fn profile_header_matches_toolbar_height_omits_back_button_and_uses_icon_only_controls() {
+        let ctx = egui::Context::default();
+        let mut app = PaperCraftApp::default();
+        crate::open_notebook_in_editor(&mut app, 0);
+        crate::open_profile_screen(&mut app);
+
+        let mut header_rect = egui::Rect::NOTHING;
+        let mut header_texts: Vec<String> = Vec::new();
+        let mut settings_tab = None;
+        let mut sync_btn = None;
+        for step in 0..3 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(f64::from(step) * 0.05),
+                predicted_dt: 0.05,
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                show(&mut app, ui);
+            });
+            header_rect = egui::Rect::NOTHING;
+            header_texts.clear();
+            settings_tab = None;
+            sync_btn = None;
+            fn find_header(shape: &Shape, out: &mut egui::Rect) {
+                match shape {
+                    Shape::Rect(rs)
+                        if rs.rect.top() <= 1.0
+                            && (rs.rect.width() - 1280.0).abs() <= 1.0
+                            && rs.rect.height() >= 40.0
+                            && rs.rect.height() <= 64.0 =>
+                    {
+                        *out = rs.rect;
+                    }
+                    Shape::Vec(items) => {
+                        for item in items {
+                            find_header(item, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for clipped in &out.shapes {
+                find_header(&clipped.shape, &mut header_rect);
+            }
+            fn scan(
+                shape: &Shape,
+                header: egui::Rect,
+                texts: &mut Vec<String>,
+                edge_tab: &mut Option<egui::Rect>,
+                sync_rect: &mut Option<egui::Rect>,
+            ) {
+                match shape {
+                    Shape::Text(text) if header.contains(text.visual_bounding_rect().center()) => {
+                        texts.push(text.galley.text().to_string());
+                    }
+                    Shape::Rect(rs)
+                        if header.contains(rs.rect.center())
+                            && (rs.rect.height() - HEADER_ROW_HEIGHT).abs() <= 0.5
+                            && rs.corner_radius.nw >= 14 =>
+                    {
+                        *edge_tab = Some(rs.rect);
+                    }
+                    Shape::Rect(rs)
+                        if header.contains(rs.rect.center())
+                            && (rs.rect.height() - HEADER_ROW_HEIGHT).abs() <= 0.5
+                            && (rs.rect.width() - HEADER_ROW_HEIGHT).abs() <= 0.5 =>
+                    {
+                        *sync_rect = Some(rs.rect);
+                    }
+                    Shape::Vec(items) => {
+                        for item in items {
+                            scan(item, header, texts, edge_tab, sync_rect);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for clipped in &out.shapes {
+                scan(
+                    &clipped.shape,
+                    header_rect,
+                    &mut header_texts,
+                    &mut settings_tab,
+                    &mut sync_btn,
+                );
+            }
+            out.drop_without_applying_deltas();
+        }
+
+        assert!(
+            header_rect.height() >= 48.0 && header_rect.height() <= 56.0,
+            "expected 52px profile header matching toolbar/home, got {header_rect:?}"
+        );
+        assert!(
+            header_texts.iter().any(|t| t == "Profile & Cloud Sync"),
+            "expected screen title in profile header, got {header_texts:?}"
+        );
+        for forbidden in [
+            "Back to Notebook",
+            "Back to Library",
+            "Settings",
+            "Local Only",
+            "Viewing Local",
+            "Sync Now",
+        ] {
+            assert!(
+                !header_texts.iter().any(|t| t == forbidden),
+                "unexpected button text {forbidden:?} in profile header: {header_texts:?}"
+            );
+        }
+        assert!(sync_btn.is_some(), "expected 36x36 sync icon button");
+        let settings_pos = settings_tab
+            .expect("expected Settings edge tab in profile header")
+            .center();
+        for (pressed, time) in [(true, 0.25), (false, 0.30)] {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(time),
+                events: vec![
+                    egui::Event::PointerMoved(settings_pos),
+                    egui::Event::PointerButton {
+                        pos: settings_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                show(&mut app, ui);
+            });
+            out.drop_without_applying_deltas();
+        }
+        assert!(app.view.inspector_open);
     }
 }

@@ -2788,10 +2788,21 @@ fn handle_shape_input(
         if let Some(fill) = fill_color {
             params["fill_color"] = serde_json::json!(fill);
         }
-        let _ = app.session.execute("shape.insert", &params);
+        let inserted = app.session.execute("shape.insert", &params);
         app.view.shape_drag_start = None;
         app.view.shape_drag_end = None;
         app.view.shape_drag_touch_id = None;
+        if let Ok(result) = inserted {
+            let shape_index = result["shapeIndex"]
+                .as_u64()
+                .and_then(|idx| usize::try_from(idx).ok())
+                .or_else(|| app.session.doc.shapes.len().checked_sub(1));
+            crate::activate_select_tool(app);
+            if let Some(index) = shape_index {
+                set_selection(app, vec![SelectedObject::Shape(index)]);
+            }
+            ui.ctx().request_repaint();
+        }
     }
 }
 
@@ -11396,6 +11407,166 @@ mod tests {
         assert!(app.session.doc.strokes.is_empty());
         assert_eq!(app.session.doc.shapes.len(), 1);
         assert_eq!(app.session.doc.shapes[0].kind, ShapeKind::Ellipse);
+        assert_eq!(
+            app.session.active_tool,
+            ToolKind::Pen(PenKind::FountainPen),
+            "Draw & Hold must keep the active pen tool selected"
+        );
+        assert!(app.view.selected_objects.is_empty());
+    }
+
+    #[test]
+    fn finishing_shape_insert_switches_to_select_and_opens_shape_editing() {
+        let ctx = egui::Context::default();
+        let mut app = setup_editor_app(&ctx);
+        app.session
+            .execute("tool.select", &serde_json::json!({ "tool": "BallPen" }))
+            .unwrap();
+        app.view.shape_insert_mode = true;
+        app.view.selected_shape_kind = ShapeKind::Rectangle;
+
+        let xf = page_affine(&app);
+        let to_scr = |x: f64, y: f64| {
+            let s = xf.to_screen(Point::new(x, y));
+            pos2(s.x as f32, s.y as f32)
+        };
+
+        // 1. Clicking without dragging (< 1 pt) must not insert or exit shape insert mode.
+        let tap = to_scr(200.0, 200.0);
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.016,
+            vec![
+                egui::Event::PointerMoved(tap),
+                egui::Event::PointerButton {
+                    pos: tap,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: tap,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+        assert!(app.session.doc.shapes.is_empty());
+        assert!(app.view.shape_insert_mode);
+        assert_eq!(app.session.active_tool, ToolKind::Pen(PenKind::BallPen));
+
+        // 2. Dragging out a rectangle inserts Shape(0), switches to Select, and selects it.
+        let p0 = to_scr(160.0, 180.0);
+        let p1 = to_scr(320.0, 280.0);
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.032,
+            vec![
+                egui::Event::PointerMoved(p0),
+                egui::Event::PointerButton {
+                    pos: p0,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(p1),
+                egui::Event::PointerButton {
+                    pos: p1,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+
+        assert_eq!(app.session.doc.shapes.len(), 1);
+        assert!(!app.view.shape_insert_mode);
+        assert_eq!(app.session.active_tool, ToolKind::Select);
+        assert_eq!(app.view.selected_object, Some(SelectedObject::Shape(0)));
+        assert_eq!(app.view.selected_objects, vec![SelectedObject::Shape(0)]);
+
+        // Selection resize handles are immediately interactive on the newly inserted shape.
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let bounds = selected_objects_bounds(&app, &painter, page_affine(&app)).unwrap();
+        let right_mid = non_text_side_handles(bounds)[1].0;
+        let resized_right = pos2(right_mid.x + 40.0 * app.view.zoom, right_mid.y);
+        let x2_before = app.session.doc.shapes[0].x2;
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.048,
+            vec![
+                egui::Event::PointerMoved(right_mid),
+                egui::Event::PointerButton {
+                    pos: right_mid,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(resized_right),
+                egui::Event::PointerButton {
+                    pos: resized_right,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+        assert!(
+            app.session.doc.shapes[0].x2 > x2_before + 20.0,
+            "expected immediate handle resize on newly inserted shape"
+        );
+
+        // 3. Re-entering Shapes and drawing a second shape via touch selects Shape(1).
+        app.view.shape_insert_mode = true;
+        app.view.selected_shape_kind = ShapeKind::Ellipse;
+        app.view.clear_selection();
+        let dev = egui::TouchDeviceId(0);
+        let pen_touch = egui::TouchId(9);
+        let t0 = to_scr(420.0, 200.0);
+        let t1 = to_scr(520.0, 300.0);
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.064,
+            vec![
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: pen_touch,
+                    phase: egui::TouchPhase::Start,
+                    pos: t0,
+                    force: Some(0.5),
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: pen_touch,
+                    phase: egui::TouchPhase::Move,
+                    pos: t1,
+                    force: Some(0.5),
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: pen_touch,
+                    phase: egui::TouchPhase::End,
+                    pos: t1,
+                    force: Some(0.5),
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+
+        assert_eq!(app.session.doc.shapes.len(), 2);
+        assert_eq!(app.session.doc.shapes[1].kind, ShapeKind::Ellipse);
+        assert!(!app.view.shape_insert_mode);
+        assert_eq!(app.session.active_tool, ToolKind::Select);
+        assert_eq!(app.view.selected_object, Some(SelectedObject::Shape(1)));
+        assert_eq!(app.view.selected_objects, vec![SelectedObject::Shape(1)]);
     }
 
     #[test]

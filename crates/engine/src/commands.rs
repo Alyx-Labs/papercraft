@@ -1695,11 +1695,15 @@ fn cmd_shape_insert(session: &mut Session, id: &str, params: &Value) -> Result<V
     next.shapes.push(Arc::new(shape));
     next.sync_active_to_pages();
     let shape_count = next.shapes.len();
+    let shape_index = shape_count.saturating_sub(1);
     session.history.record("Insert Shape", before);
     session.doc = Arc::new(next);
     session.mark_active_dirty();
     session.bump_revision();
-    Ok(json!({ "shapeCount": shape_count }))
+    Ok(json!({
+        "shapeIndex": shape_index,
+        "shapeCount": shape_count,
+    }))
 }
 
 fn cmd_shape_update(session: &mut Session, id: &str, params: &Value) -> Result<Value, EngineError> {

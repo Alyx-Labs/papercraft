@@ -27,6 +27,7 @@ pub mod page_format_picker;
 pub mod pages_sidebar;
 pub mod pdf_view;
 pub mod profile_screen;
+pub mod shortcuts_modal;
 pub mod stylus;
 pub mod sync_worker;
 pub mod tab_strip;
@@ -419,6 +420,7 @@ pub struct ViewState {
     pub last_copied_plain_text: Option<String>,
     pub rich_fonts_installed: bool,
     pub last_canvas_rect: Option<egui::Rect>,
+    pub last_home_rect: Option<egui::Rect>,
     pub first_access_nickname: String,
     pub first_access_error: Option<String>,
     pub first_access_focus_pending: bool,
@@ -603,6 +605,7 @@ impl Default for ViewState {
             last_copied_plain_text: None,
             rich_fonts_installed: false,
             last_canvas_rect: None,
+            last_home_rect: None,
             first_access_nickname: String::new(),
             first_access_error: None,
             first_access_focus_pending: false,
@@ -1670,6 +1673,12 @@ impl PaperCraftApp {
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if self.view.active_modal.is_some() {
+            if self.view.active_modal == Some(modal::ActiveModal::KeyboardShortcuts)
+                && ctx.input(is_shortcuts_toggle_pressed)
+            {
+                modal::close(self);
+                return;
+            }
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 if self.view.active_modal == Some(modal::ActiveModal::FirstAccessNickname) {
                     return;
@@ -1737,6 +1746,9 @@ impl PaperCraftApp {
     }
 
     fn detect_keyboard_shortcut(&self, i: &egui::InputState) -> Option<KeyboardShortcutAction> {
+        if is_shortcuts_toggle_pressed(i) {
+            return Some(KeyboardShortcutAction::ToggleKeyboardShortcuts);
+        }
         if i.modifiers.command && i.key_pressed(egui::Key::O) {
             return Some(KeyboardShortcutAction::OpenNotebookDialog);
         }
@@ -1931,6 +1943,13 @@ impl PaperCraftApp {
             KeyboardShortcutAction::CloseProfile => {
                 close_profile_screen(self);
             }
+            KeyboardShortcutAction::ToggleKeyboardShortcuts => {
+                if self.view.active_modal == Some(modal::ActiveModal::KeyboardShortcuts) {
+                    modal::close(self);
+                } else {
+                    modal::open(self, modal::ActiveModal::KeyboardShortcuts);
+                }
+            }
             KeyboardShortcutAction::StepPage(delta) => {
                 let idx = self.session.doc.active_page_index();
                 let target = if delta < 0 {
@@ -1974,7 +1993,21 @@ enum KeyboardShortcutAction {
     ReturnToHome,
     CloseActiveTab,
     CloseProfile,
+    ToggleKeyboardShortcuts,
     StepPage(isize),
+}
+
+fn is_shortcuts_toggle_pressed(i: &egui::InputState) -> bool {
+    if i.events
+        .iter()
+        .any(|ev| matches!(ev, egui::Event::Text(text) if text == "?"))
+    {
+        return true;
+    }
+    !i.modifiers.command
+        && !i.modifiers.alt
+        && (i.key_pressed(egui::Key::Questionmark)
+            || (i.modifiers.shift && i.key_pressed(egui::Key::Slash)))
 }
 
 impl PaperCraftApp {
@@ -2185,6 +2218,11 @@ impl PaperCraftApp {
             AppScreen::Home => {
                 home::show(self, ui);
                 tab_strip::paint_active_tab_bridge(ui, &tab_out, &tokens);
+                let home_rect = self
+                    .view
+                    .last_home_rect
+                    .unwrap_or_else(|| ui.available_rect_before_wrap());
+                shortcuts_modal::show_trigger_button(self, ui, home_rect, &tokens);
             }
             AppScreen::Editor => {
                 let header_rect = toolbar::show_inner(self, ui);
@@ -2193,6 +2231,7 @@ impl PaperCraftApp {
                 inspector::show(self, ui);
                 let canvas_rect = ui.available_rect_before_wrap();
                 toolbar::show_context_tray_in_rect(self, ui, header_rect, canvas_rect);
+                shortcuts_modal::show_trigger_button(self, ui, canvas_rect, &tokens);
                 canvas::show(self, ui);
                 color_picker::show_popover(self, ui);
                 toolbar::show_elements_popover(self, ui);

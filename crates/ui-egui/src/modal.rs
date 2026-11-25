@@ -30,6 +30,7 @@ pub enum ActiveModal {
     FolderColor,
     TagColor,
     AppUpdate,
+    KeyboardShortcuts,
 }
 
 struct DialogSpec {
@@ -80,6 +81,7 @@ impl ActiveModal {
             Self::FolderColor => 12,
             Self::TagColor => 13,
             Self::AppUpdate => 16,
+            Self::KeyboardShortcuts => 17,
         }
     }
 
@@ -190,6 +192,13 @@ impl ActiveModal {
                 width: 480.0,
                 min_body_height: 0.0,
             },
+            Self::KeyboardShortcuts => DialogSpec {
+                icon: Icon::Keyboard,
+                title: "Keyboard Shortcuts",
+                subtitle: "Quick keys and pointer gestures for tools, editing, and navigation.",
+                width: 860.0,
+                min_body_height: 0.0,
+            },
         }
     }
 }
@@ -298,7 +307,8 @@ pub(crate) fn open(app: &mut PaperCraftApp, target: ActiveModal) {
         | ActiveModal::FolderColor
         | ActiveModal::TagColor
         | ActiveModal::SyncConflict
-        | ActiveModal::AppUpdate => {}
+        | ActiveModal::AppUpdate
+        | ActiveModal::KeyboardShortcuts => {}
         ActiveModal::FirstAccessNickname => {
             app.view.first_access_error = None;
             app.view.first_access_focus_pending = true;
@@ -594,6 +604,14 @@ fn show_inner_with_motion(
             render_app_update_body,
             render_app_update_footer,
         ),
+        ActiveModal::KeyboardShortcuts => show_dialog(
+            app,
+            ui,
+            active,
+            motion,
+            crate::shortcuts_modal::render_body,
+            crate::shortcuts_modal::render_footer,
+        ),
     }
 }
 
@@ -632,7 +650,8 @@ fn modal_steps(active: ActiveModal) -> Option<&'static [ModalStepSpec]> {
         | ActiveModal::DeleteFolder
         | ActiveModal::FolderColor
         | ActiveModal::TagColor
-        | ActiveModal::AppUpdate => None,
+        | ActiveModal::AppUpdate
+        | ActiveModal::KeyboardShortcuts => None,
     }
 }
 
