@@ -964,6 +964,109 @@ pub fn chip_close_button(ui: &mut egui::Ui, tooltip: &str, color: Color32, t: &T
         .on_hover_text(tooltip)
 }
 
+/// Renders an animated boolean pill toggle switch (`36x20`) styled with active theme tokens.
+pub fn toggle_switch(
+    ui: &mut egui::Ui,
+    id_salt: impl egui::AsIdSalt,
+    on: &mut bool,
+    enabled: bool,
+    t: &Tokens,
+) -> Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(36.0, 20.0), sense);
+    if enabled && resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, *on, ""));
+
+    if ui.is_rect_visible(rect) {
+        let anim_t = ui.ctx().animate_value_with_time(
+            ui.make_persistent_id(id_salt),
+            if *on { 1.0 } else { 0.0 },
+            crate::motion::MICRO_DURATION_S,
+        );
+        let alpha = if enabled { 1.0 } else { 0.55 };
+        let track_fill =
+            crate::motion::lerp_color(t.field_bg, t.accent, anim_t).gamma_multiply(alpha);
+        let track_stroke =
+            crate::motion::lerp_color(t.border, t.accent, anim_t).gamma_multiply(alpha);
+        let knob_fill =
+            crate::motion::lerp_color(t.text_muted, Color32::WHITE, anim_t).gamma_multiply(alpha);
+
+        let p = ui.painter();
+        p.rect(
+            rect,
+            CornerRadius::same(10),
+            track_fill,
+            Stroke::new(1.0, track_stroke),
+            StrokeKind::Inside,
+        );
+        let knob_x = egui::lerp((rect.left() + 10.0)..=(rect.right() - 10.0), anim_t);
+        p.circle_filled(pos2(knob_x, rect.center().y), 7.0, knob_fill);
+    }
+
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// Renders a labeled settings row with a clickable label on the left and a right-aligned pill switch.
+pub fn toggle_switch_row(
+    ui: &mut egui::Ui,
+    id_salt: impl egui::AsIdSalt,
+    label: &str,
+    tooltip: &str,
+    on: &mut bool,
+    t: &Tokens,
+) -> Response {
+    let was_on = *on;
+    let switch_w = 36.0_f32;
+    let gap = 8.0_f32;
+    ui.horizontal(|ui| {
+        let label_w = (ui.available_width() - switch_w - gap).max(80.0);
+        let mut label_resp = ui
+            .allocate_ui_with_layout(
+                Vec2::new(label_w, 20.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(label).size(12.0).color(t.text))
+                            .wrap()
+                            .sense(Sense::click()),
+                    )
+                },
+            )
+            .inner
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if !tooltip.is_empty() {
+            label_resp = label_resp.on_hover_text(tooltip);
+        }
+        if label_resp.clicked() {
+            *on = !*on;
+        }
+
+        ui.add_space(gap);
+        let mut switch_resp = toggle_switch(ui, id_salt, on, true, t);
+        if !tooltip.is_empty() {
+            switch_resp = switch_resp.on_hover_text(tooltip);
+        }
+
+        let mut combined = label_resp.union(switch_resp);
+        if *on != was_on {
+            combined.mark_changed();
+        }
+        combined
+    })
+    .inner
+}
+
 /// Renders a section heading with an icon and muted plain-English subtitle.
 pub fn section_card_header(ui: &mut egui::Ui, icon: Icon, title: &str, subtitle: &str, t: &Tokens) {
     ui.horizontal(|ui| {
@@ -979,7 +1082,7 @@ pub fn section_card_header(ui: &mut egui::Ui, icon: Icon, title: &str, subtitle:
 mod tests {
     use super::{
         Icon, SwitchLayout, SwitchOption, max_width_icon_button, max_width_icon_button_width,
-        paint_icon, segmented_switch,
+        paint_icon, segmented_switch, toggle_switch, toggle_switch_row,
     };
     use egui::{Color32, Pos2, RawInput, Rect, Vec2, epaint::Primitive};
 
@@ -1466,5 +1569,112 @@ mod tests {
             pills_end[0].left(),
             pills_mid[0].left()
         );
+    }
+
+    #[test]
+    fn toggle_switch_and_row_render_and_toggle_on_click() {
+        for theme in [
+            papercraft_doc::UiTheme::Light,
+            papercraft_doc::UiTheme::Dark,
+        ] {
+            let ctx = egui::Context::default();
+            let t = crate::theme::Tokens::for_theme(theme);
+            let mut value = true;
+            let mut switch_rect = Rect::NOTHING;
+
+            let out = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 120.0))),
+                    time: Some(0.05),
+                    ..Default::default()
+                },
+                |ui| {
+                    switch_rect = toggle_switch(ui, ("ts_test", theme), &mut value, true, &t).rect;
+                },
+            );
+            assert!(!out.shapes.is_empty());
+            out.drop_without_applying_deltas();
+
+            let switch_pt = switch_rect.center();
+            for (pressed, time) in [(true, 0.08), (false, 0.12)] {
+                let click_out = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 120.0))),
+                        time: Some(time),
+                        events: vec![
+                            egui::Event::PointerMoved(switch_pt),
+                            egui::Event::PointerButton {
+                                pos: switch_pt,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let _ = toggle_switch(ui, ("ts_test", theme), &mut value, true, &t);
+                    },
+                );
+                click_out.drop_without_applying_deltas();
+            }
+            assert!(!value, "expected toggle_switch click to turn switch off");
+
+            let mut row_rect = Rect::NOTHING;
+            let warm_row = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 120.0))),
+                    time: Some(0.16),
+                    ..Default::default()
+                },
+                |ui| {
+                    row_rect = toggle_switch_row(
+                        ui,
+                        ("ts_row_test", theme),
+                        "Create Desktop shortcut automatically",
+                        "Tooltip",
+                        &mut value,
+                        &t,
+                    )
+                    .rect;
+                },
+            );
+            warm_row.drop_without_applying_deltas();
+
+            let row_pt = Pos2::new(row_rect.right() - 10.0, row_rect.center().y);
+            for (pressed, time) in [(true, 0.20), (false, 0.24)] {
+                let click_out = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 120.0))),
+                        time: Some(time),
+                        events: vec![
+                            egui::Event::PointerMoved(row_pt),
+                            egui::Event::PointerButton {
+                                pos: row_pt,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let _ = toggle_switch_row(
+                            ui,
+                            ("ts_row_test", theme),
+                            "Create Desktop shortcut automatically",
+                            "Tooltip",
+                            &mut value,
+                            &t,
+                        );
+                    },
+                );
+                click_out.drop_without_applying_deltas();
+            }
+            assert!(
+                value,
+                "expected toggle_switch_row click to turn switch back on"
+            );
+        }
     }
 }

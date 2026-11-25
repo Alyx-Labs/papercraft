@@ -80,6 +80,13 @@ pub fn install_platform_hooks() -> (Option<()>, PlatformHooks) {
                 let _ = Command::new("xdg-open").arg(trimmed).spawn();
             }
         })),
+        sync_desktop_shortcut: Some(Box::new(|enabled| {
+            papercraft_updater::sync_desktop_shortcut(
+                papercraft_updater::AppId::PaperCraft,
+                enabled,
+            )
+            .map(|outcome| outcome.status_message())
+        })),
         enable_auto_update_check: true,
         ..PlatformHooks::default()
     };

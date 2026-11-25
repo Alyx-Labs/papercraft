@@ -8,7 +8,7 @@ use crate::UpdateError;
 use crate::client::{
     AvailableUpdate, CheckOutcome, UpdateConfig, check_for_update, download_and_verify_update,
 };
-use crate::install::{StagedUpdate, apply_staged_update_and_relaunch};
+use crate::install::{StagedUpdate, apply_staged_update_and_relaunch_with_shortcut};
 use crate::manifest::{AppId, DEFAULT_RELEASES_PAGE_URL};
 use crate::version::SemVer;
 
@@ -343,19 +343,30 @@ impl UpdateWorker {
 
     /// Replaces the running binary with the verified staged update and relaunches the app.
     pub fn apply_ready_update_and_relaunch(&mut self) -> Result<(), String> {
+        self.apply_ready_update_and_relaunch_with_shortcut(false)
+    }
+
+    /// Replaces the running binary with the verified staged update, optionally refreshes the OS
+    /// Desktop shortcut, and relaunches the app.
+    pub fn apply_ready_update_and_relaunch_with_shortcut(
+        &mut self,
+        sync_desktop_shortcut: bool,
+    ) -> Result<(), String> {
         let staged = match &self.status {
             UpdateStatus::ReadyToInstall { staged, .. } => staged.clone(),
             _ => return Err("No verified update is currently staged to install.".to_string()),
         };
-        apply_staged_update_and_relaunch(&staged).map_err(|err| {
-            let msg = err.to_string();
-            self.status = UpdateStatus::Error {
-                message: msg.clone(),
-                release_url: DEFAULT_RELEASES_PAGE_URL.to_string(),
-                was_silent: false,
-            };
-            msg
-        })
+        apply_staged_update_and_relaunch_with_shortcut(&staged, sync_desktop_shortcut).map_err(
+            |err| {
+                let msg = err.to_string();
+                self.status = UpdateStatus::Error {
+                    message: msg.clone(),
+                    release_url: DEFAULT_RELEASES_PAGE_URL.to_string(),
+                    was_silent: false,
+                };
+                msg
+            },
+        )
     }
 }
 

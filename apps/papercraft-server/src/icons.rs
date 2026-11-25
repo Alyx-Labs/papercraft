@@ -428,6 +428,106 @@ fn paint_switch_pill_and_labels(ui: &egui::Ui, args: SwitchPaintArgs<'_>) {
     }
 }
 
+/// Renders an animated boolean pill toggle switch (`36x20`) styled with active theme tokens.
+pub fn toggle_switch(
+    ui: &mut egui::Ui,
+    id_salt: impl egui::AsIdSalt,
+    on: &mut bool,
+    enabled: bool,
+    t: &Tokens,
+) -> egui::Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(36.0, 20.0), sense);
+    if enabled && resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, *on, ""));
+
+    if ui.is_rect_visible(rect) {
+        let anim_t = ui.ctx().animate_value_with_time(
+            ui.make_persistent_id(id_salt),
+            if *on { 1.0 } else { 0.0 },
+            MICRO_DURATION_S,
+        );
+        let alpha = if enabled { 1.0 } else { 0.55 };
+        let track_fill = lerp_color(t.field_bg, t.accent, anim_t).gamma_multiply(alpha);
+        let track_stroke = lerp_color(t.border, t.accent, anim_t).gamma_multiply(alpha);
+        let knob_fill = lerp_color(t.text_muted, Color32::WHITE, anim_t).gamma_multiply(alpha);
+
+        let p = ui.painter();
+        p.rect(
+            rect,
+            CornerRadius::same(10),
+            track_fill,
+            Stroke::new(1.0, track_stroke),
+            StrokeKind::Inside,
+        );
+        let knob_x = egui::lerp((rect.left() + 10.0)..=(rect.right() - 10.0), anim_t);
+        p.circle_filled(pos2(knob_x, rect.center().y), 7.0, knob_fill);
+    }
+
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// Renders a labeled settings row with a clickable label on the left and a right-aligned pill switch.
+pub fn toggle_switch_row(
+    ui: &mut egui::Ui,
+    id_salt: impl egui::AsIdSalt,
+    label: &str,
+    tooltip: &str,
+    on: &mut bool,
+    t: &Tokens,
+) -> egui::Response {
+    let was_on = *on;
+    let switch_w = 36.0_f32;
+    let gap = 8.0_f32;
+    ui.horizontal(|ui| {
+        let label_w = (ui.available_width() - switch_w - gap).max(80.0);
+        let mut label_resp = ui
+            .allocate_ui_with_layout(
+                Vec2::new(label_w, 20.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(label).size(12.0).color(t.text))
+                            .wrap()
+                            .sense(Sense::click()),
+                    )
+                },
+            )
+            .inner
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if !tooltip.is_empty() {
+            label_resp = label_resp.on_hover_text(tooltip);
+        }
+        if label_resp.clicked() {
+            *on = !*on;
+        }
+
+        ui.add_space(gap);
+        let mut switch_resp = toggle_switch(ui, id_salt, on, true, t);
+        if !tooltip.is_empty() {
+            switch_resp = switch_resp.on_hover_text(tooltip);
+        }
+
+        let mut combined = label_resp.union(switch_resp);
+        if *on != was_on {
+            combined.mark_changed();
+        }
+        combined
+    })
+    .inner
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {

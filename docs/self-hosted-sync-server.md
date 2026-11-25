@@ -55,6 +55,14 @@ If you want to run your own sync server with zero command-line flags or environm
   cargo build --release -p papercraft-server
   ```
 
+> [!IMPORTANT]
+> **Place both executables (`papercraft` and `papercraft-server`) in their permanent folder first:**
+>
+> Neither **PaperCraft App** nor **PaperCraft Server** uses a traditional installer. Move each `.exe` (Windows), `.AppImage` (Linux), or `.app` bundle (macOS) out of `Downloads` and into the **permanent, writable folder where you want to keep and run it** (for example `C:\Users\<you>\Apps\PaperCraft\` on Windows, `~/Applications/PaperCraft/` on Linux, or `/Applications` on macOS) before opening it:
+>
+> - On Windows and Linux, portable data (`library/` for the Desktop app, `server_control_config.json` and `server-data/` for the Server) is stored right next to each executable, and in-app self-updates swap the binary in that folder.
+> - Both apps include a **Create Desktop shortcut automatically** switch enabled by default (**Settings -> System -> App Updates** in the Desktop app, and **App Updates** in `papercraft-server`). It creates an idiomatic Desktop shortcut (`.lnk` on Windows, `.desktop` + icon in `XDG_DESKTOP_DIR` on Linux, `.app` symlink on macOS) pointing to that permanent folder and **automatically refreshes the shortcut every time the app updates**.
+
 ### Control Window & System-Tray Behavior
 
 - **Dedicated `Server` | `Users` switch**: Keeps server controls and configuration separate from a dedicated **Users** tab showing a live count badge (`Users (N)`), instant search/filter by name, `@username`, or user ID, UTC join dates, per-account notebook counts, copyable user IDs, per-user **Reset** (generates a random one-time recovery code shown in a prominently copyable card, requiring the user to set a new password at next sign-in) and **Delete** (with inline confirmation) actions, and **Refresh** support even while the server is stopped.
@@ -80,6 +88,8 @@ Every control in `papercraft-server` maps directly to `server_control_config.jso
 | **Background login refresh (hours)** *(Advanced)* | `access_ttl_hours` | `24` (`1..=8760`) | `--access-ttl-hours` / `PAPERCRAFT_ACCESS_TTL_HOURS` |
 | **Start server automatically when this app opens** *(Advanced)* | `auto_start_server` | `true` | — (GUI launcher option) |
 | **Start minimized in the system tray** *(Advanced)* | `start_in_tray` | `false` | — (GUI launcher option) |
+| **Check for updates automatically on startup** *(App Updates)* | `auto_check_updates` | `true` | — (GUI update check) |
+| **Create Desktop shortcut automatically** *(App Updates)* | `auto_create_desktop_shortcut` | `true` | — (GUI Desktop shortcut sync) |
 | **Light / Dark theme toggle** (header icon) | `theme` | `"Dark"` (`"Light"` / `"Dark"`) | — (GUI appearance) |
 
 - **Environment variable import on first launch**: If `server_control_config.json` does not yet exist when `papercraft-server` first starts, any `PAPERCRAFT_*` (or legacy `NOTECRAFT_*`) environment variables already set in your environment are imported automatically as initial defaults.

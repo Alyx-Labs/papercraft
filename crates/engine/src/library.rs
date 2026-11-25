@@ -1864,4 +1864,39 @@ mod tests {
         let reopened = Session::open_library(dir);
         assert!(!reopened.prefs.auto_check_updates);
     }
+
+    #[test]
+    fn desktop_shortcut_preference_persists_and_skips_doc_timestamp() {
+        let legacy: UserStudioConfig = serde_json::from_str(r#"{"theme":"Dark"}"#).unwrap();
+        assert!(legacy.auto_create_desktop_shortcut);
+
+        let guard = temp_lib_dir("desktop_shortcut_pref");
+        let dir = guard.0.clone();
+
+        {
+            let mut session = Session::open_library(dir.clone());
+            assert!(session.prefs.auto_create_desktop_shortcut);
+            let before_modified = session.doc.updated_at_ms;
+
+            let res = session
+                .execute("updates.setDesktopShortcut", &json!({ "enabled": false }))
+                .unwrap();
+            assert_eq!(res["auto_create_desktop_shortcut"], false);
+            assert!(!session.prefs.auto_create_desktop_shortcut);
+            assert_eq!(session.doc.updated_at_ms, before_modified);
+            assert!(
+                session
+                    .execute("updates.setDesktopShortcut", &json!({}))
+                    .is_err()
+            );
+        }
+
+        let mut reopened = Session::open_library(dir);
+        assert!(!reopened.prefs.auto_create_desktop_shortcut);
+        let res_on = reopened
+            .execute("updates.setDesktopShortcut", &json!({ "enabled": true }))
+            .unwrap();
+        assert_eq!(res_on["auto_create_desktop_shortcut"], true);
+        assert!(reopened.prefs.auto_create_desktop_shortcut);
+    }
 }

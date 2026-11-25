@@ -115,7 +115,7 @@ pub(crate) fn render_body(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens
                 t.success_fg,
                 Icon::CheckCircle,
                 "Download verified (SHA-256)",
-                "PaperCraft will save any open notebooks, install the new version, and relaunch automatically.",
+                "PaperCraft will save any open notebooks, install the new version, refresh your Desktop shortcut, and relaunch automatically.",
                 false,
                 t,
             );

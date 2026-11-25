@@ -256,6 +256,13 @@ fn install_platform_hooks() -> (Option<papercraft_tablet::windows::Monitor>, Pla
             }
         })),
         paste_poll: Some(Box::new(papercraft_tablet::windows::take_paste_requested)),
+        sync_desktop_shortcut: Some(Box::new(|enabled| {
+            papercraft_updater::sync_desktop_shortcut(
+                papercraft_updater::AppId::PaperCraft,
+                enabled,
+            )
+            .map(|outcome| outcome.status_message())
+        })),
         enable_auto_update_check: true,
         ..PlatformHooks::default()
     };

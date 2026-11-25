@@ -7344,6 +7344,10 @@ fn default_auto_check_updates() -> bool {
     true
 }
 
+fn default_auto_create_desktop_shortcut() -> bool {
+    true
+}
+
 fn default_pen_sizes() -> [f32; 5] {
     UserStudioConfig::DEFAULT_PEN_SIZES
 }
@@ -7591,6 +7595,8 @@ pub struct UserStudioConfig {
     pub stylus_only_drawing: bool,
     #[serde(default = "default_auto_check_updates")]
     pub auto_check_updates: bool,
+    #[serde(default = "default_auto_create_desktop_shortcut")]
+    pub auto_create_desktop_shortcut: bool,
 }
 
 impl Default for UserStudioConfig {
@@ -7620,6 +7626,7 @@ impl Default for UserStudioConfig {
             stylus_buttons: StylusButtonConfig::default(),
             stylus_only_drawing: false,
             auto_check_updates: default_auto_check_updates(),
+            auto_create_desktop_shortcut: default_auto_create_desktop_shortcut(),
         }
     }
 }
@@ -8055,6 +8062,7 @@ impl UserStudioConfig {
             stylus_buttons: self.stylus_buttons.sanitized(),
             stylus_only_drawing: self.stylus_only_drawing,
             auto_check_updates: self.auto_check_updates,
+            auto_create_desktop_shortcut: self.auto_create_desktop_shortcut,
         }
     }
 }
@@ -9302,5 +9310,24 @@ mod tests {
             clean.stylus_buttons.eraser_end,
             StylusButtonAction::EraserHold
         );
+    }
+
+    #[test]
+    fn auto_create_desktop_shortcut_defaults_true_and_roundtrips() {
+        let def = UserStudioConfig::default();
+        assert!(def.auto_create_desktop_shortcut);
+
+        let legacy: UserStudioConfig = serde_json::from_str("{}").expect("legacy studio config");
+        assert!(legacy.auto_create_desktop_shortcut);
+
+        let disabled = UserStudioConfig {
+            auto_create_desktop_shortcut: false,
+            ..UserStudioConfig::default()
+        };
+        let encoded = serde_json::to_string(&disabled).expect("serialize studio config");
+        let decoded: UserStudioConfig =
+            serde_json::from_str(&encoded).expect("deserialize studio config");
+        assert!(!decoded.auto_create_desktop_shortcut);
+        assert!(!decoded.sanitized().auto_create_desktop_shortcut);
     }
 }

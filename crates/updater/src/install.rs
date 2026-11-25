@@ -479,12 +479,26 @@ pub fn spawn_relaunched_app(launch_path: &Path, format: AssetFormat) -> Result<(
 
 /// Installs `staged` in place and launches the updated process.
 pub fn apply_staged_update_and_relaunch(staged: &StagedUpdate) -> Result<(), UpdateError> {
+    apply_staged_update_and_relaunch_with_shortcut(staged, false)
+}
+
+/// Installs `staged` in place, refreshes the OS Desktop shortcut when requested, and relaunches.
+pub fn apply_staged_update_and_relaunch_with_shortcut(
+    staged: &StagedUpdate,
+    sync_desktop_shortcut: bool,
+) -> Result<(), UpdateError> {
     let launch_path = replace_binary_on_disk(
         &staged.staged_path,
         &staged.target_path,
         staged.format,
         staged.app,
     )?;
+    if sync_desktop_shortcut
+        && let Err(err) =
+            crate::shortcut::sync_desktop_shortcut_for_target(staged.app, &launch_path, true)
+    {
+        log::warn!("Update succeeded, but refreshing the Desktop shortcut failed: {err}");
+    }
     spawn_relaunched_app(&launch_path, staged.format)
 }
 

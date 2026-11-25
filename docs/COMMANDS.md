@@ -95,6 +95,9 @@ cargo build --release --target x86_64-unknown-linux-gnu -p papercraft -p papercr
 
 You can also double-click `target\release\papercraft.exe` in Windows Explorer or copy the binary to any folder—it is a self-contained pure-Rust executable.
 
+> [!TIP]
+> **Choose a permanent folder before regular use:** Whether you downloaded `papercraft` from GitHub Releases or copied `target\release\papercraft` (Windows `.exe`, Linux `.AppImage`, or macOS `.app`), place it directly in the permanent folder where you want to keep it (for example `C:\Apps\PaperCraft\`, `~/Applications/PaperCraft/`, or `/Applications`). On Windows and Linux, notebooks live in `library/` right beside the executable, in-app updates replace the binary in place there, and the **Create Desktop shortcut automatically** switch (**Settings -> System -> App Updates**) creates an OS-native Desktop shortcut pointing to that location and refreshes it automatically whenever the app updates.
+
 ---
 
 ## 3. Web App (`papercraft-web` — WebAssembly)
@@ -170,7 +173,7 @@ cargo build --release -p papercraft-server
 ```
 
 - Runs in the OS system tray with a minimalist control window (closing the window or clicking **Hide to Tray** hides it while keeping the server running; use **Quit** in the footer or tray menu to flush `redb` and exit cleanly).
-- Persists settings automatically in `<executable_dir>\server_control_config.json` and stores the database by default in `<executable_dir>\server-data` (or any directory selected via **Browse...**).
+- Place `papercraft-server` (`.exe`, `.AppImage`, or macOS `.app`) in the permanent folder where you want to keep and run it before launching: settings persist in `<executable_dir>\server_control_config.json`, the default database lives in `<executable_dir>\server-data` (or any directory chosen via **Browse...**), and the **Create Desktop shortcut automatically** switch under **App Updates** keeps an OS Desktop shortcut pointed at that permanent path (and refreshes it automatically on every update).
 
 ### 4.2 Headless CLI Server (`papercraft-server-cli`) — Development Mode
 
@@ -322,3 +325,6 @@ scripts\generate-branding.cmd
 | `<executable_dir>\library\` | Portable Desktop local notebooks, preferences, and sync session next to `papercraft.exe` |
 | `<executable_dir>\server_control_config.json` | Persisted GUI settings for `papercraft-server` (location, network scope, port, sign-ups, limits, tray/theme options) |
 | `<executable_dir>\server-data\` | Default portable database directory (`papercraft.redb` and `server_meta.json`) created by `papercraft-server` unless changed in the UI |
+
+> [!TIP]
+> **Portable folder tip:** When using downloaded or compiled release binaries of **`papercraft`** and **`papercraft-server`**, copy each executable (`.exe` / `.AppImage`) or `.app` bundle into the permanent, writable folder where you plan to keep it (rather than running from `Downloads` or read-only system paths like `C:\Program Files`). Portable data, in-app updates, and the **Create Desktop shortcut automatically** switch all target that folder and refresh the Desktop shortcut on every update.

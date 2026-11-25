@@ -8,6 +8,7 @@ use crate::controller::{
 };
 use crate::icons::{
     Icon, SwitchOption, icon_button, icon_button_width, paint_icon, segmented_switch,
+    toggle_switch_row,
 };
 use crate::settings::{
     MAX_ACCESS_TTL_HOURS, MAX_MAX_NOTEBOOK_MB, MAX_REFRESH_TTL_DAYS, MIN_ACCESS_TTL_HOURS,
@@ -663,7 +664,7 @@ fn render_update_ready_box(
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(
-                        "Stops sync server safely, swaps the binary, and relaunches.",
+                        "Stops sync server safely, swaps the binary, refreshes your Desktop shortcut, and relaunches.",
                     )
                     .size(11.0)
                     .color(t.text_muted),
@@ -816,6 +817,42 @@ fn render_updates_card_with_status(
             .size(11.0)
             .color(t.text_muted),
         );
+
+        ui.add_space(8.0);
+        let mut shortcut_on = ctrl.draft_settings.auto_create_desktop_shortcut;
+        let shortcut_resp = toggle_switch_row(
+            ui,
+            "srv_desktop_shortcut_switch",
+            "Create Desktop shortcut automatically",
+            "Keep a Desktop shortcut pointing to PaperCraft Server and refresh it automatically after updates.",
+            &mut shortcut_on,
+            t,
+        );
+        if shortcut_resp.changed() {
+            ctrl.set_desktop_shortcut_enabled(shortcut_on);
+        }
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!(
+                    "{} Also refreshed automatically whenever PaperCraft Server updates. Keep the executable in the permanent folder where you want to use it.",
+                    papercraft_updater::shortcut_architecture_hint()
+                ))
+                .size(11.0)
+                .color(t.text_muted),
+            )
+            .wrap(),
+        );
+        if let Some((is_err, ref msg)) = ctrl.desktop_shortcut_feedback {
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(egui::RichText::new(msg).size(11.0).color(if is_err {
+                    t.danger_fg
+                } else {
+                    t.success_fg
+                }))
+                .wrap(),
+            );
+        }
     });
 }
 
@@ -2592,5 +2629,138 @@ mod tests {
         out_ready.drop_without_applying_deltas();
         assert!(text_ready.contains("Stop Server, Install & Restart"));
         assert!(y_ready_hdr < y_ready && y_ready < y_ready_chk);
+    }
+
+    #[test]
+    fn desktop_shortcut_switch_renders_below_auto_check_and_invokes_hook() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = temp_dir("desktop-shortcut-switch");
+        let cfg_path = dir.0.join(CONFIG_FILE_NAME);
+        let settings = crate::settings::ServerControlSettings {
+            data_dir: dir.0.join("vault").to_string_lossy().into_owned(),
+            port: 18948,
+            auto_start_server: false,
+            theme: UiTheme::Dark,
+            ..Default::default()
+        };
+        settings.save_atomic(&cfg_path).unwrap();
+
+        let calls = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let calls_hook = Arc::clone(&calls);
+        let mut ctrl = ServerController::new(cfg_path.clone(), false);
+        ctrl.set_desktop_shortcut_sync(Box::new(move |enabled| {
+            calls_hook
+                .lock()
+                .map_err(|err| err.to_string())?
+                .push(enabled);
+            Ok(if enabled {
+                "Server shortcut ready (mock).".to_string()
+            } else {
+                "Server shortcut removed (mock).".to_string()
+            })
+        }));
+
+        let find_rect = |shapes: &[egui::epaint::ClippedShape], needle: &str| -> Option<Rect> {
+            fn visit(shape: &Shape, needle: &str) -> Option<Rect> {
+                match shape {
+                    Shape::Text(t) if t.galley.text().contains(needle) => {
+                        Some(Rect::from_min_size(t.pos, t.galley.size()))
+                    }
+                    Shape::Vec(items) => items.iter().find_map(|s| visit(s, needle)),
+                    _ => None,
+                }
+            }
+            shapes.iter().find_map(|c| visit(&c.shape, needle))
+        };
+
+        let ctx = egui::Context::default();
+        apply_visuals(&ctx, ctrl.theme());
+        let tokens = Tokens::for_theme(ctrl.theme());
+        let idle = papercraft_updater::UpdateStatus::Idle;
+        let run_frame = |ctrl: &mut ServerController, t: f64, events: Vec<egui::Event>| {
+            let out = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(620.0, 1450.0))),
+                    time: Some(t),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let _ = render_window_with_update_status(ctrl, ui, &tokens, &idle);
+                },
+            );
+            let shapes = out.shapes.clone();
+            out.drop_without_applying_deltas();
+            shapes
+        };
+
+        let _ = run_frame(&mut ctrl, 1.0, Vec::new());
+        let shapes = run_frame(&mut ctrl, 1.05, Vec::new());
+        let y_auto_chk =
+            find_text_y(&shapes, "Check for updates automatically on startup").unwrap();
+        let shortcut_rect = find_rect(&shapes, "Create Desktop shortcut automatically").unwrap();
+        assert!(y_auto_chk < shortcut_rect.min.y);
+
+        let pos = shortcut_rect.center();
+        let _ = run_frame(
+            &mut ctrl,
+            1.10,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let shapes_off = run_frame(
+            &mut ctrl,
+            1.14,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!ctrl.draft_settings.auto_create_desktop_shortcut);
+        assert!(find_rect(&shapes_off, "Server shortcut removed (mock).").is_some());
+
+        let pos_on = find_rect(&shapes_off, "Create Desktop shortcut automatically")
+            .unwrap()
+            .center();
+        let _ = run_frame(
+            &mut ctrl,
+            1.20,
+            vec![
+                egui::Event::PointerMoved(pos_on),
+                egui::Event::PointerButton {
+                    pos: pos_on,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let shapes_on = run_frame(
+            &mut ctrl,
+            1.24,
+            vec![egui::Event::PointerButton {
+                pos: pos_on,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(ctrl.draft_settings.auto_create_desktop_shortcut);
+        assert!(find_rect(&shapes_on, "Server shortcut ready (mock).").is_some());
+        assert_eq!(*calls.lock().unwrap(), vec![false, true]);
+
+        let (reloaded, warning) = crate::settings::ServerControlSettings::load_or_init(&cfg_path);
+        assert!(warning.is_none());
+        assert!(reloaded.auto_create_desktop_shortcut);
     }
 }

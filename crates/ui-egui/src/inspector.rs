@@ -612,6 +612,42 @@ fn draw_app_updates_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens)
         );
 
         ui.add_space(8.0);
+        let mut desktop_shortcut = app.session.prefs.auto_create_desktop_shortcut;
+        let shortcut_resp = crate::icons::toggle_switch_row(
+            ui,
+            "settings_desktop_shortcut_switch",
+            "Create Desktop shortcut automatically",
+            "Keep a Desktop shortcut pointing to PaperCraft and refresh it automatically after updates.",
+            &mut desktop_shortcut,
+            t,
+        );
+        if shortcut_resp.changed() {
+            app.set_desktop_shortcut_enabled(desktop_shortcut);
+        }
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!(
+                    "{} Also refreshed automatically whenever PaperCraft updates. Place the app in the permanent folder where you want to keep it.",
+                    papercraft_updater::shortcut_architecture_hint()
+                ))
+                .size(11.0)
+                .color(t.text_muted),
+            )
+            .wrap(),
+        );
+        if let Some((is_err, ref msg)) = app.view.desktop_shortcut_feedback {
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(msg)
+                        .size(11.0)
+                        .color(if is_err { t.danger_fg } else { t.success_fg }),
+                )
+                .wrap(),
+            );
+        }
+
+        ui.add_space(8.0);
         let (status_line, status_color) = match &status {
             UpdateStatus::Idle => ("Ready to check for updates.".to_string(), t.text_muted),
             UpdateStatus::Checking { .. } => {
@@ -1775,5 +1811,87 @@ mod tests {
         let _ =
             auto_contrast_ui_tests::click_at(&ctx, &mut app, check_rect_on.center(), &mut time_s);
         assert!(!app.session.prefs.stylus_only_drawing);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn desktop_shortcut_switch_renders_on_system_tab_and_invokes_hook() {
+        use std::sync::{Arc, Mutex};
+
+        let calls = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let calls_hook = Arc::clone(&calls);
+
+        let ctx = egui::Context::default();
+        let hooks = crate::PlatformHooks {
+            sync_desktop_shortcut: Some(Box::new(move |enabled| {
+                calls_hook
+                    .lock()
+                    .map_err(|err| err.to_string())?
+                    .push(enabled);
+                Ok(if enabled {
+                    "Desktop shortcut active (mock).".to_string()
+                } else {
+                    "Desktop shortcut removed (mock).".to_string()
+                })
+            })),
+            ..crate::PlatformHooks::default()
+        };
+        let mut app = PaperCraftApp::new(papercraft_engine::Session::default(), hooks);
+        app.view.screen = crate::AppScreen::Editor;
+        app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
+        app.view.inspector_open = true;
+        app.view.settings_tab = SettingsTab::System;
+        assert!(app.session.prefs.auto_create_desktop_shortcut);
+
+        let mut time_s = 1.0_f64;
+        let _ = auto_contrast_ui_tests::run_editor_frame(
+            &ctx,
+            &mut app,
+            auto_contrast_ui_tests::base_input(),
+            &mut time_s,
+        );
+        let shapes = auto_contrast_ui_tests::run_editor_frame(
+            &ctx,
+            &mut app,
+            auto_contrast_ui_tests::base_input(),
+            &mut time_s,
+        );
+        let switch_label = auto_contrast_ui_tests::find_text_rect_in_shapes(
+            &shapes,
+            "Create Desktop shortcut automatically",
+        )
+        .expect("Desktop shortcut switch should render in System settings");
+
+        let shapes_off =
+            auto_contrast_ui_tests::click_at(&ctx, &mut app, switch_label.center(), &mut time_s);
+        assert!(!app.session.prefs.auto_create_desktop_shortcut);
+        assert!(
+            auto_contrast_ui_tests::find_text_rect_in_shapes(
+                &shapes_off,
+                "Desktop shortcut removed (mock)."
+            )
+            .is_some()
+        );
+
+        let switch_label_off = auto_contrast_ui_tests::find_text_rect_in_shapes(
+            &shapes_off,
+            "Create Desktop shortcut automatically",
+        )
+        .expect("Desktop shortcut switch should stay visible when turned off");
+        let shapes_on = auto_contrast_ui_tests::click_at(
+            &ctx,
+            &mut app,
+            switch_label_off.center(),
+            &mut time_s,
+        );
+        assert!(app.session.prefs.auto_create_desktop_shortcut);
+        assert!(
+            auto_contrast_ui_tests::find_text_rect_in_shapes(
+                &shapes_on,
+                "Desktop shortcut active (mock)."
+            )
+            .is_some()
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![false, true]);
     }
 }

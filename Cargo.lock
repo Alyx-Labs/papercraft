@@ -3229,6 +3229,7 @@ name = "papercraft-updater"
 version = "0.2.4"
 dependencies = [
  "log",
+ "papercraft-tablet",
  "serde",
  "serde_json",
  "sha2",

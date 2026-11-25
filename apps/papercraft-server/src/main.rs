@@ -165,6 +165,14 @@ fn main() -> eframe::Result {
         native_options,
         Box::new(move |cc| {
             controller.set_repaint_ctx(cc.egui_ctx.clone());
+            controller.set_desktop_shortcut_sync(Box::new(|enabled| {
+                papercraft_updater::sync_desktop_shortcut(
+                    papercraft_updater::AppId::PaperCraftServer,
+                    enabled,
+                )
+                .map(|outcome| outcome.status_message())
+            }));
+            controller.sync_desktop_shortcut_on_startup_if_enabled();
             controller.start_startup_update_check_if_enabled();
             let (tray_tx, tray_rx) = mpsc::channel();
             let tray = TrayController::try_new(

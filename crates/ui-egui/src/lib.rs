@@ -419,6 +419,7 @@ pub struct ViewState {
     pub first_access_nickname: String,
     pub first_access_error: Option<String>,
     pub first_access_focus_pending: bool,
+    pub desktop_shortcut_feedback: Option<(bool, String)>,
 }
 
 impl Default for ViewState {
@@ -601,6 +602,7 @@ impl Default for ViewState {
             first_access_nickname: String::new(),
             first_access_error: None,
             first_access_focus_pending: false,
+            desktop_shortcut_feedback: None,
         }
     }
 }
@@ -719,6 +721,7 @@ pub type ClipboardTextFn = Box<dyn FnMut() -> Option<String>>;
 pub type SetClipboardTextFn = Box<dyn FnMut(&str)>;
 pub type OpenUrlFn = Box<dyn FnMut(&str)>;
 pub type PastePollFn = Box<dyn FnMut() -> bool>;
+pub type SyncDesktopShortcutFn = Box<dyn FnMut(bool) -> Result<String, String>>;
 
 #[derive(Default)]
 pub struct PlatformHooks {
@@ -748,6 +751,7 @@ pub struct PlatformHooks {
     pub set_clipboard_text: Option<SetClipboardTextFn>,
     pub open_url: Option<OpenUrlFn>,
     pub paste_poll: Option<PastePollFn>,
+    pub sync_desktop_shortcut: Option<SyncDesktopShortcutFn>,
     pub enable_auto_update_check: bool,
 }
 
@@ -872,6 +876,8 @@ pub struct PaperCraftApp {
     #[cfg(not(target_arch = "wasm32"))]
     startup_update_checked: bool,
     #[cfg(not(target_arch = "wasm32"))]
+    startup_desktop_shortcut_synced: bool,
+    #[cfg(not(target_arch = "wasm32"))]
     pdf_import_job: Option<PendingPdfImportState>,
     last_ctx: Option<egui::Context>,
     frame_counter: u64,
@@ -944,6 +950,8 @@ impl PaperCraftApp {
             ),
             #[cfg(not(target_arch = "wasm32"))]
             startup_update_checked: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            startup_desktop_shortcut_synced: false,
             #[cfg(not(target_arch = "wasm32"))]
             pdf_import_job: None,
             last_ctx: None,
@@ -2357,6 +2365,16 @@ impl PaperCraftApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn pump_updater(&mut self, ctx: &egui::Context) {
+        if !self.startup_desktop_shortcut_synced {
+            self.startup_desktop_shortcut_synced = true;
+            #[cfg(not(debug_assertions))]
+            if self.session.prefs.auto_create_desktop_shortcut
+                && let Some(sync_fn) = self.hooks.sync_desktop_shortcut.as_mut()
+                && let Err(err) = sync_fn(true)
+            {
+                log::warn!("Startup Desktop shortcut sync failed: {err}");
+            }
+        }
         if self.updater.poll() {
             ctx.request_repaint();
         }
@@ -2368,6 +2386,19 @@ impl PaperCraftApp {
         }
         if self.updater.is_busy() {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_desktop_shortcut_enabled(&mut self, enabled: bool) {
+        let _ = self
+            .session
+            .execute("updates.setDesktopShortcut", &json!({ "enabled": enabled }));
+        if let Some(sync_fn) = self.hooks.sync_desktop_shortcut.as_mut() {
+            match sync_fn(enabled) {
+                Ok(msg) => self.view.desktop_shortcut_feedback = Some((false, msg)),
+                Err(err) => self.view.desktop_shortcut_feedback = Some((true, err)),
+            }
         }
     }
 
@@ -2400,7 +2431,8 @@ impl PaperCraftApp {
         self.session.cancel_live_eraser();
         self.flush_pending_autosaves();
         self.sync_worker.shutdown();
-        self.updater.apply_ready_update_and_relaunch()?;
+        self.updater
+            .apply_ready_update_and_relaunch_with_shortcut(true)?;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         Ok(())
     }

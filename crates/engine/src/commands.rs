@@ -482,6 +482,11 @@ const COMMANDS: &[CommandSpec] = &[
         description: "Enable or disable checking for official PaperCraft releases automatically on startup",
     },
     CommandSpec {
+        id: "updates.setDesktopShortcut",
+        label: "Toggle Desktop Shortcut",
+        description: "Automatically create or remove the PaperCraft Desktop shortcut and refresh it after updates",
+    },
+    CommandSpec {
         id: "sync.status",
         label: "Get Sync Status",
         description: "Return the current account session, server URL, and pending synchronization count",
@@ -1284,6 +1289,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
         "stylus.setButtons" => cmd_stylus_set_buttons(session, id, params),
         "stylus.setInputMode" => cmd_stylus_set_input_mode(session, id, params),
         "updates.setAutoCheck" => cmd_updates_set_auto_check(session, id, params),
+        "updates.setDesktopShortcut" => cmd_updates_set_desktop_shortcut(session, id, params),
         "sync.status" => cmd_sync_status(session),
         "sync.setServerUrl" => cmd_sync_set_server_url(session, id, params),
         "sync.signOut" => cmd_sync_sign_out(session),
@@ -1307,6 +1313,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
             || id == "stylus.setButtons"
             || id == "stylus.setInputMode"
             || id == "updates.setAutoCheck"
+            || id == "updates.setDesktopShortcut"
             || id.starts_with("library.")
             || id.starts_with("template.")
         {
@@ -1321,6 +1328,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
                     | "stylus.setButtons"
                     | "stylus.setInputMode"
                     | "updates.setAutoCheck"
+                    | "updates.setDesktopShortcut"
                     | "library.setViewPrefs"
                     | "library.folder.setColor"
                     | "library.tag.setColor"
@@ -6021,6 +6029,25 @@ fn cmd_updates_set_auto_check(
     session.bump_revision();
     Ok(json!({
         "auto_check_updates": session.prefs.auto_check_updates,
+    }))
+}
+
+#[derive(Deserialize)]
+struct SetDesktopShortcutParams {
+    enabled: bool,
+}
+
+fn cmd_updates_set_desktop_shortcut(
+    session: &mut Session,
+    id: &str,
+    params: &Value,
+) -> Result<Value, EngineError> {
+    let p: SetDesktopShortcutParams = parse_params(id, params)?;
+    session.prefs.auto_create_desktop_shortcut = p.enabled;
+    let _ = session.save_prefs();
+    session.bump_revision();
+    Ok(json!({
+        "auto_create_desktop_shortcut": session.prefs.auto_create_desktop_shortcut,
     }))
 }
 

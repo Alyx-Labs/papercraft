@@ -103,6 +103,14 @@ Pre-built binaries are published on [GitHub Releases (`v0.2.4`)](https://github.
   </tr>
 </table>
 
+> [!IMPORTANT]
+> **Portable setup & where to place the files (`papercraft` and `papercraft-server`):**
+>
+> Both **PaperCraft App** and **PaperCraft Server** ship as self-contained portable applications with no separate installer. Before launching them for the first time, **move each executable (`.exe` / `.AppImage`) or `.app` bundle into the permanent, writable folder where you want to keep and run it** (for example `C:\Users\<you>\Apps\PaperCraft\` on Windows, `~/Applications/PaperCraft/` on Linux, or `/Applications` on macOS — avoid running from a temporary `Downloads` folder or read-only system directories like `C:\Program Files`):
+>
+> - **Portable data & updates live right next to the executable:** On Windows and Linux, the Desktop app creates `library/` and the Server creates `server_control_config.json` and `server-data/` beside the executable (and on all platforms, in-app updates replace that file in place).
+> - **Automatic Desktop shortcut:** Both apps have a **Create Desktop shortcut automatically** switch enabled by default (**Settings -> System -> App Updates** in the Desktop app, and **App Updates** in `papercraft-server`). It creates a native launcher (`PaperCraft.lnk` / `PaperCraft Server.lnk` on Windows, a `.desktop` launcher + icon in `XDG_DESKTOP_DIR` on Linux, or a `.app` link on macOS) pointing to that permanent folder, and **automatically refreshes the shortcut whenever the app updates** so you never have to search for the executable.
+
 <details>
 <summary><b>WebAssembly bundle, SHA-256 checksums, headless CLI server, and platform notes</b></summary>
 
@@ -297,6 +305,7 @@ Install the Rust toolchain (**1.95+**, via [rustup](https://rustup.rs/)), clone 
   ```bash
   cargo build --release -p papercraft
   ```
+- **Permanent folder & Desktop shortcut:** Before your first everyday launch, move the portable executable (`.exe` / `.AppImage` / `.app`) to the permanent folder where you want to keep it—your `library/` folder and in-place updates stay right beside it, and **Create Desktop shortcut automatically** (**Settings -> System -> App Updates**) keeps an OS Desktop launcher pointed there and refreshes it automatically after every update.
 - **Linux optional helpers:** Install `zenity` or `kdialog` for native file open/save dialogs, and `wl-clipboard` (Wayland) or `xclip`/`xsel` (X11) for clipboard text/image paste.
 - **macOS note:** Release binaries are built in CI for `aarch64-apple-darwin`, but macOS has not yet been tested on real Mac hardware—if you run PaperCraft on macOS, please share test feedback or issues!
 
@@ -364,7 +373,7 @@ However, the **recommended everyday setup** is to keep the lightweight **`paperc
 - **Pick your data folder visually**: browse for where `papercraft.redb` is stored (defaults to `<executable_dir>/server-data`).
 - **Choose who can connect**: switch between **This PC only** (`127.0.0.1`), **Local network / VPN** (`0.0.0.0`), or **Custom IP**, plus port (default `8787`), with 1-click **Copy** buttons for client URLs.
 - **Manage sign-ups & advanced limits**: toggle **Allow new account sign-ups**, inspect live account/notebook/device counts, and adjust upload size, token lifetimes, or startup behavior under **Advanced settings**.
-- **Tray-friendly & persistent**: closing the window hides it to the system tray while keeping the server running (use **Quit** to flush and stop cleanly); settings save automatically in `server_control_config.json`.
+- **Tray-friendly, portable & persistent:** Place `papercraft-server` in the permanent folder where you want to store its config (`server_control_config.json`) and default database (`server-data/`). Closing the window hides it to the system tray while keeping the server running (use **Quit** to flush and stop cleanly). Under **App Updates**, **Create Desktop shortcut automatically** creates a Desktop launcher pointing to that folder and refreshes it automatically on every update.
 
 ```bash
 # Run in development mode

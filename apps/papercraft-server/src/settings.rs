@@ -81,9 +81,15 @@ pub struct ServerControlSettings {
     pub theme: UiTheme,
     #[serde(default = "default_auto_check_updates")]
     pub auto_check_updates: bool,
+    #[serde(default = "default_auto_create_desktop_shortcut")]
+    pub auto_create_desktop_shortcut: bool,
 }
 
 fn default_auto_check_updates() -> bool {
+    true
+}
+
+fn default_auto_create_desktop_shortcut() -> bool {
     true
 }
 
@@ -102,6 +108,7 @@ impl Default for ServerControlSettings {
             start_in_tray: false,
             theme: UiTheme::Dark,
             auto_check_updates: default_auto_check_updates(),
+            auto_create_desktop_shortcut: default_auto_create_desktop_shortcut(),
         }
     }
 }
@@ -593,12 +600,17 @@ mod tests {
             start_in_tray: true,
             theme: UiTheme::Dark,
             auto_check_updates: false,
+            auto_create_desktop_shortcut: false,
         };
 
         original.save_atomic(&cfg_path).unwrap();
         let (loaded, warning) = ServerControlSettings::load_or_init(&cfg_path);
         assert!(warning.is_none());
         assert_eq!(loaded, original);
+
+        let legacy: ServerControlSettings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.auto_check_updates);
+        assert!(legacy.auto_create_desktop_shortcut);
     }
 
     #[test]

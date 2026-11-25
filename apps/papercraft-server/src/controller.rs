@@ -53,6 +53,8 @@ pub struct NoticeBanner {
     pub text: String,
 }
 
+pub type DesktopShortcutSyncFn = Box<dyn FnMut(bool) -> Result<String, String>>;
+
 pub struct ServerController {
     pub config_path: PathBuf,
     pub saved_settings: ServerControlSettings,
@@ -82,6 +84,8 @@ pub struct ServerController {
     server_stopped_rx: mpsc::Receiver<(u64, Result<(), String>)>,
     run_generation: u64,
     pub updater: UpdateWorker,
+    pub desktop_shortcut_feedback: Option<(bool, String)>,
+    desktop_shortcut_sync: Option<DesktopShortcutSyncFn>,
 }
 
 impl ServerController {
@@ -123,6 +127,8 @@ impl ServerController {
             server_stopped_rx,
             run_generation: 0,
             updater: UpdateWorker::new(AppId::PaperCraftServer, env!("CARGO_PKG_VERSION")),
+            desktop_shortcut_feedback: None,
+            desktop_shortcut_sync: None,
         };
 
         if auto_start {
@@ -149,6 +155,31 @@ impl ServerController {
     pub fn start_startup_update_check_if_enabled(&mut self) {
         if self.draft_settings.auto_check_updates {
             self.updater.check_now(true, self.updater_notify_cb());
+        }
+    }
+
+    pub fn set_desktop_shortcut_sync(&mut self, hook: DesktopShortcutSyncFn) {
+        self.desktop_shortcut_sync = Some(hook);
+    }
+
+    pub fn set_desktop_shortcut_enabled(&mut self, enabled: bool) {
+        self.draft_settings.auto_create_desktop_shortcut = enabled;
+        self.auto_save_settings();
+        if let Some(sync_fn) = self.desktop_shortcut_sync.as_mut() {
+            match sync_fn(enabled) {
+                Ok(msg) => self.desktop_shortcut_feedback = Some((false, msg)),
+                Err(err) => self.desktop_shortcut_feedback = Some((true, err)),
+            }
+        }
+    }
+
+    pub fn sync_desktop_shortcut_on_startup_if_enabled(&mut self) {
+        #[cfg(not(debug_assertions))]
+        if self.draft_settings.auto_create_desktop_shortcut
+            && let Some(sync_fn) = self.desktop_shortcut_sync.as_mut()
+            && let Err(err) = sync_fn(true)
+        {
+            log::warn!("Startup Desktop shortcut sync failed: {err}");
         }
     }
 
@@ -182,7 +213,8 @@ impl ServerController {
     }
 
     pub fn apply_ready_update_and_relaunch(&mut self) -> Result<(), String> {
-        self.updater.apply_ready_update_and_relaunch()
+        self.updater
+            .apply_ready_update_and_relaunch_with_shortcut(true)
     }
 
     pub fn is_running(&self) -> bool {
@@ -313,10 +345,14 @@ impl ServerController {
 
     pub fn reset_defaults(&mut self) {
         let current_theme = self.draft_settings.theme;
+        let prev_shortcut = self.draft_settings.auto_create_desktop_shortcut;
         self.draft_settings = ServerControlSettings {
             theme: current_theme,
             ..ServerControlSettings::default()
         };
+        if prev_shortcut != self.draft_settings.auto_create_desktop_shortcut {
+            self.set_desktop_shortcut_enabled(self.draft_settings.auto_create_desktop_shortcut);
+        }
         self.notice_banner = Some(NoticeBanner {
             tone: NoticeTone::Info,
             text: "Restored default settings.".to_string(),
@@ -872,5 +908,55 @@ mod tests {
         assert_eq!(ctrl.users_snapshot.len(), 1);
         assert_eq!(ctrl.users_snapshot[0].user_id, alice_id);
         ctrl.stop_server();
+    }
+
+    #[test]
+    fn controller_toggles_desktop_shortcut_persists_and_records_feedback() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = temp_dir("desktop_shortcut_ctrl");
+        let cfg_path = dir.0.join(CONFIG_FILE_NAME);
+        let settings = ServerControlSettings {
+            data_dir: dir.0.join("vault").to_string_lossy().into_owned(),
+            auto_start_server: false,
+            ..ServerControlSettings::default()
+        };
+        settings.save_atomic(&cfg_path).unwrap();
+
+        let calls = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let calls_hook = Arc::clone(&calls);
+
+        let mut ctrl = ServerController::new(cfg_path.clone(), false);
+        assert!(ctrl.draft_settings.auto_create_desktop_shortcut);
+        ctrl.set_desktop_shortcut_sync(Box::new(move |enabled| {
+            calls_hook
+                .lock()
+                .map_err(|err| err.to_string())?
+                .push(enabled);
+            Ok(if enabled {
+                "Server shortcut created (mock).".to_string()
+            } else {
+                "Server shortcut removed (mock).".to_string()
+            })
+        }));
+
+        ctrl.set_desktop_shortcut_enabled(false);
+        assert!(!ctrl.draft_settings.auto_create_desktop_shortcut);
+        assert_eq!(
+            ctrl.desktop_shortcut_feedback.as_ref(),
+            Some(&(false, "Server shortcut removed (mock).".to_string()))
+        );
+
+        let (reloaded, warning) = ServerControlSettings::load_or_init(&cfg_path);
+        assert!(warning.is_none());
+        assert!(!reloaded.auto_create_desktop_shortcut);
+
+        ctrl.set_desktop_shortcut_enabled(true);
+        assert!(ctrl.draft_settings.auto_create_desktop_shortcut);
+        assert_eq!(
+            ctrl.desktop_shortcut_feedback.as_ref(),
+            Some(&(false, "Server shortcut created (mock).".to_string()))
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![false, true]);
     }
 }

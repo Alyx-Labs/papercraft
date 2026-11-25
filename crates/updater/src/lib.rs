@@ -18,6 +18,8 @@ pub mod client;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod install;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod shortcut;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod worker;
 
 use std::error::Error;
@@ -36,8 +38,13 @@ pub use client::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use install::{
-    InstallCapability, StagedUpdate, apply_staged_update_and_relaunch, cleanup_stale_files,
-    probe_install_capability,
+    InstallCapability, StagedUpdate, apply_staged_update_and_relaunch,
+    apply_staged_update_and_relaunch_with_shortcut, cleanup_stale_files, probe_install_capability,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use shortcut::{
+    ShortcutOutcome, shortcut_architecture_hint, sync_desktop_shortcut,
+    sync_desktop_shortcut_for_target,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use worker::{UpdateStatus, UpdateWorker};

@@ -751,9 +751,8 @@ pub fn desktop_dir() -> Option<PathBuf> {
     let _com = ComGuard::init();
     let mut raw_str: *mut u16 = std::ptr::null_mut();
     // SAFETY: `FOLDERID_DESKTOP` is a valid `KNOWNFOLDERID` and `raw_str` receives a `CoTaskMemAlloc` path.
-    let hr = unsafe {
-        SHGetKnownFolderPath(&FOLDERID_DESKTOP, 0, std::ptr::null_mut(), &mut raw_str)
-    };
+    let hr =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_DESKTOP, 0, std::ptr::null_mut(), &mut raw_str) };
     if hr >= 0
         && let Some(path) = read_co_task_mem_path(raw_str)
     {
@@ -780,7 +779,9 @@ fn create_shell_link() -> Result<ComObject, String> {
         )
     };
     if hr < 0 || raw.is_null() {
-        return Err(format!("Could not create IShellLinkW COM object (HRESULT 0x{hr:08x})."));
+        return Err(format!(
+            "Could not create IShellLinkW COM object (HRESULT 0x{hr:08x})."
+        ));
     }
     Ok(ComObject { ptr: raw })
 }
@@ -799,13 +800,20 @@ fn set_shell_link_wide_str(
         setter(link.ptr, wide.as_ptr())
     };
     if hr < 0 {
-        return Err(format!("Failed setting shortcut {label} (HRESULT 0x{hr:08x})."));
+        return Err(format!(
+            "Failed setting shortcut {label} (HRESULT 0x{hr:08x})."
+        ));
     }
     Ok(())
 }
 
 fn configure_shell_link(link: &ComObject, spec: WindowsShortcutSpec<'_>) -> Result<(), String> {
-    set_shell_link_wide_str(link, VTBL_ISHELL_LINK_SET_PATH, spec.target_path.as_os_str(), "target")?;
+    set_shell_link_wide_str(
+        link,
+        VTBL_ISHELL_LINK_SET_PATH,
+        spec.target_path.as_os_str(),
+        "target",
+    )?;
 
     if let Some(work_dir) = spec.working_dir.or_else(|| spec.target_path.parent())
         && !work_dir.as_os_str().is_empty()
@@ -831,11 +839,8 @@ fn configure_shell_link(link: &ComObject, spec: WindowsShortcutSpec<'_>) -> Resu
         let icon_wide = os_str_to_wide_null(icon.as_os_str());
         // SAFETY: `SetIconLocation` at slot 17 on `IShellLinkW` takes `(LPCWSTR, int)`.
         let hr = unsafe {
-            let set_icon: unsafe extern "system" fn(
-                *mut std::ffi::c_void,
-                *const u16,
-                i32,
-            ) -> i32 = std::mem::transmute(link.vtable_slot(VTBL_ISHELL_LINK_SET_ICON_LOCATION));
+            let set_icon: unsafe extern "system" fn(*mut std::ffi::c_void, *const u16, i32) -> i32 =
+                std::mem::transmute(link.vtable_slot(VTBL_ISHELL_LINK_SET_ICON_LOCATION));
             set_icon(link.ptr, icon_wide.as_ptr(), 0)
         };
         if hr < 0 {
@@ -887,7 +892,11 @@ pub fn create_desktop_shortcut(spec: WindowsShortcutSpec<'_>) -> Result<(), Stri
     if spec.shortcut_path.as_os_str().is_empty() || spec.target_path.as_os_str().is_empty() {
         return Err("Shortcut path and target executable path must be non-empty.".to_string());
     }
-    if let Some(parent) = spec.shortcut_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+    if let Some(parent) = spec
+        .shortcut_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent).map_err(|err| {
             format!(
                 "Could not prepare shortcut folder `{}`: {err}",
