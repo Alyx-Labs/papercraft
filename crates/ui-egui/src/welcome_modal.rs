@@ -294,7 +294,7 @@ fn draw_bottom_section(ui: &mut egui::Ui, width: f32) -> (bool, Rect, Rect) {
     let mut cta_clicked = false;
     let mut body_rect = Rect::NOTHING;
     let mut footer_rect = Rect::NOTHING;
-    let side_pad_f = if width >= 620.0 { 52.0 } else { 24.0 };
+    let side_pad_f = if width >= 620.0 { 68.0 } else { 24.0 };
     let side_pad = side_pad_f as i8;
     let inner_w = (width - side_pad_f * 2.0).max(200.0);
 
@@ -350,34 +350,64 @@ fn draw_bottom_section(ui: &mut egui::Ui, width: f32) -> (bool, Rect, Rect) {
 }
 
 fn draw_feature_grid(ui: &mut egui::Ui, inner_w: f32) {
+    let badge_dim = 42.0_f32;
+    let icon_gap = 14.0_f32;
     let two_cols = inner_w >= 420.0;
     if two_cols {
-        let gap = 24.0_f32;
-        let col_w = ((inner_w - gap) * 0.5).max(140.0);
-        let row_count = FEATURES.len().div_ceil(2);
-        for (row_idx, row) in FEATURES.chunks(2).enumerate() {
-            ui.allocate_ui_with_layout(
-                Vec2::new(inner_w, 0.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.set_min_width(inner_w);
-                    ui.set_max_width(inner_w);
-                    if let Some(left) = row.first() {
-                        let _ = draw_feature_tile(ui, left, col_w);
-                    }
-                    ui.add_space(gap);
-                    if let Some(right) = row.get(1) {
-                        let _ = draw_feature_tile(ui, right, col_w);
-                    }
-                },
+        let min_col_gap = 24.0_f32;
+        let max_text_w = ((inner_w - min_col_gap) * 0.5 - badge_dim - icon_gap).max(80.0);
+        let galleys: Vec<_> = FEATURES
+            .iter()
+            .map(|item| {
+                ui.painter().layout(
+                    item.label.to_string(),
+                    FontId::proportional(13.5),
+                    BOTTOM_TEXT,
+                    max_text_w,
+                )
+            })
+            .collect();
+        let col1_w = badge_dim + icon_gap + galleys[0].size().x.max(galleys[2].size().x);
+        let col2_w = badge_dim + icon_gap + galleys[1].size().x.max(galleys[3].size().x);
+        let row_pairs = [(0usize, 1usize), (2usize, 3usize)];
+        for (row_idx, &(left_idx, right_idx)) in row_pairs.iter().enumerate() {
+            let row_h = badge_dim
+                .max(galleys[left_idx].size().y)
+                .max(galleys[right_idx].size().y);
+            let (row_rect, _) = ui.allocate_exact_size(Vec2::new(inner_w, row_h), Sense::hover());
+            let left_rect = Rect::from_min_size(row_rect.min, Vec2::new(col1_w, row_h));
+            let right_rect = Rect::from_min_size(
+                pos2(row_rect.right() - col2_w, row_rect.top()),
+                Vec2::new(col2_w, row_h),
             );
-            if row_idx + 1 < row_count {
+            paint_feature_tile(
+                ui,
+                left_rect,
+                FEATURES[left_idx].icon,
+                std::sync::Arc::clone(&galleys[left_idx]),
+            );
+            paint_feature_tile(
+                ui,
+                right_rect,
+                FEATURES[right_idx].icon,
+                std::sync::Arc::clone(&galleys[right_idx]),
+            );
+            if row_idx + 1 < row_pairs.len() {
                 ui.add_space(18.0);
             }
         }
     } else {
+        let text_w = (inner_w - badge_dim - icon_gap).max(80.0);
         for (idx, item) in FEATURES.iter().enumerate() {
-            let _ = draw_feature_tile(ui, item, inner_w);
+            let galley = ui.painter().layout(
+                item.label.to_string(),
+                FontId::proportional(13.5),
+                BOTTOM_TEXT,
+                text_w,
+            );
+            let row_h = badge_dim.max(galley.size().y);
+            let (row_rect, _) = ui.allocate_exact_size(Vec2::new(inner_w, row_h), Sense::hover());
+            paint_feature_tile(ui, row_rect, item.icon, galley);
             if idx + 1 < FEATURES.len() {
                 ui.add_space(14.0);
             }
@@ -385,31 +415,25 @@ fn draw_feature_grid(ui: &mut egui::Ui, inner_w: f32) {
     }
 }
 
-fn draw_feature_tile(ui: &mut egui::Ui, item: &FeatureItem, col_w: f32) -> (Rect, Rect) {
+fn paint_feature_tile(
+    ui: &mut egui::Ui,
+    tile_rect: Rect,
+    icon: Icon,
+    galley: std::sync::Arc<egui::Galley>,
+) {
     let badge_dim = 42.0_f32;
-    let gap = 14.0_f32;
-    let text_w = (col_w - badge_dim - gap).max(80.0);
-    let galley = ui.painter().layout(
-        item.label.to_string(),
-        FontId::proportional(13.5),
-        BOTTOM_TEXT,
-        text_w,
-    );
-    let row_h = badge_dim.max(galley.size().y);
-    let (tile_rect, _) = ui.allocate_exact_size(Vec2::new(col_w, row_h), Sense::hover());
+    let icon_gap = 14.0_f32;
     let badge_center = pos2(tile_rect.left() + badge_dim * 0.5, tile_rect.center().y);
     let badge_rect = Rect::from_center_size(badge_center, Vec2::splat(badge_dim));
     ui.painter()
         .circle_filled(badge_center, badge_dim * 0.5, BADGE_BG);
-    paint_icon(ui.painter(), badge_rect.shrink(11.0), item.icon, TOP_TITLE);
+    paint_icon(ui.painter(), badge_rect.shrink(11.0), icon, TOP_TITLE);
 
     let text_pos = pos2(
-        badge_rect.right() + gap,
+        badge_rect.right() + icon_gap,
         tile_rect.center().y - galley.size().y * 0.5,
     );
-    let text_rect = Rect::from_min_size(text_pos, galley.size());
     ui.painter().galley(text_pos, galley, BOTTOM_TEXT);
-    (badge_rect, text_rect)
 }
 
 fn draw_cta_button(ui: &mut egui::Ui, width: f32) -> (bool, Rect) {
@@ -491,6 +515,7 @@ mod tests {
         let mut rendered_text = String::new();
         let mut circle_centers: Vec<egui::Pos2> = Vec::new();
         let mut feature_text_boxes: Vec<(String, Rect)> = Vec::new();
+        let mut cta_rect = Rect::NOTHING;
         for step in 0..6 {
             let raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(
@@ -508,14 +533,19 @@ mod tests {
             rendered_text = collect_text(&out.shapes);
             circle_centers.clear();
             feature_text_boxes.clear();
+            cta_rect = Rect::NOTHING;
             fn scan_shapes(
                 shape: &egui::Shape,
                 circles: &mut Vec<egui::Pos2>,
                 texts: &mut Vec<(String, Rect)>,
+                cta: &mut Rect,
             ) {
                 match shape {
                     egui::Shape::Circle(c) if (c.radius - 21.0).abs() < 0.5 => {
                         circles.push(c.center);
+                    }
+                    egui::Shape::Rect(r) if (r.rect.height() - 44.0).abs() < 0.5 => {
+                        *cta = r.rect;
                     }
                     egui::Shape::Text(t) => {
                         let rect = Rect::from_min_size(t.pos, t.galley.size());
@@ -523,14 +553,19 @@ mod tests {
                     }
                     egui::Shape::Vec(items) => {
                         for s in items {
-                            scan_shapes(s, circles, texts);
+                            scan_shapes(s, circles, texts, cta);
                         }
                     }
                     _ => {}
                 }
             }
             for cs in &out.shapes {
-                scan_shapes(&cs.shape, &mut circle_centers, &mut feature_text_boxes);
+                scan_shapes(
+                    &cs.shape,
+                    &mut circle_centers,
+                    &mut feature_text_boxes,
+                    &mut cta_rect,
+                );
             }
             out.drop_without_applying_deltas();
         }
@@ -545,12 +580,15 @@ mod tests {
         assert!(rendered_text.contains("Start Studying"));
 
         assert_eq!(circle_centers.len(), 4, "expected 4 feature icon badges");
-        // Right-column badges must start cleanly past the modal midpoint (x = 640).
-        assert!(
-            circle_centers[1].x > 640.0 && circle_centers[3].x > 640.0,
-            "right column badges drifted left: {:?}",
-            circle_centers
-        );
+        assert!(cta_rect.width() > 400.0, "expected full-width CTA pill");
+        // Left-column icon badges must align flush with CTA button's left edge.
+        assert!((circle_centers[0].x - 21.0 - cta_rect.left()).abs() <= 1.0);
+        assert!((circle_centers[2].x - 21.0 - cta_rect.left()).abs() <= 1.0);
+        // Right-column icon badges must share the exact same x and sit cleanly in the right half.
+        assert!((circle_centers[1].x - circle_centers[3].x).abs() <= 0.5);
+        assert!(circle_centers[1].x > cta_rect.center().x);
+
+        let mut right_col_max_x = f32::NEG_INFINITY;
         // Each feature's text block must be vertically centered on its icon badge.
         for (idx, item) in FEATURES.iter().enumerate() {
             let first_line = item.label.lines().next().unwrap_or("");
@@ -558,6 +596,9 @@ mod tests {
                 .iter()
                 .find(|(txt, _)| txt.contains(first_line))
                 .expect("feature text shape missing");
+            if idx % 2 == 1 {
+                right_col_max_x = right_col_max_x.max(text_rect.right());
+            }
             let dy = (text_rect.center().y - circle_centers[idx].y).abs();
             assert!(
                 dy <= 1.5,
@@ -566,6 +607,12 @@ mod tests {
                 circle_centers[idx].y
             );
         }
+        // Right-column widest text must end flush with CTA button's right edge.
+        assert!(
+            (right_col_max_x - cta_rect.right()).abs() <= 1.5,
+            "right column right edge ({right_col_max_x}) != CTA right ({})",
+            cta_rect.right()
+        );
 
         dismiss(&mut app);
         assert!(!app.session.should_show_welcome_banner());
