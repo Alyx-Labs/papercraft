@@ -2,6 +2,7 @@
 name = "papercraft-server-cli"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 publish = false
 description = "Self-hosted PaperCraft account and offline-first sync server"

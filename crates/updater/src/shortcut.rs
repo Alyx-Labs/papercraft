@@ -147,15 +147,9 @@ pub fn parse_xdg_user_dirs_desktop(content: &str, home_dir: &Path) -> Option<Pat
 /// Renders a Freedesktop `.desktop` entry pointing directly to `exec_path`.
 #[must_use]
 pub fn render_linux_desktop_entry(app: AppId, exec_path: &Path, icon_ref: &str) -> String {
-    let (comment, categories) = match app {
-        AppId::PaperCraft => (
-            "PaperCraft notebook and handwriting studio",
-            "Office;Graphics;",
-        ),
-        AppId::PaperCraftServer => (
-            "PaperCraft self-hosted sync server control",
-            "Utility;Network;",
-        ),
+    let categories = match app {
+        AppId::PaperCraft => "Office;Graphics;",
+        AppId::PaperCraftServer => "Utility;Network;",
     };
     let exec_str = format_desktop_exec_value(&exec_path.to_string_lossy());
     let path_str = exec_path
@@ -170,15 +164,20 @@ pub fn render_linux_desktop_entry(app: AppId, exec_path: &Path, icon_ref: &str) 
          Version=1.0\n\
          Type=Application\n\
          Name={name}\n\
+         GenericName={generic}\n\
          Comment={comment}\n\
          Exec={exec_str}\n\
          Icon={icon_escaped}\n\
          Terminal=false\n\
          Categories={categories}\n\
          StartupNotify=true\n\
-         StartupWMClass={wm_class}\n",
+         StartupWMClass={wm_class}\n\
+         X-Publisher={publisher}\n",
         name = app.display_name(),
+        generic = app.generic_name(),
+        comment = app.summary(),
         wm_class = app.manifest_key(),
+        publisher = crate::manifest::PUBLISHER_NAME,
     );
     if !path_str.is_empty() {
         out.push_str(&format!("Path={path_str}\n"));
@@ -267,7 +266,7 @@ pub fn sync_desktop_shortcut_in_dir(
     }
 }
 
-fn absolutize_path(path: &Path) -> PathBuf {
+pub(crate) fn absolutize_path(path: &Path) -> PathBuf {
     if path.is_absolute() {
         return path.to_path_buf();
     }
@@ -379,7 +378,7 @@ fn resolve_desktop_dir() -> Result<PathBuf, String> {
     }
 }
 
-fn resolve_linux_icons_dir() -> Option<PathBuf> {
+pub(crate) fn resolve_linux_icons_dir() -> Option<PathBuf> {
     if !cfg!(target_os = "linux") {
         return None;
     }
@@ -532,7 +531,7 @@ fn create_linux_shortcut_at(
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn install_linux_icon(app: AppId, icons_dir: &Path) -> Result<PathBuf, String> {
+pub(crate) fn install_linux_icon(app: AppId, icons_dir: &Path) -> Result<PathBuf, String> {
     fs::create_dir_all(icons_dir).map_err(|err| {
         format!(
             "Could not create icon folder `{}`: {err}",
@@ -549,8 +548,11 @@ fn write_atomic_executable_file(dest: &Path, bytes: &[u8]) -> Result<(), String>
     write_atomic_bytes(dest, bytes, true)
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn write_atomic_bytes(dest: &Path, bytes: &[u8], executable: bool) -> Result<(), String> {
+pub(crate) fn write_atomic_bytes(
+    dest: &Path,
+    bytes: &[u8],
+    executable: bool,
+) -> Result<(), String> {
     let parent = dest
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -657,7 +659,7 @@ fn mark_linux_desktop_trusted(desktop_file: &Path) {
         .status();
 }
 
-fn escape_desktop_string(raw: &str) -> String {
+pub(crate) fn escape_desktop_string(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
         match ch {
@@ -671,7 +673,7 @@ fn escape_desktop_string(raw: &str) -> String {
     out
 }
 
-fn format_desktop_exec_value(raw_exec: &str) -> String {
+pub(crate) fn format_desktop_exec_value(raw_exec: &str) -> String {
     let needs_quotes =
         raw_exec.is_empty() || raw_exec.chars().any(|c| RESERVED_EXEC_CHARS.contains(&c));
     let mut exec_arg = String::with_capacity(raw_exec.len() + 8);

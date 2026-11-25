@@ -285,6 +285,7 @@ fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("PaperCraft")
+            .with_app_id("papercraft")
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([840.0, 560.0])
             .with_icon(egui::IconData {

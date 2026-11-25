@@ -54,6 +54,7 @@ pub struct NoticeBanner {
 }
 
 pub type DesktopShortcutSyncFn = Box<dyn FnMut(bool) -> Result<String, String>>;
+pub type AutostartSyncFn = Box<dyn FnMut(bool, bool) -> Result<String, String>>;
 
 pub struct ServerController {
     pub config_path: PathBuf,
@@ -86,6 +87,8 @@ pub struct ServerController {
     pub updater: UpdateWorker,
     pub desktop_shortcut_feedback: Option<(bool, String)>,
     desktop_shortcut_sync: Option<DesktopShortcutSyncFn>,
+    pub autostart_feedback: Option<(bool, String)>,
+    autostart_sync: Option<AutostartSyncFn>,
 }
 
 impl ServerController {
@@ -129,6 +132,8 @@ impl ServerController {
             updater: UpdateWorker::new(AppId::PaperCraftServer, env!("CARGO_PKG_VERSION")),
             desktop_shortcut_feedback: None,
             desktop_shortcut_sync: None,
+            autostart_feedback: None,
+            autostart_sync: None,
         };
 
         if auto_start {
@@ -183,6 +188,36 @@ impl ServerController {
         }
     }
 
+    pub fn set_autostart_sync(&mut self, hook: AutostartSyncFn) {
+        self.autostart_sync = Some(hook);
+    }
+
+    pub fn set_launch_at_login_enabled(&mut self, enabled: bool) {
+        self.draft_settings.launch_at_login = enabled;
+        self.auto_save_settings();
+        if let Some(sync_fn) = self.autostart_sync.as_mut() {
+            match sync_fn(enabled, true) {
+                Ok(msg) => self.autostart_feedback = Some((false, msg)),
+                Err(err) => self.autostart_feedback = Some((true, err)),
+            }
+        }
+    }
+
+    pub fn sync_autostart_on_startup_if_enabled(&mut self) {
+        #[cfg(not(debug_assertions))]
+        self.sync_autostart_on_startup_if_enabled_inner();
+    }
+
+    #[cfg(any(not(debug_assertions), test))]
+    fn sync_autostart_on_startup_if_enabled_inner(&mut self) {
+        if self.draft_settings.launch_at_login
+            && let Some(sync_fn) = self.autostart_sync.as_mut()
+            && let Err(err) = sync_fn(true, false)
+        {
+            log::warn!("Startup autostart sync failed: {err}");
+        }
+    }
+
     pub fn check_for_updates(&mut self) {
         self.updater.check_now(false, self.updater_notify_cb());
     }
@@ -213,8 +248,9 @@ impl ServerController {
     }
 
     pub fn apply_ready_update_and_relaunch(&mut self) -> Result<(), String> {
-        self.updater
-            .apply_ready_update_and_relaunch_with_shortcut(true)
+        self.updater.apply_ready_update_and_relaunch_with_shortcut(
+            self.draft_settings.auto_create_desktop_shortcut,
+        )
     }
 
     pub fn is_running(&self) -> bool {
@@ -346,12 +382,16 @@ impl ServerController {
     pub fn reset_defaults(&mut self) {
         let current_theme = self.draft_settings.theme;
         let prev_shortcut = self.draft_settings.auto_create_desktop_shortcut;
+        let prev_autostart = self.draft_settings.launch_at_login;
         self.draft_settings = ServerControlSettings {
             theme: current_theme,
             ..ServerControlSettings::default()
         };
         if prev_shortcut != self.draft_settings.auto_create_desktop_shortcut {
             self.set_desktop_shortcut_enabled(self.draft_settings.auto_create_desktop_shortcut);
+        }
+        if prev_autostart != self.draft_settings.launch_at_login {
+            self.set_launch_at_login_enabled(self.draft_settings.launch_at_login);
         }
         self.notice_banner = Some(NoticeBanner {
             tone: NoticeTone::Info,
@@ -958,5 +998,65 @@ mod tests {
             Some(&(false, "Server shortcut created (mock).".to_string()))
         );
         assert_eq!(*calls.lock().unwrap(), vec![false, true]);
+    }
+
+    #[test]
+    fn controller_autostart_defaults_enabled_syncs_on_startup_and_toggles_cleanly() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = temp_dir("autostart_ctrl");
+        let cfg_path = dir.0.join(CONFIG_FILE_NAME);
+        let settings = ServerControlSettings {
+            data_dir: dir.0.join("vault").to_string_lossy().into_owned(),
+            auto_start_server: false,
+            ..ServerControlSettings::default()
+        };
+        settings.save_atomic(&cfg_path).unwrap();
+
+        let calls = Arc::new(Mutex::new(Vec::<(bool, bool)>::new()));
+        let calls_hook = Arc::clone(&calls);
+
+        let mut ctrl = ServerController::new(cfg_path.clone(), false);
+        assert!(ctrl.draft_settings.launch_at_login);
+        ctrl.set_autostart_sync(Box::new(move |enabled, clear_override| {
+            calls_hook
+                .lock()
+                .map_err(|err| err.to_string())?
+                .push((enabled, clear_override));
+            Ok(if enabled {
+                "Startup launch enabled (mock).".to_string()
+            } else {
+                "Startup launch disabled (mock).".to_string()
+            })
+        }));
+
+        ctrl.sync_autostart_on_startup_if_enabled_inner();
+        assert_eq!(*calls.lock().unwrap(), vec![(true, false)]);
+
+        ctrl.set_launch_at_login_enabled(false);
+        assert!(!ctrl.draft_settings.launch_at_login);
+        assert_eq!(
+            ctrl.autostart_feedback.as_ref(),
+            Some(&(false, "Startup launch disabled (mock).".to_string()))
+        );
+
+        let (reloaded, warning) = ServerControlSettings::load_or_init(&cfg_path);
+        assert!(warning.is_none());
+        assert!(!reloaded.launch_at_login);
+
+        // Once disabled by the user, startup sync must not re-enable autostart.
+        ctrl.sync_autostart_on_startup_if_enabled_inner();
+        assert_eq!(*calls.lock().unwrap(), vec![(true, false), (false, true)]);
+
+        ctrl.set_launch_at_login_enabled(true);
+        assert!(ctrl.draft_settings.launch_at_login);
+        assert_eq!(
+            ctrl.autostart_feedback.as_ref(),
+            Some(&(false, "Startup launch enabled (mock).".to_string()))
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(true, false), (false, true), (true, true)]
+        );
     }
 }

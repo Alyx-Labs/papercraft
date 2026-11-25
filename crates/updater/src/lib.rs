@@ -14,6 +14,8 @@ pub mod manifest;
 pub mod version;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod autostart;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod client;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod install;
@@ -27,10 +29,16 @@ use std::fmt;
 
 pub use manifest::{
     AppId, AssetFormat, DEFAULT_MANIFEST_URL, DEFAULT_RELEASES_PAGE_URL, ENV_CURRENT_VERSION,
-    ENV_MANIFEST_URL, MAX_ASSET_BYTES, MAX_MANIFEST_BYTES, PlatformAsset, ReleaseManifest,
-    current_platform_key, current_platform_label, format_bytes,
+    ENV_MANIFEST_URL, MAX_ASSET_BYTES, MAX_MANIFEST_BYTES, PUBLISHER_NAME, PlatformAsset,
+    ReleaseManifest, current_platform_key, current_platform_label, format_bytes,
 };
 pub use version::SemVer;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use autostart::{
+    AUTOSTART_ARG, AutostartOutcome, autostart_architecture_hint, sync_autostart,
+    sync_autostart_for_target, sync_autostart_with_options,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use client::{

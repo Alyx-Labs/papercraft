@@ -766,8 +766,8 @@ fn render_updates_card_with_status(
         draw_section_header(
             ui,
             Icon::MoveDown,
-            "App Updates",
-            "Check GitHub Releases for new PaperCraft Server versions and install in place.",
+            "App Updates & System",
+            "Updates, Desktop shortcut, and automatic startup when you sign in.",
             t,
         );
         ui.add_space(10.0);
@@ -775,10 +775,13 @@ fn render_updates_card_with_status(
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.label(
-                egui::RichText::new(format!("Installed version: v{current_ver}"))
-                    .size(12.0)
-                    .strong()
-                    .color(t.text),
+                egui::RichText::new(format!(
+                    "Installed version: v{current_ver} · {}",
+                    papercraft_updater::PUBLISHER_NAME
+                ))
+                .size(12.0)
+                .strong()
+                .color(t.text),
             );
             if is_custom_feed {
                 draw_compact_pill(ui, None, "Dev feed", t.accent_soft, t.accent, t.accent);
@@ -818,42 +821,85 @@ fn render_updates_card_with_status(
             .color(t.text_muted),
         );
 
-        ui.add_space(8.0);
-        let mut shortcut_on = ctrl.draft_settings.auto_create_desktop_shortcut;
-        let shortcut_resp = toggle_switch_row(
-            ui,
-            "srv_desktop_shortcut_switch",
-            "Create Desktop shortcut automatically",
-            "Keep a Desktop shortcut pointing to PaperCraft Server and refresh it automatically after updates.",
-            &mut shortcut_on,
-            t,
-        );
-        if shortcut_resp.changed() {
-            ctrl.set_desktop_shortcut_enabled(shortcut_on);
-        }
+        render_desktop_shortcut_section(ctrl, ui, t);
+        render_autostart_section(ctrl, ui, t);
+    });
+}
+
+fn render_desktop_shortcut_section(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Tokens) {
+    ui.add_space(8.0);
+    let mut shortcut_on = ctrl.draft_settings.auto_create_desktop_shortcut;
+    let shortcut_resp = toggle_switch_row(
+        ui,
+        "srv_desktop_shortcut_switch",
+        "Create Desktop shortcut automatically",
+        "Keep a Desktop shortcut pointing to PaperCraft Server and refresh it automatically after updates.",
+        &mut shortcut_on,
+        t,
+    );
+    if shortcut_resp.changed() {
+        ctrl.set_desktop_shortcut_enabled(shortcut_on);
+    }
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(format!(
+                "{} Also refreshed automatically whenever PaperCraft Server updates. Keep the executable in the permanent folder where you want to use it.",
+                papercraft_updater::shortcut_architecture_hint()
+            ))
+            .size(11.0)
+            .color(t.text_muted),
+        )
+        .wrap(),
+    );
+    if let Some((is_err, ref msg)) = ctrl.desktop_shortcut_feedback {
+        ui.add_space(4.0);
         ui.add(
-            egui::Label::new(
-                egui::RichText::new(format!(
-                    "{} Also refreshed automatically whenever PaperCraft Server updates. Keep the executable in the permanent folder where you want to use it.",
-                    papercraft_updater::shortcut_architecture_hint()
-                ))
-                .size(11.0)
-                .color(t.text_muted),
-            )
+            egui::Label::new(egui::RichText::new(msg).size(11.0).color(if is_err {
+                t.danger_fg
+            } else {
+                t.success_fg
+            }))
             .wrap(),
         );
-        if let Some((is_err, ref msg)) = ctrl.desktop_shortcut_feedback {
-            ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(egui::RichText::new(msg).size(11.0).color(if is_err {
-                    t.danger_fg
-                } else {
-                    t.success_fg
-                }))
-                .wrap(),
-            );
-        }
-    });
+    }
+}
+
+fn render_autostart_section(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Tokens) {
+    ui.add_space(8.0);
+    let mut autostart_on = ctrl.draft_settings.launch_at_login;
+    let autostart_resp = toggle_switch_row(
+        ui,
+        "srv_autostart_switch",
+        "Launch automatically at system startup",
+        "Start PaperCraft Server quietly in the system tray when you sign in to your computer.",
+        &mut autostart_on,
+        t,
+    );
+    if autostart_resp.changed() {
+        ctrl.set_launch_at_login_enabled(autostart_on);
+    }
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(format!(
+                "{} Turn off to launch PaperCraft Server only manually.",
+                papercraft_updater::autostart_architecture_hint()
+            ))
+            .size(11.0)
+            .color(t.text_muted),
+        )
+        .wrap(),
+    );
+    if let Some((is_err, ref msg)) = ctrl.autostart_feedback {
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(egui::RichText::new(msg).size(11.0).color(if is_err {
+                t.danger_fg
+            } else {
+                t.success_fg
+            }))
+            .wrap(),
+        );
+    }
 }
 
 fn render_update_status_details(
@@ -1889,9 +1935,11 @@ fn render_advanced_card(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Toke
                 .color(t.text),
         );
         ui.label(
-            egui::RichText::new("Opens quietly in the tray without showing this window.")
-                .size(11.0)
-                .color(t.text_muted),
+            egui::RichText::new(
+                "Also hides this window on manual launches (automatic system startup always opens quietly in the tray).",
+            )
+            .size(11.0)
+            .color(t.text_muted),
         );
 
         ui.add_space(10.0);
@@ -2762,5 +2810,137 @@ mod tests {
         let (reloaded, warning) = crate::settings::ServerControlSettings::load_or_init(&cfg_path);
         assert!(warning.is_none());
         assert!(reloaded.auto_create_desktop_shortcut);
+    }
+
+    #[test]
+    fn autostart_switch_renders_below_desktop_shortcut_and_invokes_hook() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = temp_dir("autostart-switch");
+        let cfg_path = dir.0.join(CONFIG_FILE_NAME);
+        let settings = crate::settings::ServerControlSettings {
+            data_dir: dir.0.join("vault").to_string_lossy().into_owned(),
+            port: 18949,
+            auto_start_server: false,
+            theme: UiTheme::Dark,
+            ..Default::default()
+        };
+        settings.save_atomic(&cfg_path).unwrap();
+
+        let calls = Arc::new(Mutex::new(Vec::<(bool, bool)>::new()));
+        let calls_hook = Arc::clone(&calls);
+        let mut ctrl = ServerController::new(cfg_path.clone(), false);
+        ctrl.set_autostart_sync(Box::new(move |enabled, clear_override| {
+            calls_hook
+                .lock()
+                .map_err(|err| err.to_string())?
+                .push((enabled, clear_override));
+            Ok(if enabled {
+                "Startup launch ready (mock).".to_string()
+            } else {
+                "Startup launch removed (mock).".to_string()
+            })
+        }));
+
+        let find_rect = |shapes: &[egui::epaint::ClippedShape], needle: &str| -> Option<Rect> {
+            fn visit(shape: &Shape, needle: &str) -> Option<Rect> {
+                match shape {
+                    Shape::Text(t) if t.galley.text().contains(needle) => {
+                        Some(Rect::from_min_size(t.pos, t.galley.size()))
+                    }
+                    Shape::Vec(items) => items.iter().find_map(|s| visit(s, needle)),
+                    _ => None,
+                }
+            }
+            shapes.iter().find_map(|c| visit(&c.shape, needle))
+        };
+
+        let ctx = egui::Context::default();
+        apply_visuals(&ctx, ctrl.theme());
+        let tokens = Tokens::for_theme(ctrl.theme());
+        let idle = papercraft_updater::UpdateStatus::Idle;
+        let run_frame = |ctrl: &mut ServerController, t: f64, events: Vec<egui::Event>| {
+            let out = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(620.0, 1650.0))),
+                    time: Some(t),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let _ = render_window_with_update_status(ctrl, ui, &tokens, &idle);
+                },
+            );
+            let shapes = out.shapes.clone();
+            out.drop_without_applying_deltas();
+            shapes
+        };
+
+        let _ = run_frame(&mut ctrl, 1.0, Vec::new());
+        let shapes = run_frame(&mut ctrl, 1.05, Vec::new());
+        let y_shortcut = find_text_y(&shapes, "Create Desktop shortcut automatically").unwrap();
+        let autostart_rect = find_rect(&shapes, "Launch automatically at system startup").unwrap();
+        assert!(y_shortcut < autostart_rect.min.y);
+
+        let pos = autostart_rect.center();
+        let _ = run_frame(
+            &mut ctrl,
+            1.10,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let shapes_off = run_frame(
+            &mut ctrl,
+            1.14,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!ctrl.draft_settings.launch_at_login);
+        assert!(find_rect(&shapes_off, "Startup launch removed (mock).").is_some());
+
+        let pos_on = find_rect(&shapes_off, "Launch automatically at system startup")
+            .unwrap()
+            .center();
+        let _ = run_frame(
+            &mut ctrl,
+            1.20,
+            vec![
+                egui::Event::PointerMoved(pos_on),
+                egui::Event::PointerButton {
+                    pos: pos_on,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let shapes_on = run_frame(
+            &mut ctrl,
+            1.24,
+            vec![egui::Event::PointerButton {
+                pos: pos_on,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(ctrl.draft_settings.launch_at_login);
+        assert!(find_rect(&shapes_on, "Startup launch ready (mock).").is_some());
+        assert_eq!(*calls.lock().unwrap(), vec![(false, true), (true, true)]);
+
+        let (reloaded, warning) = crate::settings::ServerControlSettings::load_or_init(&cfg_path);
+        assert!(warning.is_none());
+        assert!(reloaded.launch_at_login);
     }
 }

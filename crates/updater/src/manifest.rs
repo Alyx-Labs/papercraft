@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::UpdateError;
 
+pub const PUBLISHER_NAME: &str = "Alyx Labs";
+
+// TODO(org): Update these GitHub URLs once the repository moves to the final Alyx Labs GitHub organization slug.
 pub const DEFAULT_MANIFEST_URL: &str =
     "https://github.com/alyxhard/papercraft/releases/latest/download/latest.json";
 pub const DEFAULT_RELEASES_PAGE_URL: &str =
@@ -60,6 +63,34 @@ impl AppId {
         match self {
             Self::PaperCraft => "PaperCraft.app",
             Self::PaperCraftServer => "PaperCraft Server.app",
+        }
+    }
+
+    /// Reverse-DNS bundle / tray / launch-agent identifier under Alyx Labs.
+    #[must_use]
+    pub const fn bundle_identifier(self) -> &'static str {
+        // TODO(org): Adjust reverse-DNS domain if Alyx Labs adopts a custom domain other than com.alyxlabs.
+        match self {
+            Self::PaperCraft => "com.alyxlabs.papercraft",
+            Self::PaperCraftServer => "com.alyxlabs.papercraft.server",
+        }
+    }
+
+    /// Plain-English application summary used in OS desktop entries and metadata.
+    #[must_use]
+    pub const fn summary(self) -> &'static str {
+        match self {
+            Self::PaperCraft => "PaperCraft notebook and handwriting studio",
+            Self::PaperCraftServer => "PaperCraft self-hosted sync server control",
+        }
+    }
+
+    /// Short generic category title used in Freedesktop `.desktop` entries (`GenericName`).
+    #[must_use]
+    pub const fn generic_name(self) -> &'static str {
+        match self {
+            Self::PaperCraft => "Handwriting & Notes Studio",
+            Self::PaperCraftServer => "Self-Hosted Sync Server",
         }
     }
 }

@@ -2,6 +2,7 @@
 name = "papercraft"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 description = "A native notebook and handwriting studio, built in pure Rust."
 license.workspace = true
 publish = false

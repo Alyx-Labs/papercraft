@@ -5,8 +5,11 @@ members = ["crates/*", "apps/*", "xtask"]
 [workspace.package]
 version = "0.3.1"
 edition = "2024"
+authors = ["Alyx Labs"]
 description = "A native notebook and handwriting studio, built in pure Rust."
 readme = "README.md"
+# TODO(org): Update repository URL once the GitHub repo is transferred to the Alyx Labs organization handle
+# (and update crates/updater/src/manifest.rs, crates/ui-egui/src/lib.rs, crates/ui-egui/src/profile_screen.rs, and README.md).
 repository = "https://github.com/alyxhard/papercraft"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"

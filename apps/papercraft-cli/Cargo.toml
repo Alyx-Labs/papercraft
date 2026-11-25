@@ -2,6 +2,7 @@
 name = "papercraft-cli"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 description = "Headless CLI and automation tool for PaperCraft notebooks"
 license.workspace = true
 publish = false

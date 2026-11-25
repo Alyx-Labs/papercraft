@@ -2,6 +2,7 @@
 name = "papercraft-web"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 description = "PaperCraft online web preview running in WebAssembly"
 license.workspace = true
 publish = false

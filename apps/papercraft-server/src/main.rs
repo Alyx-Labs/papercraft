@@ -137,6 +137,16 @@ impl eframe::App for ServerControlApp {
     }
 }
 
+fn is_autostart_launch<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .skip(1)
+        .any(|arg| arg.as_ref() == papercraft_updater::AUTOSTART_ARG)
+}
+
 fn main() -> eframe::Result {
     papercraft_updater::cleanup_stale_files(papercraft_updater::AppId::PaperCraftServer);
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -144,13 +154,18 @@ fn main() -> eframe::Result {
 
     let config_path = settings::default_config_path();
     let mut controller = ServerController::new(config_path, true);
+    if is_autostart_launch(std::env::args()) {
+        controller.window_visible = false;
+    }
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("PaperCraft Server")
+            .with_app_id(papercraft_updater::AppId::PaperCraftServer.manifest_key())
             .with_inner_size([560.0, 680.0])
             .with_min_inner_size([460.0, 520.0])
             .with_visible(controller.window_visible)
+            // TODO(branding): Replace shared PaperCraft icon bytes with a dedicated PaperCraft Server icon once designed.
             .with_icon(egui::IconData {
                 rgba: include_bytes!("../../papercraft/assets/branding/papercraft-256.rgba")
                     .to_vec(),
@@ -172,7 +187,16 @@ fn main() -> eframe::Result {
                 )
                 .map(|outcome| outcome.status_message())
             }));
+            controller.set_autostart_sync(Box::new(|enabled, clear_os_override| {
+                papercraft_updater::sync_autostart_with_options(
+                    papercraft_updater::AppId::PaperCraftServer,
+                    enabled,
+                    clear_os_override,
+                )
+                .map(|outcome| outcome.status_message())
+            }));
             controller.sync_desktop_shortcut_on_startup_if_enabled();
+            controller.sync_autostart_on_startup_if_enabled();
             controller.start_startup_update_check_if_enabled();
             let (tray_tx, tray_rx) = mpsc::channel();
             let tray = TrayController::try_new(
@@ -192,4 +216,20 @@ fn main() -> eframe::Result {
             }))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_autostart_launch;
+
+    #[test]
+    fn autostart_arg_detection_checks_cli_flags_only() {
+        assert!(!is_autostart_launch(["papercraft-server.exe"]));
+        assert!(!is_autostart_launch([papercraft_updater::AUTOSTART_ARG]));
+        assert!(is_autostart_launch([
+            "papercraft-server.exe",
+            papercraft_updater::AUTOSTART_ARG
+        ]));
+        assert!(!is_autostart_launch(["papercraft-server.exe", "--other"]));
+    }
 }

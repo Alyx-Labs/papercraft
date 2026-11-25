@@ -49,6 +49,7 @@ use papercraft_paint::RibbonMesh;
 use serde_json::json;
 
 /// Public source repository URL displayed in Home and Profile links.
+// TODO(org): Update GITHUB_REPO_URL (and profile_screen.rs display text) once transferred to the Alyx Labs GitHub organization slug.
 pub(crate) const GITHUB_REPO_URL: &str = "https://github.com/alyxhard/papercraft";
 
 /// Top-level workspace screen mode.

@@ -83,6 +83,8 @@ pub struct ServerControlSettings {
     pub auto_check_updates: bool,
     #[serde(default = "default_auto_create_desktop_shortcut")]
     pub auto_create_desktop_shortcut: bool,
+    #[serde(default = "default_launch_at_login")]
+    pub launch_at_login: bool,
 }
 
 fn default_auto_check_updates() -> bool {
@@ -90,6 +92,10 @@ fn default_auto_check_updates() -> bool {
 }
 
 fn default_auto_create_desktop_shortcut() -> bool {
+    true
+}
+
+fn default_launch_at_login() -> bool {
     true
 }
 
@@ -109,6 +115,7 @@ impl Default for ServerControlSettings {
             theme: UiTheme::Dark,
             auto_check_updates: default_auto_check_updates(),
             auto_create_desktop_shortcut: default_auto_create_desktop_shortcut(),
+            launch_at_login: default_launch_at_login(),
         }
     }
 }
@@ -601,6 +608,7 @@ mod tests {
             theme: UiTheme::Dark,
             auto_check_updates: false,
             auto_create_desktop_shortcut: false,
+            launch_at_login: false,
         };
 
         original.save_atomic(&cfg_path).unwrap();
@@ -611,6 +619,7 @@ mod tests {
         let legacy: ServerControlSettings = serde_json::from_str("{}").unwrap();
         assert!(legacy.auto_check_updates);
         assert!(legacy.auto_create_desktop_shortcut);
+        assert!(legacy.launch_at_login);
     }
 
     #[test]
@@ -726,6 +735,7 @@ mod tests {
         b.theme = UiTheme::Dark;
         b.auto_start_server = false;
         b.start_in_tray = true;
+        b.launch_at_login = false;
         assert!(a.same_runtime_config(&b));
 
         b.port = 9999;

@@ -272,6 +272,49 @@ unsafe extern "system" {
     fn CoTaskMemFree(pv: *const std::ffi::c_void);
 }
 
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    #[allow(clippy::too_many_arguments)]
+    fn RegCreateKeyExW(
+        h_key: *mut std::ffi::c_void,
+        lp_sub_key: *const u16,
+        reserved: u32,
+        lp_class: *mut u16,
+        dw_options: u32,
+        sam_desired: u32,
+        lp_security_attributes: *const std::ffi::c_void,
+        phk_result: *mut *mut std::ffi::c_void,
+        lpdw_disposition: *mut u32,
+    ) -> i32;
+    fn RegOpenKeyExW(
+        h_key: *mut std::ffi::c_void,
+        lp_sub_key: *const u16,
+        ul_options: u32,
+        sam_desired: u32,
+        phk_result: *mut *mut std::ffi::c_void,
+    ) -> i32;
+    fn RegSetValueExW(
+        h_key: *mut std::ffi::c_void,
+        lp_value_name: *const u16,
+        reserved: u32,
+        dw_type: u32,
+        lp_data: *const u8,
+        cb_data: u32,
+    ) -> i32;
+    fn RegQueryValueExW(
+        h_key: *mut std::ffi::c_void,
+        lp_value_name: *const u16,
+        lp_reserved: *mut u32,
+        lp_type: *mut u32,
+        lp_data: *mut u8,
+        lpcb_data: *mut u32,
+    ) -> i32;
+    fn RegDeleteValueW(h_key: *mut std::ffi::c_void, lp_value_name: *const u16) -> i32;
+    fn RegCloseKey(h_key: *mut std::ffi::c_void) -> i32;
+    #[cfg(test)]
+    fn RegDeleteKeyW(h_key: *mut std::ffi::c_void, lp_sub_key: *const u16) -> i32;
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ComGuid {
@@ -310,6 +353,18 @@ const FOS_NOCHANGEDIR: u32 = 0x0000_0008;
 const FOS_PICKFOLDERS: u32 = 0x0000_0020;
 const FOS_FORCEFILESYSTEM: u32 = 0x0000_0040;
 const SIGDN_FILESYSPATH: i32 = -2_147_123_200; // 0x80058000
+
+const HKEY_CURRENT_USER: *mut std::ffi::c_void =
+    std::ptr::without_provenance_mut((0x8000_0001_u32 as i32 as isize) as usize);
+const ERROR_SUCCESS: i32 = 0;
+const ERROR_FILE_NOT_FOUND: i32 = 2;
+const REG_OPTION_NON_VOLATILE: u32 = 0;
+const REG_SZ: u32 = 1;
+const REG_EXPAND_SZ: u32 = 2;
+const KEY_QUERY_VALUE: u32 = 0x0001;
+const KEY_SET_VALUE: u32 = 0x0002;
+const MAX_REG_STRING_CHARS: usize = 4096;
+const MAX_REG_STRING_BYTES: usize = 64 * 1024;
 
 #[cfg(test)]
 const IUNKNOWN_VTBL_LEN: usize = 3;
@@ -910,6 +965,233 @@ pub fn create_desktop_shortcut(spec: WindowsShortcutSpec<'_>) -> Result<(), Stri
     let link = create_shell_link()?;
     configure_shell_link(&link, spec)?;
     save_shell_link(&link, spec.shortcut_path)
+}
+
+struct RegKeyGuard(*mut std::ffi::c_void);
+
+impl Drop for RegKeyGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` is an open `HKEY` handle returned by `RegCreateKeyExW` or `RegOpenKeyExW`.
+            unsafe {
+                RegCloseKey(self.0);
+            }
+        }
+    }
+}
+
+fn validate_reg_text(text: &str, label: &str, allow_empty: bool) -> Result<(), String> {
+    if !allow_empty && text.trim().is_empty() {
+        return Err(format!("Registry {label} must not be empty."));
+    }
+    if text.chars().any(|c| matches!(c, '\0' | '\r' | '\n')) {
+        return Err(format!(
+            "Registry {label} contains invalid control characters."
+        ));
+    }
+    if text.chars().count() > MAX_REG_STRING_CHARS {
+        return Err(format!(
+            "Registry {label} exceeds maximum length ({MAX_REG_STRING_CHARS} characters)."
+        ));
+    }
+    Ok(())
+}
+
+/// Writes a `REG_SZ` string value under `HKEY_CURRENT_USER\<subkey>`, creating the subkey if needed.
+pub fn set_hkcu_reg_sz(subkey: &str, value_name: &str, value: &str) -> Result<(), String> {
+    validate_reg_text(subkey, "subkey", false)?;
+    validate_reg_text(value_name, "value name", false)?;
+    validate_reg_text(value, "value", true)?;
+
+    let subkey_wide = str_to_wide_null(subkey);
+    let name_wide = str_to_wide_null(value_name);
+    let data_wide = str_to_wide_null(value);
+    let byte_len = u32::try_from(data_wide.len().saturating_mul(2))
+        .map_err(|_| "Registry string byte length overflow.".to_string())?;
+
+    let mut raw_key: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: `HKEY_CURRENT_USER` is a valid predefined root key, `subkey_wide` is NUL-terminated UTF-16,
+    // and `raw_key` receives an owned `HKEY` handle closed on drop via `RegKeyGuard`.
+    let open_status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            subkey_wide.as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut raw_key,
+            std::ptr::null_mut(),
+        )
+    };
+    if open_status != ERROR_SUCCESS || raw_key.is_null() {
+        return Err(format!(
+            "Could not open or create HKCU\\{subkey} (Win32 error {open_status})."
+        ));
+    }
+    let _guard = RegKeyGuard(raw_key);
+
+    // SAFETY: `raw_key` is open with `KEY_SET_VALUE`, `name_wide` is NUL-terminated UTF-16,
+    // and `data_wide` holds `byte_len` bytes of NUL-terminated UTF-16LE `REG_SZ` data.
+    let set_status = unsafe {
+        RegSetValueExW(
+            raw_key,
+            name_wide.as_ptr(),
+            0,
+            REG_SZ,
+            data_wide.as_ptr().cast::<u8>(),
+            byte_len,
+        )
+    };
+    if set_status != ERROR_SUCCESS {
+        return Err(format!(
+            "Could not write registry value `{value_name}` under HKCU\\{subkey} (Win32 error {set_status})."
+        ));
+    }
+    Ok(())
+}
+
+/// Deletes `value_name` from `HKEY_CURRENT_USER\<subkey>`, returning `Ok(true)` if removed or `Ok(false)` if absent.
+pub fn delete_hkcu_reg_value(subkey: &str, value_name: &str) -> Result<bool, String> {
+    validate_reg_text(subkey, "subkey", false)?;
+    validate_reg_text(value_name, "value name", false)?;
+
+    let subkey_wide = str_to_wide_null(subkey);
+    let name_wide = str_to_wide_null(value_name);
+    let mut raw_key: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: `HKEY_CURRENT_USER` is a valid root key and `subkey_wide` is NUL-terminated UTF-16.
+    let open_status = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey_wide.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut raw_key,
+        )
+    };
+    if open_status == ERROR_FILE_NOT_FOUND {
+        return Ok(false);
+    }
+    if open_status != ERROR_SUCCESS || raw_key.is_null() {
+        return Err(format!(
+            "Could not open HKCU\\{subkey} (Win32 error {open_status})."
+        ));
+    }
+    let _guard = RegKeyGuard(raw_key);
+
+    // SAFETY: `raw_key` is open with `KEY_SET_VALUE` and `name_wide` is NUL-terminated UTF-16.
+    let del_status = unsafe { RegDeleteValueW(raw_key, name_wide.as_ptr()) };
+    match del_status {
+        ERROR_SUCCESS => Ok(true),
+        ERROR_FILE_NOT_FOUND => Ok(false),
+        other => Err(format!(
+            "Could not delete registry value `{value_name}` from HKCU\\{subkey} (Win32 error {other})."
+        )),
+    }
+}
+
+/// Reads a `REG_SZ` or `REG_EXPAND_SZ` string value from `HKEY_CURRENT_USER\<subkey>`, returning `Ok(None)` if absent.
+pub fn read_hkcu_reg_sz(subkey: &str, value_name: &str) -> Result<Option<String>, String> {
+    validate_reg_text(subkey, "subkey", false)?;
+    validate_reg_text(value_name, "value name", false)?;
+
+    let subkey_wide = str_to_wide_null(subkey);
+    let name_wide = str_to_wide_null(value_name);
+    let mut raw_key: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: `HKEY_CURRENT_USER` is a valid root key and `subkey_wide` is NUL-terminated UTF-16.
+    let open_status = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey_wide.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut raw_key,
+        )
+    };
+    if open_status == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
+    }
+    if open_status != ERROR_SUCCESS || raw_key.is_null() {
+        return Err(format!(
+            "Could not open HKCU\\{subkey} (Win32 error {open_status})."
+        ));
+    }
+    let _guard = RegKeyGuard(raw_key);
+
+    let mut reg_type: u32 = 0;
+    let mut byte_len: u32 = 0;
+    // SAFETY: Passing `lp_data = null` with non-null `lpcb_data` queries the value type and byte length per Win32 docs.
+    let probe_status = unsafe {
+        RegQueryValueExW(
+            raw_key,
+            name_wide.as_ptr(),
+            std::ptr::null_mut(),
+            &mut reg_type,
+            std::ptr::null_mut(),
+            &mut byte_len,
+        )
+    };
+    if probe_status == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
+    }
+    if probe_status != ERROR_SUCCESS {
+        return Err(format!(
+            "Could not query registry value `{value_name}` under HKCU\\{subkey} (Win32 error {probe_status})."
+        ));
+    }
+    if reg_type != REG_SZ && reg_type != REG_EXPAND_SZ {
+        return Err(format!(
+            "Registry value `{value_name}` under HKCU\\{subkey} has unsupported type {reg_type}."
+        ));
+    }
+    if byte_len == 0 {
+        return Ok(Some(String::new()));
+    }
+    if (byte_len as usize) > MAX_REG_STRING_BYTES {
+        return Err(format!(
+            "Registry value `{value_name}` under HKCU\\{subkey} exceeds maximum size ({MAX_REG_STRING_BYTES} bytes)."
+        ));
+    }
+
+    let mut buf = vec![0_u8; byte_len as usize];
+    let mut actual_len = byte_len;
+    // SAFETY: `buf` has `actual_len` writable bytes and remains alive for `RegQueryValueExW`.
+    let read_status = unsafe {
+        RegQueryValueExW(
+            raw_key,
+            name_wide.as_ptr(),
+            std::ptr::null_mut(),
+            &mut reg_type,
+            buf.as_mut_ptr(),
+            &mut actual_len,
+        )
+    };
+    if read_status == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
+    }
+    if read_status != ERROR_SUCCESS {
+        return Err(format!(
+            "Could not read registry value `{value_name}` under HKCU\\{subkey} (Win32 error {read_status})."
+        ));
+    }
+    if reg_type != REG_SZ && reg_type != REG_EXPAND_SZ {
+        return Err(format!(
+            "Registry value `{value_name}` under HKCU\\{subkey} changed to unsupported type {reg_type}."
+        ));
+    }
+
+    let bounded_len = (actual_len as usize).min(buf.len());
+    let (pairs, _) = buf[..bounded_len].as_chunks::<2>();
+    let mut units = Vec::with_capacity(pairs.len());
+    for &[lo, hi] in pairs {
+        let unit = u16::from_le_bytes([lo, hi]);
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+    }
+    Ok(Some(String::from_utf16_lossy(&units)))
 }
 
 /// Opens the native Windows Explorer folder picker dialog and returns the selected directory, if confirmed.
@@ -1589,5 +1871,53 @@ mod tests {
         assert_eq!(&bytes[..4], &[0x4c, 0x00, 0x00, 0x00]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hkcu_registry_set_read_delete_roundtrip_in_ephemeral_key() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let subkey = format!(
+            r"Software\PaperCraftRegTest_{}_{}",
+            std::process::id(),
+            nanos
+        );
+        struct RegCleanup(String);
+        impl Drop for RegCleanup {
+            fn drop(&mut self) {
+                let wide = str_to_wide_null(&self.0);
+                // SAFETY: `HKEY_CURRENT_USER` is valid and `wide` is NUL-terminated UTF-16 for an ephemeral test key.
+                unsafe {
+                    let _ = RegDeleteKeyW(HKEY_CURRENT_USER, wide.as_ptr());
+                }
+            }
+        }
+        let _cleanup = RegCleanup(subkey.clone());
+        let value_name = "PaperCraft Server";
+
+        assert_eq!(read_hkcu_reg_sz(&subkey, value_name).unwrap(), None);
+
+        let cmd =
+            r#""C:\Program Files\Alyx Labs\PaperCraft Server\papercraft-server.exe" --autostart"#;
+        set_hkcu_reg_sz(&subkey, value_name, cmd).unwrap();
+        assert_eq!(
+            read_hkcu_reg_sz(&subkey, value_name).unwrap().as_deref(),
+            Some(cmd)
+        );
+
+        let unicode_cmd = r#""D:\Apps\Área de Trabalho\papercraft-server.exe" --autostart"#;
+        set_hkcu_reg_sz(&subkey, value_name, unicode_cmd).unwrap();
+        assert_eq!(
+            read_hkcu_reg_sz(&subkey, value_name).unwrap().as_deref(),
+            Some(unicode_cmd)
+        );
+
+        assert!(delete_hkcu_reg_value(&subkey, value_name).unwrap());
+        assert!(!delete_hkcu_reg_value(&subkey, value_name).unwrap());
+        assert_eq!(read_hkcu_reg_sz(&subkey, value_name).unwrap(), None);
+
+        assert!(set_hkcu_reg_sz("", value_name, cmd).is_err());
+        assert!(set_hkcu_reg_sz(&subkey, value_name, "bad\nline").is_err());
     }
 }

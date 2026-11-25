@@ -5,6 +5,7 @@ use std::sync::mpsc;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
+// TODO(branding): Replace shared PaperCraft RGBA icon with a dedicated PaperCraft Server logo once designed.
 const LOGO_RGBA_256: &[u8] =
     include_bytes!("../../../apps/papercraft/assets/branding/papercraft-256.rgba");
 const LOGO_DIM: usize = 256;
@@ -128,7 +129,10 @@ impl TrayController {
             &quit_item,
         ]);
 
+        let app_id = papercraft_updater::AppId::PaperCraftServer.bundle_identifier();
         let mut builder = TrayIconBuilder::new()
+            .with_id(app_id)
+            .with_autosave_name(app_id)
             .with_menu(Box::new(menu))
             .with_tooltip(&initial.tooltip)
             .with_menu_on_left_click(false)
