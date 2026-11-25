@@ -2157,6 +2157,46 @@ mod tests {
     }
 
     #[test]
+    fn stylus_set_input_mode_toggles_preference_and_preserves_doc_timestamp() {
+        let mut s = Session::default();
+        let initial_modified = s.doc.updated_at_ms;
+        assert!(!s.prefs.stylus_only_drawing);
+
+        // Missing or invalid payload must be rejected cleanly.
+        assert!(
+            s.execute("stylus.setInputMode", &serde_json::json!({}))
+                .is_err()
+        );
+        assert!(
+            s.execute(
+                "stylus.setInputMode",
+                &serde_json::json!({ "stylus_only_drawing": "yes" })
+            )
+            .is_err()
+        );
+
+        let res_on = s
+            .execute(
+                "stylus.setInputMode",
+                &serde_json::json!({ "stylus_only_drawing": true }),
+            )
+            .unwrap();
+        assert_eq!(res_on["stylus_only_drawing"], true);
+        assert!(s.prefs.stylus_only_drawing);
+        assert_eq!(s.doc.updated_at_ms, initial_modified);
+
+        let res_off = s
+            .execute(
+                "stylus.setInputMode",
+                &serde_json::json!({ "stylus_only_drawing": false }),
+            )
+            .unwrap();
+        assert_eq!(res_off["stylus_only_drawing"], false);
+        assert!(!s.prefs.stylus_only_drawing);
+        assert_eq!(s.doc.updated_at_ms, initial_modified);
+    }
+
+    #[test]
     fn notebook_set_metadata_on_other_slot_preserves_active_doc_timestamp() {
         let mut s = Session::default();
         s.execute(

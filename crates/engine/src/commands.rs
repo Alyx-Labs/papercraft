@@ -472,6 +472,11 @@ const COMMANDS: &[CommandSpec] = &[
         description: "Assign shortcut actions to connected stylus side buttons and eraser end, or reset them to defaults",
     },
     CommandSpec {
+        id: "stylus.setInputMode",
+        label: "Configure Stylus Input Mode",
+        description: "Enable or disable stylus-only drawing so finger and palm touches pan the canvas instead of drawing",
+    },
+    CommandSpec {
         id: "updates.setAutoCheck",
         label: "Toggle Automatic Update Checks",
         description: "Enable or disable checking for official PaperCraft releases automatically on startup",
@@ -1277,6 +1282,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
         "styleFavorite.delete" => cmd_style_favorite_delete(session, id, params),
         "theme.set" => cmd_theme_set(session, id, params),
         "stylus.setButtons" => cmd_stylus_set_buttons(session, id, params),
+        "stylus.setInputMode" => cmd_stylus_set_input_mode(session, id, params),
         "updates.setAutoCheck" => cmd_updates_set_auto_check(session, id, params),
         "sync.status" => cmd_sync_status(session),
         "sync.setServerUrl" => cmd_sync_set_server_url(session, id, params),
@@ -1299,6 +1305,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
             || id == "styleFavorite.delete"
             || id == "theme.set"
             || id == "stylus.setButtons"
+            || id == "stylus.setInputMode"
             || id == "updates.setAutoCheck"
             || id.starts_with("library.")
             || id.starts_with("template.")
@@ -1312,6 +1319,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
                     | "notebook.select"
                     | "theme.set"
                     | "stylus.setButtons"
+                    | "stylus.setInputMode"
                     | "updates.setAutoCheck"
                     | "library.setViewPrefs"
                     | "library.folder.setColor"
@@ -6059,6 +6067,25 @@ fn cmd_stylus_set_buttons(
         "barrel_button": session.prefs.stylus_buttons.barrel_button,
         "secondary_barrel_button": session.prefs.stylus_buttons.secondary_barrel_button,
         "eraser_end": session.prefs.stylus_buttons.eraser_end,
+    }))
+}
+
+#[derive(Deserialize)]
+struct SetStylusInputModeParams {
+    stylus_only_drawing: bool,
+}
+
+fn cmd_stylus_set_input_mode(
+    session: &mut Session,
+    id: &str,
+    params: &Value,
+) -> Result<Value, EngineError> {
+    let p: SetStylusInputModeParams = parse_params(id, params)?;
+    session.prefs.stylus_only_drawing = p.stylus_only_drawing;
+    let _ = session.save_prefs();
+    session.bump_revision();
+    Ok(json!({
+        "stylus_only_drawing": session.prefs.stylus_only_drawing,
     }))
 }
 

@@ -1,9 +1,9 @@
-//! W3C Pointer Events bridge for hardware stylus pressure, tilt, twist, barrel buttons,
-//! and inverted eraser tip in the WebAssembly browser build.
+//! W3C Pointer Events and Touch Events bridge for hardware stylus pressure, tilt, twist,
+//! barrel buttons, inverted eraser tip, proximity, and palm-rejection classification in WebAssembly.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use papercraft_ui_egui::stylus::{PenContactEvent, PenContactKind, PenSample};
+use papercraft_ui_egui::stylus::{PenContactEvent, PenContactKind, PenSample, PointerDeviceKind};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 
@@ -11,8 +11,12 @@ use crate::web_files::SharedEguiCtx;
 
 const MAX_QUEUED_SAMPLES: usize = 2048;
 const MAX_QUEUED_CONTACTS: usize = 512;
+const MAX_TRACKED_TOUCH_POINTERS: usize = 32;
 const MIN_WEB_CONTACT_PRESSURE: f32 = 0.02;
 const CONTEXTMENU_SUPPRESS_GRACE_MS: f64 = 750.0;
+const STALE_PEN_HOVER_TIMEOUT_MS: f64 = 1500.0;
+const PEN_TOUCH_MATCH_RADIUS_PX: f64 = 28.0;
+const PEN_TOUCH_MATCH_WINDOW_MS: f64 = 250.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PointerPhase {
@@ -24,11 +28,26 @@ enum PointerPhase {
     Leave,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TouchPhase {
+    Start,
+    Move,
+    End,
+    Cancel,
+}
+
 #[derive(Default)]
 struct WebStylusState {
     samples: Vec<PenSample>,
     contact_events: Vec<PenContactEvent>,
     pen_active: bool,
+    pen_down: bool,
+    active_pen_pointer_id: Option<i32>,
+    active_pen_touch_id: Option<u64>,
+    last_pen_client_pos: Option<(f64, f64)>,
+    last_pen_event_ms: Option<f64>,
+    active_touch_pointer_ids: Vec<i32>,
+    pointer_device_kind: PointerDeviceKind,
     pen_end_eraser: Option<bool>,
     barrel_down: bool,
     secondary_barrel_down: bool,
@@ -38,22 +57,34 @@ struct WebStylusState {
     last_pen_barrel_time_ms: Option<f64>,
 }
 
-/// Shared handle to browser `PointerEvent` stylus state consumed by `PlatformHooks`.
+/// Shared handle to browser `PointerEvent` and `TouchEvent` stylus state consumed by `PlatformHooks`.
 #[derive(Clone, Default)]
 pub struct WebStylusHandle {
     state: Arc<Mutex<WebStylusState>>,
 }
 
 impl WebStylusHandle {
-    /// Installs `pointer*` and `contextmenu` DOM listeners on the canvas and window.
+    /// Installs capture-phase `pointer*`/`touch*`, `blur`, and `contextmenu` DOM listeners.
     pub fn install(canvas: &web_sys::HtmlCanvasElement, ctx_slot: SharedEguiCtx) -> Self {
         let handle = Self::default();
-        handle.attach_pointer_listener(canvas, "pointerenter", PointerPhase::Enter, &ctx_slot);
-        handle.attach_pointer_listener(canvas, "pointerdown", PointerPhase::Down, &ctx_slot);
-        handle.attach_pointer_listener(canvas, "pointermove", PointerPhase::Move, &ctx_slot);
-        handle.attach_pointer_listener(canvas, "pointerup", PointerPhase::Up, &ctx_slot);
-        handle.attach_pointer_listener(canvas, "pointercancel", PointerPhase::Cancel, &ctx_slot);
-        handle.attach_pointer_listener(canvas, "pointerleave", PointerPhase::Leave, &ctx_slot);
+        for (name, phase) in [
+            ("pointerenter", PointerPhase::Enter),
+            ("pointerdown", PointerPhase::Down),
+            ("pointermove", PointerPhase::Move),
+            ("pointerup", PointerPhase::Up),
+            ("pointercancel", PointerPhase::Cancel),
+            ("pointerleave", PointerPhase::Leave),
+        ] {
+            handle.attach_pointer_listener(canvas, name, phase, &ctx_slot);
+        }
+        for (name, phase) in [
+            ("touchstart", TouchPhase::Start),
+            ("touchmove", TouchPhase::Move),
+            ("touchend", TouchPhase::End),
+            ("touchcancel", TouchPhase::Cancel),
+        ] {
+            handle.attach_touch_listener(canvas, name, phase, &ctx_slot);
+        }
         handle.attach_contextmenu_listener(canvas);
 
         if let Some(window) = web_sys::window() {
@@ -71,6 +102,14 @@ impl WebStylusHandle {
                 PointerPhase::Cancel,
                 &ctx_slot,
             );
+            handle.attach_window_touch_listener(&window, "touchend", TouchPhase::End, &ctx_slot);
+            handle.attach_window_touch_listener(
+                &window,
+                "touchcancel",
+                TouchPhase::Cancel,
+                &ctx_slot,
+            );
+            handle.attach_window_blur_listener(&window);
         }
         handle
     }
@@ -83,6 +122,25 @@ impl WebStylusHandle {
     pub fn drain_contact_events(&self) -> Vec<PenContactEvent> {
         let mut g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         std::mem::take(&mut g.contact_events)
+    }
+
+    pub fn pen_pointer_id(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .active_pen_touch_id
+    }
+
+    pub fn pen_in_proximity(&self) -> bool {
+        let g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        g.pen_active || g.pen_down || g.active_pen_touch_id.is_some()
+    }
+
+    pub fn pointer_device_kind(&self) -> PointerDeviceKind {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pointer_device_kind
     }
 
     pub fn pen_end(&self) -> Option<bool> {
@@ -128,13 +186,40 @@ impl WebStylusHandle {
         let ctx_ref = Arc::clone(ctx_slot);
         let cb = Closure::<dyn FnMut(web_sys::PointerEvent)>::wrap(Box::new(
             move |ev: web_sys::PointerEvent| {
-                let needs_repaint = handle_pointer_event(&state, &canvas_ref, &ev, phase);
-                if needs_repaint {
+                if handle_pointer_event(&state, &canvas_ref, &ev, phase) {
                     request_repaint(&ctx_ref);
                 }
             },
         ));
-        let _ = canvas.add_event_listener_with_callback(event_name, cb.as_ref().unchecked_ref());
+        let _ = canvas.add_event_listener_with_callback_and_bool(
+            event_name,
+            cb.as_ref().unchecked_ref(),
+            true,
+        );
+        cb.forget();
+    }
+
+    fn attach_touch_listener(
+        &self,
+        canvas: &web_sys::HtmlCanvasElement,
+        event_name: &str,
+        phase: TouchPhase,
+        ctx_slot: &SharedEguiCtx,
+    ) {
+        let state = Arc::clone(&self.state);
+        let ctx_ref = Arc::clone(ctx_slot);
+        let cb = Closure::<dyn FnMut(web_sys::TouchEvent)>::wrap(Box::new(
+            move |ev: web_sys::TouchEvent| {
+                if handle_touch_event(&state, &ev, phase) {
+                    request_repaint(&ctx_ref);
+                }
+            },
+        ));
+        let _ = canvas.add_event_listener_with_callback_and_bool(
+            event_name,
+            cb.as_ref().unchecked_ref(),
+            true,
+        );
         cb.forget();
     }
 
@@ -151,13 +236,56 @@ impl WebStylusHandle {
         let ctx_ref = Arc::clone(ctx_slot);
         let cb = Closure::<dyn FnMut(web_sys::PointerEvent)>::wrap(Box::new(
             move |ev: web_sys::PointerEvent| {
-                let needs_repaint = handle_window_release(&state, &canvas_ref, &ev, phase);
-                if needs_repaint {
+                if handle_window_release(&state, &canvas_ref, &ev, phase) {
                     request_repaint(&ctx_ref);
                 }
             },
         ));
-        let _ = window.add_event_listener_with_callback(event_name, cb.as_ref().unchecked_ref());
+        let _ = window.add_event_listener_with_callback_and_bool(
+            event_name,
+            cb.as_ref().unchecked_ref(),
+            true,
+        );
+        cb.forget();
+    }
+
+    fn attach_window_touch_listener(
+        &self,
+        window: &web_sys::Window,
+        event_name: &str,
+        phase: TouchPhase,
+        ctx_slot: &SharedEguiCtx,
+    ) {
+        let state = Arc::clone(&self.state);
+        let ctx_ref = Arc::clone(ctx_slot);
+        let cb = Closure::<dyn FnMut(web_sys::TouchEvent)>::wrap(Box::new(
+            move |ev: web_sys::TouchEvent| {
+                if handle_touch_event(&state, &ev, phase) {
+                    request_repaint(&ctx_ref);
+                }
+            },
+        ));
+        let _ = window.add_event_listener_with_callback_and_bool(
+            event_name,
+            cb.as_ref().unchecked_ref(),
+            true,
+        );
+        cb.forget();
+    }
+
+    fn attach_window_blur_listener(&self, window: &web_sys::Window) {
+        let state = Arc::clone(&self.state);
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::wrap(Box::new(move |_: web_sys::Event| {
+            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = clear_pen_state(&mut g);
+            g.active_touch_pointer_ids.clear();
+            g.pointer_device_kind = PointerDeviceKind::Unknown;
+        }));
+        let _ = window.add_event_listener_with_callback_and_bool(
+            "blur",
+            cb.as_ref().unchecked_ref(),
+            true,
+        );
         cb.forget();
     }
 
@@ -260,15 +388,53 @@ fn push_bounded_contact(contacts: &mut Vec<PenContactEvent>, event: PenContactEv
 
 fn clear_pen_state(state: &mut WebStylusState) -> bool {
     let changed = state.pen_active
+        || state.pen_down
+        || state.active_pen_pointer_id.is_some()
+        || state.active_pen_touch_id.is_some()
         || state.barrel_down
         || state.secondary_barrel_down
         || state.pen_end_eraser.is_some();
     state.pen_active = false;
+    state.pen_down = false;
+    state.active_pen_pointer_id = None;
+    state.active_pen_touch_id = None;
+    state.last_pen_client_pos = None;
+    state.last_pen_event_ms = None;
     state.pen_end_eraser = None;
     state.barrel_down = false;
     state.secondary_barrel_down = false;
     state.tracked_contact_pointer_id = None;
     changed
+}
+
+fn expire_stale_pen_hover(g: &mut WebStylusState, now_ms: f64) -> bool {
+    if g.pen_down || g.active_pen_touch_id.is_some() {
+        return false;
+    }
+    let stale = g.last_pen_event_ms.is_none_or(|t| {
+        !now_ms.is_finite()
+            || !t.is_finite()
+            || now_ms < t
+            || (now_ms - t) > STALE_PEN_HOVER_TIMEOUT_MS
+    });
+    if stale { clear_pen_state(g) } else { false }
+}
+
+fn track_touch_pointer(ids: &mut Vec<i32>, pointer_id: i32, phase: PointerPhase) {
+    match phase {
+        PointerPhase::Down | PointerPhase::Move => {
+            if !ids.contains(&pointer_id) {
+                if ids.len() >= MAX_TRACKED_TOUCH_POINTERS {
+                    ids.remove(0);
+                }
+                ids.push(pointer_id);
+            }
+        }
+        PointerPhase::Up | PointerPhase::Cancel | PointerPhase::Leave => {
+            ids.retain(|id| *id != pointer_id);
+        }
+        PointerPhase::Enter => {}
+    }
 }
 
 fn coalesced_pointer_events(ev: &web_sys::PointerEvent) -> Vec<web_sys::PointerEvent> {
@@ -315,6 +481,134 @@ fn push_pen_sample_from_event(
     push_bounded_sample(&mut g.samples, sample);
 }
 
+fn touch_type_string(touch: &web_sys::Touch) -> Option<String> {
+    js_sys::Reflect::get(
+        touch.as_ref(),
+        &wasm_bindgen::JsValue::from_str("touchType"),
+    )
+    .ok()
+    .and_then(|v| v.as_string())
+}
+
+fn touch_id_u64(touch: &web_sys::Touch) -> u64 {
+    egui::TouchId::from(touch.identifier()).0
+}
+
+fn touch_matches_active_pen(g: &WebStylusState, touch: &web_sys::Touch, now_ms: f64) -> bool {
+    let recent_pen = g.last_pen_event_ms.is_some_and(|t| {
+        now_ms.is_finite()
+            && t.is_finite()
+            && now_ms >= t
+            && (now_ms - t) <= PEN_TOUCH_MATCH_WINDOW_MS
+    });
+    if !g.pen_down && !recent_pen {
+        return false;
+    }
+    if let Some((px, py)) = g.last_pen_client_pos {
+        let dx = f64::from(touch.client_x()) - px;
+        let dy = f64::from(touch.client_y()) - py;
+        if dx.hypot(dy) <= PEN_TOUCH_MATCH_RADIUS_PX {
+            return true;
+        }
+    }
+    g.pen_down && g.active_pen_touch_id.is_none() && g.active_touch_pointer_ids.is_empty()
+}
+
+fn apply_touch_contact_to_state(
+    g: &mut WebStylusState,
+    touch: &web_sys::Touch,
+    phase: TouchPhase,
+    now_ms: f64,
+) -> bool {
+    let tid = touch_id_u64(touch);
+    match phase {
+        TouchPhase::End | TouchPhase::Cancel => {
+            if g.active_pen_touch_id == Some(tid) {
+                g.active_pen_touch_id = None;
+                g.pen_down = false;
+                return true;
+            }
+            false
+        }
+        TouchPhase::Start | TouchPhase::Move => {
+            let touch_type = touch_type_string(touch);
+            let is_stylus = match touch_type.as_deref() {
+                Some("stylus") => true,
+                Some("direct") => false,
+                _ => {
+                    g.active_pen_touch_id == Some(tid) || touch_matches_active_pen(g, touch, now_ms)
+                }
+            };
+            if is_stylus {
+                let changed = g.active_pen_touch_id != Some(tid) || !g.pen_active;
+                g.active_pen_touch_id = Some(tid);
+                g.pen_active = true;
+                g.pen_down = true;
+                g.pointer_device_kind = PointerDeviceKind::Pen;
+                g.last_pen_client_pos =
+                    Some((f64::from(touch.client_x()), f64::from(touch.client_y())));
+                if now_ms.is_finite() {
+                    g.last_pen_event_ms = Some(now_ms);
+                }
+                changed
+            } else {
+                let expired = expire_stale_pen_hover(g, now_ms);
+                if !g.pen_down && g.active_pen_touch_id.is_none() {
+                    g.pointer_device_kind = PointerDeviceKind::Touch;
+                }
+                expired
+            }
+        }
+    }
+}
+
+fn handle_touch_event(
+    state: &Arc<Mutex<WebStylusState>>,
+    ev: &web_sys::TouchEvent,
+    phase: TouchPhase,
+) -> bool {
+    let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+    let now_ms = ev.time_stamp();
+    let changed_touches = ev.changed_touches();
+    let mut needs_repaint = false;
+    for idx in 0..changed_touches.length() {
+        if let Some(touch) = changed_touches.item(idx) {
+            needs_repaint |= apply_touch_contact_to_state(&mut g, &touch, phase, now_ms);
+        }
+    }
+    needs_repaint
+}
+
+fn handle_non_pen_pointer(
+    g: &mut WebStylusState,
+    pointer_type: &str,
+    ev: &web_sys::PointerEvent,
+    phase: PointerPhase,
+    now_ms: f64,
+) -> bool {
+    if pointer_type == "mouse" {
+        g.active_touch_pointer_ids.clear();
+        g.pointer_device_kind = PointerDeviceKind::Mouse;
+        return clear_pen_state(g);
+    }
+    if pointer_type == "touch" {
+        track_touch_pointer(&mut g.active_touch_pointer_ids, ev.pointer_id(), phase);
+        let expired = if matches!(
+            phase,
+            PointerPhase::Enter | PointerPhase::Down | PointerPhase::Move
+        ) {
+            expire_stale_pen_hover(g, now_ms)
+        } else {
+            false
+        };
+        if !g.pen_down && g.active_pen_touch_id.is_none() {
+            g.pointer_device_kind = PointerDeviceKind::Touch;
+        }
+        return expired;
+    }
+    false
+}
+
 fn handle_pointer_event(
     state: &Arc<Mutex<WebStylusState>>,
     canvas: &web_sys::HtmlCanvasElement,
@@ -322,16 +616,12 @@ fn handle_pointer_event(
     phase: PointerPhase,
 ) -> bool {
     let pointer_type = ev.pointer_type();
+    let now_ms = ev.time_stamp();
+    let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
     if pointer_type != "pen" {
-        if pointer_type == "mouse" {
-            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
-            return clear_pen_state(&mut g);
-        }
-        return false;
+        return handle_non_pen_pointer(&mut g, &pointer_type, ev, phase, now_ms);
     }
 
-    let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
-    let now_ms = ev.time_stamp();
     if matches!(phase, PointerPhase::Cancel | PointerPhase::Leave) {
         let mut needs_repaint = clear_pen_state(&mut g);
         if phase == PointerPhase::Cancel {
@@ -359,11 +649,25 @@ fn handle_pointer_event(
     let button = ev.button();
     let buttons = ev.buttons();
     let (barrel, secondary, eraser) = decode_pen_flags(phase, button, buttons);
+    let prev_active = g.pen_active;
     let prev_barrel = g.barrel_down;
     let prev_secondary = g.secondary_barrel_down;
     let prev_eraser = g.pen_end_eraser;
 
     g.pen_active = true;
+    g.active_pen_pointer_id = Some(ev.pointer_id());
+    g.pointer_device_kind = PointerDeviceKind::Pen;
+    g.last_pen_client_pos = Some((f64::from(ev.client_x()), f64::from(ev.client_y())));
+    if now_ms.is_finite() {
+        g.last_pen_event_ms = Some(now_ms);
+    }
+    match phase {
+        PointerPhase::Down => g.pen_down = true,
+        PointerPhase::Up => g.pen_down = false,
+        PointerPhase::Move => g.pen_down = (buttons & 1) != 0 || (buttons & 32) != 0,
+        PointerPhase::Enter | PointerPhase::Cancel | PointerPhase::Leave => {}
+    }
+
     g.barrel_down = barrel;
     g.secondary_barrel_down = secondary;
     g.pen_end_eraser = Some(eraser);
@@ -394,6 +698,7 @@ fn handle_pointer_event(
 
     let contact_queued = record_fallback_contact(&mut g, canvas, ev, phase, button, eraser);
     contact_queued
+        || !prev_active
         || prev_barrel != barrel
         || prev_secondary != secondary
         || prev_eraser != Some(eraser)
@@ -455,11 +760,35 @@ fn handle_window_release(
     ev: &web_sys::PointerEvent,
     phase: PointerPhase,
 ) -> bool {
-    if ev.pointer_type() != "pen" {
+    let pointer_type = ev.pointer_type();
+    let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+    if pointer_type == "touch" {
+        track_touch_pointer(&mut g.active_touch_pointer_ids, ev.pointer_id(), phase);
         return false;
     }
-    let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+    if pointer_type != "pen" {
+        return false;
+    }
+
     let pointer_id = ev.pointer_id();
+    if phase == PointerPhase::Cancel {
+        let mut needs_repaint = clear_pen_state(&mut g);
+        if g.tracked_contact_pointer_id == Some(pointer_id) {
+            g.tracked_contact_pointer_id = None;
+            push_bounded_contact(
+                &mut g.contact_events,
+                PenContactEvent {
+                    kind: PenContactKind::Cancel,
+                    pos: canvas_local_pos(canvas, ev),
+                    modifiers: event_modifiers(ev),
+                },
+            );
+            needs_repaint = true;
+        }
+        return needs_repaint;
+    }
+
+    g.pen_down = false;
     let had_contact = g.tracked_contact_pointer_id == Some(pointer_id);
     let had_buttons = g.barrel_down || g.secondary_barrel_down || g.pen_end_eraser == Some(true);
     if !had_contact && !had_buttons {
@@ -471,15 +800,10 @@ fn handle_window_release(
     g.pen_end_eraser = Some((buttons & 32) != 0);
     if had_contact {
         g.tracked_contact_pointer_id = None;
-        let kind = if phase == PointerPhase::Cancel {
-            PenContactKind::Cancel
-        } else {
-            PenContactKind::Up
-        };
         push_bounded_contact(
             &mut g.contact_events,
             PenContactEvent {
-                kind,
+                kind: PenContactKind::Up,
                 pos: canvas_local_pos(canvas, ev),
                 modifiers: event_modifiers(ev),
             },

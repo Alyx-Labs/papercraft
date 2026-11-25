@@ -141,6 +141,16 @@ pub struct ConnectedStylusInfo {
     pub is_external: bool,
 }
 
+/// Input device class reported by the active platform pointer stream.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PointerDeviceKind {
+    #[default]
+    Unknown,
+    Mouse,
+    Pen,
+    Touch,
+}
+
 /// Live stylus readout displayed in the Pen & Stylus Inspector.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StylusTelemetry {
@@ -275,11 +285,44 @@ pub struct Stylus {
     emulated_primary_down_by_touch: Option<egui::TouchId>,
     promoted_barrel_button: Option<egui::PointerButton>,
     synthetic_contact_active: bool,
+    pen_in_proximity: bool,
+    active_pointer_kind: PointerDeviceKind,
+    forwarded_non_pen_touches: Vec<(egui::TouchDeviceId, egui::TouchId, egui::Pos2)>,
+    active_pen_touch_ids: Vec<egui::TouchId>,
     pub telemetry: StylusTelemetry,
     pub clock_ms: f64,
 }
 
 impl Stylus {
+    pub fn set_pointer_device_kind(&mut self, kind: PointerDeviceKind) {
+        self.active_pointer_kind = kind;
+    }
+
+    #[must_use]
+    pub fn pointer_device_kind(&self) -> PointerDeviceKind {
+        self.active_pointer_kind
+    }
+
+    #[must_use]
+    pub fn is_pen_in_proximity(&self) -> bool {
+        self.pen_in_proximity || self.os_pen_id.is_some()
+    }
+
+    #[must_use]
+    pub fn is_pen_touch(&self, id: egui::TouchId, force: Option<f32>) -> bool {
+        self.os_pen_id == Some(id.0)
+            || self.last_pen_touch_id == Some(id)
+            || self.active_pen_touch_ids.contains(&id)
+            || (self.os_pen_id.is_none()
+                && self.active_pointer_kind != PointerDeviceKind::Touch
+                && force.is_some_and(|f| f.is_finite() && f > 0.0))
+    }
+
+    #[must_use]
+    pub fn is_touch_pointer_blocked_for_drawing(&self) -> bool {
+        self.active_pointer_kind == PointerDeviceKind::Touch
+    }
+
     #[must_use]
     pub fn is_connected(&self) -> bool {
         !self.connected_devices.is_empty()
@@ -1047,10 +1090,28 @@ impl Stylus {
         os_pen_id: Option<u64>,
         has_pen_hook: bool,
     ) {
+        self.sanitize_raw_input_with_proximity(
+            raw_input,
+            os_pen_id,
+            os_pen_id.is_some(),
+            has_pen_hook,
+        );
+    }
+
+    /// Isolates stylus pointer updates with explicit platform hover proximity in addition to `os_pen_id`.
+    pub fn sanitize_raw_input_with_proximity(
+        &mut self,
+        raw_input: &mut egui::RawInput,
+        os_pen_id: Option<u64>,
+        pen_in_proximity: bool,
+        has_pen_hook: bool,
+    ) {
         self.prune_ended_ignored_touches();
         let prev_os_pen_id = self.os_pen_id;
+        let prev_pen_proximity = self.pen_in_proximity;
         self.os_pen_id = os_pen_id;
-        if os_pen_id.is_some() {
+        self.pen_in_proximity = pen_in_proximity || os_pen_id.is_some();
+        if self.pen_in_proximity {
             self.hardware_seen_in_session = true;
         }
 
@@ -1079,10 +1140,13 @@ impl Stylus {
                 (Some(now), Some(last)) if now >= last && (now - last) <= POST_PEN_MOUSE_GRACE_S
             );
         let suppress_mouse_moves = os_pen_id.is_some() || batch_has_pen || within_grace;
-        let pen_active_now = os_pen_id.is_some() || pen_touch_id.is_some();
+        let pen_active_now = self.pen_in_proximity || pen_touch_id.is_some();
 
         let old = std::mem::take(&mut raw_input.events);
-        let mut out = Vec::with_capacity(old.len().saturating_add(2));
+        let mut out = Vec::with_capacity(old.len().saturating_add(4));
+        if pen_active_now && !self.forwarded_non_pen_touches.is_empty() {
+            self.cancel_forwarded_non_pen_touches(pen_touch_id, &mut out);
+        }
         let mut i = 0;
         while i < old.len() {
             if let Some(touch_idx) = touch_prefix_index(&old, i) {
@@ -1117,7 +1181,7 @@ impl Stylus {
                     i += 1;
                 }
                 egui::Event::PointerGone => {
-                    if os_pen_id.is_none() {
+                    if !self.pen_in_proximity {
                         out.push(old[i].clone());
                     }
                     i += 1;
@@ -1139,8 +1203,8 @@ impl Stylus {
             }
         }
 
-        if prev_os_pen_id.is_some()
-            && os_pen_id.is_none()
+        if (prev_os_pen_id.is_some() || prev_pen_proximity)
+            && !self.pen_in_proximity
             && !out
                 .iter()
                 .any(|ev| matches!(ev, egui::Event::PointerGone | egui::Event::PointerMoved(_)))
@@ -1153,6 +1217,7 @@ impl Stylus {
         {
             self.last_pen_touch_id = None;
         }
+        self.prune_ended_pen_touches(&out);
         raw_input.events = out;
     }
 
@@ -1164,20 +1229,138 @@ impl Stylus {
         pen_active_now: bool,
         out: &mut Vec<egui::Event>,
     ) {
-        let egui::Event::Touch { id, phase, pos, .. } = *touch_ev else {
+        let egui::Event::Touch {
+            device_id,
+            id,
+            phase,
+            pos,
+            ..
+        } = *touch_ev
+        else {
             return;
         };
-        out.push(touch_ev.clone());
         if Some(id) == pen_touch_id {
+            self.track_active_pen_touch(id, phase);
+            out.push(touch_ev.clone());
             self.process_pen_touch(paired, (id, phase, pos), out);
-        } else {
-            if !pen_active_now && phase == egui::TouchPhase::Start {
-                self.ignored_touch_ids.retain(|x| *x != id);
+            return;
+        }
+        if !pen_active_now && phase == egui::TouchPhase::Start {
+            self.ignored_touch_ids.retain(|x| *x != id);
+        }
+        if pen_active_now || self.is_ignored_touch(id) {
+            if let Some((stale_dev, _, stale_pos)) = self.take_forwarded_non_pen_touch(id) {
+                out.push(egui::Event::Touch {
+                    device_id: stale_dev,
+                    id,
+                    phase: egui::TouchPhase::Cancel,
+                    pos: stale_pos,
+                    force: None,
+                });
             }
-            if pen_active_now || self.is_ignored_touch(id) {
-                self.process_ignored_touch(paired, (id, phase, pos), out);
-            } else {
-                self.forward_touch_tail(paired, id, out);
+            self.process_ignored_touch(paired, (id, phase, pos), out);
+        } else {
+            self.track_forwarded_non_pen_touch(device_id, id, phase, pos);
+            out.push(touch_ev.clone());
+            self.forward_touch_tail(paired, id, out);
+        }
+    }
+
+    fn track_active_pen_touch(&mut self, id: egui::TouchId, phase: egui::TouchPhase) {
+        match phase {
+            egui::TouchPhase::Start | egui::TouchPhase::Move => {
+                if !self.active_pen_touch_ids.contains(&id) {
+                    if self.active_pen_touch_ids.len() >= MAX_IGNORED_TOUCHES {
+                        self.active_pen_touch_ids.remove(0);
+                    }
+                    self.active_pen_touch_ids.push(id);
+                }
+            }
+            egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                self.active_pen_touch_ids.retain(|x| *x != id);
+            }
+        }
+    }
+
+    fn prune_ended_pen_touches(&mut self, events: &[egui::Event]) {
+        for ev in events {
+            if let egui::Event::Touch {
+                id,
+                phase: egui::TouchPhase::End | egui::TouchPhase::Cancel,
+                ..
+            } = ev
+            {
+                self.active_pen_touch_ids.retain(|x| *x != *id);
+            }
+        }
+    }
+
+    fn track_forwarded_non_pen_touch(
+        &mut self,
+        device_id: egui::TouchDeviceId,
+        id: egui::TouchId,
+        phase: egui::TouchPhase,
+        pos: egui::Pos2,
+    ) {
+        match phase {
+            egui::TouchPhase::Start | egui::TouchPhase::Move => {
+                if let Some(entry) = self
+                    .forwarded_non_pen_touches
+                    .iter_mut()
+                    .find(|(_, tid, _)| *tid == id)
+                {
+                    entry.2 = pos;
+                } else {
+                    if self.forwarded_non_pen_touches.len() >= MAX_IGNORED_TOUCHES {
+                        self.forwarded_non_pen_touches.remove(0);
+                    }
+                    self.forwarded_non_pen_touches.push((device_id, id, pos));
+                }
+            }
+            egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                self.forwarded_non_pen_touches
+                    .retain(|(_, tid, _)| *tid != id);
+            }
+        }
+    }
+
+    fn take_forwarded_non_pen_touch(
+        &mut self,
+        id: egui::TouchId,
+    ) -> Option<(egui::TouchDeviceId, egui::TouchId, egui::Pos2)> {
+        let idx = self
+            .forwarded_non_pen_touches
+            .iter()
+            .position(|(_, tid, _)| *tid == id)?;
+        Some(self.forwarded_non_pen_touches.remove(idx))
+    }
+
+    fn cancel_forwarded_non_pen_touches(
+        &mut self,
+        pen_touch_id: Option<egui::TouchId>,
+        out: &mut Vec<egui::Event>,
+    ) {
+        let active = std::mem::take(&mut self.forwarded_non_pen_touches);
+        for (dev, stale_id, stale_pos) in active {
+            if Some(stale_id) == pen_touch_id {
+                continue;
+            }
+            out.push(egui::Event::Touch {
+                device_id: dev,
+                id: stale_id,
+                phase: egui::TouchPhase::Cancel,
+                pos: stale_pos,
+                force: None,
+            });
+            self.record_ignored_touch(stale_id, egui::TouchPhase::Start);
+            if self.emulated_primary_down_by_touch == Some(stale_id) {
+                out.push(egui::Event::PointerButton {
+                    pos: self.last_pen_pos.unwrap_or(stale_pos),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                self.emulated_primary_down_by_touch = None;
             }
         }
     }
@@ -2330,5 +2513,152 @@ mod tests {
             })
             .count();
         assert_eq!(primary_down_count, 1);
+    }
+
+    #[test]
+    fn hover_proximity_cancels_resting_palm_drops_new_palm_and_preserves_pointer_moves() {
+        let mut stylus = Stylus::default();
+        let dev = egui::TouchDeviceId(0);
+        let palm_a = egui::TouchId(7);
+        let palm_b = egui::TouchId(8);
+        let palm_pos = egui::pos2(210.0, 420.0);
+        let pen_hover_pos = egui::pos2(400.0, 220.0);
+
+        // 1. Resting palm arrives before the pen enters hover proximity.
+        let mut raw_palm = egui::RawInput {
+            time: Some(1.0),
+            events: vec![
+                egui::Event::PointerMoved(palm_pos),
+                egui::Event::PointerButton {
+                    pos: palm_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: palm_a,
+                    phase: egui::TouchPhase::Start,
+                    pos: palm_pos,
+                    force: Some(0.0),
+                },
+            ],
+            ..Default::default()
+        };
+        stylus.sanitize_raw_input_with_proximity(&mut raw_palm, None, false, true);
+        assert!(!stylus.is_ignored_touch(palm_a));
+        assert!(raw_palm.events.iter().any(|ev| matches!(
+            ev,
+            egui::Event::Touch { id, phase: egui::TouchPhase::Start, .. } if *id == palm_a
+        )));
+
+        // 2. Pen enters hover proximity (`pen_in_proximity = true`, `os_pen_id = None` like desktop
+        // browser hover) while palm_a moves and palm_b starts.
+        let mut raw_hover = egui::RawInput {
+            time: Some(1.016),
+            events: vec![
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: palm_a,
+                    phase: egui::TouchPhase::Move,
+                    pos: palm_pos,
+                    force: Some(0.0),
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: palm_b,
+                    phase: egui::TouchPhase::Start,
+                    pos: egui::pos2(260.0, 460.0),
+                    force: Some(0.0),
+                },
+                egui::Event::PointerMoved(pen_hover_pos),
+            ],
+            ..Default::default()
+        };
+        stylus.sanitize_raw_input_with_proximity(&mut raw_hover, None, true, true);
+        assert!(stylus.is_connected());
+        assert!(stylus.is_pen_in_proximity());
+        assert!(stylus.is_ignored_touch(palm_a));
+        assert!(stylus.is_ignored_touch(palm_b));
+        assert!(raw_hover.events.iter().any(|ev| matches!(
+            ev,
+            egui::Event::Touch { id, phase: egui::TouchPhase::Cancel, .. } if *id == palm_a
+        )));
+        assert!(raw_hover.events.iter().any(|ev| matches!(
+            ev,
+            egui::Event::PointerButton {
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                ..
+            }
+        )));
+        assert!(!raw_hover.events.iter().any(|ev| matches!(
+            ev,
+            egui::Event::Touch { id, .. } if *id == palm_b
+        )));
+        assert!(raw_hover.events.iter().any(|ev| matches!(
+            ev,
+            egui::Event::PointerMoved(pos) if *pos == pen_hover_pos
+        )));
+    }
+
+    #[test]
+    fn matched_zero_force_pen_touch_recognizes_pen_and_drops_concurrent_palm() {
+        let mut stylus = Stylus::default();
+        let dev = egui::TouchDeviceId(0);
+        let pen = egui::TouchId(42);
+        let palm = egui::TouchId(99);
+
+        let mut raw = egui::RawInput {
+            time: Some(2.0),
+            events: vec![
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: pen,
+                    phase: egui::TouchPhase::Start,
+                    pos: egui::pos2(500.0, 300.0),
+                    force: Some(0.0),
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: palm,
+                    phase: egui::TouchPhase::Start,
+                    pos: egui::pos2(220.0, 440.0),
+                    force: None,
+                },
+            ],
+            ..Default::default()
+        };
+        stylus.set_pointer_device_kind(PointerDeviceKind::Pen);
+        stylus.sanitize_raw_input_with_proximity(&mut raw, Some(42), true, true);
+
+        assert!(stylus.is_pen_touch(pen, Some(0.0)));
+        assert!(!stylus.is_pen_touch(palm, None));
+        assert!(stylus.is_ignored_touch(palm));
+        assert!(raw.events.iter().any(|ev| matches!(
+            ev,
+            egui::Event::Touch { id, phase: egui::TouchPhase::Start, .. } if *id == pen
+        )));
+        assert!(!raw.events.iter().any(|ev| matches!(
+            ev,
+            egui::Event::Touch { id, .. } if *id == palm
+        )));
+    }
+
+    #[test]
+    fn pointer_device_kind_blocks_only_touch_for_drawing() {
+        let mut stylus = Stylus::default();
+        assert!(!stylus.is_touch_pointer_blocked_for_drawing());
+
+        stylus.set_pointer_device_kind(PointerDeviceKind::Touch);
+        assert!(stylus.is_touch_pointer_blocked_for_drawing());
+        assert!(!stylus.is_pen_touch(egui::TouchId(1), Some(0.5)));
+
+        stylus.set_pointer_device_kind(PointerDeviceKind::Pen);
+        assert!(!stylus.is_touch_pointer_blocked_for_drawing());
+        assert!(stylus.is_pen_touch(egui::TouchId(1), Some(0.5)));
+
+        stylus.set_pointer_device_kind(PointerDeviceKind::Mouse);
+        assert!(!stylus.is_touch_pointer_blocked_for_drawing());
     }
 }

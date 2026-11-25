@@ -7587,6 +7587,8 @@ pub struct UserStudioConfig {
     pub saved_elements: Vec<SavedElement>,
     #[serde(default)]
     pub stylus_buttons: StylusButtonConfig,
+    #[serde(default)]
+    pub stylus_only_drawing: bool,
     #[serde(default = "default_auto_check_updates")]
     pub auto_check_updates: bool,
 }
@@ -7616,6 +7618,7 @@ impl Default for UserStudioConfig {
             style_favorites: Vec::new(),
             saved_elements: Vec::new(),
             stylus_buttons: StylusButtonConfig::default(),
+            stylus_only_drawing: false,
             auto_check_updates: default_auto_check_updates(),
         }
     }
@@ -8050,6 +8053,7 @@ impl UserStudioConfig {
             style_favorites,
             saved_elements,
             stylus_buttons: self.stylus_buttons.sanitized(),
+            stylus_only_drawing: self.stylus_only_drawing,
             auto_check_updates: self.auto_check_updates,
         }
     }
@@ -9261,6 +9265,7 @@ mod tests {
 
         let legacy: UserStudioConfig = serde_json::from_str("{}").expect("legacy studio config");
         assert_eq!(legacy.stylus_buttons, def);
+        assert!(!legacy.stylus_only_drawing);
 
         let custom = UserStudioConfig {
             stylus_buttons: StylusButtonConfig {
@@ -9268,12 +9273,15 @@ mod tests {
                 secondary_barrel_button: StylusButtonAction::LassoSelectHold,
                 eraser_end: StylusButtonAction::HighlighterHold,
             },
+            stylus_only_drawing: true,
             ..UserStudioConfig::default()
         };
         let encoded = serde_json::to_string(&custom).expect("serialize stylus config");
         let decoded: UserStudioConfig =
             serde_json::from_str(&encoded).expect("deserialize stylus config");
         assert_eq!(decoded.stylus_buttons, custom.stylus_buttons);
+        assert!(decoded.stylus_only_drawing);
+        assert!(decoded.sanitized().stylus_only_drawing);
 
         // Non-hold actions on the inverted eraser end sanitize back to EraserHold.
         let dirty = UserStudioConfig {

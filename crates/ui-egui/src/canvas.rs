@@ -1327,6 +1327,111 @@ fn apply_zoom_around_anchor(
     app.session.zoom = zoom;
 }
 
+const FINGER_PAN_DEADZONE_PX: f32 = 6.0;
+
+fn clear_finger_pan(app: &mut PaperCraftApp) {
+    app.view.finger_pan_touch_id = None;
+    app.view.finger_pan_start = None;
+    app.view.finger_pan_last = None;
+    app.view.finger_pan_engaged = false;
+}
+
+fn screen_pos_hits_ruler_body_or_handle(app: &PaperCraftApp, screen_pos: Pos2) -> bool {
+    let xf = page_affine(app);
+    let page_pos = xf.to_page(Point::new(f64::from(screen_pos.x), f64::from(screen_pos.y)));
+    let handle = xf.to_screen(ruler_rotation_handle(app));
+    let handle_dx = f64::from(screen_pos.x) - handle.x;
+    let handle_dy = f64::from(screen_pos.y) - handle.y;
+    let (along, across) = ruler_local_position(app, page_pos);
+    let (_, _, _, half_length, half_width) = ruler_geometry(app);
+    let end_margin = 4.0 / f64::from(app.view.zoom.max(0.05));
+    handle_dx.hypot(handle_dy) <= 16.0
+        || (along.abs() <= half_length + end_margin
+            && across.abs() <= half_width
+            && ruler_edge_for_point(app, page_pos).is_none())
+}
+
+fn handle_finger_pan(app: &mut PaperCraftApp, ui: &mut egui::Ui, resp: &egui::Response) {
+    let allow_finger_pan = app.session.prefs.stylus_only_drawing
+        && !app.view.text_editing
+        && !app.view.text_insert_mode
+        && app.session.active_tool != ToolKind::Select
+        && app.view.ruler_drag_mode.is_none()
+        && !app.stylus.is_pen_in_proximity()
+        && !has_active_live(app);
+    if !allow_finger_pan {
+        clear_finger_pan(app);
+        return;
+    }
+
+    let events = ui.input(|i| i.events.clone());
+    for ev in events {
+        let egui::Event::Touch {
+            id,
+            phase,
+            pos,
+            force,
+            ..
+        } = ev
+        else {
+            continue;
+        };
+        if app.stylus.is_ignored_touch(id) || app.stylus.is_pen_touch(id, force) {
+            if app.view.finger_pan_touch_id == Some(id) {
+                clear_finger_pan(app);
+            }
+            continue;
+        }
+        match phase {
+            egui::TouchPhase::Start => {
+                if app.view.finger_pan_touch_id.is_none()
+                    && can_start_on_canvas(ui, resp, pos)
+                    && !(app.view.ruler_active && screen_pos_hits_ruler_body_or_handle(app, pos))
+                {
+                    app.view.finger_pan_touch_id = Some(id);
+                    app.view.finger_pan_start = Some(pos);
+                    app.view.finger_pan_last = Some(pos);
+                    app.view.finger_pan_engaged = false;
+                }
+            }
+            egui::TouchPhase::Move => {
+                if app.view.finger_pan_touch_id == Some(id) {
+                    if !app.view.finger_pan_engaged {
+                        let moved_far = app.view.finger_pan_start.is_some_and(|start| {
+                            start.x.is_finite()
+                                && start.y.is_finite()
+                                && pos.x.is_finite()
+                                && pos.y.is_finite()
+                                && (pos - start).length_sq()
+                                    >= FINGER_PAN_DEADZONE_PX * FINGER_PAN_DEADZONE_PX
+                        });
+                        if moved_far {
+                            app.view.finger_pan_engaged = true;
+                        }
+                    }
+                    if app.view.finger_pan_engaged {
+                        if let Some(prev) = app.view.finger_pan_last {
+                            let delta = pos - prev;
+                            if delta.x.is_finite() && delta.y.is_finite() {
+                                cancel_camera_glide(app);
+                                app.view.pan[0] += f64::from(delta.x);
+                                app.view.pan[1] += f64::from(delta.y);
+                            }
+                        }
+                        app.view.finger_pan_last = Some(pos);
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
+            egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                if app.view.finger_pan_touch_id == Some(id) {
+                    clear_finger_pan(app);
+                }
+            }
+        }
+    }
+}
+
 fn handle_pan_and_zoom(app: &mut PaperCraftApp, ui: &mut egui::Ui, resp: &egui::Response) {
     let mut xf = page_affine(app);
     let space_held = !app.view.text_editing && ui.input(|i| i.key_down(egui::Key::Space));
@@ -1340,6 +1445,7 @@ fn handle_pan_and_zoom(app: &mut PaperCraftApp, ui: &mut egui::Ui, resp: &egui::
             || resp.dragged_by(egui::PointerButton::Middle));
 
     if mid_drag || space_drag || stylus_pan_drag {
+        clear_finger_pan(app);
         cancel_camera_glide(app);
         let delta = ui.input(|i| i.pointer.delta());
         app.view.pan[0] += f64::from(delta.x);
@@ -1360,6 +1466,7 @@ fn handle_pan_and_zoom(app: &mut PaperCraftApp, ui: &mut egui::Ui, resp: &egui::
     });
 
     if let Some(mt) = multi_touch {
+        clear_finger_pan(app);
         let anchor_pt = Point::new(f64::from(mt.center_pos.x), f64::from(mt.center_pos.y));
         let moved = mt.translation_delta.length_sq() > 1e-4;
         let zoomed = (mt.zoom_delta - 1.0).abs() > 1e-4;
@@ -1376,6 +1483,8 @@ fn handle_pan_and_zoom(app: &mut PaperCraftApp, ui: &mut egui::Ui, resp: &egui::
         }
         return;
     }
+
+    handle_finger_pan(app, ui, resp);
 
     if resp.hovered() {
         let anchor = hover_pos.unwrap_or_else(|| resp.rect.center());
@@ -1749,6 +1858,57 @@ fn touch_start_has_paired_pointer(events: &[egui::Event], start_idx: usize) -> b
     after || before
 }
 
+fn is_non_pen_touch_for_drawing(
+    app: &PaperCraftApp,
+    id: egui::TouchId,
+    force: Option<f32>,
+) -> bool {
+    app.session.prefs.stylus_only_drawing && !app.stylus.is_pen_touch(id, force)
+}
+
+fn scan_paired_touch_start<'a>(
+    iter: impl Iterator<Item = &'a egui::Event>,
+    press_pos: Pos2,
+) -> Option<(egui::TouchId, Option<f32>)> {
+    for ev in iter.take(4) {
+        if let egui::Event::Touch {
+            id,
+            phase: egui::TouchPhase::Start,
+            pos,
+            force,
+            ..
+        } = *ev
+            && pointer_pos_matches_touch(press_pos, pos)
+        {
+            return Some((id, force));
+        }
+    }
+    None
+}
+
+fn pointer_press_is_blocked_touch(
+    app: &PaperCraftApp,
+    events: &[egui::Event],
+    press_idx: usize,
+    press_pos: Pos2,
+) -> bool {
+    if !app.session.prefs.stylus_only_drawing {
+        return false;
+    }
+    if app.stylus.is_touch_pointer_blocked_for_drawing() {
+        return true;
+    }
+    let after = events
+        .get(press_idx + 1..)
+        .and_then(|tail| scan_paired_touch_start(tail.iter(), press_pos));
+    let before = events
+        .get(..press_idx)
+        .and_then(|head| scan_paired_touch_start(head.iter().rev(), press_pos));
+    after
+        .or(before)
+        .is_some_and(|(id, force)| !app.stylus.is_pen_touch(id, force))
+}
+
 fn touch_start_claims_stroke(
     app: &PaperCraftApp,
     events: &[egui::Event],
@@ -1757,6 +1917,7 @@ fn touch_start_claims_stroke(
     force: Option<f32>,
 ) -> bool {
     !app.stylus.is_ignored_touch(id)
+        && !is_non_pen_touch_for_drawing(app, id, force)
         && (force.is_some() || !touch_start_has_paired_pointer(events, start_idx))
 }
 
@@ -1925,7 +2086,9 @@ impl DrawingEventCounter {
         idx: usize,
         pos: Pos2,
     ) {
-        if pointer_press_superseded_by_following_touch(app, ctx.events, idx, pos) {
+        if pointer_press_is_blocked_touch(app, ctx.events, idx, pos)
+            || pointer_press_superseded_by_following_touch(app, ctx.events, idx, pos)
+        {
             return;
         }
         if let Some(active_id) = self.touch_id {
@@ -2087,7 +2250,9 @@ fn handle_pointer_canvas_event(
             pressed: true,
             ..
         } => {
-            if pointer_press_superseded_by_following_touch(app, ctx.events, idx, *pos) {
+            if pointer_press_is_blocked_touch(app, ctx.events, idx, *pos)
+                || pointer_press_superseded_by_following_touch(app, ctx.events, idx, *pos)
+            {
                 return;
             }
             if let Some(active_id) = app.view.active_touch_id {
@@ -2348,7 +2513,13 @@ fn handle_drawing_input(app: &mut PaperCraftApp, ui: &mut egui::Ui, resp: &egui:
 
     let pan_space = !app.view.text_editing && space_held;
     let stylus_pan_held = !app.view.text_editing && app.stylus.pan_held();
-    if !focused || pan_space || stylus_pan_held || app.view.pan_dragging || multi_touch_active {
+    if !focused
+        || pan_space
+        || stylus_pan_held
+        || app.view.pan_dragging
+        || app.view.finger_pan_engaged
+        || multi_touch_active
+    {
         clear_ruler_drag(app);
         if app.view.shape_insert_mode {
             app.view.shape_drag_start = None;
@@ -2444,7 +2615,12 @@ fn handle_shape_input(
     let (focused, space_held, modifiers) =
         ui.input(|i| (i.focused, i.key_down(egui::Key::Space), i.modifiers));
     let stylus_pan_held = !app.view.text_editing && app.stylus.pan_held();
-    if !focused || space_held || stylus_pan_held || app.view.pan_dragging {
+    if !focused
+        || space_held
+        || stylus_pan_held
+        || app.view.pan_dragging
+        || app.view.finger_pan_engaged
+    {
         app.view.shape_drag_start = None;
         app.view.shape_drag_end = None;
         app.view.shape_drag_touch_id = None;
@@ -2454,15 +2630,18 @@ fn handle_shape_input(
         return;
     }
 
-    let pointer_start = events.iter().find_map(|event| match event {
-        egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            ..
-        } => Some(*pos),
-        _ => None,
-    });
+    let pointer_start = events
+        .iter()
+        .enumerate()
+        .find_map(|(idx, event)| match event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                ..
+            } if !pointer_press_is_blocked_touch(app, events, idx, *pos) => Some(*pos),
+            _ => None,
+        });
     let touch_start = events
         .iter()
         .enumerate()
@@ -2473,14 +2652,17 @@ fn handle_shape_input(
                 pos,
                 force,
                 ..
-            } => Some((idx, *id, *pos, force.is_some())),
+            } => Some((idx, *id, *pos, *force)),
             _ => None,
         });
 
     if app.view.shape_drag_start.is_none() {
         let start = match touch_start {
-            Some((idx, id, pos, has_force)) if !app.stylus.is_ignored_touch(id) => {
-                if has_force || !touch_start_has_paired_pointer(events, idx) {
+            Some((idx, id, pos, force))
+                if !app.stylus.is_ignored_touch(id)
+                    && !is_non_pen_touch_for_drawing(app, id, force) =>
+            {
+                if force.is_some() || !touch_start_has_paired_pointer(events, idx) {
                     Some((pos, Some(id)))
                 } else {
                     pointer_start.map(|pointer| (pointer, None))
@@ -2953,22 +3135,8 @@ fn update_canvas_cursor_icon(app: &PaperCraftApp, ui: &egui::Ui, resp: &egui::Re
     let ruler_move_hover = app.view.ruler_active
         && ui
             .input(|i| i.pointer.hover_pos())
-            .is_some_and(|screen_pos| {
-                let xf = page_affine(app);
-                let page_pos =
-                    xf.to_page(Point::new(f64::from(screen_pos.x), f64::from(screen_pos.y)));
-                let handle = xf.to_screen(ruler_rotation_handle(app));
-                let handle_dx = f64::from(screen_pos.x) - handle.x;
-                let handle_dy = f64::from(screen_pos.y) - handle.y;
-                let (along, across) = ruler_local_position(app, page_pos);
-                let (_, _, _, half_length, half_width) = ruler_geometry(app);
-                let end_margin = 4.0 / f64::from(app.view.zoom.max(0.05));
-                handle_dx.hypot(handle_dy) <= 16.0
-                    || (along.abs() <= half_length + end_margin
-                        && across.abs() <= half_width
-                        && ruler_edge_for_point(app, page_pos).is_none())
-            });
-    let icon = if app.view.pan_dragging {
+            .is_some_and(|screen_pos| screen_pos_hits_ruler_body_or_handle(app, screen_pos));
+    let icon = if app.view.pan_dragging || app.view.finger_pan_engaged {
         egui::CursorIcon::Grabbing
     } else if space_held || stylus_pan_held {
         egui::CursorIcon::Grab
@@ -8983,8 +9151,11 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
             if input_active {
                 handle_pan_and_zoom(app, ui, &resp);
                 handle_drawing_input(app, ui, &resp);
-            } else if has_active_live(app) {
-                finish_active_stroke(app);
+            } else {
+                clear_finger_pan(app);
+                if has_active_live(app) {
+                    finish_active_stroke(app);
+                }
             }
 
             let xf = page_affine(app);
@@ -14250,5 +14421,375 @@ mod tests {
                 pt.y
             );
         }
+    }
+
+    #[test]
+    fn stylus_only_drawing_pans_with_finger_and_blocks_finger_and_shape_strokes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        let ctx = egui::Context::default();
+        let mut app = setup_editor_app(&ctx);
+        app.session.prefs.stylus_only_drawing = true;
+
+        let kind_flag = Arc::new(AtomicU8::new(3)); // Touch
+        let kind_hook = Arc::clone(&kind_flag);
+        app.hooks.pointer_device_kind =
+            Some(Box::new(move || match kind_hook.load(Ordering::Relaxed) {
+                1 => crate::stylus::PointerDeviceKind::Mouse,
+                2 => crate::stylus::PointerDeviceKind::Pen,
+                3 => crate::stylus::PointerDeviceKind::Touch,
+                _ => crate::stylus::PointerDeviceKind::Unknown,
+            }));
+
+        // 1. Synchronous web-style pointerdown before touchstart with Touch kind must not start a stroke.
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.016,
+            vec![
+                egui::Event::PointerMoved(pos2(500.0, 350.0)),
+                egui::Event::PointerButton {
+                    pos: pos2(500.0, 350.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+        assert!(app.session.live_stroke.is_none());
+        assert_eq!(app.session.doc.strokes.len(), 0);
+
+        // 2. Finger touch jitter (< 6 px deadzone) must not move camera pan or draw.
+        let dev = egui::TouchDeviceId(0);
+        let finger = egui::TouchId(5);
+        let initial_pan = app.view.pan;
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.032,
+            vec![
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: finger,
+                    phase: egui::TouchPhase::Start,
+                    pos: pos2(500.0, 350.0),
+                    force: Some(0.0),
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: finger,
+                    phase: egui::TouchPhase::Move,
+                    pos: pos2(503.0, 350.0),
+                    force: Some(0.0),
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(app.view.pan, initial_pan);
+        assert_eq!(app.session.doc.strokes.len(), 0);
+
+        // 3. Dragging finger past 6 px pans canvas cleanly without drawing.
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.048,
+            vec![
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: finger,
+                    phase: egui::TouchPhase::Move,
+                    pos: pos2(530.0, 370.0),
+                    force: Some(0.0),
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: finger,
+                    phase: egui::TouchPhase::End,
+                    pos: pos2(530.0, 370.0),
+                    force: Some(0.0),
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+        assert!((app.view.pan[0] - (initial_pan[0] + 30.0)).abs() < 1e-3);
+        assert!((app.view.pan[1] - (initial_pan[1] + 20.0)).abs() < 1e-3);
+        assert_eq!(app.session.doc.strokes.len(), 0);
+
+        // 4. Finger touch in shape insert mode must not create a shape.
+        app.view.shape_insert_mode = true;
+        let shape_touch = egui::TouchId(6);
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.064,
+            vec![
+                egui::Event::PointerMoved(pos2(480.0, 320.0)),
+                egui::Event::PointerButton {
+                    pos: pos2(480.0, 320.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: shape_touch,
+                    phase: egui::TouchPhase::Start,
+                    pos: pos2(480.0, 320.0),
+                    force: Some(0.0),
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: shape_touch,
+                    phase: egui::TouchPhase::Move,
+                    pos: pos2(560.0, 400.0),
+                    force: Some(0.0),
+                },
+                egui::Event::PointerButton {
+                    pos: pos2(560.0, 400.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: shape_touch,
+                    phase: egui::TouchPhase::End,
+                    pos: pos2(560.0, 400.0),
+                    force: Some(0.0),
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+        assert!(app.view.shape_drag_start.is_none());
+        assert_eq!(app.session.doc.shapes.len(), 0);
+    }
+
+    #[test]
+    fn stylus_only_drawing_allows_stylus_zero_force_and_mouse_to_draw() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+
+        let ctx = egui::Context::default();
+        let mut app = setup_editor_app(&ctx);
+        app.session.prefs.stylus_only_drawing = true;
+
+        let pen_id_slot = Arc::new(AtomicU64::new(33));
+        let pen_prox = Arc::new(AtomicBool::new(true));
+        let kind_flag = Arc::new(AtomicU8::new(2)); // Pen
+        let p_id = Arc::clone(&pen_id_slot);
+        let p_prox = Arc::clone(&pen_prox);
+        let p_kind = Arc::clone(&kind_flag);
+
+        app.hooks.pen_pointer_id = Some(Box::new(move || {
+            let v = p_id.load(Ordering::Relaxed);
+            (v != u64::MAX).then_some(v)
+        }));
+        app.hooks.pen_in_proximity = Some(Box::new(move || p_prox.load(Ordering::Relaxed)));
+        app.hooks.pointer_device_kind =
+            Some(Box::new(move || match p_kind.load(Ordering::Relaxed) {
+                1 => crate::stylus::PointerDeviceKind::Mouse,
+                2 => crate::stylus::PointerDeviceKind::Pen,
+                3 => crate::stylus::PointerDeviceKind::Touch,
+                _ => crate::stylus::PointerDeviceKind::Unknown,
+            }));
+
+        // Zero-force stylus (such as USB-C pencil) draws normally when matched via pen_pointer_id.
+        let dev = egui::TouchDeviceId(0);
+        let pen_touch = egui::TouchId(33);
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.016,
+            vec![
+                egui::Event::PointerMoved(pos2(460.0, 320.0)),
+                egui::Event::PointerButton {
+                    pos: pos2(460.0, 320.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: pen_touch,
+                    phase: egui::TouchPhase::Start,
+                    pos: pos2(460.0, 320.0),
+                    force: Some(0.0),
+                },
+                egui::Event::PointerMoved(pos2(540.0, 360.0)),
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: pen_touch,
+                    phase: egui::TouchPhase::Move,
+                    pos: pos2(540.0, 360.0),
+                    force: Some(0.0),
+                },
+                egui::Event::PointerButton {
+                    pos: pos2(540.0, 360.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerGone,
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: pen_touch,
+                    phase: egui::TouchPhase::End,
+                    pos: pos2(540.0, 360.0),
+                    force: Some(0.0),
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(app.session.doc.strokes.len(), 1);
+
+        // Mouse input still draws normally in stylus-only mode.
+        pen_id_slot.store(u64::MAX, Ordering::Relaxed);
+        pen_prox.store(false, Ordering::Relaxed);
+        kind_flag.store(1, Ordering::Relaxed); // Mouse
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.25,
+            vec![
+                egui::Event::PointerMoved(pos2(460.0, 420.0)),
+                egui::Event::PointerButton {
+                    pos: pos2(460.0, 420.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(pos2(560.0, 450.0)),
+                egui::Event::PointerButton {
+                    pos: pos2(560.0, 450.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(app.session.doc.strokes.len(), 2);
+    }
+
+    #[test]
+    fn resting_palm_before_stylus_touchdown_is_cancelled_without_aborting_stroke() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+
+        let ctx = egui::Context::default();
+        let mut app = setup_editor_app(&ctx);
+        app.session.prefs.stylus_only_drawing = true;
+
+        let pen_id_slot = Arc::new(AtomicU64::new(u64::MAX));
+        let pen_prox = Arc::new(AtomicBool::new(false));
+        let kind_flag = Arc::new(AtomicU8::new(3)); // Touch initially
+        let p_id = Arc::clone(&pen_id_slot);
+        let p_prox = Arc::clone(&pen_prox);
+        let p_kind = Arc::clone(&kind_flag);
+
+        app.hooks.pen_pointer_id = Some(Box::new(move || {
+            let v = p_id.load(Ordering::Relaxed);
+            (v != u64::MAX).then_some(v)
+        }));
+        app.hooks.pen_in_proximity = Some(Box::new(move || p_prox.load(Ordering::Relaxed)));
+        app.hooks.pointer_device_kind =
+            Some(Box::new(move || match p_kind.load(Ordering::Relaxed) {
+                2 => crate::stylus::PointerDeviceKind::Pen,
+                3 => crate::stylus::PointerDeviceKind::Touch,
+                _ => crate::stylus::PointerDeviceKind::Unknown,
+            }));
+
+        let dev = egui::TouchDeviceId(0);
+        let palm = egui::TouchId(1);
+        let pen = egui::TouchId(2);
+
+        // Frame 1: Palm touches down before stylus enters proximity.
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.016,
+            vec![
+                egui::Event::PointerMoved(pos2(240.0, 480.0)),
+                egui::Event::PointerButton {
+                    pos: pos2(240.0, 480.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: palm,
+                    phase: egui::TouchPhase::Start,
+                    pos: pos2(240.0, 480.0),
+                    force: Some(0.0),
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(app.session.doc.strokes.len(), 0);
+        assert!(app.session.live_stroke.is_none());
+
+        // Frame 2: Stylus enters proximity and draws a 3-point stroke while palm rests.
+        pen_id_slot.store(2, Ordering::Relaxed);
+        pen_prox.store(true, Ordering::Relaxed);
+        kind_flag.store(2, Ordering::Relaxed);
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.032,
+            vec![
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: palm,
+                    phase: egui::TouchPhase::Move,
+                    pos: pos2(242.0, 482.0),
+                    force: Some(0.0),
+                },
+                egui::Event::PointerMoved(pos2(500.0, 300.0)),
+                egui::Event::PointerButton {
+                    pos: pos2(500.0, 300.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: pen,
+                    phase: egui::TouchPhase::Start,
+                    pos: pos2(500.0, 300.0),
+                    force: Some(0.35),
+                },
+                egui::Event::PointerMoved(pos2(560.0, 330.0)),
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: pen,
+                    phase: egui::TouchPhase::Move,
+                    pos: pos2(560.0, 330.0),
+                    force: Some(0.65),
+                },
+                egui::Event::PointerButton {
+                    pos: pos2(590.0, 350.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerGone,
+                egui::Event::Touch {
+                    device_id: dev,
+                    id: pen,
+                    phase: egui::TouchPhase::End,
+                    pos: pos2(590.0, 350.0),
+                    force: Some(0.15),
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+
+        assert!(ctx.input(|i| i.multi_touch()).is_none());
+        assert!(app.stylus.is_ignored_touch(palm));
+        assert_eq!(app.session.doc.strokes.len(), 1);
+        assert_eq!(app.session.doc.strokes[0].raw_points.len(), 3);
     }
 }

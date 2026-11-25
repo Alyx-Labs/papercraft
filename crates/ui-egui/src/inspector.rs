@@ -123,6 +123,42 @@ fn draw_stylus_button_row(
     chosen.filter(|&next| next != spec.current)
 }
 
+fn draw_touch_and_palm_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    card_frame(t).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_card_header(
+            ui,
+            Icon::Pencil,
+            "Touch & Palm Rejection",
+            "Control how finger and palm touches behave on the canvas while writing with a stylus.",
+            t,
+        );
+
+        let mut stylus_only = app.session.prefs.stylus_only_drawing;
+        let check_resp = ui
+            .checkbox(&mut stylus_only, "Draw with stylus only")
+            .on_hover_text(
+                "Ignore finger and resting palm touches when drawing, erasing, or placing shapes. Drag with one finger to pan the page and pinch with two fingers to zoom; mouse input still draws normally.",
+            );
+        if check_resp.changed() {
+            let _ = app.session.execute(
+                "stylus.setInputMode",
+                &json!({ "stylus_only_drawing": stylus_only }),
+            );
+        }
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Finger and resting palm touches pan the canvas instead of leaving stray marks. Stylus and mouse input continue drawing normally, and toolbar controls remain tappable by touch.",
+                )
+                .size(11.0)
+                .color(t.text_muted),
+            )
+            .wrap(),
+        );
+    });
+}
+
 fn draw_stylus_disconnected_card(ui: &mut egui::Ui, t: &Tokens) {
     card_frame(t).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -911,7 +947,7 @@ fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, kind: PenKin
             SettingsTab::Pen,
             Icon::FountainPen,
             "Pen",
-            "Stylus detection, hardware button shortcuts, and active pen reset",
+            "Touch palm rejection, stylus detection, hardware button shortcuts, and active pen reset",
         ),
         (
             SettingsTab::Appearance,
@@ -1035,6 +1071,8 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
                 ui.multiply_opacity(tab_opacity);
                 match app.view.settings_tab {
                     SettingsTab::Pen => {
+                        draw_touch_and_palm_card(app, ui, &t);
+                        ui.add_space(8.0);
                         if app.is_stylus_connected() {
                             draw_stylus_shortcuts_card(app, ui, &t);
                         } else {
@@ -1693,5 +1731,49 @@ mod tests {
         let (texts_unplugged, _) = render_step(&ctx, &mut app, 4.5, Vec::new());
         assert!(!texts_unplugged.contains("Stylus shortcuts"));
         assert!(texts_unplugged.contains("No stylus detected"));
+    }
+
+    #[test]
+    fn touch_and_palm_card_renders_when_disconnected_and_toggles_stylus_only_drawing() {
+        let ctx = egui::Context::default();
+        let mut app = PaperCraftApp::default();
+        app.view.screen = crate::AppScreen::Editor;
+        app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
+        app.view.inspector_open = true;
+        app.view.settings_tab = SettingsTab::Pen;
+        assert!(!app.is_stylus_connected());
+        assert!(!app.session.prefs.stylus_only_drawing);
+
+        let mut time_s = 1.0_f64;
+        let _ = auto_contrast_ui_tests::run_editor_frame(
+            &ctx,
+            &mut app,
+            auto_contrast_ui_tests::base_input(),
+            &mut time_s,
+        );
+        let shapes = auto_contrast_ui_tests::run_editor_frame(
+            &ctx,
+            &mut app,
+            auto_contrast_ui_tests::base_input(),
+            &mut time_s,
+        );
+        assert!(
+            auto_contrast_ui_tests::find_text_rect_in_shapes(&shapes, "Touch & Palm Rejection")
+                .is_some()
+        );
+        let check_rect =
+            auto_contrast_ui_tests::find_text_rect_in_shapes(&shapes, "Draw with stylus only")
+                .expect("Draw with stylus only checkbox should render on Pen tab");
+
+        let shapes_on =
+            auto_contrast_ui_tests::click_at(&ctx, &mut app, check_rect.center(), &mut time_s);
+        assert!(app.session.prefs.stylus_only_drawing);
+
+        let check_rect_on =
+            auto_contrast_ui_tests::find_text_rect_in_shapes(&shapes_on, "Draw with stylus only")
+                .expect("Draw with stylus only checkbox should remain visible when enabled");
+        let _ =
+            auto_contrast_ui_tests::click_at(&ctx, &mut app, check_rect_on.center(), &mut time_s);
+        assert!(!app.session.prefs.stylus_only_drawing);
     }
 }

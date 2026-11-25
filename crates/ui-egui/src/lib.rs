@@ -352,6 +352,10 @@ pub struct ViewState {
     pub template_import_error: Option<String>,
     pub settings_tab: SettingsTab,
     pub pan_dragging: bool,
+    pub finger_pan_touch_id: Option<egui::TouchId>,
+    pub finger_pan_start: Option<egui::Pos2>,
+    pub finger_pan_last: Option<egui::Pos2>,
+    pub finger_pan_engaged: bool,
     pub active_touch_id: Option<egui::TouchId>,
     pub active_pointer_stroke: bool,
     pub straighten_reference_point: Option<papercraft_geom::Point>,
@@ -528,6 +532,10 @@ impl Default for ViewState {
             template_import_error: None,
             settings_tab: SettingsTab::Pen,
             pan_dragging: false,
+            finger_pan_touch_id: None,
+            finger_pan_start: None,
+            finger_pan_last: None,
+            finger_pan_engaged: false,
             active_touch_id: None,
             active_pointer_stroke: false,
             straighten_reference_point: None,
@@ -690,6 +698,8 @@ pub enum ClipboardImagePayload {
 
 pub type TabletPollFn = Box<dyn FnMut() -> Vec<stylus::PenSample>>;
 pub type PenPointerIdFn = Box<dyn Fn() -> Option<u64>>;
+pub type PenInProximityFn = Box<dyn Fn() -> bool>;
+pub type PointerDeviceKindFn = Box<dyn Fn() -> stylus::PointerDeviceKind>;
 pub type PenEndFn = Box<dyn Fn() -> Option<bool>>;
 pub type BarrelDownFn = Box<dyn Fn() -> bool>;
 pub type ButtonPressCountFn = Box<dyn FnMut() -> u32>;
@@ -714,6 +724,8 @@ pub type PastePollFn = Box<dyn FnMut() -> bool>;
 pub struct PlatformHooks {
     pub tablet_poll: Option<TabletPollFn>,
     pub pen_pointer_id: Option<PenPointerIdFn>,
+    pub pen_in_proximity: Option<PenInProximityFn>,
+    pub pointer_device_kind: Option<PointerDeviceKindFn>,
     pub pen_end: Option<PenEndFn>,
     pub barrel_down: Option<BarrelDownFn>,
     pub secondary_barrel_down: Option<BarrelDownFn>,
@@ -2419,8 +2431,23 @@ fn tool_command_name(tool: papercraft_engine::ToolKind) -> &'static str {
 impl eframe::App for PaperCraftApp {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         let os_pen_id = self.hooks.pen_pointer_id.as_ref().and_then(|f| f());
-        self.stylus
-            .sanitize_raw_input(raw_input, os_pen_id, self.hooks.pen_pointer_id.is_some());
+        let pen_in_proximity = self
+            .hooks
+            .pen_in_proximity
+            .as_ref()
+            .map_or(os_pen_id.is_some(), |f| f());
+        let pointer_kind = self
+            .hooks
+            .pointer_device_kind
+            .as_ref()
+            .map_or(stylus::PointerDeviceKind::Unknown, |f| f());
+        self.stylus.set_pointer_device_kind(pointer_kind);
+        self.stylus.sanitize_raw_input_with_proximity(
+            raw_input,
+            os_pen_id,
+            pen_in_proximity,
+            self.hooks.pen_pointer_id.is_some(),
+        );
         if let Some(poll) = self.hooks.tablet_poll.as_mut() {
             let samples = poll();
             if !samples.is_empty() {

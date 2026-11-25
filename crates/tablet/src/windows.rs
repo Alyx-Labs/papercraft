@@ -250,6 +250,12 @@ unsafe extern "system" {
         riid: *const ComGuid,
         ppv: *mut *mut std::ffi::c_void,
     ) -> i32;
+    fn SHGetKnownFolderPath(
+        rfid: *const ComGuid,
+        dw_flags: u32,
+        h_token: *mut std::ffi::c_void,
+        ppsz_path: *mut *mut u16,
+    ) -> i32;
 }
 
 #[link(name = "ole32")]
@@ -289,6 +295,10 @@ impl ComGuid {
 const CLSID_FILE_OPEN_DIALOG: ComGuid = ComGuid::from_u128(0xdc1c5a9c_e88a_4dde_a5a1_60f82a20aef7);
 const IID_I_FILE_DIALOG: ComGuid = ComGuid::from_u128(0x42f85136_db7e_439c_85f1_e4075d135fc8);
 const IID_I_SHELL_ITEM: ComGuid = ComGuid::from_u128(0x43826d1e_e718_42ee_bc55_a1e261c37bfe);
+const FOLDERID_DESKTOP: ComGuid = ComGuid::from_u128(0xb4bfcc3a_db2c_424c_b029_7fe99a87c641);
+const CLSID_SHELL_LINK: ComGuid = ComGuid::from_u128(0x00021401_0000_0000_c000_000000000046);
+const IID_I_SHELL_LINK_W: ComGuid = ComGuid::from_u128(0x000214f9_0000_0000_c000_000000000046);
+const IID_I_PERSIST_FILE: ComGuid = ComGuid::from_u128(0x0000010b_0000_0000_c000_000000000046);
 
 const S_OK: i32 = 0;
 const S_FALSE: i32 = 1;
@@ -307,6 +317,11 @@ const IUNKNOWN_VTBL_LEN: usize = 3;
 const IFILE_DIALOG_VTBL_LEN: usize = 27;
 #[cfg(test)]
 const ISHELL_ITEM_VTBL_LEN: usize = 8;
+#[cfg(test)]
+const ISHELL_LINK_VTBL_LEN: usize = 21;
+#[cfg(test)]
+const IPERSIST_FILE_VTBL_LEN: usize = 9;
+const VTBL_IUNKNOWN_QUERY_INTERFACE: usize = 0;
 const VTBL_IUNKNOWN_RELEASE: usize = 2;
 const VTBL_IMODAL_WINDOW_SHOW: usize = 3;
 const VTBL_IFILE_DIALOG_SET_OPTIONS: usize = 9;
@@ -315,6 +330,11 @@ const VTBL_IFILE_DIALOG_SET_FOLDER: usize = 12;
 const VTBL_IFILE_DIALOG_SET_TITLE: usize = 17;
 const VTBL_IFILE_DIALOG_GET_RESULT: usize = 20;
 const VTBL_ISHELL_ITEM_GET_DISPLAY_NAME: usize = 5;
+const VTBL_ISHELL_LINK_SET_DESCRIPTION: usize = 7;
+const VTBL_ISHELL_LINK_SET_WORKING_DIR: usize = 9;
+const VTBL_ISHELL_LINK_SET_ICON_LOCATION: usize = 17;
+const VTBL_ISHELL_LINK_SET_PATH: usize = 20;
+const VTBL_IPERSIST_FILE_SAVE: usize = 6;
 
 #[link(name = "comdlg32")]
 unsafe extern "system" {
@@ -673,6 +693,30 @@ fn configure_folder_dialog(dialog: &ComObject, title: &str, initial_dir: Option<
     true
 }
 
+fn read_co_task_mem_path(raw_str: *mut u16) -> Option<PathBuf> {
+    let _free_guard = CoTaskMemWideGuard(raw_str);
+    if raw_str.is_null() {
+        return None;
+    }
+
+    let mut len = 0usize;
+    while len < 32_768 {
+        // SAFETY: `raw_str` is a valid NUL-terminated UTF-16 string allocated via `CoTaskMemAlloc`.
+        let unit = unsafe { *raw_str.add(len) };
+        if unit == 0 {
+            break;
+        }
+        len += 1;
+    }
+    if len == 0 {
+        return None;
+    }
+    // SAFETY: `len` code units preceding the NUL terminator belong to the COM-allocated string buffer.
+    let slice = unsafe { std::slice::from_raw_parts(raw_str, len) };
+    let chosen = String::from_utf16_lossy(slice);
+    (!chosen.trim().is_empty()).then(|| PathBuf::from(chosen))
+}
+
 fn read_shell_item_path(item: &ComObject) -> Option<PathBuf> {
     let mut raw_str: *mut u16 = std::ptr::null_mut();
     // SAFETY: `item` is an `IShellItem`; `GetDisplayName` is at slot 5 and writes a `CoTaskMemAlloc` UTF-16 string.
@@ -684,27 +728,179 @@ fn read_shell_item_path(item: &ComObject) -> Option<PathBuf> {
         ) -> i32 = std::mem::transmute(item.vtable_slot(VTBL_ISHELL_ITEM_GET_DISPLAY_NAME));
         get_display_name(item.ptr, SIGDN_FILESYSPATH, &mut raw_str)
     };
-    let _free_guard = CoTaskMemWideGuard(raw_str);
-    if hr < 0 || raw_str.is_null() {
+    if hr < 0 {
+        let _free_guard = CoTaskMemWideGuard(raw_str);
         return None;
+    }
+    read_co_task_mem_path(raw_str)
+}
+
+/// Parameters for creating or refreshing a Windows `.lnk` desktop shortcut.
+#[derive(Clone, Copy, Debug)]
+pub struct WindowsShortcutSpec<'a> {
+    pub shortcut_path: &'a Path,
+    pub target_path: &'a Path,
+    pub working_dir: Option<&'a Path>,
+    pub description: &'a str,
+    pub icon_path: Option<&'a Path>,
+}
+
+/// Resolves the user's current Windows Desktop directory (`FOLDERID_Desktop`), with `%USERPROFILE%\Desktop` fallback.
+#[must_use]
+pub fn desktop_dir() -> Option<PathBuf> {
+    let _com = ComGuard::init();
+    let mut raw_str: *mut u16 = std::ptr::null_mut();
+    // SAFETY: `FOLDERID_DESKTOP` is a valid `KNOWNFOLDERID` and `raw_str` receives a `CoTaskMemAlloc` path.
+    let hr = unsafe {
+        SHGetKnownFolderPath(&FOLDERID_DESKTOP, 0, std::ptr::null_mut(), &mut raw_str)
+    };
+    if hr >= 0
+        && let Some(path) = read_co_task_mem_path(raw_str)
+    {
+        return Some(path);
+    } else {
+        let _free_guard = CoTaskMemWideGuard(raw_str);
     }
 
-    let mut len = 0usize;
-    while len < 32_768 {
-        // SAFETY: `raw_str` is a valid NUL-terminated UTF-16 string until the NUL terminator is reached.
-        let unit = unsafe { *raw_str.add(len) };
-        if unit == 0 {
-            break;
+    std::env::var_os("USERPROFILE")
+        .filter(|v| !v.is_empty())
+        .map(|home| PathBuf::from(home).join("Desktop"))
+}
+
+fn create_shell_link() -> Result<ComObject, String> {
+    let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: `CLSID_SHELL_LINK` and `IID_I_SHELL_LINK_W` are valid COM GUIDs and `raw` receives an owning `IShellLinkW`.
+    let hr = unsafe {
+        CoCreateInstance(
+            &CLSID_SHELL_LINK,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IID_I_SHELL_LINK_W,
+            &mut raw,
+        )
+    };
+    if hr < 0 || raw.is_null() {
+        return Err(format!("Could not create IShellLinkW COM object (HRESULT 0x{hr:08x})."));
+    }
+    Ok(ComObject { ptr: raw })
+}
+
+fn set_shell_link_wide_str(
+    link: &ComObject,
+    slot: usize,
+    value: &std::ffi::OsStr,
+    label: &str,
+) -> Result<(), String> {
+    let wide = os_str_to_wide_null(value);
+    // SAFETY: Caller supplies an initialized `IShellLinkW` and a single-`LPCWSTR` setter slot (`SetPath`, `SetWorkingDirectory`, or `SetDescription`).
+    let hr = unsafe {
+        let setter: unsafe extern "system" fn(*mut std::ffi::c_void, *const u16) -> i32 =
+            std::mem::transmute(link.vtable_slot(slot));
+        setter(link.ptr, wide.as_ptr())
+    };
+    if hr < 0 {
+        return Err(format!("Failed setting shortcut {label} (HRESULT 0x{hr:08x})."));
+    }
+    Ok(())
+}
+
+fn configure_shell_link(link: &ComObject, spec: WindowsShortcutSpec<'_>) -> Result<(), String> {
+    set_shell_link_wide_str(link, VTBL_ISHELL_LINK_SET_PATH, spec.target_path.as_os_str(), "target")?;
+
+    if let Some(work_dir) = spec.working_dir.or_else(|| spec.target_path.parent())
+        && !work_dir.as_os_str().is_empty()
+    {
+        set_shell_link_wide_str(
+            link,
+            VTBL_ISHELL_LINK_SET_WORKING_DIR,
+            work_dir.as_os_str(),
+            "working directory",
+        )?;
+    }
+
+    if !spec.description.trim().is_empty() {
+        set_shell_link_wide_str(
+            link,
+            VTBL_ISHELL_LINK_SET_DESCRIPTION,
+            std::ffi::OsStr::new(spec.description),
+            "description",
+        )?;
+    }
+
+    if let Some(icon) = spec.icon_path {
+        let icon_wide = os_str_to_wide_null(icon.as_os_str());
+        // SAFETY: `SetIconLocation` at slot 17 on `IShellLinkW` takes `(LPCWSTR, int)`.
+        let hr = unsafe {
+            let set_icon: unsafe extern "system" fn(
+                *mut std::ffi::c_void,
+                *const u16,
+                i32,
+            ) -> i32 = std::mem::transmute(link.vtable_slot(VTBL_ISHELL_LINK_SET_ICON_LOCATION));
+            set_icon(link.ptr, icon_wide.as_ptr(), 0)
+        };
+        if hr < 0 {
+            return Err(format!(
+                "Failed setting shortcut icon location (HRESULT 0x{hr:08x})."
+            ));
         }
-        len += 1;
     }
-    if len == 0 {
-        return None;
+
+    Ok(())
+}
+
+fn save_shell_link(link: &ComObject, shortcut_path: &Path) -> Result<(), String> {
+    let mut persist_raw: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: `QueryInterface` is slot 0 on `IUnknown` / `IShellLinkW`; `IID_I_PERSIST_FILE` writes an owned `IPersistFile`.
+    let qi_hr = unsafe {
+        let qi: unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            *const ComGuid,
+            *mut *mut std::ffi::c_void,
+        ) -> i32 = std::mem::transmute(link.vtable_slot(VTBL_IUNKNOWN_QUERY_INTERFACE));
+        qi(link.ptr, &IID_I_PERSIST_FILE, &mut persist_raw)
+    };
+    if qi_hr < 0 || persist_raw.is_null() {
+        return Err(format!(
+            "Could not obtain IPersistFile from ShellLink (HRESULT 0x{qi_hr:08x})."
+        ));
     }
-    // SAFETY: `len` code units preceding the NUL terminator belong to the buffer returned by `GetDisplayName`.
-    let slice = unsafe { std::slice::from_raw_parts(raw_str, len) };
-    let chosen = String::from_utf16_lossy(slice);
-    (!chosen.trim().is_empty()).then(|| PathBuf::from(chosen))
+    let persist = ComObject { ptr: persist_raw };
+
+    let lnk_wide = os_str_to_wide_null(shortcut_path.as_os_str());
+    // SAFETY: `IPersistFile::Save` is at slot 6 and borrows `lnk_wide` for the duration of the write.
+    let save_hr = unsafe {
+        let save: unsafe extern "system" fn(*mut std::ffi::c_void, *const u16, i32) -> i32 =
+            std::mem::transmute(persist.vtable_slot(VTBL_IPERSIST_FILE_SAVE));
+        save(persist.ptr, lnk_wide.as_ptr(), 1)
+    };
+    if save_hr < 0 {
+        return Err(format!(
+            "Could not save shortcut `{}` (HRESULT 0x{save_hr:08x}).",
+            shortcut_path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Creates or overwrites a Windows Explorer `.lnk` shortcut pointing to `spec.target_path`.
+pub fn create_desktop_shortcut(spec: WindowsShortcutSpec<'_>) -> Result<(), String> {
+    if spec.shortcut_path.as_os_str().is_empty() || spec.target_path.as_os_str().is_empty() {
+        return Err("Shortcut path and target executable path must be non-empty.".to_string());
+    }
+    if let Some(parent) = spec.shortcut_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "Could not prepare shortcut folder `{}`: {err}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let _com = ComGuard::init()
+        .ok_or_else(|| "Could not initialize Windows COM for shortcut creation.".to_string())?;
+    let link = create_shell_link()?;
+    configure_shell_link(&link, spec)?;
+    save_shell_link(&link, spec.shortcut_path)
 }
 
 /// Opens the native Windows Explorer folder picker dialog and returns the selected directory, if confirmed.
@@ -1343,8 +1539,46 @@ mod tests {
         assert_eq!(CLSID_FILE_OPEN_DIALOG.data1, 0xdc1c_5a9c);
         assert_eq!(IID_I_FILE_DIALOG.data1, 0x42f8_5136);
         assert_eq!(IID_I_SHELL_ITEM.data1, 0x4382_6d1e);
+        assert_eq!(FOLDERID_DESKTOP.data1, 0xb4bf_cc3a);
+        assert_eq!(CLSID_SHELL_LINK.data1, 0x0002_1401);
+        assert_eq!(IID_I_SHELL_LINK_W.data1, 0x0002_14f9);
+        assert_eq!(IID_I_PERSIST_FILE.data1, 0x0000_010b);
         assert_eq!(IUNKNOWN_VTBL_LEN, 3);
         assert_eq!(IFILE_DIALOG_VTBL_LEN, 27);
         assert_eq!(ISHELL_ITEM_VTBL_LEN, 8);
+        assert_eq!(ISHELL_LINK_VTBL_LEN, 21);
+        assert_eq!(IPERSIST_FILE_VTBL_LEN, 9);
+    }
+
+    #[test]
+    fn desktop_dir_resolves_and_creates_valid_lnk_in_temp_dir() {
+        assert!(desktop_dir().is_some());
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("papercraft_lnk_test_{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let dummy_exe = dir.join("papercraft.exe");
+        std::fs::write(&dummy_exe, b"").unwrap();
+        let lnk_path = dir.join("PaperCraft.lnk");
+
+        create_desktop_shortcut(WindowsShortcutSpec {
+            shortcut_path: &lnk_path,
+            target_path: &dummy_exe,
+            working_dir: Some(&dir),
+            description: "PaperCraft shortcut test",
+            icon_path: Some(&dummy_exe),
+        })
+        .unwrap();
+
+        let bytes = std::fs::read(&lnk_path).unwrap();
+        assert!(bytes.len() > 76);
+        // Shell Link Binary File Format always begins with HeaderSize = 0x0000004C.
+        assert_eq!(&bytes[..4], &[0x4c, 0x00, 0x00, 0x00]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -62,6 +62,9 @@ mod web {
                     let stylus =
                         web_stylus::WebStylusHandle::install(&stylus_canvas, Arc::clone(&ctx_slot));
                     let stylus_poll = stylus.clone();
+                    let stylus_pointer_id = stylus.clone();
+                    let stylus_proximity = stylus.clone();
+                    let stylus_device_kind = stylus.clone();
                     let stylus_end = stylus.clone();
                     let stylus_barrel = stylus.clone();
                     let stylus_secondary_barrel = stylus.clone();
@@ -85,6 +88,13 @@ mod web {
 
                     let hooks = PlatformHooks {
                         tablet_poll: Some(Box::new(move || stylus_poll.drain_samples())),
+                        pen_pointer_id: Some(Box::new(move || stylus_pointer_id.pen_pointer_id())),
+                        pen_in_proximity: Some(Box::new(move || {
+                            stylus_proximity.pen_in_proximity()
+                        })),
+                        pointer_device_kind: Some(Box::new(move || {
+                            stylus_device_kind.pointer_device_kind()
+                        })),
                         pen_end: Some(Box::new(move || stylus_end.pen_end())),
                         barrel_down: Some(Box::new(move || stylus_barrel.barrel_down())),
                         secondary_barrel_down: Some(Box::new(move || {

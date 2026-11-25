@@ -2597,6 +2597,7 @@ pub(crate) fn merge_studio_prefs(
         target.wildcard_highlighter = incoming.wildcard_highlighter;
         target.active_palette_id = incoming.active_palette_id;
         target.stylus_buttons = incoming.stylus_buttons;
+        target.stylus_only_drawing = incoming.stylus_only_drawing;
         target.library_view_mode = incoming.library_view_mode;
         target.library_sort_by = incoming.library_sort_by;
         target.library_sort_ascending = incoming.library_sort_ascending;
