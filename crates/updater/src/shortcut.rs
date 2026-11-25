@@ -400,19 +400,29 @@ fn resolve_linux_icons_dir() -> Option<PathBuf> {
     )
 }
 
+/// Returns true when `a` and `b` name the same directory entry.
+///
+/// Only parent directories are canonicalized; the final component is compared
+/// lexically so a Desktop symlink created by PaperCraft is never mistaken for
+/// the real app it points to.
 fn paths_refer_to_same_location(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
     }
-    if let (Ok(ca), Ok(cb)) = (fs::canonicalize(a), fs::canonicalize(b))
-        && ca == cb
-    {
-        return true;
+    let (Some(name_a), Some(name_b)) = (a.file_name(), b.file_name()) else {
+        return false;
+    };
+    if name_a != name_b {
+        return false;
     }
-    matches!(
-        (a.parent(), b.parent(), a.file_name(), b.file_name()),
-        (Some(pa), Some(pb), Some(fa), Some(fb)) if pa == pb && fa == fb
-    )
+    match (a.parent(), b.parent()) {
+        (Some(pa), Some(pb)) if pa == pb => true,
+        (Some(pa), Some(pb)) => matches!(
+            (fs::canonicalize(pa), fs::canonicalize(pb)),
+            (Ok(ca), Ok(cb)) if ca == cb
+        ),
+        _ => false,
+    }
 }
 
 fn remove_shortcut_at(shortcut_path: &Path, target_os: &str) -> Result<ShortcutOutcome, String> {
