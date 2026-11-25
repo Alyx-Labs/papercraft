@@ -2157,6 +2157,32 @@ mod tests {
     }
 
     #[test]
+    fn notebook_set_metadata_on_other_slot_preserves_active_doc_timestamp() {
+        let mut s = Session::default();
+        s.execute(
+            "notebook.create",
+            &serde_json::json!({ "title": "Second Notebook" }),
+        )
+        .unwrap();
+        assert_eq!(s.active_notebook, 1);
+
+        Arc::make_mut(&mut s.notebooks[0]).updated_at_ms = 1_000;
+        Arc::make_mut(&mut s.notebooks[1]).updated_at_ms = 2_000;
+        s.doc = Arc::clone(&s.notebooks[1]);
+
+        s.execute(
+            "notebook.setMetadata",
+            &serde_json::json!({ "index": 0, "favorite": true }),
+        )
+        .unwrap();
+
+        assert!(s.notebooks[0].favorite);
+        assert!(s.notebooks[0].updated_at_ms > 1_000);
+        assert_eq!(s.notebooks[1].updated_at_ms, 2_000);
+        assert_eq!(s.doc.updated_at_ms, 2_000);
+    }
+
+    #[test]
     fn default_session_starts_with_blue_fountain_pen() {
         let s = Session::default();
         assert_eq!(s.active_tool, ToolKind::Pen(PenKind::FountainPen));

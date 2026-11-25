@@ -3728,7 +3728,8 @@ fn shape_broadphase_page_rect(shape: &GeometricShape) -> papercraft_geom::Rect {
     } else {
         0.0
     };
-    let pad = f64::from(s.width) * 0.75 + 4.0 + arrow_pad;
+    // Account for sharp miter corners up to POLYLINE_MITER_LIMIT * (width / 2) = 3 * width.
+    let pad = f64::from(s.width) * 3.0 + 4.0 + arrow_pad;
     papercraft_geom::Rect::new(
         cx - rx - pad,
         cy - ry - pad,
@@ -7464,70 +7465,407 @@ impl ShapeSink for &egui::Painter {
     }
 }
 
-fn emit_polyline_with_style<S: ShapeSink>(
-    sink: &mut S,
+const POLYLINE_STROKE_FEATHER_PT: f32 = 0.75;
+/// Handles acute corners down to ~19.2 degrees cleanly without bevel chopping.
+const POLYLINE_MITER_LIMIT: f32 = 6.0;
+const MAX_POLYLINE_STROKE_VERTICES: usize = 250_000;
+
+#[derive(Clone, Copy)]
+struct PolySegGeom {
+    a: Pos2,
+    b: Pos2,
+    d: Vec2,
+    n: Vec2,
+    len: f32,
+}
+
+#[derive(Clone, Copy)]
+struct PolyJoinInfo {
+    miter: Vec2,
+    back: f32,
+    can_miter: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PolyStrokeStyle {
+    core_half: f32,
+    outer_half: f32,
+    feather: f32,
+    color: Color32,
+}
+
+#[inline]
+fn push_stroke_vertex(mesh: &mut Mesh, pos: Pos2, color: Color32) -> Option<u32> {
+    if mesh.vertices.len() >= MAX_POLYLINE_STROKE_VERTICES
+        || !pos.x.is_finite()
+        || !pos.y.is_finite()
+    {
+        return None;
+    }
+    let idx = u32::try_from(mesh.vertices.len()).ok()?;
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos,
+        uv: egui::epaint::WHITE_UV,
+        color,
+    });
+    Some(idx)
+}
+
+#[inline]
+fn push_stroke_quad(mesh: &mut Mesh, a: u32, b: u32, c: u32, d: u32) {
+    mesh.indices.extend_from_slice(&[a, b, c, a, c, d]);
+}
+
+#[inline]
+fn push_stroke_tri(mesh: &mut Mesh, a: u32, b: u32, c: u32) {
+    mesh.indices.extend_from_slice(&[a, b, c]);
+}
+
+fn append_open_cap_aa(mesh: &mut Mesh, p: Pos2, out_dir: Vec2, n: Vec2, style: PolyStrokeStyle) {
+    let c_pos_p = p + n * style.core_half;
+    let c_neg_p = p - n * style.core_half;
+    let o_pos_p = p + n * style.outer_half;
+    let o_neg_p = p - n * style.outer_half;
+    let cap_c_pos_p = c_pos_p + out_dir * style.feather;
+    let cap_c_neg_p = c_neg_p + out_dir * style.feather;
+    let cap_o_pos_p = o_pos_p + out_dir * style.feather;
+    let cap_o_neg_p = o_neg_p + out_dir * style.feather;
+
+    let (
+        Some(c_pos),
+        Some(c_neg),
+        Some(o_pos),
+        Some(o_neg),
+        Some(cap_c_pos),
+        Some(cap_c_neg),
+        Some(cap_o_pos),
+        Some(cap_o_neg),
+    ) = (
+        push_stroke_vertex(mesh, c_pos_p, style.color),
+        push_stroke_vertex(mesh, c_neg_p, style.color),
+        push_stroke_vertex(mesh, o_pos_p, Color32::TRANSPARENT),
+        push_stroke_vertex(mesh, o_neg_p, Color32::TRANSPARENT),
+        push_stroke_vertex(mesh, cap_c_pos_p, Color32::TRANSPARENT),
+        push_stroke_vertex(mesh, cap_c_neg_p, Color32::TRANSPARENT),
+        push_stroke_vertex(mesh, cap_o_pos_p, Color32::TRANSPARENT),
+        push_stroke_vertex(mesh, cap_o_neg_p, Color32::TRANSPARENT),
+    )
+    else {
+        return;
+    };
+
+    push_stroke_quad(mesh, c_pos, cap_c_pos, cap_c_neg, c_neg);
+    push_stroke_quad(mesh, c_pos, o_pos, cap_o_pos, cap_c_pos);
+    push_stroke_quad(mesh, c_neg, cap_c_neg, cap_o_neg, o_neg);
+}
+
+/// Zero-overlap continuous mitered strip for closed loops and non-inverted open paths.
+fn append_polyline_stroke_regime_a(
+    mesh: &mut Mesh,
+    clean: &[Pos2],
+    segs: &[PolySegGeom],
+    joins: &[PolyJoinInfo],
+    is_closed: bool,
+    style: PolyStrokeStyle,
+) {
+    let mut ring: Vec<[u32; 4]> = Vec::with_capacity(clean.len());
+    for (p, join) in clean.iter().zip(joins.iter()) {
+        let m = join.miter;
+        let (Some(op), Some(cp), Some(cn), Some(on)) = (
+            push_stroke_vertex(mesh, *p + m * style.outer_half, Color32::TRANSPARENT),
+            push_stroke_vertex(mesh, *p + m * style.core_half, style.color),
+            push_stroke_vertex(mesh, *p - m * style.core_half, style.color),
+            push_stroke_vertex(mesh, *p - m * style.outer_half, Color32::TRANSPARENT),
+        ) else {
+            return;
+        };
+        ring.push([op, cp, cn, on]);
+    }
+
+    for i in 0..segs.len() {
+        let j = (i + 1) % ring.len();
+        let a = ring[i];
+        let b = ring[j];
+        push_stroke_quad(mesh, a[1], b[1], b[2], a[2]);
+        push_stroke_quad(mesh, a[0], b[0], b[1], a[1]);
+        push_stroke_quad(mesh, a[2], b[2], b[3], a[3]);
+    }
+
+    if !is_closed
+        && let (Some(first_p), Some(first_seg), Some(last_p), Some(last_seg)) =
+            (clean.first(), segs.first(), clean.last(), segs.last())
+    {
+        append_open_cap_aa(mesh, *first_p, -first_seg.d, first_seg.n, style);
+        append_open_cap_aa(mesh, *last_p, last_seg.d, last_seg.n, style);
+    }
+}
+
+/// Fallback builder for extreme needles (< 19 deg), 180-deg foldbacks, and short thick segments.
+fn append_polyline_stroke_regime_b(
+    mesh: &mut Mesh,
+    clean: &[Pos2],
+    segs: &[PolySegGeom],
+    is_closed: bool,
+    style: PolyStrokeStyle,
+) {
+    for seg in segs {
+        let (
+            Some(a_op),
+            Some(a_cp),
+            Some(a_cn),
+            Some(a_on),
+            Some(b_op),
+            Some(b_cp),
+            Some(b_cn),
+            Some(b_on),
+        ) = (
+            push_stroke_vertex(mesh, seg.a + seg.n * style.outer_half, Color32::TRANSPARENT),
+            push_stroke_vertex(mesh, seg.a + seg.n * style.core_half, style.color),
+            push_stroke_vertex(mesh, seg.a - seg.n * style.core_half, style.color),
+            push_stroke_vertex(mesh, seg.a - seg.n * style.outer_half, Color32::TRANSPARENT),
+            push_stroke_vertex(mesh, seg.b + seg.n * style.outer_half, Color32::TRANSPARENT),
+            push_stroke_vertex(mesh, seg.b + seg.n * style.core_half, style.color),
+            push_stroke_vertex(mesh, seg.b - seg.n * style.core_half, style.color),
+            push_stroke_vertex(mesh, seg.b - seg.n * style.outer_half, Color32::TRANSPARENT),
+        )
+        else {
+            return;
+        };
+        push_stroke_quad(mesh, a_cp, b_cp, b_cn, a_cn);
+        push_stroke_quad(mesh, a_op, b_op, b_cp, a_cp);
+        push_stroke_quad(mesh, a_cn, b_cn, b_on, a_on);
+    }
+
+    let join_start = usize::from(!is_closed);
+    let join_end = if is_closed {
+        segs.len()
+    } else {
+        clean.len().saturating_sub(1)
+    };
+    for i in join_start..join_end {
+        let prev = segs[(i + segs.len() - 1) % segs.len()];
+        let next = segs[i];
+        let p = clean[i];
+        let cross = prev.d.x * next.d.y - prev.d.y * next.d.x;
+        let dot = prev.d.x * next.d.x + prev.d.y * next.d.y;
+        if cross.abs() <= 1e-4 && dot > 0.0 {
+            continue;
+        }
+        let s_out = if cross >= 0.0 { -1.0 } else { 1.0 };
+        let bisector = (prev.n + next.n) * s_out;
+        let b_len = bisector.length();
+        if !b_len.is_finite() || b_len <= 1e-4 {
+            append_open_cap_aa(mesh, p, prev.d, prev.n, style);
+            continue;
+        }
+        let denom = 1.0 + dot;
+        let n0 = prev.n * s_out;
+        let n1 = next.n * s_out;
+        let (Some(vp), Some(c0), Some(c1), Some(o0), Some(o1)) = (
+            push_stroke_vertex(mesh, p, style.color),
+            push_stroke_vertex(mesh, p + n0 * style.core_half, style.color),
+            push_stroke_vertex(mesh, p + n1 * style.core_half, style.color),
+            push_stroke_vertex(mesh, p + n0 * style.outer_half, Color32::TRANSPARENT),
+            push_stroke_vertex(mesh, p + n1 * style.outer_half, Color32::TRANSPARENT),
+        ) else {
+            return;
+        };
+        if denom > 1e-6 && (2.0 / denom).sqrt() <= POLYLINE_MITER_LIMIT {
+            let m = (prev.n + next.n) * (s_out / denom);
+            let (Some(cm), Some(om)) = (
+                push_stroke_vertex(mesh, p + m * style.core_half, style.color),
+                push_stroke_vertex(mesh, p + m * style.outer_half, Color32::TRANSPARENT),
+            ) else {
+                return;
+            };
+            push_stroke_tri(mesh, vp, c0, cm);
+            push_stroke_tri(mesh, vp, cm, c1);
+            push_stroke_quad(mesh, c0, o0, om, cm);
+            push_stroke_quad(mesh, cm, om, o1, c1);
+        } else {
+            let bn = bisector / b_len;
+            let c0_p = p + n0 * style.core_half;
+            let c1_p = p + n1 * style.core_half;
+            let (Some(ob0), Some(ob1)) = (
+                push_stroke_vertex(mesh, c0_p + bn * style.feather, Color32::TRANSPARENT),
+                push_stroke_vertex(mesh, c1_p + bn * style.feather, Color32::TRANSPARENT),
+            ) else {
+                return;
+            };
+            push_stroke_tri(mesh, vp, c0, c1);
+            push_stroke_quad(mesh, c0, ob0, ob1, c1);
+            push_stroke_tri(mesh, c0, o0, ob0);
+            push_stroke_tri(mesh, c1, ob1, o1);
+        }
+    }
+
+    if !is_closed
+        && let (Some(first_p), Some(first_seg), Some(last_p), Some(last_seg)) =
+            (clean.first(), segs.first(), clean.last(), segs.last())
+    {
+        append_open_cap_aa(mesh, *first_p, -first_seg.d, first_seg.n, style);
+        append_open_cap_aa(mesh, *last_p, last_seg.d, last_seg.n, style);
+    }
+}
+
+fn append_polyline_stroke_to_mesh(
+    mesh: &mut Mesh,
     pts: &[Pos2],
     closed: bool,
     stroke_w: f32,
     stroke_color: Color32,
-    line_style: papercraft_doc::ShapeLineStyle,
 ) {
-    if pts.len() < 2 {
+    if pts.len() < 2 || !stroke_w.is_finite() || stroke_w <= 0.0 || stroke_color.a() == 0 {
         return;
     }
-    let Some((dash_raw, gap_raw)) = line_style.dash_pattern(stroke_w) else {
-        let mut path = pts.to_vec();
-        if closed && let Some(first) = path.first().copied() {
-            path.push(first);
+
+    let mut clean: Vec<Pos2> = Vec::with_capacity(pts.len());
+    for &p in pts {
+        if !p.x.is_finite() || !p.y.is_finite() {
+            continue;
         }
-        sink.push_shape(Shape::line(path, Stroke::new(stroke_w, stroke_color)));
+        if clean.last().is_none_or(|prev| prev.distance_sq(p) > 1e-6) {
+            clean.push(p);
+        }
+    }
+    if closed {
+        while clean.len() >= 2
+            && clean
+                .first()
+                .zip(clean.last())
+                .is_some_and(|(a, b)| a.distance_sq(*b) <= 1e-6)
+        {
+            clean.pop();
+        }
+    }
+    if clean.len() < 2 {
         return;
+    }
+    let is_closed = closed && clean.len() >= 3;
+    let seg_count = if is_closed {
+        clean.len()
+    } else {
+        clean.len() - 1
     };
-    let dash = f64::from(dash_raw.max(1.5));
-    let gap = f64::from(gap_raw.max(2.0));
-    let cycle = (dash + gap).max(2.0);
-    let is_dotted = line_style == papercraft_doc::ShapeLineStyle::Dotted;
-    let dot_r = (stroke_w * 0.54).clamp(1.0, 24.0);
-    let stroke = Stroke::new(stroke_w, stroke_color);
 
-    let mut path = pts.to_vec();
-    if closed && let Some(first) = path.first().copied() {
-        path.push(first);
+    let mut segs: Vec<PolySegGeom> = Vec::with_capacity(seg_count);
+    for i in 0..seg_count {
+        let a = clean[i];
+        let b = clean[(i + 1) % clean.len()];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let len = dx.hypot(dy);
+        if !len.is_finite() || len <= 1e-4 {
+            return;
+        }
+        let d = Vec2::new(dx / len, dy / len);
+        let n = Vec2::new(-d.y, d.x);
+        segs.push(PolySegGeom { a, b, d, n, len });
     }
 
+    let half_w = stroke_w * 0.5;
+    let feather = POLYLINE_STROKE_FEATHER_PT.min(half_w.max(0.25));
+    let core_half = (half_w - feather * 0.5).max(0.0);
+    let outer_half = core_half + feather;
+    let style = PolyStrokeStyle {
+        core_half,
+        outer_half,
+        feather,
+        color: stroke_color,
+    };
+
+    let mut joins: Vec<PolyJoinInfo> = Vec::with_capacity(clean.len());
+    for i in 0..clean.len() {
+        if !is_closed && i == 0 {
+            joins.push(PolyJoinInfo {
+                miter: segs[0].n,
+                back: 0.0,
+                can_miter: true,
+            });
+            continue;
+        }
+        if !is_closed && i == clean.len() - 1 {
+            joins.push(PolyJoinInfo {
+                miter: segs[segs.len() - 1].n,
+                back: 0.0,
+                can_miter: true,
+            });
+            continue;
+        }
+        let prev = segs[(i + segs.len() - 1) % segs.len()];
+        let next = segs[i];
+        let dot = prev.d.x * next.d.x + prev.d.y * next.d.y;
+        let cross = prev.d.x * next.d.y - prev.d.y * next.d.x;
+        let denom = 1.0 + dot;
+        if denom > 1e-6 && (2.0 / denom).sqrt() <= POLYLINE_MITER_LIMIT {
+            let miter = (prev.n + next.n) / denom;
+            let back = outer_half * cross.abs() / denom;
+            let can_miter = miter.x.is_finite() && miter.y.is_finite() && back.is_finite();
+            joins.push(PolyJoinInfo {
+                miter,
+                back,
+                can_miter,
+            });
+        } else {
+            joins.push(PolyJoinInfo {
+                miter: Vec2::ZERO,
+                back: 0.0,
+                can_miter: false,
+            });
+        }
+    }
+
+    let use_regime_a = joins.iter().all(|j| j.can_miter)
+        && segs.iter().enumerate().all(|(i, seg)| {
+            let j = (i + 1) % joins.len();
+            joins[i].back + joins[j].back <= seg.len * 0.99
+        });
+
+    if use_regime_a {
+        append_polyline_stroke_regime_a(mesh, &clean, &segs, &joins, is_closed, style);
+    } else {
+        append_polyline_stroke_regime_b(mesh, &clean, &segs, is_closed, style);
+    }
+}
+
+#[inline]
+fn push_dash_point(cur_dash: &mut Vec<Pos2>, pt: Pos2) {
+    if cur_dash
+        .last()
+        .is_none_or(|prev| prev.distance_sq(pt) > 1e-4)
+    {
+        cur_dash.push(pt);
+    }
+}
+
+fn emit_dotted_polyline<S: ShapeSink>(
+    sink: &mut S,
+    path: &[Pos2],
+    (dash, cycle): (f64, f64),
+    dot_r: f32,
+    stroke_color: Color32,
+) {
     let mut phase = 0.0_f64;
     let mut seg_count = 0usize;
     for pair in path.windows(2) {
         if seg_count >= 10_000 {
             break;
         }
-        let a = pair[0];
-        let b = pair[1];
-        let dx = f64::from(b.x - a.x);
-        let dy = f64::from(b.y - a.y);
+        let (a, b) = (pair[0], pair[1]);
+        let (dx, dy) = (f64::from(b.x - a.x), f64::from(b.y - a.y));
         let len = dx.hypot(dy);
         if len <= 1e-3 || !len.is_finite() {
             continue;
         }
-        let ux = dx / len;
-        let uy = dy / len;
+        let (ux, uy) = (dx / len, dy / len);
         let mut d = 0.0_f64;
         while d + 1e-4 < len && seg_count < 10_000 {
             phase = phase.rem_euclid(cycle);
             if phase < dash - 1e-3 {
                 let take = (dash - phase).min(len - d).max(0.0);
-                let p0 = pos2(a.x + (ux * d) as f32, a.y + (uy * d) as f32);
-                let p1 = pos2(
-                    a.x + (ux * (d + take)) as f32,
-                    a.y + (uy * (d + take)) as f32,
-                );
-                if is_dotted {
-                    if phase < 0.5 || d == 0.0 {
-                        sink.push_shape(Shape::circle_filled(p0, dot_r, stroke_color));
-                        seg_count += 1;
-                    }
-                } else if take > 1e-3 {
-                    sink.push_shape(Shape::line_segment([p0, p1], stroke));
+                if phase < 0.5 || d == 0.0 {
+                    let p0 = pos2(a.x + (ux * d) as f32, a.y + (uy * d) as f32);
+                    sink.push_shape(Shape::circle_filled(p0, dot_r, stroke_color));
                     seg_count += 1;
                 }
                 let advance = take.max((len - d).min(1e-2));
@@ -7546,6 +7884,166 @@ fn emit_polyline_with_style<S: ShapeSink>(
                 }
             }
         }
+    }
+}
+
+fn flush_dashed_polyline<S: ShapeSink>(
+    sink: &mut S,
+    mut dashes: Vec<Vec<Pos2>>,
+    cur_dash: Vec<Pos2>,
+    closed: bool,
+    stroke_w: f32,
+    stroke_color: Color32,
+) {
+    if cur_dash.len() >= 2 {
+        dashes.push(cur_dash);
+    }
+    if closed
+        && dashes.len() >= 2
+        && let (Some(first_pt), Some(last_pt)) = (
+            dashes.first().and_then(|d| d.first()).copied(),
+            dashes.last().and_then(|d| d.last()).copied(),
+        )
+        && first_pt.distance_sq(last_pt) <= 1e-2
+        && let Some(tail) = dashes.pop()
+    {
+        let mut merged = tail;
+        if let Some(first_dash) = dashes.first_mut() {
+            merged.extend(first_dash.iter().skip(1).copied());
+            *first_dash = merged;
+        }
+    }
+    if dashes.is_empty() {
+        return;
+    }
+    let single_dash = dashes.len() == 1;
+    let mut mesh = Mesh::default();
+    for mut dash_pts in dashes {
+        let is_closed_dash = closed
+            && single_dash
+            && dash_pts.len() >= 3
+            && dash_pts
+                .first()
+                .zip(dash_pts.last())
+                .is_some_and(|(a, b)| a.distance_sq(*b) <= 1e-2);
+        if is_closed_dash {
+            dash_pts.pop();
+        }
+        append_polyline_stroke_to_mesh(
+            &mut mesh,
+            &dash_pts,
+            is_closed_dash,
+            stroke_w,
+            stroke_color,
+        );
+    }
+    if !mesh.indices.is_empty() {
+        sink.push_shape(Shape::mesh(Arc::new(mesh)));
+    }
+}
+
+fn emit_dashed_polyline<S: ShapeSink>(
+    sink: &mut S,
+    path: &[Pos2],
+    closed: bool,
+    (dash, cycle): (f64, f64),
+    stroke_w: f32,
+    stroke_color: Color32,
+) {
+    let mut phase = 0.0_f64;
+    let mut seg_count = 0usize;
+    let mut dashes: Vec<Vec<Pos2>> = Vec::new();
+    let mut cur_dash: Vec<Pos2> = Vec::new();
+    for pair in path.windows(2) {
+        if seg_count >= 10_000 {
+            break;
+        }
+        let (a, b) = (pair[0], pair[1]);
+        let (dx, dy) = (f64::from(b.x - a.x), f64::from(b.y - a.y));
+        let len = dx.hypot(dy);
+        if len <= 1e-3 || !len.is_finite() {
+            continue;
+        }
+        let (ux, uy) = (dx / len, dy / len);
+        let mut d = 0.0_f64;
+        while d + 1e-4 < len && seg_count < 10_000 {
+            phase = phase.rem_euclid(cycle);
+            if phase < dash - 1e-3 {
+                let take = (dash - phase).min(len - d).max(0.0);
+                if take > 1e-3 {
+                    let p0 = pos2(a.x + (ux * d) as f32, a.y + (uy * d) as f32);
+                    let p1 = pos2(
+                        a.x + (ux * (d + take)) as f32,
+                        a.y + (uy * (d + take)) as f32,
+                    );
+                    push_dash_point(&mut cur_dash, p0);
+                    push_dash_point(&mut cur_dash, p1);
+                    seg_count += 1;
+                }
+                let finished_dash = take >= (dash - phase) - 1e-3;
+                let advance = take.max((len - d).min(1e-2));
+                d = (d + advance).min(len);
+                phase = (phase + advance).rem_euclid(cycle);
+                if (phase - dash).abs() <= 1e-3 {
+                    phase = dash;
+                }
+                if finished_dash {
+                    if cur_dash.len() >= 2 {
+                        dashes.push(std::mem::take(&mut cur_dash));
+                    } else {
+                        cur_dash.clear();
+                    }
+                }
+            } else {
+                if cur_dash.len() >= 2 {
+                    dashes.push(std::mem::take(&mut cur_dash));
+                } else {
+                    cur_dash.clear();
+                }
+                let skip = (cycle - phase).min(len - d).max(0.0);
+                let advance = skip.max((len - d).min(1e-2));
+                d = (d + advance).min(len);
+                phase = (phase + advance).rem_euclid(cycle);
+                if phase >= cycle - 1e-3 {
+                    phase = 0.0;
+                }
+            }
+        }
+    }
+    flush_dashed_polyline(sink, dashes, cur_dash, closed, stroke_w, stroke_color);
+}
+
+fn emit_polyline_with_style<S: ShapeSink>(
+    sink: &mut S,
+    pts: &[Pos2],
+    closed: bool,
+    stroke_w: f32,
+    stroke_color: Color32,
+    line_style: papercraft_doc::ShapeLineStyle,
+) {
+    if pts.len() < 2 || !stroke_w.is_finite() || stroke_w <= 0.0 || stroke_color.a() == 0 {
+        return;
+    }
+    let Some((dash_raw, gap_raw)) = line_style.dash_pattern(stroke_w) else {
+        let mut mesh = Mesh::default();
+        append_polyline_stroke_to_mesh(&mut mesh, pts, closed, stroke_w, stroke_color);
+        if !mesh.indices.is_empty() {
+            sink.push_shape(Shape::mesh(Arc::new(mesh)));
+        }
+        return;
+    };
+    let dash = f64::from(dash_raw.max(1.5));
+    let gap = f64::from(gap_raw.max(2.0));
+    let cycle = (dash + gap).max(2.0);
+    let mut path = pts.to_vec();
+    if closed && let Some(first) = path.first().copied() {
+        path.push(first);
+    }
+    if line_style == papercraft_doc::ShapeLineStyle::Dotted {
+        let dot_r = (stroke_w * 0.54).clamp(1.0, 24.0);
+        emit_dotted_polyline(sink, &path, (dash, cycle), dot_r, stroke_color);
+    } else {
+        emit_dashed_polyline(sink, &path, closed, (dash, cycle), stroke_w, stroke_color);
     }
 }
 
@@ -12654,6 +13152,251 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn collect_solid_mesh_vertices(shapes: &[Shape], solid_color: Color32) -> (Vec<Pos2>, usize) {
+        let mut verts = Vec::new();
+        let mut mesh_count = 0usize;
+        for shape in shapes {
+            if let Shape::Mesh(mesh) = shape {
+                mesh_count += 1;
+                for v in &mesh.vertices {
+                    if v.color == solid_color {
+                        verts.push(v.pos);
+                    }
+                }
+            }
+        }
+        (verts, mesh_count)
+    }
+
+    fn has_vertex_near(verts: &[Pos2], target: Pos2, tol: f32) -> bool {
+        verts
+            .iter()
+            .any(|p| (p.x - target.x).abs() <= tol && (p.y - target.y).abs() <= tol)
+    }
+
+    #[test]
+    fn closed_rectangle_stroke_joins_start_corner_symmetrically_without_notch() {
+        let stroke_w = 20.0_f32;
+        let feather = POLYLINE_STROKE_FEATHER_PT.min((stroke_w * 0.5).max(0.25));
+        let core_half = (stroke_w * 0.5 - feather * 0.5).max(0.0);
+        let rect_pts = [
+            pos2(100.0, 100.0),
+            pos2(260.0, 100.0),
+            pos2(260.0, 220.0),
+            pos2(100.0, 220.0),
+        ];
+        let mut out = Vec::new();
+        emit_polyline_with_style(
+            &mut out,
+            &rect_pts,
+            true,
+            stroke_w,
+            Color32::RED,
+            papercraft_doc::ShapeLineStyle::Solid,
+        );
+        let (core_verts, mesh_count) = collect_solid_mesh_vertices(&out, Color32::RED);
+        assert_eq!(mesh_count, 1, "expected single joined mesh");
+        for (x, y) in [
+            (100.0, 100.0),
+            (260.0, 100.0),
+            (260.0, 220.0),
+            (100.0, 220.0),
+        ] {
+            let sx = if x < 180.0 { -1.0 } else { 1.0 };
+            let sy = if y < 160.0 { -1.0 } else { 1.0 };
+            let outer = pos2(x + sx * core_half, y + sy * core_half);
+            let inner = pos2(x - sx * core_half, y - sy * core_half);
+            assert!(
+                has_vertex_near(&core_verts, outer, 0.1),
+                "missing outer corner near {outer:?} in {core_verts:?}"
+            );
+            assert!(
+                has_vertex_near(&core_verts, inner, 0.1),
+                "missing inner corner near {inner:?} in {core_verts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn triangle_and_arrow_strokes_keep_sharp_pointed_tips_without_bevel_chopping() {
+        let stroke_w = 18.0_f32;
+        let feather = POLYLINE_STROKE_FEATHER_PT.min((stroke_w * 0.5).max(0.25));
+        let core_half = (stroke_w * 0.5 - feather * 0.5).max(0.0);
+        let tri_pts = [pos2(180.0, 100.0), pos2(260.0, 310.0), pos2(100.0, 310.0)];
+        let mut tri_out = Vec::new();
+        emit_polyline_with_style(
+            &mut tri_out,
+            &tri_pts,
+            true,
+            stroke_w,
+            Color32::YELLOW,
+            papercraft_doc::ShapeLineStyle::Solid,
+        );
+        let (tri_verts, tri_meshes) = collect_solid_mesh_vertices(&tri_out, Color32::YELLOW);
+        assert_eq!(tri_meshes, 1);
+        let apex_ext = core_half / 80.0_f32.atan2(210.0).sin();
+        let apex_tip = pos2(180.0, 100.0 - apex_ext);
+        assert!(
+            has_vertex_near(&tri_verts, apex_tip, 0.1),
+            "expected pointed apex near {apex_tip:?}, got {tri_verts:?}"
+        );
+        let base_half_angle = 210.0_f32.atan2(80.0) * 0.5;
+        let base_x_ext = core_half / base_half_angle.tan();
+        let bl_tip = pos2(100.0 - base_x_ext, 310.0 + core_half);
+        let br_tip = pos2(260.0 + base_x_ext, 310.0 + core_half);
+        assert!(
+            has_vertex_near(&tri_verts, bl_tip, 0.1),
+            "expected pointed bottom-left miter near {bl_tip:?}, got {tri_verts:?}"
+        );
+        assert!(
+            has_vertex_near(&tri_verts, br_tip, 0.1),
+            "expected pointed bottom-right miter near {br_tip:?}, got {tri_verts:?}"
+        );
+
+        let arrow_w = 14.0_f32;
+        let arrow_feather = POLYLINE_STROKE_FEATHER_PT.min((arrow_w * 0.5).max(0.25));
+        let arrow_core_half = (arrow_w * 0.5 - arrow_feather * 0.5).max(0.0);
+        let arrow_head = [pos2(60.0, 120.0), pos2(180.0, 150.0), pos2(60.0, 180.0)];
+        let mut arrow_out = Vec::new();
+        emit_polyline_with_style(
+            &mut arrow_out,
+            &arrow_head,
+            false,
+            arrow_w,
+            Color32::YELLOW,
+            papercraft_doc::ShapeLineStyle::Solid,
+        );
+        let (arrow_verts, arrow_meshes) = collect_solid_mesh_vertices(&arrow_out, Color32::YELLOW);
+        assert_eq!(arrow_meshes, 1);
+        let tip_ext = arrow_core_half / 30.0_f32.atan2(120.0).sin();
+        let arrow_tip = pos2(180.0 + tip_ext, 150.0);
+        assert!(
+            has_vertex_near(&arrow_verts, arrow_tip, 0.1),
+            "expected sharp arrowhead tip near {arrow_tip:?}, got {arrow_verts:?}"
+        );
+    }
+
+    #[test]
+    fn extreme_sharp_tiny_and_hostile_polylines_stay_bounded_without_panicking() {
+        let cases: [(&[Pos2], bool, f32, Color32); 6] = [
+            // Acute needle (< 19 deg): Regime B AA bevel fallback without long miter spike.
+            (
+                &[pos2(0.0, 0.0), pos2(200.0, 4.0), pos2(0.0, 8.0)],
+                false,
+                20.0,
+                Color32::WHITE,
+            ),
+            // Tiny thick rectangle: Regime B fallback without miter self-inversion.
+            (
+                &[
+                    pos2(10.0, 10.0),
+                    pos2(16.0, 10.0),
+                    pos2(16.0, 16.0),
+                    pos2(10.0, 16.0),
+                ],
+                true,
+                24.0,
+                Color32::WHITE,
+            ),
+            // 180-degree foldback.
+            (
+                &[pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(0.0, 0.0)],
+                false,
+                12.0,
+                Color32::WHITE,
+            ),
+            // Non-finite point coordinates.
+            (
+                &[
+                    pos2(f32::NAN, 0.0),
+                    pos2(10.0, 10.0),
+                    pos2(50.0, 10.0),
+                    pos2(f32::INFINITY, 20.0),
+                ],
+                true,
+                10.0,
+                Color32::WHITE,
+            ),
+            // Zero and negative widths.
+            (
+                &[pos2(0.0, 0.0), pos2(20.0, 20.0)],
+                false,
+                0.0,
+                Color32::WHITE,
+            ),
+            (
+                &[pos2(0.0, 0.0), pos2(20.0, 20.0)],
+                false,
+                -5.0,
+                Color32::WHITE,
+            ),
+        ];
+
+        for (idx, (pts, closed, width, color)) in cases.into_iter().enumerate() {
+            let mut out = Vec::new();
+            emit_polyline_with_style(
+                &mut out,
+                pts,
+                closed,
+                width,
+                color,
+                papercraft_doc::ShapeLineStyle::Solid,
+            );
+            for shape in &out {
+                if let Shape::Mesh(mesh) = shape {
+                    assert!(
+                        mesh.vertices.len() <= MAX_POLYLINE_STROKE_VERTICES,
+                        "case {idx}: too many vertices {}",
+                        mesh.vertices.len()
+                    );
+                    for v in &mesh.vertices {
+                        assert!(
+                            v.pos.x.is_finite() && v.pos.y.is_finite(),
+                            "case {idx}: non-finite vertex {:?}",
+                            v.pos
+                        );
+                        assert!(
+                            v.pos.x.abs() < 500.0 && v.pos.y.abs() < 500.0,
+                            "case {idx}: unbounded miter spike {:?}",
+                            v.pos
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dashed_closed_rectangle_wraps_corners_cleanly() {
+        let rect_pts = [
+            pos2(100.0, 100.0),
+            pos2(240.0, 100.0),
+            pos2(240.0, 200.0),
+            pos2(100.0, 200.0),
+        ];
+        let mut out = Vec::new();
+        emit_polyline_with_style(
+            &mut out,
+            &rect_pts,
+            true,
+            10.0,
+            Color32::BLUE,
+            papercraft_doc::ShapeLineStyle::Dashed,
+        );
+        let (verts, mesh_count) = collect_solid_mesh_vertices(&out, Color32::BLUE);
+        assert_eq!(mesh_count, 1, "expected single dashed polyline mesh");
+        assert!(!verts.is_empty());
+        assert!(
+            verts.iter().all(|v| v.x.is_finite() && v.y.is_finite()),
+            "dashed vertices must remain finite"
+        );
+        // Start corner wraps cleanly and emits outer vertices beyond the rectangle boundary.
+        assert!(
+            verts.iter().any(|v| v.x < 100.0 && v.y < 100.0),
+            "expected closed dash corner miter outside top-left vertex, got {verts:?}"
+        );
     }
 
     fn assert_shape_and_text_caches_persist_on_ink_commit(

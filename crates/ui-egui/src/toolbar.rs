@@ -3539,115 +3539,9 @@ fn push_selection_controls<'a>(
     };
     if shown {
         flow.divider();
-        flow.push(tray_icon_button_width(ui, "Copy"), |app, ui, t| {
-            if tray_icon_button(ui, Icon::Duplicate, Some("Copy"), false, true, t)
-                .on_hover_text("Copy selected items (Ctrl+C)")
-                .clicked()
-            {
-                let _ = crate::copy_selection(app, Some(ui.ctx()), false);
-            }
-        });
-        flow.push(tray_icon_button_width(ui, "Cut"), |app, ui, t| {
-            if tray_icon_button(ui, Icon::StrokeEraser, Some("Cut"), false, true, t)
-                .on_hover_text("Cut selected items (Ctrl+X)")
-                .clicked()
-            {
-                let _ = crate::copy_selection(app, Some(ui.ctx()), true);
-            }
-        });
-        flow.push(tray_icon_button_width(ui, "Duplicate"), |app, ui, t| {
-            if tray_icon_button(ui, Icon::Plus, Some("Duplicate"), false, true, t)
-                .on_hover_text("Duplicate selected items in place (Ctrl+D)")
-                .clicked()
-            {
-                let _ = crate::duplicate_selection(app);
-            }
-        });
-        let save_open = app.view.save_element_open;
-        flow.push(tray_icon_button_width(ui, "Save"), move |app, ui, t| {
-            if tray_icon_button(ui, Icon::Sticker, Some("Save"), save_open, true, t)
-                .on_hover_text("Save selection as a reusable sticker or diagram element")
-                .clicked()
-            {
-                app.view.save_element_open = !app.view.save_element_open;
-                if app.view.save_element_open && app.view.element_name_draft.trim().is_empty() {
-                    app.view.element_name_draft = "My Sticker".to_string();
-                }
-            }
-        });
-        if save_open {
-            push_inline_save_element_bar(ui, flow, selected);
-        }
-        if app.session.clipboard.is_some() {
-            flow.push(tray_icon_button_width(ui, "Paste"), |app, ui, t| {
-                if tray_icon_button(ui, Icon::Paste, Some("Paste"), false, true, t)
-                    .on_hover_text("Paste clipboard selection onto current page (Ctrl+V)")
-                    .clicked()
-                    && let Ok(val) = app.session.execute("selection.paste", &json!({}))
-                {
-                    crate::select_stamped_result(app, &val);
-                }
-            });
-        }
-        flow.push(tray_icon_button_width(ui, "Delete"), |app, ui, t| {
-            if tray_icon_button(ui, Icon::Trash, Some("Delete"), false, true, t)
-                .on_hover_text("Delete selected object (Delete / Backspace)")
-                .clicked()
-            {
-                let _ = crate::delete_selection(app);
-            }
-        });
-        flow.divider();
         push_select_mode_switch(app, ui, flow, false, "toolbar_selection_mode_switch");
     }
     shown
-}
-
-fn push_inline_save_element_bar<'a>(
-    ui: &egui::Ui,
-    flow: &mut DockFlow<'a>,
-    selected: &'a [crate::SelectedObject],
-) {
-    flow.divider();
-    let save_w = tray_icon_button_width(ui, "Save");
-    let total_w = 116.0 + ZONE_ITEM_SPACING + save_w;
-    flow.push(total_w, move |app, ui, t| {
-        let mut commit = false;
-        let edit_resp = ui.add_sized(
-            Vec2::new(116.0, CONTEXT_TRAY_ROW_HEIGHT),
-            egui::TextEdit::singleline(&mut app.view.element_name_draft)
-                .hint_text("Sticker name...")
-                .font(FontId::proportional(11.5))
-                .align(egui::Align2::LEFT_CENTER),
-        );
-        if edit_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            commit = true;
-        }
-        if tray_icon_button(ui, Icon::Check, Some("Save"), true, true, t)
-            .on_hover_text("Save to Stickers & Elements library")
-            .clicked()
-        {
-            commit = true;
-        }
-        if commit {
-            let targets = selected_targets_json(selected);
-            let name = app.view.element_name_draft.trim();
-            if app
-                .session
-                .execute(
-                    "element.save",
-                    &json!({
-                        "name": if name.is_empty() { "Sticker" } else { name },
-                        "targets": targets,
-                    }),
-                )
-                .is_ok()
-            {
-                app.view.stickers_tab = crate::StickersTab::Saved;
-            }
-            app.view.save_element_open = false;
-        }
-    });
 }
 
 fn selected_object_color(app: &PaperCraftApp, object: crate::SelectedObject) -> Option<Color> {
@@ -5204,6 +5098,8 @@ pub(crate) fn show_elements_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui) 
     let mut close = false;
     let mut place_id: Option<String> = None;
     let mut delete_id: Option<String> = None;
+    let mut save_selected_name: Option<String> = None;
+    let has_selection = !app.view.selected_objects.is_empty();
 
     let viewport = ctx.content_rect();
     let pop_x = (viewport.center().x - 202.0).clamp(12.0, (viewport.right() - 416.0).max(12.0));
@@ -5307,6 +5203,62 @@ pub(crate) fn show_elements_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui) 
                                 );
                             }
                             crate::StickersTab::Saved => {
+                                if has_selection {
+                                    egui::Frame::new()
+                                        .fill(t.field_bg)
+                                        .stroke(Stroke::new(1.0, t.border))
+                                        .corner_radius(CornerRadius::same(8))
+                                        .inner_margin(egui::Margin::same(10))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.label(
+                                                egui::RichText::new("Save current selection")
+                                                    .size(11.5)
+                                                    .strong()
+                                                    .color(t.text),
+                                            );
+                                            ui.add_space(4.0);
+                                            ui.horizontal(|ui| {
+                                                let save_w =
+                                                    tray_icon_button_width(ui, "Save Selection");
+                                                let input_w =
+                                                    (ui.available_width() - save_w - 6.0).max(80.0);
+                                                let edit_resp = ui.add_sized(
+                                                    Vec2::new(input_w, CONTEXT_TRAY_ROW_HEIGHT),
+                                                    egui::TextEdit::singleline(
+                                                        &mut app.view.element_name_draft,
+                                                    )
+                                                    .hint_text("Sticker name...")
+                                                    .font(FontId::proportional(11.5))
+                                                    .align(egui::Align2::LEFT_CENTER),
+                                                );
+                                                let enter_save = edit_resp.lost_focus()
+                                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                                let clicked_save = tray_icon_button(
+                                                    ui,
+                                                    Icon::Check,
+                                                    Some("Save Selection"),
+                                                    true,
+                                                    true,
+                                                    &t,
+                                                )
+                                                .on_hover_text(
+                                                    "Save selected page items as a reusable sticker",
+                                                )
+                                                .clicked();
+                                                if enter_save || clicked_save {
+                                                    let trimmed =
+                                                        app.view.element_name_draft.trim();
+                                                    save_selected_name = Some(if trimmed.is_empty() {
+                                                        "Sticker".to_string()
+                                                    } else {
+                                                        trimmed.to_string()
+                                                    });
+                                                }
+                                            });
+                                        });
+                                    ui.add_space(8.0);
+                                }
                                 if user_saved.is_empty() {
                                     egui::Frame::new()
                                         .fill(t.field_bg)
@@ -5324,7 +5276,7 @@ pub(crate) fn show_elements_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui) 
                                             ui.add_space(3.0);
                                             ui.label(
                                                 egui::RichText::new(
-                                                    "Select strokes, shapes, text, or images on a page and click Save in the selection bar to store your own stickers here.",
+                                                    "Select strokes, shapes, text, or images on a page, then open My Stickers to save them as reusable stickers here.",
                                                 )
                                                 .size(11.5)
                                                 .color(t.text_muted),
@@ -5362,6 +5314,17 @@ pub(crate) fn show_elements_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui) 
         }
         app.view.elements_popover_open = false;
         return;
+    }
+    if let Some(name) = save_selected_name {
+        let targets = selected_targets_json(&app.view.selected_objects);
+        let _ = app.session.execute(
+            "element.save",
+            &json!({
+                "name": name,
+                "targets": targets,
+            }),
+        );
+        app.view.element_name_draft.clear();
     }
     if let Some(id) = delete_id {
         let _ = app.session.execute("element.delete", &json!({ "id": id }));
@@ -6657,7 +6620,7 @@ mod tests {
 
     #[test]
     fn selected_text_dock_wraps_proportionally_and_centers_inside_canvas_with_open_sidebars() {
-        for viewport_w in [1280.0_f32, 1440.0_f32] {
+        for viewport_w in [1120.0_f32, 1240.0_f32] {
             let mut app = PaperCraftApp::default();
             crate::open_notebook_in_editor(&mut app, 0);
             app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
@@ -6723,10 +6686,12 @@ mod tests {
                 text_boxes.iter().any(|(txt, _)| txt.contains("Edit text")),
                 "expected Edit text button inside tray"
             );
-            assert!(
-                text_boxes.iter().any(|(txt, _)| txt.contains("Delete")),
-                "expected Delete button inside tray"
-            );
+            for hidden in ["Copy", "Cut", "Duplicate", "Save", "Paste", "Delete"] {
+                assert!(
+                    !text_boxes.iter().any(|(txt, _)| txt == hidden),
+                    "did not expect {hidden:?} button inside selection tray"
+                );
+            }
             for (label, box_rect) in &text_boxes {
                 assert!(
                     box_rect.left() >= tray_rect.left() + 4.0
@@ -7077,6 +7042,7 @@ mod tests {
         app.view.selected_object = Some(crate::SelectedObject::Shape(0));
         app.view.selected_objects = vec![crate::SelectedObject::Shape(0)];
         let mut sel_tray = egui::Rect::NOTHING;
+        let mut sel_shapes = Vec::new();
         let mut sel_boxes = Vec::new();
         for frame in 0..2 {
             let out = ctx.run_ui(
@@ -7093,18 +7059,25 @@ mod tests {
             );
             if let Some(r) = find_tray_frame_rect(&out.shapes, t.panel_bg, 40.0) {
                 sel_tray = r;
+                sel_shapes = out.shapes.clone();
                 sel_boxes = collect_text_boxes_inside(&out.shapes, sel_tray);
             }
             out.drop_without_applying_deltas();
         }
         assert!(sel_tray.is_positive());
-        let delete_rect = sel_boxes
-            .iter()
-            .find(|(txt, _)| txt == "Delete")
-            .map(|(_, r)| *r)
-            .expect("expected Delete button in selection tray");
-        // Compact Box segment sits just after the divider to the right of Delete.
-        let box_click_pos = egui::pos2(delete_rect.right() + 36.0, delete_rect.center().y);
+        for hidden in ["Copy", "Cut", "Duplicate", "Save", "Paste", "Delete"] {
+            assert!(
+                !sel_boxes.iter().any(|(txt, _)| txt == hidden),
+                "selection tray should omit {hidden:?}"
+            );
+        }
+        let rows = collect_tray_widget_bounds_by_row(&sel_shapes, sel_tray);
+        let (row_cy, _, row_max_x) = rows
+            .last()
+            .copied()
+            .expect("expected widget rows in selection tray");
+        // Compact [Box | Lasso] switch sits at the right end of the last row (~62px wide).
+        let box_click_pos = egui::pos2(row_max_x - 45.0, row_cy);
         let click_box = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -7136,6 +7109,117 @@ mod tests {
             !app.view.freeform_lasso_mode,
             "clicking Box in selection tray must switch back to Box marquee mode"
         );
+    }
+
+    #[test]
+    fn selection_tray_omits_clipboard_and_delete_buttons_while_shortcuts_and_sticker_save_work() {
+        let mut app = PaperCraftApp::default();
+        crate::open_notebook_in_editor(&mut app, 0);
+        app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
+        app.session
+            .execute(
+                "shape.insert",
+                &json!({ "kind": "Rectangle", "x1": 120.0, "y1": 140.0, "x2": 260.0, "y2": 240.0 }),
+            )
+            .unwrap();
+        crate::activate_select_tool(&mut app);
+        app.view.selected_object = Some(crate::SelectedObject::Shape(0));
+        app.view.selected_objects = vec![crate::SelectedObject::Shape(0)];
+        let ctx = egui::Context::default();
+        assert!(crate::copy_selection(&mut app, Some(&ctx), false));
+        assert!(app.session.clipboard.is_some());
+
+        let t = Tokens::for_theme(app.session.prefs.theme);
+        let mut tray_rect = egui::Rect::NOTHING;
+        let mut tray_boxes = Vec::new();
+        for frame in 0..3 {
+            let (shapes, _) = step_editor_frame(
+                &ctx,
+                &mut app,
+                Vec2::new(1280.0, 800.0),
+                f64::from(frame) * 0.08 + 0.1,
+                0.08,
+                Vec::new(),
+            );
+            if let Some(r) = find_tray_frame_rect(&shapes, t.panel_bg, 40.0) {
+                tray_rect = r;
+                tray_boxes = collect_text_boxes_inside(&shapes, r);
+            }
+        }
+        assert!(tray_rect.is_positive());
+        assert!(
+            tray_boxes.iter().any(|(txt, _)| txt == "Rectangle"),
+            "expected shape controls in selection tray, got {tray_boxes:?}"
+        );
+        assert!(
+            tray_boxes.iter().any(|(txt, _)| txt.contains("Curve")),
+            "expected curve control in selection tray, got {tray_boxes:?}"
+        );
+        for hidden in ["Copy", "Cut", "Duplicate", "Save", "Paste", "Delete"] {
+            assert!(
+                !tray_boxes.iter().any(|(txt, _)| txt == hidden),
+                "unexpected {hidden:?} button in selection tray: {tray_boxes:?}"
+            );
+        }
+
+        // Open Stickers & Elements -> My Stickers while the shape is selected and save via popover.
+        app.view.elements_popover_open = true;
+        app.view.stickers_tab = crate::StickersTab::Saved;
+        let mut pop_shapes = Vec::new();
+        for f in 0..3 {
+            pop_shapes = step_editor_frame(
+                &ctx,
+                &mut app,
+                Vec2::new(1280.0, 800.0),
+                0.36 + f64::from(f) * 0.02,
+                0.02,
+                Vec::new(),
+            )
+            .0;
+        }
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1280.0, 800.0));
+        let save_btn_pos = collect_text_boxes_inside(&pop_shapes, viewport)
+            .into_iter()
+            .find(|(txt, _)| txt == "Save Selection")
+            .map(|(_, r)| r.center())
+            .expect("expected Save Selection button in My Stickers popover");
+        for (i, pressed) in [true, false].into_iter().enumerate() {
+            step_editor_frame(
+                &ctx,
+                &mut app,
+                Vec2::new(1280.0, 800.0),
+                0.44 + i as f64 * 0.02,
+                0.02,
+                vec![
+                    egui::Event::PointerMoved(save_btn_pos),
+                    egui::Event::PointerButton {
+                        pos: save_btn_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(app.session.prefs.saved_elements.len(), 1);
+
+        // Close popover and verify keyboard Delete still deletes the selected shape.
+        app.view.elements_popover_open = false;
+        step_editor_frame(
+            &ctx,
+            &mut app,
+            Vec2::new(1280.0, 800.0),
+            0.50,
+            0.016,
+            vec![egui::Event::Key {
+                key: egui::Key::Delete,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.session.doc.shapes.is_empty());
     }
 
     fn step_editor_frame(

@@ -763,16 +763,20 @@ fn matching_notebook_indices(app: &PaperCraftApp) -> Vec<usize> {
     matched.sort_by(|&a, &b| {
         let da = &notebooks[a];
         let db = &notebooks[b];
-        let ord = match sort_by {
-            LibrarySortBy::ModifiedDate => da.updated_at_ms.cmp(&db.updated_at_ms),
-            LibrarySortBy::CreatedDate => da.created_at_ms.cmp(&db.created_at_ms),
-            LibrarySortBy::Name => da
-                .title
-                .to_ascii_lowercase()
-                .cmp(&db.title.to_ascii_lowercase()),
-        };
-        let ordered = if asc { ord } else { ord.reverse() };
-        ordered.then_with(|| a.cmp(&b))
+        db.favorite
+            .cmp(&da.favorite)
+            .then_with(|| {
+                let ord = match sort_by {
+                    LibrarySortBy::ModifiedDate => da.updated_at_ms.cmp(&db.updated_at_ms),
+                    LibrarySortBy::CreatedDate => da.created_at_ms.cmp(&db.created_at_ms),
+                    LibrarySortBy::Name => da
+                        .title
+                        .to_ascii_lowercase()
+                        .cmp(&db.title.to_ascii_lowercase()),
+                };
+                if asc { ord } else { ord.reverse() }
+            })
+            .then_with(|| a.cmp(&b))
     });
     matched
 }
@@ -1206,7 +1210,7 @@ fn draw_library_sort_combo(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Token
         },
     )
     .response
-    .on_hover_text("Choose how notebooks are sorted");
+    .on_hover_text("Choose how notebooks are sorted (favorites always appear first)");
     if selected_sort != sort_by {
         let default_asc = selected_sort == LibrarySortBy::Name;
         let _ = app.session.execute(
@@ -2844,11 +2848,163 @@ mod tests {
             }),
         );
         let sorted = matching_notebook_indices(&app);
-        assert_eq!(app.session.notebooks[sorted[0]].title, "Alpha Notes");
+        let sorted_titles: Vec<&str> = sorted
+            .iter()
+            .map(|&idx| app.session.notebooks[idx].title.as_str())
+            .collect();
+        assert_eq!(
+            sorted_titles,
+            vec!["Zeta Notes", "Alpha Notes", "Quick Notes"]
+        );
 
         let m = run_home_frames(&mut app, Vec2::new(1100.0, 720.0), 2);
         assert_eq!(m.card_rects.len(), 3);
         assert!(m.create_card_rect.is_some());
+    }
+
+    #[test]
+    fn favorites_always_sort_first_in_sequence_across_sort_modes_and_toggles() {
+        let mut app = PaperCraftApp::default();
+        let _ = app
+            .session
+            .execute("notebook.create", &json!({ "title": "Alpha Book" }));
+        let _ = app
+            .session
+            .execute("notebook.create", &json!({ "title": "Beta Book" }));
+        let _ = app
+            .session
+            .execute("notebook.create", &json!({ "title": "Charlie Book" }));
+
+        {
+            let nb0 = std::sync::Arc::make_mut(&mut app.session.notebooks[0]);
+            nb0.title = "Delta Book".to_string();
+            nb0.favorite = false;
+            nb0.created_at_ms = 4_000;
+            nb0.updated_at_ms = 4_000;
+
+            let nb1 = std::sync::Arc::make_mut(&mut app.session.notebooks[1]);
+            nb1.favorite = true;
+            nb1.created_at_ms = 2_000;
+            nb1.updated_at_ms = 2_000;
+
+            let nb2 = std::sync::Arc::make_mut(&mut app.session.notebooks[2]);
+            nb2.favorite = false;
+            nb2.created_at_ms = 1_000;
+            nb2.updated_at_ms = 1_000;
+
+            let nb3 = std::sync::Arc::make_mut(&mut app.session.notebooks[3]);
+            nb3.favorite = false;
+            nb3.created_at_ms = 3_000;
+            nb3.updated_at_ms = 3_000;
+
+            app.session.doc =
+                std::sync::Arc::clone(&app.session.notebooks[app.session.active_notebook]);
+        }
+
+        let ordered_titles = |app: &PaperCraftApp| -> Vec<String> {
+            matching_notebook_indices(app)
+                .into_iter()
+                .map(|idx| app.session.notebooks[idx].title.clone())
+                .collect()
+        };
+
+        // Default ModifiedDate (Newest): existing favorite ranks ahead of newer non-favorite.
+        assert_eq!(
+            ordered_titles(&app),
+            vec!["Alpha Book", "Delta Book", "Charlie Book", "Beta Book"]
+        );
+
+        // Favoriting "Beta Book" places both favorites first in sequence.
+        app.session
+            .execute(
+                "notebook.setMetadata",
+                &json!({ "index": 2, "favorite": true }),
+            )
+            .expect("favoriting Beta Book should succeed");
+        assert_eq!(
+            ordered_titles(&app),
+            vec!["Beta Book", "Alpha Book", "Delta Book", "Charlie Book"]
+        );
+
+        // Modifying a non-favorite newer than all favorites never pushes favorites down.
+        let newer_ts = app.session.notebooks[2]
+            .updated_at_ms
+            .saturating_add(10_000);
+        std::sync::Arc::make_mut(&mut app.session.notebooks[0]).updated_at_ms = newer_ts;
+        assert_eq!(
+            ordered_titles(&app),
+            vec!["Beta Book", "Alpha Book", "Delta Book", "Charlie Book"]
+        );
+
+        // Unfavoriting "Beta Book" moves it behind the remaining favorite (and Delta Book keeps its newer timestamp).
+        app.session
+            .execute(
+                "notebook.setMetadata",
+                &json!({ "index": 2, "favorite": false }),
+            )
+            .expect("unfavoriting Beta Book should succeed");
+        assert_eq!(
+            ordered_titles(&app),
+            vec!["Alpha Book", "Delta Book", "Beta Book", "Charlie Book"]
+        );
+
+        // Set distinct timestamps to verify every sort mode and direction keeps favorites first.
+        {
+            let nb0 = std::sync::Arc::make_mut(&mut app.session.notebooks[0]);
+            nb0.updated_at_ms = 6_000;
+            let nb2 = std::sync::Arc::make_mut(&mut app.session.notebooks[2]);
+            nb2.favorite = true;
+            nb2.updated_at_ms = 5_000;
+            app.session.doc =
+                std::sync::Arc::clone(&app.session.notebooks[app.session.active_notebook]);
+        }
+
+        let expected_orders = [
+            (
+                "modified_date",
+                false,
+                vec!["Beta Book", "Alpha Book", "Delta Book", "Charlie Book"],
+            ),
+            (
+                "modified_date",
+                true,
+                vec!["Alpha Book", "Beta Book", "Charlie Book", "Delta Book"],
+            ),
+            (
+                "created_date",
+                false,
+                vec!["Alpha Book", "Beta Book", "Delta Book", "Charlie Book"],
+            ),
+            (
+                "created_date",
+                true,
+                vec!["Beta Book", "Alpha Book", "Charlie Book", "Delta Book"],
+            ),
+            (
+                "name",
+                true,
+                vec!["Alpha Book", "Beta Book", "Charlie Book", "Delta Book"],
+            ),
+            (
+                "name",
+                false,
+                vec!["Beta Book", "Alpha Book", "Delta Book", "Charlie Book"],
+            ),
+        ];
+
+        for (sort_by, sort_ascending, expected) in expected_orders {
+            app.session
+                .execute(
+                    "library.setViewPrefs",
+                    &json!({ "sort_by": sort_by, "sort_ascending": sort_ascending }),
+                )
+                .expect("setting sort prefs should succeed");
+            assert_eq!(
+                ordered_titles(&app),
+                expected,
+                "mismatch for sort_by={sort_by}, sort_ascending={sort_ascending}"
+            );
+        }
     }
 
     #[test]

@@ -403,7 +403,6 @@ pub struct ViewState {
     pub stickers_tab: StickersTab,
     pub modal_open_seq: u64,
     pub element_name_draft: String,
-    pub save_element_open: bool,
     pub text_alignment_draft: papercraft_doc::TextAlignment,
     pub text_spans_draft: Vec<papercraft_doc::TextSpan>,
     pub text_prev_draft: String,
@@ -582,7 +581,6 @@ impl Default for ViewState {
             stickers_tab: StickersTab::Starter,
             modal_open_seq: 0,
             element_name_draft: String::new(),
-            save_element_open: false,
             text_alignment_draft: papercraft_doc::TextAlignment::Left,
             text_spans_draft: Vec::new(),
             text_prev_draft: String::new(),
@@ -2513,7 +2511,6 @@ pub(crate) fn sync_view_to_active_notebook(app: &mut PaperCraftApp) {
     app.view.text_selection_needs_restore = false;
     app.view.text_editor_page_size = None;
     app.view.elements_popover_open = false;
-    app.view.save_element_open = false;
     app.view.laser_points.clear();
     app.view.last_canvas_page_pos = None;
     app.view.text_insert_error = None;
@@ -3180,7 +3177,6 @@ pub(crate) fn return_to_home(app: &mut PaperCraftApp) {
     app.view.text_selection_needs_restore = false;
     app.view.text_editor_page_size = None;
     app.view.elements_popover_open = false;
-    app.view.save_element_open = false;
     app.view.laser_points.clear();
     app.view.last_canvas_page_pos = None;
     app.view.text_insert_error = None;

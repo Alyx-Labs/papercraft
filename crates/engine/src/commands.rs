@@ -1329,7 +1329,21 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
                     | "package.import"
             )
         {
-            session.bump_active_doc_modified_timestamp();
+            if !matches!(
+                id,
+                "notebook.create"
+                    | "notebook.rename"
+                    | "notebook.setMetadata"
+                    | "notebook.merge"
+                    | "notebook.delete"
+                    | "notebook.restore"
+                    | "notebook.trash.cleanupExpired"
+                    | "library.folder.create"
+                    | "library.folder.rename"
+                    | "library.folder.delete"
+            ) {
+                session.bump_active_doc_modified_timestamp();
+            }
             session.mark_offline_edits_if_disconnected();
         }
         session.sync_active_notebook_slot();
