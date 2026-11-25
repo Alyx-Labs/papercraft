@@ -2682,7 +2682,7 @@ mod tests {
         let ctx = egui::Context::default();
         let viewport = Vec2::new(1280.0, 800.0);
         let expected_version = format!("v{}", env!("CARGO_PKG_VERSION"));
-        assert_eq!(expected_version, "v0.4.0");
+        assert_eq!(expected_version, "v0.5.0");
 
         let mut sidebar_rect = Rect::NOTHING;
         let mut github_rect = None;
