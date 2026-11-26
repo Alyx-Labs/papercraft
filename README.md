@@ -439,6 +439,7 @@ Community participation is at the heart of this initial alpha—bug reports, usa
 - [Command Reference](docs/COMMANDS.md) — separated guide for dev mode, Windows `.exe` builds (Desktop & Server Tray App), Web builds, and server commands.
 - [Self-hosted account and sync guide](docs/self-hosted-sync-server.md) — set up, run, and configure sync via the Server Tray App (`papercraft-server`) or headless CLI (`papercraft-server-cli`).
 - [Web & GitHub Pages deployment](docs/GITHUB_PAGES.md) — build and deploy the WebAssembly browser version.
+- [Installers & packaging architecture](docs/INSTALLERS_AND_PACKAGING.md) — options, OS folder layout, and auto-update design for future native installers.
 - [Iconography](docs/ICONOGRAPHY.md) — local icon assets, licensing, and update rules.
 - [Feature roadmap](docs/FEATURE_ROADMAP.md) — planned and implemented features checklist.
 - [Workspace instructions](AGENTS.md) — mandatory architecture layers, supported scope, and coding rules for contributors and AI assistants.
