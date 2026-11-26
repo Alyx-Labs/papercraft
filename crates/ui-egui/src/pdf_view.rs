@@ -1,6 +1,6 @@
 //! Bounded GPU texture cache and background rendering helpers for PDF page backdrops.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
@@ -11,11 +11,36 @@ use papercraft_doc::{
     CustomPaperTemplate, CustomTemplateKind, Document, EmbeddedImageTemplate, EmbeddedPdf,
     NotebookPage, PdfPageBackdrop,
 };
-use papercraft_engine::Session;
+use papercraft_engine::{RenderedPdfPage, Session};
 use papercraft_sync_protocol::now_unix_ms;
 
 use crate::icons::{Icon, paint_icon};
 use crate::theme::Tokens;
+
+/// Request dispatched to the browser Web Worker to rasterize one PDF page off the UI thread.
+#[derive(Clone, Debug)]
+pub struct WebPdfRenderRequest {
+    pub job_id: u64,
+    pub fingerprint: u64,
+    pub byte_len: usize,
+    pub bytes: Arc<Vec<u8>>,
+    pub page_index: usize,
+    pub max_dim: u32,
+}
+
+/// Completed RGBA rasterization frame returned from the browser Web Worker.
+#[derive(Clone, Debug)]
+pub struct WebPdfRenderResult {
+    pub job_id: u64,
+    pub rendered: Option<RenderedPdfPage>,
+}
+
+/// Platform bridge allowing `papercraft-ui-egui` to delegate Web PDF rasterization to a Worker.
+pub struct WebPdfWorkerHooks {
+    pub is_available: Box<dyn Fn() -> bool>,
+    pub dispatch: Box<dyn FnMut(WebPdfRenderRequest) -> bool>,
+    pub poll_results: Box<dyn FnMut() -> Vec<WebPdfRenderResult>>,
+}
 
 const MAX_CANVAS_TEXTURES: usize = 24;
 const MAX_THUMB_TEXTURES: usize = 128;
@@ -458,8 +483,19 @@ const WASM_MAX_PENDING_THUMBS: usize = 24;
 const WASM_FRAME_BUDGET_MS: f64 = 10.0;
 #[cfg(target_arch = "wasm32")]
 const WASM_MAX_THUMBS_PER_FRAME: usize = 3;
-const WASM_CANVAS_SETTLE_DELAY_MS: f64 = 140.0;
-const WASM_SIDEBAR_SETTLE_DELAY_MS: f64 = 120.0;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const WASM_CANVAS_SETTLE_DELAY_MS: f64 = 240.0;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const WASM_SIDEBAR_SETTLE_DELAY_MS: f64 = 280.0;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const WASM_WRITING_COOLDOWN_MS: f64 = 650.0;
+const SIDEBAR_SCROLL_ACTIVE_MS: f64 = 180.0;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const WORKER_SIDEBAR_SETTLE_MS: f64 = 70.0;
+#[cfg(target_arch = "wasm32")]
+const MAX_WORKER_UPLOADS_PER_FRAME: usize = 2;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const MAX_COMPLETED_READY_QUEUE: usize = 32;
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone)]
@@ -477,8 +513,15 @@ struct WasmPdfQueueState {
     writing_active: bool,
     defer_canvas_until_ms: f64,
     defer_sidebar_until_ms: f64,
+    defer_writing_until_ms: f64,
+    sidebar_last_motion_ms: f64,
     pending_canvas: Vec<WasmPdfJob>,
     pending_thumbs: Vec<WasmPdfJob>,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    next_job_id: u64,
+    in_flight: Option<(u64, PdfTexKey)>,
+    completed_ready: VecDeque<(PdfTexKey, Option<RenderedPdfPage>)>,
+    worker_mode_active: bool,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -489,6 +532,11 @@ impl WasmPdfQueueState {
     }
 
     fn enqueue(&mut self, key: PdfTexKey, bytes: Arc<Vec<u8>>, page_index: usize, max_dim: u32) {
+        if self.in_flight.as_ref().is_some_and(|(_, k)| *k == key)
+            || self.completed_ready.iter().any(|(k, _)| *k == key)
+        {
+            return;
+        }
         let seq = self.next_seq();
         let is_thumb = is_thumb_dim(max_dim);
         let (list, cap) = if is_thumb {
@@ -524,7 +572,10 @@ impl WasmPdfQueueState {
     }
 
     fn pop_next_job(&mut self, now_ms: f64) -> Option<(WasmPdfJob, bool)> {
-        if self.writing_active || now_ms < self.defer_canvas_until_ms {
+        if self.writing_active
+            || now_ms < self.defer_writing_until_ms
+            || now_ms < self.defer_canvas_until_ms
+        {
             return None;
         }
         if let Some(job) = Self::pop_most_recent(&mut self.pending_canvas) {
@@ -536,20 +587,93 @@ impl WasmPdfQueueState {
         Self::pop_most_recent(&mut self.pending_thumbs).map(|job| (job, true))
     }
 
+    fn pop_next_worker_job(&mut self, now_ms: f64) -> Option<(u64, WasmPdfJob)> {
+        if self.in_flight.is_some() {
+            return None;
+        }
+        let job = if let Some(job) = Self::pop_most_recent(&mut self.pending_canvas) {
+            job
+        } else if now_ms >= self.sidebar_last_motion_ms + WORKER_SIDEBAR_SETTLE_MS {
+            Self::pop_most_recent(&mut self.pending_thumbs)?
+        } else {
+            return None;
+        };
+        self.next_job_id = self.next_job_id.saturating_add(1);
+        let job_id = self.next_job_id;
+        self.in_flight = Some((job_id, job.key));
+        Some((job_id, job))
+    }
+
+    fn abandon_in_flight(&mut self, job_id: u64) {
+        if self.in_flight.as_ref().is_some_and(|(id, _)| *id == job_id) {
+            self.in_flight = None;
+        }
+    }
+
+    fn record_worker_result(&mut self, result: WebPdfRenderResult) {
+        let Some((active_id, key)) = self.in_flight else {
+            return;
+        };
+        if active_id != result.job_id {
+            return;
+        }
+        self.in_flight = None;
+        while self.completed_ready.len() >= MAX_COMPLETED_READY_QUEUE {
+            let _ = self.completed_ready.pop_front();
+        }
+        self.completed_ready.push_back((key, result.rendered));
+    }
+
+    fn take_ready_upload(&mut self) -> Option<(PdfTexKey, Option<RenderedPdfPage>)> {
+        if !self.writing_active {
+            return self.completed_ready.pop_front();
+        }
+        let idx = self
+            .completed_ready
+            .iter()
+            .position(|(k, _)| !is_thumb_dim(k.max_dim))?;
+        self.completed_ready.remove(idx)
+    }
+
+    fn cancel_in_flight_for_fallback(&mut self) {
+        self.in_flight = None;
+        self.worker_mode_active = false;
+    }
+
     fn next_wakeup_delay_ms(&self, now_ms: f64) -> Option<u64> {
+        if self.worker_mode_active {
+            if !self.completed_ready.is_empty() && !self.writing_active {
+                return Some(0);
+            }
+            if self.in_flight.is_none() {
+                if !self.pending_canvas.is_empty() {
+                    return Some(0);
+                }
+                if !self.pending_thumbs.is_empty() {
+                    let target = self.sidebar_last_motion_ms + WORKER_SIDEBAR_SETTLE_MS;
+                    return if target > now_ms {
+                        Some(((target - now_ms).ceil() as u64).clamp(16, 250))
+                    } else {
+                        Some(0)
+                    };
+                }
+            }
+            return None;
+        }
         if !self.has_pending() {
             return None;
         }
         if self.writing_active {
             return Some(48);
         }
+        let base = self.defer_canvas_until_ms.max(self.defer_writing_until_ms);
         let target_ms = if !self.pending_canvas.is_empty() {
-            self.defer_canvas_until_ms
+            base
         } else {
-            self.defer_canvas_until_ms.max(self.defer_sidebar_until_ms)
+            base.max(self.defer_sidebar_until_ms)
         };
         if target_ms > now_ms {
-            Some(((target_ms - now_ms).ceil() as u64).clamp(16, 250))
+            Some(((target_ms - now_ms).ceil() as u64).clamp(16, 700))
         } else {
             Some(0)
         }
@@ -585,35 +709,56 @@ pub(crate) fn note_canvas_camera_motion(ctx: &egui::Context) {
 
 /// Defers queued sidebar thumbnail PDF rasterization briefly while scrolling the thumbnail list.
 pub(crate) fn note_sidebar_scroll_motion(ctx: &egui::Context) {
-    let until_ms = now_unix_ms() as f64 + WASM_SIDEBAR_SETTLE_DELAY_MS;
+    let now_ms = now_unix_ms() as f64;
     let queue = wasm_queue(ctx);
     if let Ok(mut st) = queue.inner.lock() {
-        st.defer_sidebar_until_ms = st.defer_sidebar_until_ms.max(until_ms);
+        st.sidebar_last_motion_ms = now_ms;
+        st.defer_sidebar_until_ms = st
+            .defer_sidebar_until_ms
+            .max(now_ms + WASM_SIDEBAR_SETTLE_DELAY_MS);
     }
 }
 
-/// Returns `true` when sidebar thumbnail scrolling settled within the last ~120ms.
+/// Returns `true` when sidebar thumbnail scrolling settled within the last ~180ms.
 pub(crate) fn is_sidebar_scroll_active(ctx: &egui::Context) -> bool {
     let now_ms = now_unix_ms() as f64;
     let queue = wasm_queue(ctx);
     queue
         .inner
         .lock()
-        .is_ok_and(|st| now_ms < st.defer_sidebar_until_ms)
+        .is_ok_and(|st| now_ms < st.sidebar_last_motion_ms + SIDEBAR_SCROLL_ACTIVE_MS)
 }
 
 /// Marks whether live stylus/pointer drawing or erasing is active so queued PDF work waits cleanly.
 pub(crate) fn set_writing_active(ctx: &egui::Context, active: bool) {
+    let now_ms = now_unix_ms() as f64;
     let queue = wasm_queue(ctx);
-    let wake = if let Ok(mut st) = queue.inner.lock() {
+    let wake_delay = if let Ok(mut st) = queue.inner.lock() {
         let stopped = st.writing_active && !active;
         st.writing_active = active;
-        stopped && st.has_pending()
+        if stopped {
+            st.defer_writing_until_ms = st
+                .defer_writing_until_ms
+                .max(now_ms + WASM_WRITING_COOLDOWN_MS);
+        }
+        if stopped
+            && (!st.completed_ready.is_empty() || (st.worker_mode_active && st.has_pending()))
+        {
+            Some(0)
+        } else if stopped && st.has_pending() {
+            Some(WASM_WRITING_COOLDOWN_MS as u64)
+        } else {
+            None
+        }
     } else {
-        false
+        None
     };
-    if wake {
-        ctx.request_repaint();
+    if let Some(delay) = wake_delay {
+        if delay == 0 {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(delay));
+        }
     }
 }
 
@@ -694,11 +839,126 @@ fn pump_wasm_renders(ctx: &egui::Context) {
     }
 }
 
-/// Uploads completed background PDF renders into the texture cache for `ctx`, or drains the
-/// budgeted WASM render queue.
-pub(crate) fn pump_completed_renders(ctx: &egui::Context) {
+#[cfg(target_arch = "wasm32")]
+fn take_ready_uploads_batch(
+    ctx: &egui::Context,
+) -> (Vec<(PdfTexKey, Option<RenderedPdfPage>)>, bool) {
+    let queue = wasm_queue(ctx);
+    let mut batch = Vec::with_capacity(MAX_WORKER_UPLOADS_PER_FRAME);
+    let mut more_ready = false;
+    if let Ok(mut st) = queue.inner.lock() {
+        st.worker_mode_active = true;
+        for _ in 0..MAX_WORKER_UPLOADS_PER_FRAME {
+            let Some(item) = st.take_ready_upload() else {
+                break;
+            };
+            batch.push(item);
+        }
+        more_ready = !st.completed_ready.is_empty() && !st.writing_active;
+    }
+    (batch, more_ready)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn dispatch_worker_queue_if_idle(ctx: &egui::Context, worker: &mut WebPdfWorkerHooks) {
+    let queue = wasm_queue(ctx);
+    loop {
+        let popped = queue
+            .inner
+            .lock()
+            .ok()
+            .and_then(|mut st| st.pop_next_worker_job(now_unix_ms() as f64));
+        let Some((job_id, job)) = popped else {
+            break;
+        };
+        let is_thumb = is_thumb_dim(job.max_dim);
+        if lookup_cached_texture(ctx, job.key, is_thumb).is_some()
+            || is_failed_key(ctx, job.key, is_thumb)
+        {
+            if let Ok(mut st) = queue.inner.lock() {
+                st.abandon_in_flight(job_id);
+            }
+            continue;
+        }
+        let req = WebPdfRenderRequest {
+            job_id,
+            fingerprint: job.key.fingerprint,
+            byte_len: job.key.byte_len,
+            bytes: Arc::clone(&job.bytes),
+            page_index: job.page_index,
+            max_dim: job.max_dim,
+        };
+        if !(worker.dispatch)(req)
+            && let Ok(mut st) = queue.inner.lock()
+        {
+            st.cancel_in_flight_for_fallback();
+            st.enqueue(job.key, job.bytes, job.page_index, job.max_dim);
+        }
+        break;
+    }
+
+    let delay = queue
+        .inner
+        .lock()
+        .ok()
+        .and_then(|st| st.next_wakeup_delay_ms(now_unix_ms() as f64));
+    if let Some(delay) = delay {
+        if delay == 0 {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(delay));
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn pump_wasm_with_worker(ctx: &egui::Context, worker: &mut WebPdfWorkerHooks) {
+    let results = (worker.poll_results)();
+    if !results.is_empty()
+        && let Ok(mut st) = wasm_queue(ctx).inner.lock()
+    {
+        for res in results {
+            st.record_worker_result(res);
+        }
+    }
+    let (batch, more_ready) = take_ready_uploads_batch(ctx);
+    for (key, rendered) in batch {
+        insert_rendered_texture(ctx, key, rendered);
+    }
+    if more_ready {
+        ctx.request_repaint();
+    }
+    dispatch_worker_queue_if_idle(ctx, worker);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn fallback_from_worker(ctx: &egui::Context) {
+    let queue = wasm_queue(ctx);
+    let mut ready = Vec::with_capacity(MAX_WORKER_UPLOADS_PER_FRAME);
+    if let Ok(mut st) = queue.inner.lock() {
+        st.cancel_in_flight_for_fallback();
+        for _ in 0..MAX_WORKER_UPLOADS_PER_FRAME {
+            let Some(item) = st.take_ready_upload() else {
+                break;
+            };
+            ready.push(item);
+        }
+    }
+    for (key, rendered) in ready {
+        insert_rendered_texture(ctx, key, rendered);
+    }
+    pump_wasm_renders(ctx);
+}
+
+/// Uploads completed background PDF renders into the texture cache for `ctx`, delegating
+/// Web rasterization to the browser Web Worker when available.
+pub(crate) fn pump_completed_renders_with_worker(
+    ctx: &egui::Context,
+    worker: Option<&mut WebPdfWorkerHooks>,
+) {
     #[cfg(not(target_arch = "wasm32"))]
     {
+        let _ = worker;
         let coord = pdf_coordinator(ctx);
         for done in coord.drain_completed() {
             insert_rendered_texture(ctx, done.key, done.rgba);
@@ -706,8 +966,42 @@ pub(crate) fn pump_completed_renders(ctx: &egui::Context) {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        pump_wasm_renders(ctx);
+        if let Some(w) = worker
+            && (w.is_available)()
+        {
+            pump_wasm_with_worker(ctx, w);
+        } else {
+            fallback_from_worker(ctx);
+        }
     }
+}
+
+/// Dispatches the highest-priority pending PDF job to the browser Web Worker if idle.
+pub(crate) fn dispatch_pending_web_worker_job(
+    ctx: &egui::Context,
+    worker: Option<&mut WebPdfWorkerHooks>,
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (ctx, worker);
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(w) = worker
+            && (w.is_available)()
+        {
+            if let Ok(mut st) = wasm_queue(ctx).inner.lock() {
+                st.worker_mode_active = true;
+            }
+            dispatch_worker_queue_if_idle(ctx, w);
+        }
+    }
+}
+
+/// Uploads completed background PDF renders into the texture cache for `ctx`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn pump_completed_renders(ctx: &egui::Context) {
+    pump_completed_renders_with_worker(ctx, None);
 }
 
 fn lookup_cached_texture(
@@ -1200,5 +1494,86 @@ mod wasm_queue_tests {
         let (thumb_job, is_thumb) = q.pop_next_job(1_310.0).expect("thumb ready");
         assert!(is_thumb);
         assert_eq!(thumb_job.page_index, WASM_MAX_PENDING_THUMBS + 4);
+    }
+
+    #[test]
+    fn wasm_fallback_honors_writing_cooldown_after_pen_lift() {
+        let bytes = Arc::new(Vec::new());
+        let mut q = WasmPdfQueueState::default();
+        q.enqueue(test_key(0, 900), Arc::clone(&bytes), 0, 900);
+
+        q.writing_active = true;
+        assert!(q.pop_next_job(1_000.0).is_none());
+
+        // Simulate pen lift setting WASM_WRITING_COOLDOWN_MS.
+        q.writing_active = false;
+        q.defer_writing_until_ms = 1_000.0 + WASM_WRITING_COOLDOWN_MS;
+        assert!(q.pop_next_job(1_200.0).is_none());
+        let wait = q.next_wakeup_delay_ms(1_200.0).expect("scheduled wakeup");
+        assert!(wait > 0);
+
+        let (job, is_thumb) = q
+            .pop_next_job(1_000.0 + WASM_WRITING_COOLDOWN_MS + 1.0)
+            .expect("canvas job after cooldown");
+        assert!(!is_thumb);
+        assert_eq!(job.max_dim, 900);
+    }
+
+    #[test]
+    fn worker_queue_enforces_single_in_flight_priority_and_writing_upload_guard() {
+        let bytes = Arc::new(Vec::new());
+        let mut q = WasmPdfQueueState {
+            worker_mode_active: true,
+            sidebar_last_motion_ms: 1_000.0,
+            ..Default::default()
+        };
+        q.enqueue(test_key(0, 160), Arc::clone(&bytes), 0, 160);
+        q.enqueue(test_key(1, 900), Arc::clone(&bytes), 1, 900);
+
+        // Even while writing_active and sidebar scrolling, canvas dispatches to worker immediately.
+        q.writing_active = true;
+        let (job_id_1, first) = q
+            .pop_next_worker_job(1_010.0)
+            .expect("canvas dispatches while writing");
+        assert_eq!(first.max_dim, 900);
+        assert_eq!(q.in_flight, Some((job_id_1, test_key(1, 900))));
+
+        // Only 1 job may be in flight at a time, and duplicate key is ignored.
+        q.enqueue(test_key(1, 900), Arc::clone(&bytes), 1, 900);
+        assert!(q.pop_next_worker_job(2_000.0).is_none());
+
+        q.record_worker_result(WebPdfRenderResult {
+            job_id: job_id_1,
+            rendered: Some(RenderedPdfPage {
+                width: 2,
+                height: 2,
+                rgba: vec![255; 16],
+            }),
+        });
+        assert!(q.in_flight.is_none());
+
+        // Thumbs wait briefly for sidebar scroll settle, then dispatch while writing_active.
+        assert!(q.pop_next_worker_job(1_020.0).is_none());
+        let (job_id_2, second) = q
+            .pop_next_worker_job(1_000.0 + WORKER_SIDEBAR_SETTLE_MS + 1.0)
+            .expect("thumb dispatches after settle");
+        assert_eq!(second.max_dim, 160);
+        q.record_worker_result(WebPdfRenderResult {
+            job_id: job_id_2,
+            rendered: Some(RenderedPdfPage {
+                width: 1,
+                height: 1,
+                rgba: vec![255; 4],
+            }),
+        });
+
+        // While writing_active, canvas upload proceeds immediately while thumb upload waits.
+        let (k1, _) = q.take_ready_upload().expect("canvas upload allowed");
+        assert_eq!(k1.max_dim, 900);
+        assert!(q.take_ready_upload().is_none());
+
+        q.writing_active = false;
+        let (k2, _) = q.take_ready_upload().expect("thumb upload after pen lift");
+        assert_eq!(k2.max_dim, 160);
     }
 }

@@ -23,8 +23,14 @@ use crate::PaperCraftApp;
 
 const MAX_CHUNK_STROKES: usize = 64;
 const MAX_CHUNK_VERTS: usize = 48_000;
+#[cfg(target_arch = "wasm32")]
+const PROXY_ZOOM_TRI_THRESHOLD: usize = 8_000;
+#[cfg(not(target_arch = "wasm32"))]
 const PROXY_ZOOM_TRI_THRESHOLD: usize = 150_000;
 /// Seconds without zoom input before proxy-scaled layers are rebaked.
+#[cfg(target_arch = "wasm32")]
+const ZOOM_SETTLE_S: f64 = 0.14;
+#[cfg(not(target_arch = "wasm32"))]
 const ZOOM_SETTLE_S: f64 = 0.06;
 const VERTEX_STRIDE: u64 = 20;
 

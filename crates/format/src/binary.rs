@@ -1820,17 +1820,9 @@ fn collect_pen_palette(
     Ok((palette, page_pen_indices))
 }
 
-/// Encodes a [`Document`] into a compact zlib-compressed `.pcraft` v2 binary byte vector.
-pub fn encode_binary_v2(doc: &Document) -> Result<Vec<u8>, FormatError> {
-    encode_binary_v2_with_compression(doc, None)
-}
+const FAST_UNCOMPRESSED_THRESHOLD_BYTES: usize = 512 * 1024;
 
-/// Encodes a [`Document`] into a `.pcraft` v2 binary container using an explicit zlib
-/// compression preset (`None` chooses automatically based on embedded assets and payload size).
-pub fn encode_binary_v2_with_compression(
-    doc: &Document,
-    compression: Option<Compression>,
-) -> Result<Vec<u8>, FormatError> {
+fn encode_binary_v2_raw(doc: &Document) -> Result<Vec<u8>, FormatError> {
     let pages = ResolvedPagesRef::new(doc);
     let (palette, page_pen_indices) = collect_pen_palette(&pages)?;
 
@@ -1863,16 +1855,59 @@ pub fn encode_binary_v2_with_compression(
         }
     }
     write_page_extensions(&mut raw, doc, &pages);
+    Ok(raw)
+}
 
+fn wrap_binary_v2_raw(
+    raw: &[u8],
+    est_cap: usize,
+    compression: Compression,
+) -> Result<Vec<u8>, FormatError> {
+    let mut out = Vec::with_capacity(est_cap);
+    out.extend_from_slice(BINARY_MAGIC);
+    out.extend_from_slice(&BINARY_VERSION.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+
+    let mut encoder = ZlibEncoder::new(out, compression);
+    encoder
+        .write_all(raw)
+        .map_err(|e| FormatError::Compression(e.to_string()))?;
+    encoder
+        .finish()
+        .map_err(|e| FormatError::Compression(e.to_string()))
+}
+
+/// Encodes a [`Document`] into a compact zlib-compressed `.pcraft` v2 binary byte vector.
+pub fn encode_binary_v2(doc: &Document) -> Result<Vec<u8>, FormatError> {
+    encode_binary_v2_with_compression(doc, None)
+}
+
+/// Encodes a [`Document`] into a latency-optimized `.pcraft` v2 binary container for local autosave.
+///
+/// Small detached payloads (`<= 512 KiB`) use valid zlib stored blocks (`Compression::none()`) to
+/// avoid UI-thread deflate stalls, while larger payloads use `Compression::fast()`.
+pub fn encode_binary_v2_fast(doc: &Document) -> Result<Vec<u8>, FormatError> {
+    let raw = encode_binary_v2_raw(doc)?;
+    let compression = if raw.len() <= FAST_UNCOMPRESSED_THRESHOLD_BYTES {
+        Compression::none()
+    } else {
+        Compression::fast()
+    };
+    wrap_binary_v2_raw(&raw, HEADER_LEN + raw.len() + 64, compression)
+}
+
+/// Encodes a [`Document`] into a `.pcraft` v2 binary container using an explicit zlib
+/// compression preset (`None` chooses automatically based on embedded assets and payload size).
+pub fn encode_binary_v2_with_compression(
+    doc: &Document,
+    compression: Option<Compression>,
+) -> Result<Vec<u8>, FormatError> {
+    let raw = encode_binary_v2_raw(doc)?;
     let est_cap = if doc.pdf_documents.is_empty() {
         HEADER_LEN + raw.len() / 2
     } else {
         HEADER_LEN + raw.len()
     };
-    let mut out = Vec::with_capacity(est_cap);
-    out.extend_from_slice(BINARY_MAGIC);
-    out.extend_from_slice(&BINARY_VERSION.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
 
     // Embedded PDFs already hold compressed streams; fast deflate avoids multi-second CPU stalls
     // while standard stroke-only notebooks keep default compression unless overridden.
@@ -1883,13 +1918,7 @@ pub fn encode_binary_v2_with_compression(
             Compression::default()
         }
     });
-    let mut encoder = ZlibEncoder::new(out, compression);
-    encoder
-        .write_all(&raw)
-        .map_err(|e| FormatError::Compression(e.to_string()))?;
-    encoder
-        .finish()
-        .map_err(|e| FormatError::Compression(e.to_string()))
+    wrap_binary_v2_raw(&raw, est_cap, compression)
 }
 
 /// Decodes a `.pcraft` (or legacy `.ncraft`) v2 binary container into a [`Document`].

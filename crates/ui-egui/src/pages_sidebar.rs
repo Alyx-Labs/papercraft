@@ -788,13 +788,17 @@ fn paint_page_sheet_contents(
         opts.border_color,
     );
     if has_backdrop {
+        #[cfg(target_arch = "wasm32")]
+        let thumb_pdf_max_dim = 160;
+        #[cfg(not(target_arch = "wasm32"))]
+        let thumb_pdf_max_dim = 240;
         crate::pdf_view::paint_page_pdf_backdrop_if_present(
             ui.ctx(),
             ui.painter(),
             sheet_rect,
             &app.session.doc,
             page,
-            240,
+            thumb_pdf_max_dim,
         );
     }
     paint_thumbnail_images(ui, sheet_rect, page);
@@ -812,6 +816,7 @@ fn paint_page_sheet_contents(
                 || app.session.live_stroke.is_some()
                 || app.session.live_eraser.is_some()
                 || crate::pdf_view::is_sidebar_scroll_active(ui.ctx()),
+            frame_counter: app.frame_counter,
         },
     );
 }
@@ -2140,6 +2145,7 @@ struct ThumbForegroundTarget<'a> {
     theme: papercraft_doc::UiTheme,
     auto_contrast: bool,
     defer_rebuild: bool,
+    frame_counter: u64,
 }
 
 fn try_append_thumb_stroke(
@@ -2317,14 +2323,39 @@ fn paint_thumbnail_foreground_cached(
     });
 
     if !exact_hit {
-        if target.defer_rebuild && entry.is_some() {
+        const MAX_THUMB_FG_BUILDS_PER_FRAME: usize =
+            if cfg!(target_arch = "wasm32") { 2 } else { 6 };
+        if target.defer_rebuild {
             ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(120));
+                .request_repaint_after(std::time::Duration::from_millis(150));
         } else {
             let appended = entry
                 .as_mut()
                 .is_some_and(|e| try_append_thumb_stroke(e, &key, sheet_rect, page));
-            if !appended {
+            let within_budget = if appended {
+                true
+            } else {
+                let budget_id = egui::Id::unique("papercraft_thumb_fg_frame_budget");
+                ui.ctx().data_mut(|d| {
+                    let (frame_id, count) = d
+                        .get_temp::<(u64, usize)>(budget_id)
+                        .unwrap_or((target.frame_counter, 0));
+                    let cur = if frame_id == target.frame_counter {
+                        count
+                    } else {
+                        0
+                    };
+                    if cur < MAX_THUMB_FG_BUILDS_PER_FRAME {
+                        d.insert_temp(budget_id, (target.frame_counter, cur + 1));
+                        true
+                    } else {
+                        false
+                    }
+                })
+            };
+            if !appended && !within_budget {
+                ui.ctx().request_repaint();
+            } else if !appended {
                 let (maybe_img, built_shapes) = build_thumbnail_foreground_assets(
                     ui.painter(),
                     sheet_rect,

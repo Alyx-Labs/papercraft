@@ -54,6 +54,8 @@ use papercraft_engine::{PdfExportJob, PdfExportStep, Session};
 use papercraft_paint::RibbonMesh;
 use serde_json::json;
 
+pub use pdf_view::{WebPdfRenderRequest, WebPdfRenderResult, WebPdfWorkerHooks};
+
 /// Official PaperCraft website URL displayed in the Home sidebar footer.
 pub(crate) const WEBSITE_URL: &str = "https://papercraft.ink/";
 /// Public source repository URL displayed in Profile download links.
@@ -832,6 +834,7 @@ pub type SetClipboardTextFn = Box<dyn FnMut(&str)>;
 pub type OpenUrlFn = Box<dyn FnMut(&str)>;
 pub type PastePollFn = Box<dyn FnMut() -> bool>;
 pub type SyncDesktopShortcutFn = Box<dyn FnMut(bool) -> Result<String, String>>;
+pub type NotifyWritingActiveFn = Box<dyn FnMut(bool)>;
 
 #[derive(Default)]
 pub struct PlatformHooks {
@@ -856,6 +859,8 @@ pub struct PlatformHooks {
     pub flush_web_storage_delta: Option<FlushWebStorageDeltaFn>,
     pub poll_web_storage_events: Option<PollWebStorageEventsFn>,
     pub retry_web_storage_write: Option<RetryWebStorageWriteFn>,
+    pub notify_writing_active: Option<NotifyWritingActiveFn>,
+    pub web_pdf_worker: Option<WebPdfWorkerHooks>,
     pub web_sync_dispatch: Option<sync_worker::WebSyncDispatchFn>,
     pub pick_image_file: Option<PickImageFileFn>,
     pub clipboard_image: Option<ClipboardImageFn>,
@@ -1115,6 +1120,9 @@ pub struct PaperCraftApp {
     last_ctx: Option<egui::Context>,
     frame_counter: u64,
     last_saved_cache_state: Option<WebCacheStateKey>,
+    last_writing_activity_ms: f64,
+    last_web_pending_check_ms: f64,
+    last_notified_writing_active: bool,
     last_stylus_device_poll_s: f64,
     stylus_synced_in_raw_hook: bool,
     pub(crate) wgpu_enabled: bool,
@@ -1136,6 +1144,21 @@ struct WebCacheStateKey {
     needs_initial_nickname: bool,
     last_sync_at_ms: Option<i64>,
     active_notebook: usize,
+}
+
+impl WebCacheStateKey {
+    fn same_except_revision(self, other: Self) -> bool {
+        self.notebook_count == other.notebook_count
+            && self.trashed_count == other.trashed_count
+            && self.signed_in == other.signed_in
+            && self.viewing_cloud == other.viewing_cloud
+            && self.local_profile_count == other.local_profile_count
+            && self.remembered_server_count == other.remembered_server_count
+            && self.pending_changes == other.pending_changes
+            && self.needs_initial_nickname == other.needs_initial_nickname
+            && self.last_sync_at_ms == other.last_sync_at_ms
+            && self.active_notebook == other.active_notebook
+    }
 }
 
 impl Default for PaperCraftApp {
@@ -1206,6 +1229,9 @@ impl PaperCraftApp {
             last_ctx: None,
             frame_counter: 0,
             last_saved_cache_state: None,
+            last_writing_activity_ms: -10_000.0,
+            last_web_pending_check_ms: -10_000.0,
+            last_notified_writing_active: false,
             last_stylus_device_poll_s: -10.0,
             stylus_synced_in_raw_hook: false,
             wgpu_enabled: false,
@@ -2240,12 +2266,29 @@ impl PaperCraftApp {
         }
     }
 
+    fn sync_writing_activity(&mut self, ctx: &egui::Context) {
+        let active = self.session.live_stroke.is_some() || self.session.live_eraser.is_some();
+        let was_active = self.last_notified_writing_active;
+        pdf_view::set_writing_active(ctx, active);
+        if active || was_active {
+            self.last_writing_activity_ms = papercraft_sync_protocol::now_unix_ms() as f64;
+        }
+        if active != was_active {
+            self.last_notified_writing_active = active;
+            if let Some(cb) = self.hooks.notify_writing_active.as_mut() {
+                cb(active);
+            }
+        }
+    }
+
     pub(crate) fn flush_web_cache_if_needed(&mut self) {
         self.flush_web_storage(false);
     }
 
     pub(crate) fn flush_web_storage(&mut self, force_urgent: bool) {
+        let now_ms = papercraft_sync_protocol::now_unix_ms() as f64;
         if self.session.live_stroke.is_some() || self.session.live_eraser.is_some() {
+            self.last_writing_activity_ms = now_ms;
             return;
         }
         let state_key = WebCacheStateKey {
@@ -2264,8 +2307,24 @@ impl PaperCraftApp {
         if self.hooks.flush_web_storage_delta.is_some() {
             if !force_urgent
                 && self.last_saved_cache_state == Some(state_key)
-                && !self.session.has_pending_web_storage_changes()
+                && !self.session.has_queued_web_delta()
             {
+                if (now_ms - self.last_web_pending_check_ms) < 1_000.0 {
+                    return;
+                }
+                self.last_web_pending_check_ms = now_ms;
+                if !self.session.has_pending_web_storage_changes() {
+                    return;
+                }
+            }
+            if !force_urgent
+                && let Some(prev) = self.last_saved_cache_state
+                && prev.same_except_revision(state_key)
+                && (now_ms - self.last_writing_activity_ms) < 900.0
+            {
+                if let Some(ctx) = self.last_ctx.as_ref() {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(950));
+                }
                 return;
             }
             let delta = self.session.take_web_storage_delta(force_urgent);
@@ -2275,6 +2334,7 @@ impl PaperCraftApp {
                 flush(delta);
             }
             self.last_saved_cache_state = Some(state_key);
+            self.last_web_pending_check_ms = now_ms;
             return;
         }
         if self.hooks.save_web_cache.is_none() || self.last_saved_cache_state == Some(state_key) {
@@ -2864,11 +2924,8 @@ impl PaperCraftApp {
         self.last_ctx = Some(ctx.clone());
         self.install_rich_fonts_if_needed(&ctx);
         self.sync_ui_scale_before_render(&ctx);
-        pdf_view::set_writing_active(
-            &ctx,
-            self.session.live_stroke.is_some() || self.session.live_eraser.is_some(),
-        );
-        pdf_view::pump_completed_renders(&ctx);
+        self.sync_writing_activity(&ctx);
+        pdf_view::pump_completed_renders_with_worker(&ctx, self.hooks.web_pdf_worker.as_mut());
         #[cfg(not(target_arch = "wasm32"))]
         self.poll_async_pdf_import(&ctx);
         self.poll_async_pdf_export(&ctx);
@@ -2967,6 +3024,8 @@ impl PaperCraftApp {
         }
         self.sync_ui_scale_after_render(&ctx);
         self.forward_output_commands(&ctx);
+        self.sync_writing_activity(&ctx);
+        pdf_view::dispatch_pending_web_worker_job(&ctx, self.hooks.web_pdf_worker.as_mut());
         self.flush_web_cache_if_needed();
     }
 

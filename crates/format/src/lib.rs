@@ -84,10 +84,10 @@ pub fn save_document_bytes(doc: &Document) -> Result<Vec<u8>, FormatError> {
     binary::encode_binary_v2(doc)
 }
 
-/// Serializes a document into a `.pcraft` v2 binary container using fast zlib compression,
-/// suited for latency-sensitive local autosaves (e.g. IndexedDB persistence).
+/// Serializes a document into a latency-optimized `.pcraft` v2 binary container suited for local
+/// autosaves (stored zlib below 512 KiB, fast deflate above).
 pub fn save_document_bytes_fast(doc: &Document) -> Result<Vec<u8>, FormatError> {
-    binary::encode_binary_v2_with_compression(doc, Some(flate2::Compression::fast()))
+    binary::encode_binary_v2_fast(doc)
 }
 
 /// Loads a `.pcraft` (or legacy `.ncraft`) document from compressed binary v2 bytes

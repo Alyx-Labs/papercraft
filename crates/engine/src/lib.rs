@@ -108,6 +108,19 @@ impl LiveStroke {
         out
     }
 
+    #[must_use]
+    pub fn frozen_preview_len(&self) -> usize {
+        self.frozen_preview.len()
+    }
+
+    #[must_use]
+    pub fn predicted_tip(&self) -> Option<StrokeSample> {
+        if self.straight_line || self.pen.smoothing.is_smoothing_disabled() {
+            return None;
+        }
+        predict_live_tip(&self.smoothed_preview, self.pen.smoothing.prediction_ms)
+    }
+
     pub fn string_tether(&self) -> Option<(Point, Point)> {
         self.stabilizer.string_tether()
     }

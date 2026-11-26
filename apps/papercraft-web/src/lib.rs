@@ -11,6 +11,8 @@
 #[cfg(target_arch = "wasm32")]
 mod web_files;
 #[cfg(target_arch = "wasm32")]
+mod web_pdf_worker;
+#[cfg(target_arch = "wasm32")]
 mod web_storage;
 #[cfg(target_arch = "wasm32")]
 mod web_stylus;
@@ -26,7 +28,7 @@ mod web {
     use wasm_bindgen::prelude::wasm_bindgen;
     use wasm_bindgen::{JsCast, JsValue};
 
-    use super::{web_files, web_storage, web_stylus, web_sync};
+    use super::{web_files, web_pdf_worker, web_storage, web_stylus, web_sync};
 
     /// Starts the PaperCraft web application on the specified HTML canvas and removes
     /// the loading overlay once initialization completes.
@@ -94,7 +96,8 @@ mod web {
 
                     let flush_ctrl = storage_ctrl.clone();
                     let poll_ctrl = storage_ctrl.clone();
-                    let retry_ctrl = storage_ctrl;
+                    let retry_ctrl = storage_ctrl.clone();
+                    let writing_ctrl = storage_ctrl;
 
                     let hooks = PlatformHooks {
                         tablet_poll: Some(Box::new(move || stylus_poll.drain_samples())),
@@ -164,6 +167,13 @@ mod web {
                         retry_web_storage_write: Some(Box::new(move || {
                             retry_ctrl.retry_failed();
                         })),
+                        notify_writing_active: Some(Box::new(move |active| {
+                            writing_ctrl.set_writing_active(active);
+                        })),
+                        web_pdf_worker: web_pdf_worker::WebPdfWorkerBridge::try_spawn(Arc::clone(
+                            &ctx_slot,
+                        ))
+                        .map(|bridge| bridge.into_hooks()),
                         web_sync_dispatch: Some(Box::new(|cmd, evt_tx, ctx| {
                             web_sync::dispatch_sync_command(cmd, evt_tx, ctx);
                         })),
@@ -206,3 +216,5 @@ mod web {
 
 #[cfg(target_arch = "wasm32")]
 pub use web::{WebHandle, start_on_canvas};
+#[cfg(target_arch = "wasm32")]
+pub use web_pdf_worker::{papercraft_pdf_worker_register_doc, papercraft_pdf_worker_render_page};

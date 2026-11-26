@@ -1247,6 +1247,13 @@ impl Session {
         }
     }
 
+    /// Fast O(1) check for queued web storage deltas or dirty open notebooks (no serialization).
+    #[must_use]
+    pub fn has_queued_web_delta(&self) -> bool {
+        self.sync.web_cache_enabled
+            && (!self.sync.pending_web_delta.is_empty() || self.library.has_dirty())
+    }
+
     /// Returns `true` when any in-memory or queued web storage changes have not yet been drained
     /// via [`Session::take_web_storage_delta`].
     #[must_use]

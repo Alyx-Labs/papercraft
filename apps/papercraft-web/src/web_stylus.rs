@@ -46,6 +46,7 @@ struct WebStylusState {
     active_pen_touch_id: Option<u64>,
     last_pen_client_pos: Option<(f64, f64)>,
     last_pen_event_ms: Option<f64>,
+    cached_canvas_origin: Option<(f64, f64)>,
     active_touch_pointer_ids: Vec<i32>,
     pointer_device_kind: PointerDeviceKind,
     pen_end_eraser: Option<bool>,
@@ -55,6 +56,13 @@ struct WebStylusState {
     secondary_barrel_press_count: u32,
     tracked_contact_pointer_id: Option<i32>,
     last_pen_barrel_time_ms: Option<f64>,
+}
+
+fn passive_capture_options() -> web_sys::AddEventListenerOptions {
+    let opts = web_sys::AddEventListenerOptions::new();
+    opts.set_capture(true);
+    opts.set_passive(true);
+    opts
 }
 
 /// Shared handle to browser `PointerEvent` and `TouchEvent` stylus state consumed by `PlatformHooks`.
@@ -110,6 +118,8 @@ impl WebStylusHandle {
                 &ctx_slot,
             );
             handle.attach_window_blur_listener(&window);
+            handle.attach_window_viewport_listener(&window, "resize");
+            handle.attach_window_viewport_listener(&window, "scroll");
         }
         handle
     }
@@ -191,10 +201,10 @@ impl WebStylusHandle {
                 }
             },
         ));
-        let _ = canvas.add_event_listener_with_callback_and_bool(
+        let _ = canvas.add_event_listener_with_callback_and_add_event_listener_options(
             event_name,
             cb.as_ref().unchecked_ref(),
-            true,
+            &passive_capture_options(),
         );
         cb.forget();
     }
@@ -215,10 +225,10 @@ impl WebStylusHandle {
                 }
             },
         ));
-        let _ = canvas.add_event_listener_with_callback_and_bool(
+        let _ = canvas.add_event_listener_with_callback_and_add_event_listener_options(
             event_name,
             cb.as_ref().unchecked_ref(),
-            true,
+            &passive_capture_options(),
         );
         cb.forget();
     }
@@ -241,10 +251,10 @@ impl WebStylusHandle {
                 }
             },
         ));
-        let _ = window.add_event_listener_with_callback_and_bool(
+        let _ = window.add_event_listener_with_callback_and_add_event_listener_options(
             event_name,
             cb.as_ref().unchecked_ref(),
-            true,
+            &passive_capture_options(),
         );
         cb.forget();
     }
@@ -265,10 +275,10 @@ impl WebStylusHandle {
                 }
             },
         ));
-        let _ = window.add_event_listener_with_callback_and_bool(
+        let _ = window.add_event_listener_with_callback_and_add_event_listener_options(
             event_name,
             cb.as_ref().unchecked_ref(),
-            true,
+            &passive_capture_options(),
         );
         cb.forget();
     }
@@ -280,11 +290,26 @@ impl WebStylusHandle {
             let _ = clear_pen_state(&mut g);
             g.active_touch_pointer_ids.clear();
             g.pointer_device_kind = PointerDeviceKind::Unknown;
+            g.cached_canvas_origin = None;
         }));
-        let _ = window.add_event_listener_with_callback_and_bool(
+        let _ = window.add_event_listener_with_callback_and_add_event_listener_options(
             "blur",
             cb.as_ref().unchecked_ref(),
-            true,
+            &passive_capture_options(),
+        );
+        cb.forget();
+    }
+
+    fn attach_window_viewport_listener(&self, window: &web_sys::Window, event_name: &str) {
+        let state = Arc::clone(&self.state);
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::wrap(Box::new(move |_: web_sys::Event| {
+            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+            g.cached_canvas_origin = None;
+        }));
+        let _ = window.add_event_listener_with_callback_and_add_event_listener_options(
+            event_name,
+            cb.as_ref().unchecked_ref(),
+            &passive_capture_options(),
         );
         cb.forget();
     }
@@ -324,10 +349,29 @@ fn request_repaint(ctx_slot: &SharedEguiCtx) {
     }
 }
 
-fn canvas_local_pos(canvas: &web_sys::HtmlCanvasElement, ev: &web_sys::PointerEvent) -> egui::Pos2 {
+fn refresh_canvas_origin(
+    g: &mut WebStylusState,
+    canvas: &web_sys::HtmlCanvasElement,
+) -> (f64, f64) {
     let rect = canvas.get_bounding_client_rect();
-    let x = f64::from(ev.client_x()) - rect.left();
-    let y = f64::from(ev.client_y()) - rect.top();
+    let origin = (rect.left(), rect.top());
+    g.cached_canvas_origin = Some(origin);
+    origin
+}
+
+fn canvas_local_pos(
+    g: &mut WebStylusState,
+    canvas: &web_sys::HtmlCanvasElement,
+    ev: &web_sys::PointerEvent,
+    refresh_rect: bool,
+) -> egui::Pos2 {
+    let (left, top) = if refresh_rect || g.cached_canvas_origin.is_none() {
+        refresh_canvas_origin(g, canvas)
+    } else {
+        g.cached_canvas_origin.unwrap_or((0.0, 0.0))
+    };
+    let x = f64::from(ev.client_x()) - left;
+    let y = f64::from(ev.client_y()) - top;
     let x_f32 = if x.is_finite() { x as f32 } else { 0.0 };
     let y_f32 = if y.is_finite() { y as f32 } else { 0.0 };
     egui::pos2(x_f32, y_f32)
@@ -625,11 +669,12 @@ fn handle_pointer_event(
     if matches!(phase, PointerPhase::Cancel | PointerPhase::Leave) {
         let mut needs_repaint = clear_pen_state(&mut g);
         if phase == PointerPhase::Cancel {
+            let pos = canvas_local_pos(&mut g, canvas, ev, false);
             push_bounded_contact(
                 &mut g.contact_events,
                 PenContactEvent {
                     kind: PenContactKind::Cancel,
-                    pos: canvas_local_pos(canvas, ev),
+                    pos,
                     modifiers: event_modifiers(ev),
                 },
             );
@@ -644,6 +689,10 @@ fn handle_pointer_event(
             },
         );
         return needs_repaint;
+    }
+
+    if matches!(phase, PointerPhase::Enter | PointerPhase::Down) {
+        let _ = refresh_canvas_origin(&mut g, canvas);
     }
 
     let button = ev.button();
@@ -717,22 +766,24 @@ fn record_fallback_contact(
     match phase {
         PointerPhase::Down if is_special_contact => {
             g.tracked_contact_pointer_id = Some(pointer_id);
+            let pos = canvas_local_pos(g, canvas, ev, true);
             push_bounded_contact(
                 &mut g.contact_events,
                 PenContactEvent {
                     kind: PenContactKind::Down,
-                    pos: canvas_local_pos(canvas, ev),
+                    pos,
                     modifiers: event_modifiers(ev),
                 },
             );
             true
         }
         PointerPhase::Move if g.tracked_contact_pointer_id == Some(pointer_id) => {
+            let pos = canvas_local_pos(g, canvas, ev, false);
             push_bounded_contact(
                 &mut g.contact_events,
                 PenContactEvent {
                     kind: PenContactKind::Move,
-                    pos: canvas_local_pos(canvas, ev),
+                    pos,
                     modifiers: event_modifiers(ev),
                 },
             );
@@ -740,11 +791,12 @@ fn record_fallback_contact(
         }
         PointerPhase::Up if g.tracked_contact_pointer_id == Some(pointer_id) => {
             g.tracked_contact_pointer_id = None;
+            let pos = canvas_local_pos(g, canvas, ev, false);
             push_bounded_contact(
                 &mut g.contact_events,
                 PenContactEvent {
                     kind: PenContactKind::Up,
-                    pos: canvas_local_pos(canvas, ev),
+                    pos,
                     modifiers: event_modifiers(ev),
                 },
             );
@@ -775,11 +827,12 @@ fn handle_window_release(
         let mut needs_repaint = clear_pen_state(&mut g);
         if g.tracked_contact_pointer_id == Some(pointer_id) {
             g.tracked_contact_pointer_id = None;
+            let pos = canvas_local_pos(&mut g, canvas, ev, false);
             push_bounded_contact(
                 &mut g.contact_events,
                 PenContactEvent {
                     kind: PenContactKind::Cancel,
-                    pos: canvas_local_pos(canvas, ev),
+                    pos,
                     modifiers: event_modifiers(ev),
                 },
             );
@@ -800,11 +853,12 @@ fn handle_window_release(
     g.pen_end_eraser = Some((buttons & 32) != 0);
     if had_contact {
         g.tracked_contact_pointer_id = None;
+        let pos = canvas_local_pos(&mut g, canvas, ev, false);
         push_bounded_contact(
             &mut g.contact_events,
             PenContactEvent {
                 kind: PenContactKind::Up,
-                pos: canvas_local_pos(canvas, ev),
+                pos,
                 modifiers: event_modifiers(ev),
             },
         );

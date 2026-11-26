@@ -219,10 +219,28 @@ struct LiveRibbonCacheKey {
     color_key: (UiTheme, bool, PaperColor),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveFrozenMeshKey {
+    frozen_len: usize,
+    first_pt_bits: Option<[u64; 2]>,
+    zoom_bits: u32,
+    pan_bits: [u64; 2],
+    color_key: (UiTheme, bool, PaperColor),
+}
+
+#[derive(Clone)]
+struct LiveFrozenMeshCache {
+    key: LiveFrozenMeshKey,
+    mesh: Arc<Mesh>,
+    constant_mouse_pressure: bool,
+}
+
 #[derive(Clone)]
 struct LiveRibbonCache {
     key: LiveRibbonCacheKey,
-    mesh: Arc<Mesh>,
+    frozen: Option<LiveFrozenMeshCache>,
+    tail_mesh: Option<Arc<Mesh>>,
+    full_mesh: Option<Arc<Mesh>>,
 }
 
 /// Cached screen-space geometry for paper ruling, committed ink strokes, shapes, and text.
@@ -623,6 +641,125 @@ pub(crate) fn build_live_ribbon_mesh(
     let ribbon = build_stroke_ribbon(pen, &nodes, feather);
     (!ribbon.indices.is_empty())
         .then(|| ribbon_to_egui_mesh(&ribbon, xf, pen.kind == PenKind::Pencil))
+}
+
+fn update_live_ribbon_cache(
+    cache: &mut Option<LiveRibbonCache>,
+    live: &papercraft_engine::LiveStroke,
+    xf: Affine2,
+    zoom: f32,
+    pan: [f64; 2],
+    color_ctx: (UiTheme, bool, PaperColor),
+) {
+    let (theme, auto_contrast, eff_paper_color) = color_ctx;
+    let first_pt_bits = live
+        .raw_points
+        .first()
+        .map(|s| [s.x.to_bits(), s.y.to_bits()]);
+    let zoom_bits = zoom.to_bits();
+    let pan_bits = [pan[0].to_bits(), pan[1].to_bits()];
+    let key = LiveRibbonCacheKey {
+        preview_generation: live.preview_generation,
+        raw_len: live.raw_points.len(),
+        preview_len: live.smoothed_preview.len(),
+        first_pt_bits,
+        zoom_bits,
+        pan_bits,
+        color_key: color_ctx,
+    };
+    if cache.as_ref().is_some_and(|c| c.key == key) {
+        return;
+    }
+
+    let feather = (0.9 / zoom.max(0.25)).clamp(0.3, 2.5);
+    let mut display_pen = live.pen.clone();
+    display_pen.color =
+        eff_paper_color.resolve_ink_color(theme, auto_contrast, live.pen.color, false);
+
+    let frozen_len = live.frozen_preview_len().min(live.smoothed_preview.len());
+    let can_split = !live.straight_line
+        && display_pen.kind != PenKind::Pencil
+        && display_pen.kind != PenKind::Highlighter
+        && display_pen.color.a >= 0.995
+        && display_pen.opacity >= 0.995
+        && frozen_len >= 16
+        && live.smoothed_preview.len() > frozen_len + 4;
+
+    if can_split {
+        let frozen_key = LiveFrozenMeshKey {
+            frozen_len,
+            first_pt_bits,
+            zoom_bits,
+            pan_bits,
+            color_key: color_ctx,
+        };
+        let existing_frozen = cache
+            .take()
+            .and_then(|c| c.frozen)
+            .filter(|f| f.key == frozen_key);
+        let frozen_entry = if let Some(existing) = existing_frozen {
+            Some(existing)
+        } else {
+            let prefix = &live.smoothed_preview[..frozen_len];
+            let mut frozen_pen = display_pen.clone();
+            frozen_pen.end_taper_px = 0.0;
+            let const_p = prefix.iter().all(|s| (s.pressure - 1.0).abs() < 1e-3);
+            build_live_ribbon_mesh(&frozen_pen, prefix, xf, feather).map(|mesh| {
+                LiveFrozenMeshCache {
+                    key: frozen_key,
+                    mesh: Arc::new(mesh),
+                    constant_mouse_pressure: const_p,
+                }
+            })
+        };
+
+        if let Some(frozen_entry) = frozen_entry {
+            let tail_start = frozen_len.saturating_sub(2);
+            let tip = live.predicted_tip();
+            let mut tail_samples = Vec::with_capacity(
+                live.smoothed_preview.len().saturating_sub(tail_start) + usize::from(tip.is_some()),
+            );
+            tail_samples.extend_from_slice(&live.smoothed_preview[tail_start..]);
+            if let Some(tip_sample) = tip {
+                tail_samples.push(tip_sample);
+            }
+            let tail_const_p = tail_samples.iter().all(|s| (s.pressure - 1.0).abs() < 1e-3);
+            if tail_const_p == frozen_entry.constant_mouse_pressure {
+                let mut tail_pen = display_pen.clone();
+                tail_pen.start_taper_px = 0.0;
+                let tail_mesh =
+                    build_live_ribbon_mesh(&tail_pen, &tail_samples, xf, feather).map(Arc::new);
+                *cache = Some(LiveRibbonCache {
+                    key,
+                    frozen: Some(frozen_entry),
+                    tail_mesh,
+                    full_mesh: None,
+                });
+                return;
+            }
+        }
+    }
+
+    let preview = live.preview_samples();
+    *cache =
+        build_live_ribbon_mesh(&display_pen, &preview, xf, feather).map(|mesh| LiveRibbonCache {
+            key,
+            frozen: None,
+            tail_mesh: None,
+            full_mesh: Some(Arc::new(mesh)),
+        });
+}
+
+fn paint_cached_live_ribbon(p: &egui::Painter, cache: &LiveRibbonCache) {
+    if let Some(frozen) = &cache.frozen {
+        p.add(Shape::Mesh(Arc::clone(&frozen.mesh)));
+    }
+    if let Some(tail) = &cache.tail_mesh {
+        p.add(Shape::Mesh(Arc::clone(tail)));
+    }
+    if let Some(full) = &cache.full_mesh {
+        p.add(Shape::Mesh(Arc::clone(full)));
+    }
 }
 
 const MAX_CPU_HL_DIM: f32 = 2048.0;
@@ -10055,44 +10192,16 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
                         t.accent,
                     );
                 } else if live.pen.kind != PenKind::Highlighter {
-                    let key = LiveRibbonCacheKey {
-                        preview_generation: live.preview_generation,
-                        raw_len: live.raw_points.len(),
-                        preview_len: live.smoothed_preview.len(),
-                        first_pt_bits: live
-                            .raw_points
-                            .first()
-                            .map(|s| [s.x.to_bits(), s.y.to_bits()]),
-                        zoom_bits: app.view.zoom.to_bits(),
-                        pan_bits: [app.view.pan[0].to_bits(), app.view.pan[1].to_bits()],
-                        color_key: (theme, auto_contrast, eff_paper_color),
-                    };
-                    if let Some(cached) = &app.canvas_cache.live_ribbon
-                        && cached.key == key
-                    {
-                        p.add(Shape::Mesh(Arc::clone(&cached.mesh)));
-                    } else {
-                        let preview = live.preview_samples();
-                        let feather = (0.9 / app.view.zoom.max(0.25)).clamp(0.3, 2.5);
-                        let mut display_pen = live.pen.clone();
-                        display_pen.color = eff_paper_color.resolve_ink_color(
-                            theme,
-                            auto_contrast,
-                            live.pen.color,
-                            false,
-                        );
-                        if let Some(mesh) =
-                            build_live_ribbon_mesh(&display_pen, &preview, xf, feather)
-                        {
-                            let mesh_arc = Arc::new(mesh);
-                            p.add(Shape::Mesh(Arc::clone(&mesh_arc)));
-                            app.canvas_cache.live_ribbon = Some(LiveRibbonCache {
-                                key,
-                                mesh: mesh_arc,
-                            });
-                        } else {
-                            app.canvas_cache.live_ribbon = None;
-                        }
+                    update_live_ribbon_cache(
+                        &mut app.canvas_cache.live_ribbon,
+                        live,
+                        xf,
+                        app.view.zoom,
+                        app.view.pan,
+                        (theme, auto_contrast, eff_paper_color),
+                    );
+                    if let Some(cached) = &app.canvas_cache.live_ribbon {
+                        paint_cached_live_ribbon(&p, cached);
                     }
                 } else {
                     app.canvas_cache.live_ribbon = None;
@@ -16504,5 +16613,63 @@ mod tests {
         // At `(275, 400)`, filled Shape 3 (`z=6`) sits on top of same-sized filled Shape 2 (`z=5`).
         click_at(&ctx, &mut app, 0.064, 275.0, 400.0);
         assert_eq!(app.view.selected_object, Some(SelectedObject::Shape(3)));
+    }
+
+    #[test]
+    fn live_ribbon_cache_reuses_frozen_prefix_mesh_across_tail_updates() {
+        let mut session = papercraft_engine::Session::default();
+        session.begin_live_stroke(StrokeSample::from_xy_pressure(20.0, 20.0, 0.7));
+        for i in 1..120 {
+            let x = 20.0 + f64::from(i) * 4.0;
+            let y = 20.0 + (f64::from(i) * 0.1).sin() * 12.0;
+            let mut sample = StrokeSample::from_xy_pressure(x, y, 0.7);
+            sample.time_ms = f64::from(i) * 4.0;
+            session.update_live_stroke(sample);
+        }
+        let xf = Affine2::new(1.0, 0.0, 0.0);
+        let color_ctx = (UiTheme::Light, false, PaperColor::PureWhite);
+        let mut cache: Option<LiveRibbonCache> = None;
+
+        {
+            let live = session.live_stroke.as_ref().expect("live stroke active");
+            assert!(live.frozen_preview_len() >= 16);
+            update_live_ribbon_cache(&mut cache, live, xf, 1.0, [0.0, 0.0], color_ctx);
+        }
+        let first_frozen_arc = Arc::clone(
+            &cache
+                .as_ref()
+                .expect("cached live ribbon")
+                .frozen
+                .as_ref()
+                .expect("frozen prefix mesh")
+                .mesh,
+        );
+        assert!(cache.as_ref().unwrap().tail_mesh.is_some());
+        assert!(cache.as_ref().unwrap().full_mesh.is_none());
+
+        // Append a few tail samples (fewer than needed to advance frozen boundary).
+        for i in 120..124 {
+            let x = 20.0 + f64::from(i) * 4.0;
+            let mut sample = StrokeSample::from_xy_pressure(x, 25.0, 0.7);
+            sample.time_ms = f64::from(i) * 4.0;
+            session.update_live_stroke(sample);
+        }
+        {
+            let live = session.live_stroke.as_ref().expect("live stroke active");
+            update_live_ribbon_cache(&mut cache, live, xf, 1.0, [0.0, 0.0], color_ctx);
+        }
+        let second_frozen_arc = Arc::clone(
+            &cache
+                .as_ref()
+                .expect("cached live ribbon")
+                .frozen
+                .as_ref()
+                .expect("frozen prefix mesh")
+                .mesh,
+        );
+        assert!(
+            Arc::ptr_eq(&first_frozen_arc, &second_frozen_arc),
+            "expected frozen prefix mesh Arc to be reused without re-tessellating"
+        );
     }
 }

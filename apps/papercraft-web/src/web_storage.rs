@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use js_sys::{Array, Date, Promise, Reflect, Uint8Array};
@@ -45,8 +46,8 @@ const META_KEY_SCHEMA: &str = "schema";
 const META_KEY_GLOBAL: &str = "global";
 const BROADCAST_CHANNEL_NAME: &str = "papercraft_storage_sync_v1";
 
-const DEBOUNCE_TRAILING_MS: i32 = 1_500;
-const DEBOUNCE_MAX_WAIT_MS: f64 = 10_000.0;
+const DEBOUNCE_TRAILING_MS: i32 = 2_000;
+const DEBOUNCE_MAX_WAIT_MS: f64 = 20_000.0;
 const ESTIMATE_REFRESH_MIN_MS: f64 = 30_000.0;
 const PEER_STALE_MS: f64 = 90_000.0;
 const GC_IDLE_DELAY_MS: i32 = 2_500;
@@ -158,6 +159,7 @@ struct WebStorageInner {
     first_pending_at_ms: Option<f64>,
     debounce_timer_id: Option<i32>,
     gc_timer_id: Option<i32>,
+    writing_active: Arc<AtomicBool>,
     hash_cache: BlobHashCache,
     known_blobs: HashSet<String>,
     fallback_mirror: Option<FallbackMirror>,
@@ -263,6 +265,7 @@ impl WebStorageController {
             first_pending_at_ms: None,
             debounce_timer_id: None,
             gc_timer_id: None,
+            writing_active: Arc::new(AtomicBool::new(false)),
             hash_cache: BlobHashCache::default(),
             known_blobs: HashSet::new(),
             fallback_mirror: None,
@@ -416,7 +419,8 @@ impl WebStorageController {
             let exceeded_max_wait = st
                 .first_pending_at_ms
                 .is_some_and(|start| (now - start) >= DEBOUNCE_MAX_WAIT_MS);
-            let flush_now = !st.in_flight && (urgent || exceeded_max_wait);
+            let is_writing = st.writing_active.load(Ordering::Relaxed);
+            let flush_now = !st.in_flight && (urgent || (exceeded_max_wait && !is_writing));
             if flush_now && let Some(timer_id) = st.debounce_timer_id.take() {
                 clear_window_timeout(timer_id);
             }
@@ -461,6 +465,15 @@ impl WebStorageController {
         }
     }
 
+    /// Updates whether live stylus/pointer writing is active so background IndexedDB
+    /// debounced flushes postpone cleanly until pen lift instead of stalling mid-stroke.
+    pub fn set_writing_active(&self, active: bool) {
+        self.inner
+            .borrow()
+            .writing_active
+            .store(active, Ordering::Relaxed);
+    }
+
     /// Drains pending status events for the UI shell.
     pub fn drain_events(&self) -> Vec<WebStorageEvent> {
         let events_arc = Arc::clone(&self.inner.borrow().events);
@@ -472,19 +485,33 @@ impl WebStorageController {
     }
 
     fn schedule_debounced_flush(&self) {
+        self.schedule_debounced_flush_after(DEBOUNCE_TRAILING_MS);
+    }
+
+    fn schedule_debounced_flush_after(&self, delay_ms: i32) {
         let mut st = self.inner.borrow_mut();
         if let Some(old_id) = st.debounce_timer_id.take() {
             clear_window_timeout(old_id);
         }
         let ctrl = self.clone();
         let cb = Closure::once(move || {
-            ctrl.inner.borrow_mut().debounce_timer_id = None;
-            ctrl.start_async_idb_flush();
+            let reschedule_for_writing = {
+                let mut st = ctrl.inner.borrow_mut();
+                st.debounce_timer_id = None;
+                st.writing_active.load(Ordering::Relaxed)
+                    && !st.pending_delta.is_empty()
+                    && !st.pending_delta.urgent
+            };
+            if reschedule_for_writing {
+                ctrl.schedule_debounced_flush_after(1_000);
+            } else {
+                ctrl.start_async_idb_flush();
+            }
         });
         if let Some(window) = web_sys::window()
             && let Ok(id) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
                 cb.as_ref().unchecked_ref(),
-                DEBOUNCE_TRAILING_MS,
+                delay_ms,
             )
         {
             st.debounce_timer_id = Some(id);

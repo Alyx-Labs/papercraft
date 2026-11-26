@@ -31,6 +31,7 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
 web-sys = { version = "0.3", features = [
+    "AddEventListenerOptions",
     "BeforeUnloadEvent",
     "Blob",
     "BlobPropertyBag",
@@ -67,6 +68,7 @@ web-sys = { version = "0.3", features = [
     "MouseEvent",
     "Navigator",
     "Node",
+    "NodeList",
     "PageTransitionEvent",
     "PointerEvent",
     "Request",
@@ -82,6 +84,9 @@ web-sys = { version = "0.3", features = [
     "Url",
     "VisibilityState",
     "Window",
+    "Worker",
+    "WorkerOptions",
+    "WorkerType",
     "console",
 ] }
 
