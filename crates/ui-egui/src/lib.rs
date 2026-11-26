@@ -55,6 +55,16 @@ use serde_json::json;
 pub(crate) const WEBSITE_URL: &str = "https://papercraft.ink/";
 /// Public source repository URL displayed in Profile download links.
 pub(crate) const GITHUB_REPO_URL: &str = "https://github.com/Alyx-Labs/papercraft";
+/// Short stability tag shown beside the application version in the UI.
+pub(crate) const ALPHA_STATUS_LABEL: &str = "Unstable Alpha";
+/// Plain-English explanation shown when hovering over the version label.
+pub(crate) const ALPHA_STATUS_TOOLTIP: &str =
+    "PaperCraft is still an unstable alpha build — expect rough edges and breaking changes.";
+
+/// Formats the user-visible application version with its stability stage.
+pub(crate) fn display_version_label() -> String {
+    format!("v{} · {ALPHA_STATUS_LABEL}", env!("CARGO_PKG_VERSION"))
+}
 
 /// Top-level workspace screen mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2868,7 +2878,7 @@ impl PaperCraftApp {
         if !pt.is_finite() {
             return fallback;
         }
-        papercraft_geom::Point::new(pt.x.clamp(0.0, page_w), pt.y.clamp(0.0, page_h))
+        papercraft_geom::Point::new(pt.x.clamp(-1e6, 1e6), pt.y.clamp(-1e6, 1e6))
     }
 
     pub(crate) fn insert_image_from_bytes(&mut self, bytes: &[u8]) -> bool {
@@ -3063,8 +3073,8 @@ pub(crate) fn insert_text_on_page(
         .cloned();
 
     let mut payload = if let Some(mut item) = copied_match {
-        let next_x = (item.x + 18.0).clamp(16.0, (page_w - 48.0).max(16.0));
-        let next_y = (item.y + 18.0).clamp(16.0, (page_h - 48.0).max(16.0));
+        let next_x = item.x + 18.0;
+        let next_y = item.y + 18.0;
         item.x = next_x;
         item.y = next_y;
         app.view.copied_text_item = Some(item.clone());
@@ -3110,8 +3120,8 @@ pub(crate) fn insert_text_on_page(
             .or(auto_link);
         let mut p = json!({
             "text": cleaned,
-            "x": x.clamp(8.0, (page_w - 32.0).max(8.0)),
-            "y": y.clamp(8.0, (page_h - 32.0).max(8.0)),
+            "x": x,
+            "y": y,
             "size": app.view.text_size_draft,
             "color": app.view.text_color_draft,
             "font": app.view.text_font_draft,

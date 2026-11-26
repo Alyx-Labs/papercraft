@@ -70,6 +70,7 @@ fn build_non_roundtrip_document() -> Document {
         pixel_width: 4,
         pixel_height: 4,
         png_bytes: Arc::new(vec![0x89, b'P', b'N', b'G']),
+        z_order: 0,
     });
     let stroke = InkStroke::new(
         StrokeId(1),
@@ -168,5 +169,29 @@ fn canonical_hashes_match_when_title_requires_server_sanitization() {
     assert_eq!(
         canonical_document_meta_hash(&untrimmed),
         canonical_document_meta_hash(&sanitized)
+    );
+}
+
+#[test]
+fn canonical_hashes_detect_layer_order_changes() {
+    let mut doc_a = build_non_roundtrip_document();
+    doc_a.pages[0].shapes[0] = Arc::new(GeometricShape {
+        z_order: 1,
+        ..(*doc_a.pages[0].shapes[0]).clone()
+    });
+    doc_a.pages[0].strokes[0] = Arc::new((*doc_a.pages[0].strokes[0]).clone().with_z_order(2));
+    doc_a.load_active_from_pages();
+
+    let mut doc_b = doc_a.clone();
+    doc_b.pages[0].shapes[0] = Arc::new(GeometricShape {
+        z_order: 5,
+        ..(*doc_b.pages[0].shapes[0]).clone()
+    });
+    doc_b.load_active_from_pages();
+
+    assert_ne!(
+        canonical_document_body_hash(&doc_a),
+        canonical_document_body_hash(&doc_b),
+        "sync body hash must reflect element z_order changes"
     );
 }

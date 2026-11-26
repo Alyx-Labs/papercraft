@@ -979,25 +979,56 @@ impl Session {
         })
     }
 
+    /// Returns the number of non-placeholder notebooks stored in an accessible local profile.
+    pub fn local_profile_notebook_count(&self, profile_id: &str) -> usize {
+        let uid = self.sync.global.active_cloud_user_id();
+        let accessible = self
+            .sync
+            .global
+            .local_profiles
+            .iter()
+            .any(|p| p.local_profile_id == profile_id && p.is_accessible_to_cloud_user(uid));
+        if !accessible {
+            return 0;
+        }
+        self.count_local_profile_notebooks(profile_id)
+    }
+
+    /// Returns the number of non-placeholder notebooks in the connected cloud workspace.
+    pub fn cloud_notebooks_count(&self) -> usize {
+        let Some(ref acct) = self.sync.global.session else {
+            return 0;
+        };
+        if self.is_viewing_cloud() {
+            return count_non_placeholder_slots(
+                self.notebooks.len(),
+                &self.sync.slot_placeholder_blank,
+            );
+        }
+        if let Some(ref root) = self.sync.desktop_root {
+            return count_ncraft_files_in_dir(&account_library_dir(root, &acct.user.user_id));
+        }
+        if self.sync.web_cache_enabled
+            && let Some(bundle) = self.sync.web_account_bundles.get(&acct.user.user_id)
+        {
+            return count_non_placeholder_slots(
+                bundle.notebooks.len(),
+                &bundle.slot_placeholder_blank,
+            );
+        }
+        0
+    }
+
     fn count_local_profile_notebooks(&self, profile_id: &str) -> usize {
         if !self.is_viewing_cloud()
             && self
                 .active_local_profile()
                 .is_some_and(|p| p.local_profile_id == profile_id)
         {
-            return self
-                .notebooks
-                .iter()
-                .enumerate()
-                .filter(|(idx, _)| {
-                    !self
-                        .sync
-                        .slot_placeholder_blank
-                        .get(*idx)
-                        .copied()
-                        .unwrap_or(false)
-                })
-                .count();
+            return count_non_placeholder_slots(
+                self.notebooks.len(),
+                &self.sync.slot_placeholder_blank,
+            );
         }
         if let Some(ref root) = self.sync.desktop_root {
             let dir = profile_library_dir(root, profile_id);
@@ -1006,18 +1037,10 @@ impl Session {
         if self.sync.web_cache_enabled
             && let Some(bundle) = self.sync.web_local_bundles.get(profile_id)
         {
-            return bundle
-                .notebooks
-                .iter()
-                .enumerate()
-                .filter(|(idx, _)| {
-                    !bundle
-                        .slot_placeholder_blank
-                        .get(*idx)
-                        .copied()
-                        .unwrap_or(false)
-                })
-                .count();
+            return count_non_placeholder_slots(
+                bundle.notebooks.len(),
+                &bundle.slot_placeholder_blank,
+            );
         }
         0
     }
@@ -2659,6 +2682,12 @@ pub(crate) fn merge_studio_prefs(
     *target = target.sanitized();
 }
 
+fn count_non_placeholder_slots(total: usize, placeholders: &[bool]) -> usize {
+    (0..total)
+        .filter(|&idx| !placeholders.get(idx).copied().unwrap_or(false))
+        .count()
+}
+
 fn ensure_default_profile_in_global(global: &mut GlobalSyncState) -> String {
     if let Some(active) = global.active_local_profile() {
         let id = active.local_profile_id.clone();
@@ -3658,6 +3687,8 @@ mod tests {
         session.switch_to_authenticated_library(acct, AuthWorkspaceMode::SwitchOnly);
         assert!(session.is_signed_in());
         assert_eq!(session.local_profiles().len(), 1);
+        assert_eq!(session.local_profile_notebook_count(&bruno_id), 1);
+        assert_eq!(session.cloud_notebooks_count(), 0);
 
         let res = session
             .execute(
@@ -3667,6 +3698,7 @@ mod tests {
             .unwrap();
         assert_eq!(res["sourceNickname"], "Bruno");
         assert!(session.notebooks.iter().any(|d| d.title == "Math - Bruno"));
+        assert_eq!(session.cloud_notebooks_count(), 1);
         assert!(session.local_profiles().is_empty());
         assert!(!papercraft_sync::profile_library_dir(&dir.0, &bruno_id).exists());
 

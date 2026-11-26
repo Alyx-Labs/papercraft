@@ -85,6 +85,8 @@ pub struct ServerControlSettings {
     pub auto_create_desktop_shortcut: bool,
     #[serde(default = "default_launch_at_login")]
     pub launch_at_login: bool,
+    #[serde(default)]
+    pub open_window_at_login: bool,
 }
 
 fn default_auto_check_updates() -> bool {
@@ -116,6 +118,7 @@ impl Default for ServerControlSettings {
             auto_check_updates: default_auto_check_updates(),
             auto_create_desktop_shortcut: default_auto_create_desktop_shortcut(),
             launch_at_login: default_launch_at_login(),
+            open_window_at_login: false,
         }
     }
 }
@@ -445,6 +448,18 @@ impl ServerControlSettings {
             PathBuf::from(trimmed)
         }
     }
+
+    /// Resolves whether the control window should start visible on this launch.
+    ///
+    /// Automatic system startup (`--autostart`) stays quietly in the system tray unless
+    /// `open_window_at_login` is enabled; manual launches stay visible unless `start_in_tray` is set.
+    pub const fn initial_window_visible(&self, autostart_launch: bool) -> bool {
+        if autostart_launch {
+            self.open_window_at_login
+        } else {
+            !self.start_in_tray
+        }
+    }
 }
 
 /// Returns the portable config path (`<exe_dir>/server_control_config.json`).
@@ -609,6 +624,7 @@ mod tests {
             auto_check_updates: false,
             auto_create_desktop_shortcut: false,
             launch_at_login: false,
+            open_window_at_login: true,
         };
 
         original.save_atomic(&cfg_path).unwrap();
@@ -620,6 +636,7 @@ mod tests {
         assert!(legacy.auto_check_updates);
         assert!(legacy.auto_create_desktop_shortcut);
         assert!(legacy.launch_at_login);
+        assert!(!legacy.open_window_at_login);
     }
 
     #[test]
@@ -736,10 +753,30 @@ mod tests {
         b.auto_start_server = false;
         b.start_in_tray = true;
         b.launch_at_login = false;
+        b.open_window_at_login = true;
         assert!(a.same_runtime_config(&b));
 
         b.port = 9999;
         assert!(!a.same_runtime_config(&b));
+    }
+
+    #[test]
+    fn initial_window_visible_respects_autostart_and_manual_settings() {
+        let mut s = ServerControlSettings::default();
+        assert!(!s.initial_window_visible(true));
+        assert!(s.initial_window_visible(false));
+
+        s.open_window_at_login = true;
+        assert!(s.initial_window_visible(true));
+        assert!(s.initial_window_visible(false));
+
+        s.start_in_tray = true;
+        assert!(s.initial_window_visible(true));
+        assert!(!s.initial_window_visible(false));
+
+        s.open_window_at_login = false;
+        assert!(!s.initial_window_visible(true));
+        assert!(!s.initial_window_visible(false));
     }
 
     #[test]

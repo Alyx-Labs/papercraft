@@ -56,15 +56,15 @@ impl AutostartOutcome {
 pub const fn autostart_architecture_hint() -> &'static str {
     #[cfg(target_os = "windows")]
     {
-        "Registers PaperCraft Server under your Windows user startup apps (Task Manager -> Startup apps) to launch quietly in the system tray when you sign in."
+        "Registers PaperCraft Server under your Windows user startup apps (Task Manager -> Startup apps) to start automatically when you sign in."
     }
     #[cfg(target_os = "macos")]
     {
-        "Creates a per-user LaunchAgent in ~/Library/LaunchAgents so PaperCraft Server starts quietly in the menu bar when you sign in."
+        "Creates a per-user LaunchAgent in ~/Library/LaunchAgents so PaperCraft Server starts automatically when you sign in."
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        "Creates a Freedesktop autostart entry in ~/.config/autostart so PaperCraft Server starts quietly in the system tray when you sign in."
+        "Creates a Freedesktop autostart entry in ~/.config/autostart so PaperCraft Server starts automatically when you sign in."
     }
 }
 

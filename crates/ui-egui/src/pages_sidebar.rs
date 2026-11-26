@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use egui::Color32;
-use papercraft_doc::{InkStroke, NotebookPage, PenKind};
+use papercraft_doc::{
+    InkStroke, LayerElementKind, NotebookPage, PagePaintStep, PenKind, element_layer_rank,
+};
 use serde_json::json;
 
 use crate::PaperCraftApp;
@@ -2140,29 +2142,70 @@ fn build_thumbnail_foreground_assets(
     let mut image =
         egui::ColorImage::new([tex_w, tex_h], vec![Color32::TRANSPARENT; tex_w * tex_h]);
 
-    if !page.strokes.is_empty() {
-        let strokes = build_thumbnail_strokes(sheet_size, page, theme, auto_contrast);
-        let mut scratch = Vec::new();
-        for pass_hl in [true, false] {
-            for stroke in &strokes {
-                if stroke.is_highlighter == pass_hl {
-                    rasterize_single_thumb_stroke(&mut image, sheet_size, stroke, &mut scratch);
+    let sx = sheet_size.x / (page.width.max(1) as f32);
+    let sy = sheet_size.y / (page.height.max(1) as f32);
+    let (eff_contrast, eff_paper) = if page.pdf_backdrop.is_some() {
+        (false, papercraft_doc::PaperColor::PureWhite)
+    } else {
+        (auto_contrast, page.paper_color)
+    };
+    let mut stroke_scratch = Vec::new();
+    let mut heading_shapes = Vec::new();
+    let mut shaped_lines_emitted = 0_usize;
+
+    for step in page.paint_steps() {
+        match step {
+            PagePaintStep::Images(_) => {}
+            PagePaintStep::Highlighters(indices) | PagePaintStep::InkRun(indices) => {
+                for idx in indices {
+                    if let Some(stroke) = page.strokes.get(idx)
+                        && let Some(built) = build_single_thumb_stroke(
+                            sx,
+                            sy,
+                            eff_paper,
+                            theme,
+                            eff_contrast,
+                            stroke,
+                        )
+                    {
+                        rasterize_single_thumb_stroke(
+                            &mut image,
+                            sheet_size,
+                            &built,
+                            &mut stroke_scratch,
+                        );
+                    }
+                }
+            }
+            PagePaintStep::Text(idx) => {
+                if let Some(item) = page.texts.get(idx) {
+                    append_thumbnail_single_text_asset(
+                        &mut image,
+                        &mut heading_shapes,
+                        &mut shaped_lines_emitted,
+                        p,
+                        sheet_rect,
+                        page,
+                        item,
+                        theme,
+                        auto_contrast,
+                    );
+                }
+            }
+            PagePaintStep::Shape(idx) => {
+                if let Some(shape) = page.shapes.get(idx) {
+                    rasterize_single_thumbnail_shape(
+                        &mut image,
+                        sheet_size,
+                        page,
+                        shape,
+                        theme,
+                        auto_contrast,
+                    );
                 }
             }
         }
     }
-
-    let mut heading_shapes = Vec::new();
-    append_thumbnail_text_assets(
-        &mut image,
-        &mut heading_shapes,
-        p,
-        sheet_rect,
-        page,
-        theme,
-        auto_contrast,
-    );
-    rasterize_thumbnail_shapes(&mut image, sheet_size, page, theme, auto_contrast);
 
     let has_pixels = !page.strokes.is_empty() || !page.shapes.is_empty() || !page.texts.is_empty();
     (has_pixels.then_some(image), heading_shapes)
@@ -2282,7 +2325,14 @@ fn paint_thumbnail_images(ui: &egui::Ui, sheet_rect: egui::Rect, page: &Notebook
     let sx = sheet_rect.width() / page.width.max(1) as f32;
     let sy = sheet_rect.height() / page.height.max(1) as f32;
     let clipped = ui.painter().with_clip_rect(sheet_rect);
-    for image in &page.images {
+    let mut order: Vec<usize> = (0..page.images.len()).collect();
+    order.sort_by_key(|&idx| {
+        element_layer_rank(LayerElementKind::Image, page.images[idx].z_order, idx)
+    });
+    for idx in order {
+        let Some(image) = page.images.get(idx) else {
+            continue;
+        };
         let clean = image.sanitized();
         let Some(handle) =
             crate::canvas::cached_page_image_texture(ui.ctx(), "papercraft_thumb_img", image)
@@ -2449,18 +2499,18 @@ fn rasterize_thumb_micro_line(
     }
 }
 
-fn append_thumbnail_text_assets(
+#[allow(clippy::too_many_arguments)]
+fn append_thumbnail_single_text_asset(
     image: &mut egui::ColorImage,
     out: &mut Vec<egui::Shape>,
+    shaped_lines_emitted: &mut usize,
     p: &egui::Painter,
     sheet_rect: egui::Rect,
     page: &NotebookPage,
+    item: &papercraft_doc::TextItem,
     theme: papercraft_doc::UiTheme,
     auto_contrast: bool,
 ) {
-    if page.texts.is_empty() {
-        return;
-    }
     let [tex_w, tex_h] = image.size;
     let sx = sheet_rect.width() / page.width.max(1) as f32;
     let sy = sheet_rect.height() / page.height.max(1) as f32;
@@ -2472,66 +2522,63 @@ fn append_thumbnail_text_assets(
     } else {
         (auto_contrast, page.paper_color)
     };
-    let mut shaped_lines_emitted = 0_usize;
-    for item in &page.texts {
-        let item = item.as_ref().sanitized();
-        let color = to_color32(eff_paper.resolve_ink_color(theme, eff_contrast, item.color, false));
-        let raw_font_size = (item.size * scale).clamp(1.0, 7.0);
-        let max_w = item.effective_max_width(page.width);
-        let lines = papercraft_doc::wrap_text_lines(&item.text, max_w, |ch| {
-            let base = if item.font == papercraft_doc::TextFont::Monospace {
-                item.size * 0.62
-            } else if ch == ' ' {
-                item.size * 0.28
-            } else {
-                item.size * 0.54
-            };
-            (base + item.letter_spacing).max(1.0)
-        });
-        if raw_font_size < 2.9 || shaped_lines_emitted >= 24 {
-            let char_adv = ((item.size * 0.52) * sx_img).clamp(0.9, 6.0);
-            let line_h_img = (item.size * sy_img * item.line_spacing).max(2.0);
-            let bar_h = (item.size * sy_img * 0.68).clamp(1.2, 4.5);
-            let base_x = (item.x as f32) * sx_img;
-            let base_y = (item.y as f32) * sy_img;
-            for (line_idx, line) in lines.iter().enumerate() {
-                let ly = base_y + line_h_img * (line_idx as f32);
-                if ly > tex_h as f32 {
-                    break;
-                }
-                rasterize_thumb_micro_line(
-                    &mut image.pixels,
-                    [tex_w, tex_h],
-                    [base_x, ly],
-                    line,
-                    char_adv,
-                    bar_h,
-                    color,
-                );
-            }
-            continue;
-        }
-        let font_size = raw_font_size.round().clamp(3.0, 7.0);
-        let pos = egui::pos2(
-            sheet_rect.left() + item.x as f32 * sx,
-            sheet_rect.top() + item.y as f32 * sy,
-        );
-        let family = match item.font {
-            papercraft_doc::TextFont::Sans => egui::FontFamily::Proportional,
-            papercraft_doc::TextFont::Monospace => egui::FontFamily::Monospace,
+    let item = item.sanitized();
+    let color = to_color32(eff_paper.resolve_ink_color(theme, eff_contrast, item.color, false));
+    let raw_font_size = (item.size * scale).clamp(1.0, 7.0);
+    let max_w = item.effective_max_width(page.width);
+    let lines = papercraft_doc::wrap_text_lines(&item.text, max_w, |ch| {
+        let base = if item.font == papercraft_doc::TextFont::Monospace {
+            item.size * 0.62
+        } else if ch == ' ' {
+            item.size * 0.28
+        } else {
+            item.size * 0.54
         };
-        let font_id = egui::FontId::new(font_size, family);
-        for (line_idx, line) in lines.into_iter().enumerate() {
-            if shaped_lines_emitted >= 24 {
+        (base + item.letter_spacing).max(1.0)
+    });
+    if raw_font_size < 2.9 || *shaped_lines_emitted >= 24 {
+        let char_adv = ((item.size * 0.52) * sx_img).clamp(0.9, 6.0);
+        let line_h_img = (item.size * sy_img * item.line_spacing).max(2.0);
+        let bar_h = (item.size * sy_img * 0.68).clamp(1.2, 4.5);
+        let base_x = (item.x as f32) * sx_img;
+        let base_y = (item.y as f32) * sy_img;
+        for (line_idx, line) in lines.iter().enumerate() {
+            let ly = base_y + line_h_img * (line_idx as f32);
+            if ly > tex_h as f32 {
                 break;
             }
-            let line_pos = pos + egui::vec2(0.0, font_size * item.line_spacing * line_idx as f32);
-            let galley = p.layout_no_wrap(line, font_id.clone(), color);
-            out.push(egui::Shape::Text(egui::epaint::TextShape::new(
-                line_pos, galley, color,
-            )));
-            shaped_lines_emitted += 1;
+            rasterize_thumb_micro_line(
+                &mut image.pixels,
+                [tex_w, tex_h],
+                [base_x, ly],
+                line,
+                char_adv,
+                bar_h,
+                color,
+            );
         }
+        return;
+    }
+    let font_size = raw_font_size.round().clamp(3.0, 7.0);
+    let pos = egui::pos2(
+        sheet_rect.left() + item.x as f32 * sx,
+        sheet_rect.top() + item.y as f32 * sy,
+    );
+    let family = match item.font {
+        papercraft_doc::TextFont::Sans => egui::FontFamily::Proportional,
+        papercraft_doc::TextFont::Monospace => egui::FontFamily::Monospace,
+    };
+    let font_id = egui::FontId::new(font_size, family);
+    for (line_idx, line) in lines.into_iter().enumerate() {
+        if *shaped_lines_emitted >= 24 {
+            break;
+        }
+        let line_pos = pos + egui::vec2(0.0, font_size * item.line_spacing * line_idx as f32);
+        let galley = p.layout_no_wrap(line, font_id.clone(), color);
+        out.push(egui::Shape::Text(egui::epaint::TextShape::new(
+            line_pos, galley, color,
+        )));
+        *shaped_lines_emitted += 1;
     }
 }
 
@@ -2695,16 +2742,14 @@ fn rasterize_thumb_polyline(
     }
 }
 
-fn rasterize_thumbnail_shapes(
+fn rasterize_single_thumbnail_shape(
     image: &mut egui::ColorImage,
     sheet_size: egui::Vec2,
     page: &NotebookPage,
+    item: &papercraft_doc::GeometricShape,
     theme: papercraft_doc::UiTheme,
     auto_contrast: bool,
 ) {
-    if page.shapes.is_empty() {
-        return;
-    }
     let tex_size = image.size;
     let sx_img = (tex_size[0] as f32) / page.width.max(1) as f32;
     let sy_img = (tex_size[1] as f32) / page.height.max(1) as f32;
@@ -2717,33 +2762,30 @@ fn rasterize_thumbnail_shapes(
     } else {
         (auto_contrast, page.paper_color)
     };
-    for item in &page.shapes {
-        let shape = item.as_ref().sanitized();
-        let color =
-            to_color32(eff_paper.resolve_ink_color(theme, eff_contrast, shape.color, false));
-        let fill = shape
-            .fill_color
-            .map(|fc| to_color32(eff_paper.resolve_ink_color(theme, eff_contrast, fc, false)));
-        let radius = ((shape.width * scale_img).clamp(1.0, 4.0) * 0.5).max(0.65);
-        for (points, closed) in shape.path_segments() {
-            let pts = decimate_thumb_img_points(&points, sx_img, sy_img);
-            if pts.len() < 2 {
-                continue;
-            }
-            if closed && let Some(fc) = fill {
-                rasterize_polygon_fill(&mut image.pixels, tex_size, &pts, fc);
-            }
-            if shape.color.a > 0.0 && color.a() > 0 {
-                rasterize_thumb_polyline(
-                    &mut image.pixels,
-                    tex_size,
-                    &pts,
-                    closed,
-                    radius,
-                    color,
-                    shape.line_style,
-                );
-            }
+    let shape = item.sanitized();
+    let color = to_color32(eff_paper.resolve_ink_color(theme, eff_contrast, shape.color, false));
+    let fill = shape
+        .fill_color
+        .map(|fc| to_color32(eff_paper.resolve_ink_color(theme, eff_contrast, fc, false)));
+    let radius = ((shape.width * scale_img).clamp(1.0, 4.0) * 0.5).max(0.65);
+    for (points, closed) in shape.path_segments() {
+        let pts = decimate_thumb_img_points(&points, sx_img, sy_img);
+        if pts.len() < 2 {
+            continue;
+        }
+        if closed && let Some(fc) = fill {
+            rasterize_polygon_fill(&mut image.pixels, tex_size, &pts, fc);
+        }
+        if shape.color.a > 0.0 && color.a() > 0 {
+            rasterize_thumb_polyline(
+                &mut image.pixels,
+                tex_size,
+                &pts,
+                closed,
+                radius,
+                color,
+                shape.line_style,
+            );
         }
     }
 }
@@ -5146,6 +5188,7 @@ mod tests {
             raw_points: Arc::clone(&pts_arc),
             smoothed_points: pts_arc,
             bounds,
+            z_order: 0,
         }));
         let sheet_size = egui::vec2(100.0, 140.0);
         doc.with_resolved_page(0, |page| {
@@ -5184,6 +5227,7 @@ mod tests {
                 papercraft_geom::Point::new(420.0, 460.0),
                 papercraft_geom::Point::new(120.0, 460.0),
             ],
+            z_order: 0,
         }));
         doc.texts.push(Arc::new(papercraft_doc::TextItem {
             text: "Small dense note body that renders directly into thumbnail raster".into(),
@@ -5199,6 +5243,7 @@ mod tests {
             alignment: papercraft_doc::TextAlignment::Left,
             spans: Vec::new(),
             link_url: None,
+            z_order: 0,
         }));
         let ctx = egui::Context::default();
         let mut img_opt = None;
@@ -5399,6 +5444,7 @@ mod tests {
             raw_points: Arc::clone(&left_arc),
             smoothed_points: left_arc,
             bounds: left_bounds,
+            z_order: 0,
         }));
 
         let top_pts = vec![
@@ -5414,6 +5460,7 @@ mod tests {
             raw_points: Arc::clone(&top_arc),
             smoothed_points: top_arc,
             bounds: top_bounds,
+            z_order: 0,
         }));
 
         let sheet_size = egui::vec2(100.0, 125.0);
@@ -5486,6 +5533,7 @@ mod tests {
                 raw_points: Arc::clone(&arc),
                 smoothed_points: arc,
                 bounds,
+                z_order: 0,
             }));
         }
         doc.shapes.push(Arc::new(papercraft_doc::GeometricShape {
@@ -5506,6 +5554,7 @@ mod tests {
                 papercraft_geom::Point::new(120.0, 120.0),
                 papercraft_geom::Point::new(-200.0, 120.0),
             ],
+            z_order: 0,
         }));
         doc.texts.push(Arc::new(papercraft_doc::TextItem {
             text: "Offpage start heading".into(),
@@ -5521,6 +5570,7 @@ mod tests {
             alignment: papercraft_doc::TextAlignment::Left,
             spans: Vec::new(),
             link_url: None,
+            z_order: 0,
         }));
         doc.sync_active_to_pages();
 

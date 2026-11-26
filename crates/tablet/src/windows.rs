@@ -225,6 +225,17 @@ unsafe extern "system" {
     ) -> i32;
     fn GetPointerDevices(device_count: *mut u32, pointer_devices: *mut POINTER_DEVICE_INFO) -> i32;
     fn GetSystemMetrics(n_index: i32) -> i32;
+    fn IsWindow(h_wnd: *mut std::ffi::c_void) -> i32;
+}
+
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    fn DwmSetWindowAttribute(
+        hwnd: *mut std::ffi::c_void,
+        dw_attribute: u32,
+        pv_attribute: *const std::ffi::c_void,
+        cb_attribute: u32,
+    ) -> i32;
 }
 
 #[link(name = "kernel32")]
@@ -1778,6 +1789,30 @@ pub fn pen_pointer_id() -> Option<u64> {
     (id != NO_PEN).then_some(u64::from(id))
 }
 
+/// Cloaks or uncloaks a Win32 window via DWM (`DWMWA_CLOAK`) so hidden transitions never flash.
+pub fn set_window_cloaked(hwnd: isize, cloaked: bool) -> bool {
+    const DWMWA_CLOAK: u32 = 13;
+    if hwnd == 0 {
+        return false;
+    }
+    let handle = std::ptr::without_provenance_mut::<std::ffi::c_void>(hwnd as usize);
+    // SAFETY: `IsWindow` safely validates whether `handle` refers to an existing Win32 window.
+    if unsafe { IsWindow(handle) } == 0 {
+        return false;
+    }
+    let value: i32 = i32::from(cloaked);
+    // SAFETY: `handle` was verified by `IsWindow` and `value` is a live `BOOL` (`i32`) matching `DWMWA_CLOAK`.
+    let hr = unsafe {
+        DwmSetWindowAttribute(
+            handle,
+            DWMWA_CLOAK,
+            (&raw const value).cast(),
+            std::mem::size_of::<i32>() as u32,
+        )
+    };
+    hr >= 0
+}
+
 pub fn pen_end() -> Option<bool> {
     decode_end(PEN_END.load(Ordering::Relaxed))
 }
@@ -1919,5 +1954,11 @@ mod tests {
 
         assert!(set_hkcu_reg_sz("", value_name, cmd).is_err());
         assert!(set_hkcu_reg_sz(&subkey, value_name, "bad\nline").is_err());
+    }
+
+    #[test]
+    fn set_window_cloaked_rejects_null_and_invalid_handles() {
+        assert!(!set_window_cloaked(0, true));
+        assert!(!set_window_cloaked(-1, false));
     }
 }

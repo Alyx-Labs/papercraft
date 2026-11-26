@@ -5,21 +5,19 @@ use papercraft_sync::{SyncConnectionState, SyncStatusSummary};
 
 use crate::PaperCraftApp;
 use crate::account_modal::{
-    BannerTone, PillIcon, PillStyle, ProfileSection, SignedOutProfileSection, draw_hairline,
-    draw_pill_badge, draw_section_card, draw_status_banner, handle_auth_submit_on_enter,
-    render_account_email_card, render_auth_banners, render_auth_card_contents,
-    render_change_password_card, render_detected_local_accounts_migration_card,
-    render_local_profiles_manager, render_logout_safeguard_actions, render_logout_safeguard_body,
-    render_profile_identity_card, render_server_probe_section, render_session_sign_out_card,
-    render_signed_in_account_card, render_signed_in_server_card, render_signed_in_transfer_section,
-    status_badge_style, trigger_test_connection,
+    BannerTone, ProfileSection, SignedOutProfileSection, draw_cloud_workspace_block, draw_hairline,
+    draw_section_card, draw_status_banner, handle_auth_submit_on_enter, render_account_email_card,
+    render_auth_banners, render_auth_card_contents, render_change_password_card,
+    render_detected_local_accounts_migration_card, render_local_profiles_manager,
+    render_logout_safeguard_actions, render_logout_safeguard_body, render_profile_identity_card,
+    render_server_probe_section, render_session_sign_out_card, render_signed_in_account_card,
+    render_signed_in_server_card, status_badge_style, trigger_test_connection,
 };
 use crate::icons::{
     Icon, SidebarEdge, SidebarEdgeButtonSpec, SidebarEdgeSize, SwitchLayout, SwitchOption,
     TOOLBAR_CONTROL_HEIGHT, paint_icon, segmented_switch, sidebar_edge_button_sized,
     toolbar_icon_button,
 };
-use crate::modal::secondary_action_button;
 use crate::sync_worker::trigger_manual_sync;
 use crate::theme::Tokens;
 
@@ -774,58 +772,29 @@ fn draw_signed_in_workspaces_section(
     t: &Tokens,
 ) {
     draw_section_card(ui, t, |ui| {
-        let acct_label = summary
-            .email
-            .clone()
-            .or_else(|| summary.username.as_ref().map(|u| format!("@{u}")))
-            .unwrap_or_else(|| "Cloud Account".to_string());
         ui.horizontal(|ui| {
             let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-            paint_icon(ui.painter(), ir, Icon::Sync, t.accent);
+            paint_icon(ui.painter(), ir, Icon::Inbox, t.accent);
             ui.label(
-                egui::RichText::new(format!("Cloud Workspace · {acct_label}"))
+                egui::RichText::new("Workspaces")
                     .size(13.5)
                     .strong()
                     .color(t.text),
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if summary.viewing_cloud {
-                    draw_pill_badge(
-                        ui,
-                        PillStyle {
-                            fill: t.success_bg,
-                            border: t.success_border,
-                            fg: t.success_fg,
-                            icon: PillIcon::GreenCheck(t),
-                        },
-                        "Active",
-                    );
-                } else if secondary_action_button(ui, "Switch to Cloud", true, t).clicked() {
-                    crate::canvas::commit_pending_text(app);
-                    if let Err(err) = app
-                        .session
-                        .execute("profile.switch", &serde_json::json!({ "target": "cloud" }))
-                    {
-                        app.view.account.error_message = Some(err.to_string());
-                    } else {
-                        app.view.account.error_message = None;
-                        app.view.profile_return_screen = crate::AppScreen::Home;
-                        crate::sync_view_to_active_notebook(app);
-                    }
-                }
-            });
         });
-        ui.add_space(4.0);
+        ui.add_space(3.0);
         ui.add(
             egui::Label::new(
                 egui::RichText::new(
-                    "Switch between Cloud Sync and isolated Local Only profiles on this computer.",
+                    "Separate blocks for your Cloud Sync account and each offline Local Only account on this device.",
                 )
                 .size(11.0)
                 .color(t.text_muted),
             )
             .wrap(),
         );
+        ui.add_space(10.0);
+        draw_cloud_workspace_block(app, ui, summary, t);
         ui.add_space(10.0);
         draw_hairline(ui, t);
         ui.add_space(10.0);
@@ -838,12 +807,6 @@ fn draw_signed_in_workspaces_section(
             render_detected_local_accounts_migration_card(app, ui, summary, t);
         });
     }
-
-    ui.add_space(10.0);
-    draw_section_card(ui, t, |ui| {
-        app.view.account.import_local_open = true;
-        render_signed_in_transfer_section(app, ui, t);
-    });
 }
 
 #[cfg(test)]
@@ -940,6 +903,9 @@ mod tests {
     fn signed_in_profile_screen_renders_all_sections_in_light_and_dark() {
         let ctx = egui::Context::default();
         let mut app = PaperCraftApp::default();
+        let _ = app
+            .session
+            .execute("profile.create", &serde_json::json!({ "nickname": "Ana" }));
         app.session.switch_to_authenticated_library(
             ActiveAccountSession {
                 server_url: DEFAULT_SERVER_URL.to_string(),
@@ -986,6 +952,9 @@ mod tests {
         app.view.account.profile_section = ProfileSection::Workspaces;
         let ws_text = render_profile_text(&ctx, &mut app);
         assert!(ws_text.contains("Cloud Workspace"));
+        assert!(ws_text.contains("Ana"));
+        assert!(ws_text.contains("0 notebooks"));
+        assert!(ws_text.contains("Local Only"));
 
         crate::close_profile_screen(&mut app);
         assert_eq!(app.view.screen, AppScreen::Home);

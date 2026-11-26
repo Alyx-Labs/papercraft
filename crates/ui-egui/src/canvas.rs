@@ -109,6 +109,7 @@ struct CommittedBatchKey {
     revision: u64,
     stroke_count: usize,
     last_stroke_id: Option<StrokeId>,
+    fg_object_count: usize,
     zoom_bits: u32,
 }
 
@@ -117,7 +118,7 @@ struct CommittedMeshCache {
     key: Option<CommittedBatchKey>,
     rendered_pan: [f64; 2],
     translate_steps: u16,
-    batches: Vec<Arc<Mesh>>,
+    ink_runs: Vec<Vec<Arc<Mesh>>>,
     hl_rect: Option<Rect>,
     hl_clipped: bool,
     hl_texture: Option<egui::TextureHandle>,
@@ -128,6 +129,8 @@ struct CommittedMeshCache {
     built_color_key: Option<(UiTheme, bool, PaperColor)>,
     built_stroke_count: usize,
     built_stroke_refs: Vec<(StrokeId, usize)>,
+    built_trailing_ink: bool,
+    built_max_fg_non_stroke_z: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,7 +150,7 @@ struct CommittedShapeCache {
     built_has_culled: bool,
     rendered_pan: [f64; 2],
     translate_steps: u16,
-    shapes: Vec<Shape>,
+    items: Vec<Vec<Shape>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -952,11 +955,21 @@ fn build_stroke_ribbon_cached(
 }
 
 struct CommittedBuildOutput {
-    batches: Vec<Arc<Mesh>>,
+    ink_runs: Vec<Vec<Arc<Mesh>>>,
     hl_rect: Option<Rect>,
     hl_clipped: bool,
     hl_image: Option<egui::ColorImage>,
     culled_any: bool,
+    trailing_ink: bool,
+}
+
+fn max_fg_non_stroke_z(doc: &Document) -> u64 {
+    doc.shapes
+        .iter()
+        .map(|s| s.z_order)
+        .chain(doc.texts.iter().map(|t| t.z_order))
+        .max()
+        .unwrap_or(0)
 }
 
 fn build_committed_batches_and_hl(
@@ -965,54 +978,92 @@ fn build_committed_batches_and_hl(
     avail_rect: Rect,
     ppp: f32,
     clip_page: Option<papercraft_geom::Rect>,
+    paint_steps: &[papercraft_doc::PagePaintStep],
 ) -> CommittedBuildOutput {
-    let mut batches = Vec::new();
-    let mut current = Mesh::default();
+    let mut ink_runs = Vec::new();
     let mut hl_meshes = Vec::new();
     let mut hl_raw_union = Rect::NOTHING;
     let mut culled_any = false;
+    let trailing_ink = matches!(
+        paint_steps.last(),
+        Some(papercraft_doc::PagePaintStep::InkRun(_))
+    );
 
-    for stroke in &app.session.doc.strokes {
-        if let Some(clip) = clip_page
-            && let Some(bounds) = valid_stroke_page_bounds(stroke)
-            && !bounds.intersects(clip)
-        {
-            culled_any = true;
-            continue;
-        }
-        let Some((_, _, ribbon)) = app.mesh_cache.get(&stroke.id) else {
-            continue;
-        };
-        if ribbon.indices.is_empty() {
-            continue;
-        }
-        if stroke.pen.kind == PenKind::Highlighter {
-            let m = ribbon_to_egui_mesh(ribbon, xf, false);
-            if let Some(b) = mesh_screen_bounds(&m) {
-                hl_raw_union = hl_raw_union.union(b);
-                hl_meshes.push(m);
+    for step in paint_steps {
+        match step {
+            papercraft_doc::PagePaintStep::Highlighters(indices) => {
+                for &idx in indices {
+                    let Some(stroke) = app.session.doc.strokes.get(idx) else {
+                        continue;
+                    };
+                    if let Some(clip) = clip_page
+                        && let Some(bounds) = valid_stroke_page_bounds(stroke)
+                        && !bounds.intersects(clip)
+                    {
+                        culled_any = true;
+                        continue;
+                    }
+                    let Some((_, _, ribbon)) = app.mesh_cache.get(&stroke.id) else {
+                        continue;
+                    };
+                    if ribbon.indices.is_empty() {
+                        continue;
+                    }
+                    let m = ribbon_to_egui_mesh(ribbon, xf, false);
+                    if let Some(b) = mesh_screen_bounds(&m) {
+                        hl_raw_union = hl_raw_union.union(b);
+                        hl_meshes.push(m);
+                    }
+                }
             }
-            continue;
+            papercraft_doc::PagePaintStep::InkRun(indices) => {
+                let mut run_batches = Vec::new();
+                let mut current = Mesh::default();
+                for &idx in indices {
+                    let Some(stroke) = app.session.doc.strokes.get(idx) else {
+                        continue;
+                    };
+                    if let Some(clip) = clip_page
+                        && let Some(bounds) = valid_stroke_page_bounds(stroke)
+                        && !bounds.intersects(clip)
+                    {
+                        culled_any = true;
+                        continue;
+                    }
+                    let Some((_, _, ribbon)) = app.mesh_cache.get(&stroke.id) else {
+                        continue;
+                    };
+                    if ribbon.indices.is_empty() {
+                        continue;
+                    }
+                    if !current.vertices.is_empty()
+                        && current.vertices.len().saturating_add(ribbon.vertices.len())
+                            > MAX_BATCH_VERTICES
+                    {
+                        run_batches.push(Arc::new(std::mem::take(&mut current)));
+                    }
+                    append_ribbon_transformed(&mut current, ribbon, xf, false);
+                }
+                if !current.indices.is_empty() {
+                    run_batches.push(Arc::new(current));
+                }
+                ink_runs.push(run_batches);
+            }
+            papercraft_doc::PagePaintStep::Images(_)
+            | papercraft_doc::PagePaintStep::Shape(_)
+            | papercraft_doc::PagePaintStep::Text(_) => {}
         }
-        if !current.vertices.is_empty()
-            && current.vertices.len().saturating_add(ribbon.vertices.len()) > MAX_BATCH_VERTICES
-        {
-            batches.push(Arc::new(std::mem::take(&mut current)));
-        }
-        append_ribbon_transformed(&mut current, ribbon, xf, false);
-    }
-    if !current.indices.is_empty() {
-        batches.push(Arc::new(current));
     }
 
     let (hl_rect, hl_clipped, hl_image) =
         build_committed_highlighter_image(&hl_meshes, hl_raw_union, avail_rect, ppp);
     CommittedBuildOutput {
-        batches,
+        ink_runs,
         hl_rect,
         hl_clipped,
         hl_image,
         culled_any,
+        trailing_ink,
     }
 }
 
@@ -1098,12 +1149,15 @@ fn try_append_last_committed_stroke(
         }
         _ => true,
     };
-    let can_append = !cache.batches.is_empty()
-        && cache.key.is_some()
+    let cur_max_fg_z = max_fg_non_stroke_z(&app.session.doc);
+    let can_append = cache.key.is_some()
         && cache.built_page_key == Some(page_key)
         && cache.built_color_key == Some(color_key)
         && cache.built_zoom_bucket == Some(zoom_bucket)
         && cache.rendered_pan == app.view.pan
+        && cache.built_max_fg_non_stroke_z == cur_max_fg_z
+        && ((last_stroke.z_order > 0 && last_stroke.z_order >= cur_max_fg_z)
+            || (app.session.doc.shapes.is_empty() && app.session.doc.texts.is_empty()))
         && viewport_ok
         && n == cache.built_stroke_count.saturating_add(1)
         && cache.built_stroke_refs.len() == cache.built_stroke_count
@@ -1126,6 +1180,10 @@ fn try_append_last_committed_stroke(
     } else {
         false
     };
+    if !app.canvas_cache.committed.built_trailing_ink {
+        app.canvas_cache.committed.ink_runs.push(Vec::new());
+        app.canvas_cache.committed.built_trailing_ink = true;
+    }
     if !ribbon_empty_or_culled {
         let needs_build = match app.mesh_cache.get(&last_id) {
             Some((cached, bucket, _)) => {
@@ -1140,8 +1198,8 @@ fn try_append_last_committed_stroke(
         }
         if let Some((_, _, ribbon)) = app.mesh_cache.get(&last_id)
             && !ribbon.indices.is_empty()
+            && let Some(batches) = app.canvas_cache.committed.ink_runs.last_mut()
         {
-            let batches = &mut app.canvas_cache.committed.batches;
             let append_existing = batches.last().is_some_and(|b| {
                 b.vertices.len().saturating_add(ribbon.vertices.len()) <= MAX_BATCH_VERTICES
             });
@@ -1163,21 +1221,23 @@ fn try_append_last_committed_stroke(
     true
 }
 
-fn emit_committed_batches(p: &egui::Painter, cache: &CommittedMeshCache) {
+fn emit_cpu_highlighters(p: &egui::Painter, cache: &CommittedMeshCache) {
     if let (Some(hl_rect), Some(tex)) = (cache.hl_rect, cache.hl_texture.as_ref()) {
         paint_textured_quad(p, hl_rect, tex.id());
     }
-    for batch in &cache.batches {
-        p.add(Shape::mesh(Arc::clone(batch)));
+}
+
+fn emit_cpu_ink_run(p: &egui::Painter, cache: &CommittedMeshCache, run_idx: usize) {
+    if let Some(batches) = cache.ink_runs.get(run_idx) {
+        for batch in batches {
+            p.add(Shape::mesh(Arc::clone(batch)));
+        }
     }
 }
 
-fn paint_committed_strokes(
+fn sync_page_stroke_cache_context(
     app: &mut PaperCraftApp,
-    p: &egui::Painter,
-    avail_rect: Rect,
-    xf: Affine2,
-) {
+) -> ((usize, usize), (UiTheme, bool, PaperColor)) {
     let page_key = (
         app.session.active_notebook,
         app.session.doc.active_page_index(),
@@ -1197,18 +1257,32 @@ fn paint_committed_strokes(
         app.view.cached_page_key = page_key;
         app.view.cached_color_key = Some(color_key);
     }
-    if app.wgpu_enabled {
-        crate::gpu_ink::paint_committed_strokes_gpu(app, p, avail_rect, xf, page_key, color_key);
-        return;
-    }
+    (page_key, color_key)
+}
 
+fn prepare_cpu_stroke_scene(
+    app: &mut PaperCraftApp,
+    p: &egui::Painter,
+    avail_rect: Rect,
+    xf: Affine2,
+    page_key: (usize, usize),
+    color_key: (UiTheme, bool, PaperColor),
+    paint_steps: &[papercraft_doc::PagePaintStep],
+) {
     let visible_page = page_rect_for_screen_rect(avail_rect, xf);
+    let fg_object_count = app
+        .session
+        .doc
+        .shapes
+        .len()
+        .saturating_add(app.session.doc.texts.len());
     let batch_key = CommittedBatchKey {
         page_key,
         color_key,
         revision: app.session.revision,
         stroke_count: app.session.doc.strokes.len(),
         last_stroke_id: app.session.doc.strokes.last().map(|s| s.id),
+        fg_object_count,
         zoom_bits: app.view.zoom.to_bits(),
     };
     let page_cache_ready = !app.mesh_cache.is_empty() || app.session.doc.strokes.is_empty();
@@ -1224,7 +1298,6 @@ fn paint_committed_strokes(
             _ => true,
         };
         if viewport_ok && cache.rendered_pan == app.view.pan {
-            emit_committed_batches(p, cache);
             return;
         }
         let hl_pan_ok = !cache.hl_clipped || cache.rendered_pan == app.view.pan;
@@ -1232,15 +1305,16 @@ fn paint_committed_strokes(
             let dx = (app.view.pan[0] - cache.rendered_pan[0]) as f32;
             let dy = (app.view.pan[1] - cache.rendered_pan[1]) as f32;
             let delta = egui::vec2(dx, dy);
-            for batch in &mut cache.batches {
-                Arc::make_mut(batch).translate(delta);
+            for run in &mut cache.ink_runs {
+                for batch in run {
+                    Arc::make_mut(batch).translate(delta);
+                }
             }
             if let Some(hl_rect) = &mut cache.hl_rect {
                 *hl_rect = hl_rect.translate(delta);
             }
             cache.rendered_pan = app.view.pan;
             cache.translate_steps = cache.translate_steps.saturating_add(1);
-            emit_committed_batches(p, cache);
             return;
         }
     }
@@ -1259,7 +1333,6 @@ fn paint_committed_strokes(
             visible_page,
         )
     {
-        emit_committed_batches(p, &app.canvas_cache.committed);
         return;
     }
 
@@ -1268,8 +1341,14 @@ fn paint_committed_strokes(
         v.inflated(margin)
     });
     sync_page_ribbon_cache(app, page_key, zoom_bucket, feather, color_key);
-    let built =
-        build_committed_batches_and_hl(app, xf, avail_rect, p.pixels_per_point(), clip_page);
+    let built = build_committed_batches_and_hl(
+        app,
+        xf,
+        avail_rect,
+        p.pixels_per_point(),
+        clip_page,
+        paint_steps,
+    );
     let stroke_refs: Vec<(StrokeId, usize)> = app
         .session
         .doc
@@ -1277,11 +1356,12 @@ fn paint_committed_strokes(
         .iter()
         .map(|s| (s.id, Arc::as_ptr(s) as usize))
         .collect();
+    let max_fg_z = max_fg_non_stroke_z(&app.session.doc);
     let cache = &mut app.canvas_cache.committed;
     cache.key = Some(batch_key);
     cache.rendered_pan = app.view.pan;
     cache.translate_steps = 0;
-    cache.batches = built.batches;
+    cache.ink_runs = built.ink_runs;
     cache.hl_rect = built.hl_rect;
     cache.hl_clipped = built.hl_clipped;
     match built.hl_image {
@@ -1306,7 +1386,28 @@ fn paint_committed_strokes(
     cache.built_color_key = Some(color_key);
     cache.built_stroke_count = stroke_refs.len();
     cache.built_stroke_refs = stroke_refs;
-    emit_committed_batches(p, cache);
+    cache.built_trailing_ink = built.trailing_ink;
+    cache.built_max_fg_non_stroke_z = max_fg_z;
+}
+
+#[allow(dead_code)]
+fn paint_committed_strokes(
+    app: &mut PaperCraftApp,
+    p: &egui::Painter,
+    avail_rect: Rect,
+    xf: Affine2,
+) {
+    let (page_key, color_key) = sync_page_stroke_cache_context(app);
+    if app.wgpu_enabled {
+        crate::gpu_ink::paint_committed_strokes_gpu(app, p, avail_rect, xf, page_key, color_key);
+        return;
+    }
+    let steps = app.session.doc.page_paint_steps();
+    prepare_cpu_stroke_scene(app, p, avail_rect, xf, page_key, color_key, &steps);
+    emit_cpu_highlighters(p, &app.canvas_cache.committed);
+    for run_idx in 0..app.canvas_cache.committed.ink_runs.len() {
+        emit_cpu_ink_run(p, &app.canvas_cache.committed, run_idx);
+    }
 }
 
 fn apply_zoom_around_anchor(
@@ -2589,11 +2690,7 @@ fn handle_text_canvas_press(
         return;
     }
     let page_pos = xf.to_page(Point::new(f64::from(screen_pos.x), f64::from(screen_pos.y)));
-    if page_pos.x >= 0.0
-        && page_pos.y >= 0.0
-        && page_pos.x <= f64::from(app.session.doc.width)
-        && page_pos.y <= f64::from(app.session.doc.height)
-    {
+    if page_pos.is_finite() {
         app.view.last_canvas_page_pos = Some([page_pos.x, page_pos.y]);
         app.view.text_insert_position = [page_pos.x, page_pos.y];
         app.view.text_draft.clear();
@@ -2822,15 +2919,12 @@ fn handle_shape_input(
         {
             let xf = page_affine(app);
             let page_pos = xf.to_page(Point::new(f64::from(screen_pos.x), f64::from(screen_pos.y)));
-            if page_pos.x >= 0.0
-                && page_pos.y >= 0.0
-                && page_pos.x <= f64::from(app.session.doc.width)
-                && page_pos.y <= f64::from(app.session.doc.height)
-            {
+            if page_pos.is_finite() {
                 if has_active_live(app) {
                     finish_active_stroke(app);
                 }
                 let start = [page_pos.x, page_pos.y];
+                app.view.last_canvas_page_pos = Some(start);
                 app.view.shape_drag_start = Some(start);
                 app.view.shape_drag_end = Some(start);
                 app.view.shape_drag_touch_id = touch_id;
@@ -2866,10 +2960,9 @@ fn handle_shape_input(
     };
     if let Some(pos) = end_pos {
         let page = xf.to_page(Point::new(f64::from(pos.x), f64::from(pos.y)));
-        app.view.shape_drag_end = Some([
-            page.x.clamp(0.0, f64::from(app.session.doc.width)),
-            page.y.clamp(0.0, f64::from(app.session.doc.height)),
-        ]);
+        if page.is_finite() {
+            app.view.shape_drag_end = Some([page.x, page.y]);
+        }
         ui.ctx().request_repaint();
     }
 
@@ -2913,10 +3006,6 @@ fn handle_shape_input(
         let raw_end = app.view.shape_drag_end.unwrap_or(start);
         let (start, end) =
             constrain_shape_drag(app.view.selected_shape_kind, start, raw_end, modifiers);
-        let max_x = f64::from(app.session.doc.width);
-        let max_y = f64::from(app.session.doc.height);
-        let start = [start[0].clamp(0.0, max_x), start[1].clamp(0.0, max_y)];
-        let end = [end[0].clamp(0.0, max_x), end[1].clamp(0.0, max_y)];
         let border_color = crate::toolbar::effective_shape_insert_border(app)
             .unwrap_or(papercraft_color::Color::TRANSPARENT);
         let fill_color = crate::toolbar::effective_shape_insert_fill(app);
@@ -4043,7 +4132,7 @@ struct HitCandidate {
     core_hit: bool,
     screen_area: f32,
     norm_dist: f32,
-    paint_rank: (u8, usize),
+    paint_rank: papercraft_doc::LayerPaintRank,
 }
 
 fn is_better_hit(cand: &HitCandidate, best: &HitCandidate) -> bool {
@@ -4189,7 +4278,11 @@ fn shape_hit_detail(
             core_hit: dist <= core_tolerance,
             screen_area,
             norm_dist: (dist / tolerance).clamp(0.0, 1.0),
-            paint_rank: (4, index),
+            paint_rank: papercraft_doc::element_layer_rank(
+                papercraft_doc::LayerElementKind::Shape,
+                shape.z_order,
+                index,
+            ),
         });
     }
     if in_fill {
@@ -4199,7 +4292,11 @@ fn shape_hit_detail(
             core_hit: true,
             screen_area,
             norm_dist: 0.5,
-            paint_rank: (4, index),
+            paint_rank: papercraft_doc::element_layer_rank(
+                papercraft_doc::LayerElementKind::Shape,
+                shape.z_order,
+                index,
+            ),
         });
     }
     None
@@ -4257,7 +4354,11 @@ fn text_hit_detail(
         core_hit,
         screen_area,
         norm_dist,
-        paint_rank: (3, index),
+        paint_rank: papercraft_doc::element_layer_rank(
+            papercraft_doc::LayerElementKind::Text,
+            clean.z_order,
+            index,
+        ),
     })
 }
 
@@ -4329,7 +4430,15 @@ fn stroke_hit_detail(
         core_hit: dist <= core_tolerance,
         screen_area: (total_len_px.max(stroke_px) * stroke_px.max(6.0)).max(1.0),
         norm_dist: (dist / tolerance).clamp(0.0, 1.0),
-        paint_rank: (if is_hl { 1 } else { 2 }, index),
+        paint_rank: papercraft_doc::element_layer_rank(
+            if is_hl {
+                papercraft_doc::LayerElementKind::Highlighter
+            } else {
+                papercraft_doc::LayerElementKind::Ink
+            },
+            stroke.z_order,
+            index,
+        ),
     })
 }
 
@@ -4353,7 +4462,11 @@ fn image_hit_detail(
         core_hit: true,
         screen_area,
         norm_dist: 0.5,
-        paint_rank: (0, index),
+        paint_rank: papercraft_doc::element_layer_rank(
+            papercraft_doc::LayerElementKind::Image,
+            clean.z_order,
+            index,
+        ),
     })
 }
 
@@ -4420,11 +4533,7 @@ fn handle_selection_press(
     let painter = ui.painter_at(resp.rect);
     let xf = page_affine(app);
     let page_pt = xf.to_page(Point::new(f64::from(pos.x), f64::from(pos.y)));
-    if page_pt.x >= 0.0
-        && page_pt.y >= 0.0
-        && page_pt.x <= f64::from(app.session.doc.width)
-        && page_pt.y <= f64::from(app.session.doc.height)
-    {
+    if page_pt.is_finite() {
         app.view.last_canvas_page_pos = Some([page_pt.x, page_pt.y]);
     }
     if touch_id.is_none()
@@ -5766,14 +5875,8 @@ fn update_selection_drag(app: &mut PaperCraftApp, pos: Pos2, constrain_held: boo
             let min_w = (f64::from(current.size) * 0.95)
                 .max(f64::from(papercraft_doc::MIN_TEXT_BOX_WIDTH))
                 .min((*start_width).max(f64::from(papercraft_doc::MIN_TEXT_BOX_WIDTH)));
-            let page_w = f64::from(app.session.doc.width);
-            let unrotated = angle_degrees.abs() <= 1e-3;
+            let max_w = f64::from(papercraft_doc::MAX_TEXT_BOX_WIDTH).max(min_w);
             let (new_x, new_y, new_width) = if *from_left {
-                let max_w = if unrotated {
-                    (start_origin[0] + *start_width).max(min_w)
-                } else {
-                    f64::from(papercraft_doc::MAX_TEXT_BOX_WIDTH).max(min_w)
-                };
                 let clamped_w = (*start_width - delta_along).clamp(min_w, max_w);
                 let shift = *start_width - clamped_w;
                 (
@@ -5782,12 +5885,6 @@ fn update_selection_drag(app: &mut PaperCraftApp, pos: Pos2, constrain_held: boo
                     clamped_w,
                 )
             } else {
-                let max_w = if unrotated {
-                    (page_w - start_origin[0] - papercraft_doc::TEXT_PAGE_RIGHT_MARGIN_PT)
-                        .max(min_w)
-                } else {
-                    f64::from(papercraft_doc::MAX_TEXT_BOX_WIDTH).max(min_w)
-                };
                 let clamped_w = (*start_width + delta_along).clamp(min_w, max_w);
                 (start_origin[0], start_origin[1], clamped_w)
             };
@@ -7527,7 +7624,24 @@ fn sync_committed_text_cache(
     }
 }
 
-fn paint_committed_text(app: &mut PaperCraftApp, p: &egui::Painter, xf: Affine2, t: &Tokens) {
+struct TextEmitCtx {
+    doc_width: u32,
+    ink_ctx: Option<TextInkResolveCtx>,
+    text_editing: bool,
+    text_edit_index: Option<usize>,
+    accent: Color32,
+    safe_ppp: f32,
+    layout_zoom: f32,
+    scale_ratio: f32,
+    scaled_diff: bool,
+    zoom: f32,
+}
+
+fn prepare_committed_text_cache(
+    app: &mut PaperCraftApp,
+    p: &egui::Painter,
+    t: &Tokens,
+) -> Option<TextEmitCtx> {
     let doc = &app.session.doc;
     if doc.texts.is_empty() {
         app.canvas_cache.texts.key = None;
@@ -7535,21 +7649,10 @@ fn paint_committed_text(app: &mut PaperCraftApp, p: &egui::Painter, xf: Affine2,
         app.canvas_cache.texts.baked_zoom = 0.0;
         app.canvas_cache.texts.pending_zoom_rebake = false;
         app.canvas_cache.texts.items.clear();
-        return;
+        return None;
     }
     let theme = app.session.prefs.theme;
     let (auto_contrast, eff_paper_color) = crate::effective_doc_ink_context(app);
-    let clip = xf.to_screen(Point::new(f64::from(doc.width), f64::from(doc.height)));
-    let page_rect = Rect::from_min_max(
-        pos2(xf.offset_x as f32, xf.offset_y as f32),
-        pos2(clip.x as f32, clip.y as f32),
-    );
-    let page_clip = page_rect.intersect(p.clip_rect());
-    if !page_clip.is_positive() {
-        return;
-    }
-    let page_painter = p.with_clip_rect(page_clip);
-    let visible_clip = page_clip.expand(48.0);
     let page_key = (app.session.active_notebook, doc.active_page_index());
     let color_key = (theme, auto_contrast, eff_paper_color);
     let text_digest = arc_slice_digest(&doc.texts);
@@ -7563,119 +7666,146 @@ fn paint_committed_text(app: &mut PaperCraftApp, p: &egui::Painter, xf: Affine2,
     let doc_width = doc.width;
     let zoom = app.view.zoom;
     let now_s = p.ctx().input(|i| i.time);
-    sync_committed_text_cache(app, &page_painter, key, now_s, zoom);
+    sync_committed_text_cache(app, p, key, now_s, zoom);
 
-    let ink_ctx = Some(TextInkResolveCtx {
-        theme,
-        auto_contrast,
-        paper_color: eff_paper_color,
-    });
-    let text_editing = app.view.text_editing;
-    let text_edit_index = app.view.text_edit_index;
-    let accent = t.accent;
-    let safe_ppp = page_painter.pixels_per_point().max(0.1);
     let layout_zoom = app.canvas_cache.texts.baked_zoom.max(0.05);
     let scale_ratio = (zoom / layout_zoom).clamp(0.25, 4.0);
-    let scaled_diff = (scale_ratio - 1.0).abs() > 1e-5;
+    Some(TextEmitCtx {
+        doc_width,
+        ink_ctx: Some(TextInkResolveCtx {
+            theme,
+            auto_contrast,
+            paper_color: eff_paper_color,
+        }),
+        text_editing: app.view.text_editing,
+        text_edit_index: app.view.text_edit_index,
+        accent: t.accent,
+        safe_ppp: p.pixels_per_point().max(0.1),
+        layout_zoom,
+        scale_ratio,
+        scaled_diff: (scale_ratio - 1.0).abs() > 1e-5,
+        zoom,
+    })
+}
 
-    for (index, entry) in app.canvas_cache.texts.items.iter_mut().enumerate() {
-        if text_editing && text_edit_index == Some(index) {
-            continue;
-        }
-        let rough_screen = rough_page_rect_to_screen(entry.rough_page_rect, xf);
-        if !rough_screen.intersects(visible_clip) {
-            continue;
-        }
-        let base_galley = if let Some(job) = &entry.baked_job {
-            let fresh = page_painter.layout_job((**job).clone());
-            if entry
-                .galley
-                .as_ref()
-                .is_none_or(|prev| !Arc::ptr_eq(prev, &fresh))
-            {
-                entry.prefix_rects = collect_list_prefix_rects(&fresh, &entry.clean.text);
-                entry.galley = Some(Arc::clone(&fresh));
-                entry.emitted_key = None;
-                entry.emitted_galley = None;
-            }
-            fresh
-        } else {
-            let job = build_text_layout_job_for_item(
-                &page_painter,
-                doc_width,
-                &entry.clean,
-                layout_zoom,
-                entry.color,
-                ink_ctx,
-            );
-            let built = page_painter.layout_job(job.clone());
-            entry.prefix_rects = collect_list_prefix_rects(&built, &entry.clean.text);
-            entry.baked_job = Some(Arc::new(job));
-            entry.galley = Some(Arc::clone(&built));
+fn emit_committed_text_index(
+    app: &mut PaperCraftApp,
+    page_painter: &egui::Painter,
+    visible_clip: Rect,
+    xf: Affine2,
+    ctx: &TextEmitCtx,
+    index: usize,
+) {
+    if ctx.text_editing && ctx.text_edit_index == Some(index) {
+        return;
+    }
+    let Some(entry) = app.canvas_cache.texts.items.get_mut(index) else {
+        return;
+    };
+    let rough_screen = rough_page_rect_to_screen(entry.rough_page_rect, xf);
+    if !rough_screen.intersects(visible_clip) {
+        return;
+    }
+    let base_galley = if let Some(job) = &entry.baked_job {
+        let fresh = page_painter.layout_job((**job).clone());
+        if entry
+            .galley
+            .as_ref()
+            .is_none_or(|prev| !Arc::ptr_eq(prev, &fresh))
+        {
+            entry.prefix_rects = collect_list_prefix_rects(&fresh, &entry.clean.text);
+            entry.galley = Some(Arc::clone(&fresh));
             entry.emitted_key = None;
             entry.emitted_galley = None;
-            built
-        };
-
-        let screen = xf.to_screen(Point::new(entry.clean.x, entry.clean.y));
-        let top_left = pos2(screen.x as f32, screen.y as f32);
-        let galley_origin =
-            top_left + entry.rot * Vec2::new(-base_galley.rect.left() * scale_ratio, 0.0);
-        let snapped_pos = egui::emath::GuiRounding::round_to_pixels(galley_origin, safe_ppp);
-        let world_residual = galley_origin - snapped_pos;
-        let local_residual = if entry.angle.abs() <= f32::EPSILON {
-            world_residual
-        } else {
-            entry.rot.inverse() * world_residual
-        };
-
-        let emit_key = (
-            zoom.to_bits(),
-            safe_ppp.to_bits(),
-            local_residual.x.to_bits(),
-            local_residual.y.to_bits(),
-            Arc::as_ptr(&base_galley) as usize,
-        );
-        let emitted_galley = if entry.emitted_key == Some(emit_key)
-            && let Some(cached) = &entry.emitted_galley
-        {
-            Arc::clone(cached)
-        } else {
-            let built =
-                transform_galley_for_subpixel_zoom(&base_galley, scale_ratio, local_residual);
-            entry.emitted_key = Some(emit_key);
-            entry.emitted_galley = Some(Arc::clone(&built));
-            built
-        };
-
-        page_painter.add(egui::Shape::Text(
-            egui::epaint::TextShape::new(snapped_pos, emitted_galley, entry.color)
-                .with_angle(entry.angle),
-        ));
-        if scaled_diff && !entry.prefix_rects.is_empty() {
-            let scaled_rects: Vec<(usize, ListItemKind, Rect)> = entry
-                .prefix_rects
-                .iter()
-                .map(|&(p_idx, kind, r)| (p_idx, kind, scale_rect_uniform(r, scale_ratio)))
-                .collect();
-            paint_list_prefix_markers_from_rects(
-                &page_painter,
-                &scaled_rects,
-                &entry.clean,
-                galley_origin,
-                [entry.color, accent],
-                zoom,
-            );
-        } else {
-            paint_list_prefix_markers_from_rects(
-                &page_painter,
-                &entry.prefix_rects,
-                &entry.clean,
-                galley_origin,
-                [entry.color, accent],
-                zoom,
-            );
         }
+        fresh
+    } else {
+        let job = build_text_layout_job_for_item(
+            page_painter,
+            ctx.doc_width,
+            &entry.clean,
+            ctx.layout_zoom,
+            entry.color,
+            ctx.ink_ctx,
+        );
+        let built = page_painter.layout_job(job.clone());
+        entry.prefix_rects = collect_list_prefix_rects(&built, &entry.clean.text);
+        entry.baked_job = Some(Arc::new(job));
+        entry.galley = Some(Arc::clone(&built));
+        entry.emitted_key = None;
+        entry.emitted_galley = None;
+        built
+    };
+
+    let screen = xf.to_screen(Point::new(entry.clean.x, entry.clean.y));
+    let top_left = pos2(screen.x as f32, screen.y as f32);
+    let galley_origin =
+        top_left + entry.rot * Vec2::new(-base_galley.rect.left() * ctx.scale_ratio, 0.0);
+    let snapped_pos = egui::emath::GuiRounding::round_to_pixels(galley_origin, ctx.safe_ppp);
+    let world_residual = galley_origin - snapped_pos;
+    let local_residual = if entry.angle.abs() <= f32::EPSILON {
+        world_residual
+    } else {
+        entry.rot.inverse() * world_residual
+    };
+
+    let emit_key = (
+        ctx.zoom.to_bits(),
+        ctx.safe_ppp.to_bits(),
+        local_residual.x.to_bits(),
+        local_residual.y.to_bits(),
+        Arc::as_ptr(&base_galley) as usize,
+    );
+    let emitted_galley = if entry.emitted_key == Some(emit_key)
+        && let Some(cached) = &entry.emitted_galley
+    {
+        Arc::clone(cached)
+    } else {
+        let built =
+            transform_galley_for_subpixel_zoom(&base_galley, ctx.scale_ratio, local_residual);
+        entry.emitted_key = Some(emit_key);
+        entry.emitted_galley = Some(Arc::clone(&built));
+        built
+    };
+
+    page_painter.add(egui::Shape::Text(
+        egui::epaint::TextShape::new(snapped_pos, emitted_galley, entry.color)
+            .with_angle(entry.angle),
+    ));
+    if ctx.scaled_diff && !entry.prefix_rects.is_empty() {
+        let scaled_rects: Vec<(usize, ListItemKind, Rect)> = entry
+            .prefix_rects
+            .iter()
+            .map(|&(p_idx, kind, r)| (p_idx, kind, scale_rect_uniform(r, ctx.scale_ratio)))
+            .collect();
+        paint_list_prefix_markers_from_rects(
+            page_painter,
+            &scaled_rects,
+            &entry.clean,
+            galley_origin,
+            [entry.color, ctx.accent],
+            ctx.zoom,
+        );
+    } else {
+        paint_list_prefix_markers_from_rects(
+            page_painter,
+            &entry.prefix_rects,
+            &entry.clean,
+            galley_origin,
+            [entry.color, ctx.accent],
+            ctx.zoom,
+        );
+    }
+}
+
+#[allow(dead_code)]
+fn paint_committed_text(app: &mut PaperCraftApp, p: &egui::Painter, xf: Affine2, t: &Tokens) {
+    let Some(ctx) = prepare_committed_text_cache(app, p, t) else {
+        return;
+    };
+    let visible_clip = p.clip_rect().expand(48.0);
+    for index in 0..app.canvas_cache.texts.items.len() {
+        emit_committed_text_index(app, p, visible_clip, xf, &ctx, index);
     }
 }
 
@@ -8472,25 +8602,19 @@ fn paint_shape_outline(
     emit_shape_outline(&mut sink, shape, xf, zoom, color, fill_color);
 }
 
-fn paint_committed_shapes(app: &mut PaperCraftApp, p: &egui::Painter, xf: Affine2) {
+fn prepare_committed_shapes_cache(app: &mut PaperCraftApp, p: &egui::Painter, xf: Affine2) {
     let doc = &app.session.doc;
     if doc.shapes.is_empty() {
         app.canvas_cache.shapes.key = None;
         app.canvas_cache.shapes.shape_ptrs.clear();
-        app.canvas_cache.shapes.shapes.clear();
+        app.canvas_cache.shapes.items.clear();
         return;
     }
-    let bottom_right = xf.to_screen(Point::new(f64::from(doc.width), f64::from(doc.height)));
-    let page_rect = Rect::from_min_max(
-        pos2(xf.offset_x as f32, xf.offset_y as f32),
-        pos2(bottom_right.x as f32, bottom_right.y as f32),
-    );
-    let page_clip = page_rect.intersect(p.clip_rect());
-    if !page_clip.is_positive() {
+    let visible_clip = p.clip_rect();
+    if !visible_clip.is_positive() {
         return;
     }
-    let clipped = p.with_clip_rect(page_clip);
-    let visible_page = page_rect_for_screen_rect(page_clip, xf);
+    let visible_page = page_rect_for_screen_rect(visible_clip, xf);
     let page_key = (
         app.session.active_notebook,
         app.session.doc.active_page_index(),
@@ -8515,18 +8639,16 @@ fn paint_committed_shapes(app: &mut PaperCraftApp, p: &egui::Painter, xf: Affine
             _ => true,
         };
         if viewport_ok && cache.rendered_pan == app.view.pan {
-            for shape in &cache.shapes {
-                clipped.add(shape.clone());
-            }
             return;
         }
         if viewport_ok && cache.translate_steps < MAX_CACHE_TRANSLATE_STEPS {
             let dx = (app.view.pan[0] - cache.rendered_pan[0]) as f32;
             let dy = (app.view.pan[1] - cache.rendered_pan[1]) as f32;
             let delta = egui::vec2(dx, dy);
-            for shape in &mut cache.shapes {
-                shape.translate(delta);
-                clipped.add(shape.clone());
+            for item_shapes in &mut cache.items {
+                for shape in item_shapes {
+                    shape.translate(delta);
+                }
             }
             cache.rendered_pan = app.view.pan;
             cache.translate_steps = cache.translate_steps.saturating_add(1);
@@ -8539,12 +8661,14 @@ fn paint_committed_shapes(app: &mut PaperCraftApp, p: &egui::Painter, xf: Affine
         v.inflated(margin)
     });
     let mut culled_any = false;
-    let mut raw_shapes = Vec::with_capacity(doc.shapes.len().saturating_mul(2));
+    let ppp = p.pixels_per_point();
+    let mut items = Vec::with_capacity(doc.shapes.len());
     for item in &doc.shapes {
         if let Some(clip_rect) = clip_page {
             let page_bounds = shape_broadphase_page_rect(item);
             if !page_bounds.intersects(clip_rect) {
                 culled_any = true;
+                items.push(Vec::new());
                 continue;
             }
         }
@@ -8568,6 +8692,7 @@ fn paint_committed_shapes(app: &mut PaperCraftApp, p: &egui::Painter, xf: Affine
             );
             to_color32(resolved)
         });
+        let mut raw_shapes = Vec::with_capacity(2);
         emit_shape_outline(
             &mut raw_shapes,
             &shape,
@@ -8576,10 +8701,7 @@ fn paint_committed_shapes(app: &mut PaperCraftApp, p: &egui::Painter, xf: Affine
             to_color32(color),
             fill,
         );
-    }
-    let cached_shapes = pre_tessellate_shapes(raw_shapes, p.pixels_per_point());
-    for shape in &cached_shapes {
-        clipped.add(shape.clone());
+        items.push(pre_tessellate_shapes(raw_shapes, ppp));
     }
     let shape_ptrs: Vec<usize> = doc.shapes.iter().map(|s| Arc::as_ptr(s) as usize).collect();
     let cache = &mut app.canvas_cache.shapes;
@@ -8589,7 +8711,23 @@ fn paint_committed_shapes(app: &mut PaperCraftApp, p: &egui::Painter, xf: Affine
     cache.built_has_culled = culled_any;
     cache.rendered_pan = app.view.pan;
     cache.translate_steps = 0;
-    cache.shapes = cached_shapes;
+    cache.items = items;
+}
+
+fn emit_committed_shape_index(p: &egui::Painter, cache: &CommittedShapeCache, index: usize) {
+    if let Some(shapes) = cache.items.get(index) {
+        for shape in shapes {
+            p.add(shape.clone());
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn paint_committed_shapes(app: &mut PaperCraftApp, p: &egui::Painter, xf: Affine2) {
+    prepare_committed_shapes_cache(app, p, xf);
+    for index in 0..app.canvas_cache.shapes.items.len() {
+        emit_committed_shape_index(p, &app.canvas_cache.shapes, index);
+    }
 }
 
 fn paint_shape_preview(
@@ -8602,16 +8740,6 @@ fn paint_shape_preview(
         return;
     };
     let (start, end) = constrain_shape_drag(app.view.selected_shape_kind, start, end, modifiers);
-    let max_x = f64::from(app.session.doc.width);
-    let max_y = f64::from(app.session.doc.height);
-    let start = [start[0].clamp(0.0, max_x), start[1].clamp(0.0, max_y)];
-    let end = [end[0].clamp(0.0, max_x), end[1].clamp(0.0, max_y)];
-    let doc = &app.session.doc;
-    let bottom_right = xf.to_screen(Point::new(f64::from(doc.width), f64::from(doc.height)));
-    let page_rect = Rect::from_min_max(
-        pos2(xf.offset_x as f32, xf.offset_y as f32),
-        pos2(bottom_right.x as f32, bottom_right.y as f32),
-    );
     let pen = app.session.active_pen();
     let eff_border = crate::toolbar::effective_shape_insert_border(app);
     let fill_color = crate::toolbar::effective_shape_insert_fill(app);
@@ -8629,6 +8757,7 @@ fn paint_shape_preview(
         fill_color,
         line_style: app.view.shape_line_style,
         points: Vec::new(),
+        z_order: 0,
     };
     let preview_border = if let Some(border) = eff_border {
         to_color32(eff_paper_color.resolve_ink_color(
@@ -8651,14 +8780,7 @@ fn paint_shape_preview(
             false,
         ))
     });
-    paint_shape_outline(
-        &p.with_clip_rect(page_rect),
-        &shape,
-        xf,
-        app.view.zoom,
-        preview_border,
-        fill,
-    );
+    paint_shape_outline(p, &shape, xf, app.view.zoom, preview_border, fill);
 }
 
 enum RulerSnapVisual {
@@ -9366,26 +9488,19 @@ pub(crate) fn paint_textured_image_quad(
     painter.add(Shape::mesh(mesh));
 }
 
-fn paint_committed_images(
-    app: &mut PaperCraftApp,
-    ctx: &egui::Context,
-    painter: &egui::Painter,
-    page_rect: Rect,
-    xf: Affine2,
-) {
+fn sync_committed_image_textures(app: &mut PaperCraftApp, ctx: &egui::Context) {
     let img_count = app.session.doc.images.len();
     app.image_textures.retain(|idx, _| *idx < img_count);
-    if img_count == 0 {
-        return;
-    }
-    let clipped = painter.with_clip_rect(page_rect);
-    for (idx, image) in app.session.doc.images.iter().enumerate() {
-        let clean = image.sanitized();
+    for idx in 0..img_count {
+        let Some(image) = app.session.doc.images.get(idx) else {
+            continue;
+        };
         let needs_reload = app
             .image_textures
             .get(&idx)
             .is_none_or(|(cached_bytes, _)| !Arc::ptr_eq(cached_bytes, &image.png_bytes));
         if needs_reload {
+            let clean = image.sanitized();
             let Some(color_image) = decode_png_color_image(&clean.png_bytes) else {
                 continue;
             };
@@ -9397,9 +9512,25 @@ fn paint_committed_images(
             app.image_textures
                 .insert(idx, (Arc::clone(&image.png_bytes), handle));
         }
+    }
+}
+
+fn paint_committed_image_indices(
+    app: &mut PaperCraftApp,
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    xf: Affine2,
+    indices: &[usize],
+) {
+    sync_committed_image_textures(app, ctx);
+    for &idx in indices {
+        let Some(image) = app.session.doc.images.get(idx) else {
+            continue;
+        };
         let Some((_, handle)) = app.image_textures.get(&idx) else {
             continue;
         };
+        let clean = image.sanitized();
         let corners_page = clean.corners();
         let to_pos = |pt: Point| {
             let s = xf.to_screen(pt);
@@ -9411,8 +9542,174 @@ fn paint_committed_images(
             to_pos(corners_page[2]),
             to_pos(corners_page[3]),
         ];
-        paint_textured_image_quad(&clipped, handle.id(), corners);
+        paint_textured_image_quad(painter, handle.id(), corners);
     }
+}
+
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+fn paint_committed_page_scene(
+    app: &mut PaperCraftApp,
+    ctx: &egui::Context,
+    p: &egui::Painter,
+    avail_rect: Rect,
+    xf: Affine2,
+    t: &Tokens,
+    modifiers: egui::Modifiers,
+) {
+    let steps = app.session.doc.page_paint_steps();
+    let (page_key, color_key) = sync_page_stroke_cache_context(app);
+    let gpu_scene = if app.wgpu_enabled {
+        crate::gpu_ink::prepare_gpu_stroke_scene(
+            app, p, avail_rect, xf, page_key, color_key, &steps,
+        )
+    } else {
+        prepare_cpu_stroke_scene(app, p, avail_rect, xf, page_key, color_key, &steps);
+        None
+    };
+
+    prepare_committed_shapes_cache(app, p, xf);
+    let text_ctx = prepare_committed_text_cache(app, p, t);
+    let visible_clip = p.clip_rect().expand(48.0);
+    if app.session.doc.images.is_empty() {
+        app.image_textures.clear();
+    }
+
+    let emit_cpu_live_highlighter = |app: &PaperCraftApp| {
+        if !app.wgpu_enabled
+            && let Some(live) = &app.session.live_stroke
+            && live.recognized_shape.is_none()
+            && live.pen.kind == PenKind::Highlighter
+        {
+            let (_, auto_contrast, eff_paper_color) = color_key;
+            let theme = app.session.prefs.theme;
+            let preview = live.preview_samples();
+            let feather = (0.9 / app.view.zoom.max(0.25)).clamp(0.3, 2.5);
+            let mut display_pen = live.pen.clone();
+            display_pen.color =
+                eff_paper_color.resolve_ink_color(theme, auto_contrast, live.pen.color, true);
+            paint_live_ribbon(p, &display_pen, &preview, xf, feather);
+        }
+    };
+
+    let mut emitted_band1 = false;
+    let mut ink_run_cursor = 0_usize;
+
+    for step in &steps {
+        match step {
+            papercraft_doc::PagePaintStep::Images(indices) => {
+                paint_committed_image_indices(app, ctx, p, xf, indices);
+            }
+            papercraft_doc::PagePaintStep::Highlighters(_) => {
+                if !emitted_band1 {
+                    if let Some(scene) = &gpu_scene {
+                        crate::gpu_ink::emit_gpu_scene_phase(
+                            p,
+                            scene,
+                            crate::gpu_ink::GpuInkPhase::FrameSyncAndHighlighters,
+                        );
+                    } else {
+                        emit_cpu_highlighters(p, &app.canvas_cache.committed);
+                        emit_cpu_live_highlighter(app);
+                    }
+                    emitted_band1 = true;
+                }
+            }
+            papercraft_doc::PagePaintStep::InkRun(_)
+            | papercraft_doc::PagePaintStep::Shape(_)
+            | papercraft_doc::PagePaintStep::Text(_) => {
+                if !emitted_band1 {
+                    if let Some(scene) = &gpu_scene {
+                        crate::gpu_ink::emit_gpu_scene_phase(
+                            p,
+                            scene,
+                            crate::gpu_ink::GpuInkPhase::FrameSyncAndHighlighters,
+                        );
+                    } else {
+                        emit_cpu_highlighters(p, &app.canvas_cache.committed);
+                        emit_cpu_live_highlighter(app);
+                    }
+                    emitted_band1 = true;
+                }
+                match step {
+                    papercraft_doc::PagePaintStep::InkRun(_) => {
+                        if let Some(scene) = &gpu_scene {
+                            if scene.single_ink_run {
+                                crate::gpu_ink::emit_gpu_scene_phase(
+                                    p,
+                                    scene,
+                                    crate::gpu_ink::GpuInkPhase::BakedInk,
+                                );
+                            } else if let Some(range) = scene.ink_run_ranges.get(ink_run_cursor) {
+                                crate::gpu_ink::emit_gpu_scene_phase(
+                                    p,
+                                    scene,
+                                    crate::gpu_ink::GpuInkPhase::InkRunChunks {
+                                        start: range.start,
+                                        end: range.end,
+                                    },
+                                );
+                            }
+                        } else {
+                            emit_cpu_ink_run(p, &app.canvas_cache.committed, ink_run_cursor);
+                        }
+                        ink_run_cursor += 1;
+                    }
+                    papercraft_doc::PagePaintStep::Shape(idx) => {
+                        emit_committed_shape_index(p, &app.canvas_cache.shapes, *idx);
+                    }
+                    papercraft_doc::PagePaintStep::Text(idx) => {
+                        if let Some(ref tctx) = text_ctx {
+                            emit_committed_text_index(app, p, visible_clip, xf, tctx, *idx);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if !emitted_band1 {
+        if let Some(scene) = &gpu_scene {
+            crate::gpu_ink::emit_gpu_scene_phase(
+                p,
+                scene,
+                crate::gpu_ink::GpuInkPhase::FrameSyncAndHighlighters,
+            );
+        } else {
+            emit_cpu_highlighters(p, &app.canvas_cache.committed);
+            emit_cpu_live_highlighter(app);
+        }
+    }
+    if let Some(scene) = &gpu_scene
+        && scene.has_overlay_ink
+    {
+        crate::gpu_ink::emit_gpu_scene_phase(p, scene, crate::gpu_ink::GpuInkPhase::InkOverlay);
+    }
+    paint_shape_preview(app, p, xf, modifiers);
+}
+
+#[allow(dead_code)]
+fn paint_committed_images(
+    app: &mut PaperCraftApp,
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    _page_rect: Rect,
+    xf: Affine2,
+) {
+    if app.session.doc.images.is_empty() {
+        app.image_textures.clear();
+        return;
+    }
+    let mut order: Vec<usize> = (0..app.session.doc.images.len()).collect();
+    order.sort_by_key(|&idx| {
+        papercraft_doc::element_layer_rank(
+            papercraft_doc::LayerElementKind::Image,
+            app.session.doc.images[idx].z_order,
+            idx,
+        )
+    });
+    paint_committed_image_indices(app, ctx, painter, xf, &order);
 }
 
 fn smooth_laser_run(
@@ -9669,11 +9966,7 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
             } else {
                 draw_paper_template(app, &p, paper_colors, page_rect, xf);
             }
-            paint_committed_images(app, ui.ctx(), &p, page_rect, xf);
-            paint_committed_strokes(app, &p, avail, xf);
-            paint_committed_text(app, &p, xf, &t);
-            paint_committed_shapes(app, &p, xf);
-            paint_shape_preview(app, &p, xf, ui.input(|i| i.modifiers));
+            paint_committed_page_scene(app, ui.ctx(), &p, avail, xf, &t, ui.input(|i| i.modifiers));
             let snap_preview = ruler_snap_preview(app, ui, &resp, xf);
             paint_ruler(app, &p, xf, &t, snap_preview);
 
@@ -9707,7 +10000,7 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
                         ))
                     });
                     paint_shape_outline(
-                        &p.with_clip_rect(page_rect),
+                        &p,
                         shape,
                         xf,
                         app.view.zoom,
@@ -9725,7 +10018,7 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
                         FontId::proportional(11.5),
                         t.accent,
                     );
-                } else if !(app.wgpu_enabled && live.pen.kind == PenKind::Highlighter) {
+                } else if live.pen.kind != PenKind::Highlighter {
                     let preview = live.preview_samples();
                     let feather = (0.9 / app.view.zoom.max(0.25)).clamp(0.3, 2.5);
                     let mut display_pen = live.pen.clone();
@@ -9733,7 +10026,7 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
                         theme,
                         auto_contrast,
                         live.pen.color,
-                        matches!(live.pen.kind, papercraft_doc::PenKind::Highlighter),
+                        false,
                     );
                     paint_live_ribbon(&p, &display_pen, &preview, xf, feather);
                 }
@@ -10470,8 +10763,9 @@ mod tests {
                 .any(|s| count_meshes(s) > 0),
             "expected Dotted paper dots to batch into GPU mesh shapes"
         );
-        assert_eq!(app.canvas_cache.committed.batches.len(), 1);
-        let batch_ptr = Arc::as_ptr(&app.canvas_cache.committed.batches[0]);
+        assert_eq!(app.canvas_cache.committed.ink_runs.len(), 1);
+        assert_eq!(app.canvas_cache.committed.ink_runs[0].len(), 1);
+        let batch_ptr = Arc::as_ptr(&app.canvas_cache.committed.ink_runs[0][0]);
         assert_eq!(app.canvas_cache.committed.translate_steps, 0);
 
         // Cursor hover alone must reuse cached batches with zero rebuild or translation.
@@ -10483,7 +10777,7 @@ mod tests {
         );
         out_hover.drop_without_applying_deltas();
         assert_eq!(
-            Arc::as_ptr(&app.canvas_cache.committed.batches[0]),
+            Arc::as_ptr(&app.canvas_cache.committed.ink_runs[0][0]),
             batch_ptr
         );
         assert_eq!(app.canvas_cache.committed.translate_steps, 0);
@@ -13659,8 +13953,9 @@ mod tests {
     fn cached_shape_mesh_ptrs(app: &PaperCraftApp) -> Vec<*const Mesh> {
         app.canvas_cache
             .shapes
-            .shapes
+            .items
             .iter()
+            .flatten()
             .filter_map(|s| match s {
                 Shape::Mesh(m) => Some(Arc::as_ptr(m)),
                 _ => None,
@@ -13700,6 +13995,7 @@ mod tests {
                 Point::new(310.0, 210.0),
                 Point::new(190.0, 210.0),
             ],
+            z_order: 0,
         }));
         next.shapes.push(Arc::new(GeometricShape {
             kind: papercraft_doc::ShapeKind::Rectangle,
@@ -13714,6 +14010,7 @@ mod tests {
             fill_color: Some(papercraft_color::Color::from_rgba8(245, 225, 195, 180)),
             line_style: papercraft_doc::ShapeLineStyle::Solid,
             points: Vec::new(),
+            z_order: 0,
         }));
         next.shapes.push(Arc::new(GeometricShape {
             kind: papercraft_doc::ShapeKind::Line,
@@ -13728,6 +14025,7 @@ mod tests {
             fill_color: None,
             line_style: papercraft_doc::ShapeLineStyle::Dashed,
             points: Vec::new(),
+            z_order: 0,
         }));
         // Off-screen shape exercises broadphase culling and `rect_contains_rect` pan checks.
         next.shapes.push(Arc::new(GeometricShape {
@@ -13743,6 +14041,7 @@ mod tests {
             fill_color: None,
             line_style: papercraft_doc::ShapeLineStyle::Solid,
             points: Vec::new(),
+            z_order: 0,
         }));
         next.sync_active_to_pages();
         app.session.doc = Arc::new(next);
@@ -13798,6 +14097,7 @@ mod tests {
                 Point::new(100.0, 100.0),
                 Point::new(0.0, 100.0),
             ],
+            z_order: 0,
         };
         for item in
             std::iter::once(&rounded_rect).chain(app.session.doc.shapes.iter().map(AsRef::as_ref))
@@ -13823,7 +14123,7 @@ mod tests {
             vec![egui::Event::PointerMoved(pos2(720.0, 420.0))],
         );
         assert!(app.canvas_cache.shapes.key.is_some());
-        assert!(!app.canvas_cache.shapes.shapes.is_empty());
+        assert!(app.canvas_cache.shapes.items.iter().any(|s| !s.is_empty()));
         assert_eq!(app.canvas_cache.shapes.translate_steps, 0);
         assert!(app.canvas_cache.texts.key.is_some());
         assert!(!app.canvas_cache.texts.items.is_empty());
@@ -13921,18 +14221,20 @@ mod tests {
                 .is_some()
         );
         run_editor_frame(&ctx, &mut app, 0.016, Vec::new());
-        assert_eq!(app.canvas_cache.committed.batches.len(), 1);
-        let batch_ptr_before = Arc::as_ptr(&app.canvas_cache.committed.batches[0]);
-        let verts_before = app.canvas_cache.committed.batches[0].vertices.len();
+        assert_eq!(app.canvas_cache.committed.ink_runs.len(), 1);
+        assert_eq!(app.canvas_cache.committed.ink_runs[0].len(), 1);
+        let batch_ptr_before = Arc::as_ptr(&app.canvas_cache.committed.ink_runs[0][0]);
+        let verts_before = app.canvas_cache.committed.ink_runs[0][0].vertices.len();
 
         assert!(app.session.commit_raw_stroke(pen, mk_pts(260.0)).is_some());
         run_editor_frame(&ctx, &mut app, 0.032, Vec::new());
-        assert_eq!(app.canvas_cache.committed.batches.len(), 1);
+        assert_eq!(app.canvas_cache.committed.ink_runs.len(), 1);
+        assert_eq!(app.canvas_cache.committed.ink_runs[0].len(), 1);
         assert_eq!(
-            Arc::as_ptr(&app.canvas_cache.committed.batches[0]),
+            Arc::as_ptr(&app.canvas_cache.committed.ink_runs[0][0]),
             batch_ptr_before
         );
-        assert!(app.canvas_cache.committed.batches[0].vertices.len() > verts_before);
+        assert!(app.canvas_cache.committed.ink_runs[0][0].vertices.len() > verts_before);
     }
 
     #[test]
@@ -15855,5 +16157,231 @@ mod tests {
         } else {
             assert!(img_reenter.is_none());
         }
+    }
+
+    #[test]
+    fn shape_can_start_and_extend_outside_page_bounds_while_thumbnail_stays_cropped_to_sheet() {
+        let ctx = egui::Context::default();
+        let mut app = setup_editor_app(&ctx);
+        app.view.shape_insert_mode = true;
+        app.view.selected_shape_kind = ShapeKind::Rectangle;
+        app.view.fit_requested = false;
+        app.view.motion.camera_glide = None;
+
+        // First frame to capture canvas layout & fitted pan/zoom.
+        run_editor_frame_with_hooks(&ctx, &mut app, 0.016, Vec::new())
+            .drop_without_applying_deltas();
+        let canvas_rect = app.view.last_canvas_rect.expect("canvas rect recorded");
+        // Align page left edge `(x = 0.0)` with `canvas_rect.center().x` so both
+        // an off-page start `(-80.0, 80.0)` and an in-page end `(140.0, 260.0)` sit inside `canvas_rect`.
+        app.view.zoom = 0.5;
+        app.session.zoom = 0.5;
+        app.view.pan = [
+            f64::from(canvas_rect.center().x),
+            f64::from(canvas_rect.top()) + 40.0,
+        ];
+        run_editor_frame_with_hooks(&ctx, &mut app, 0.032, Vec::new())
+            .drop_without_applying_deltas();
+
+        let xf = page_affine(&app);
+        let p_start = xf.to_screen(Point::new(-80.0, 80.0));
+        let p_end = xf.to_screen(Point::new(140.0, 260.0));
+        let scr_start = pos2(p_start.x as f32, p_start.y as f32);
+        let scr_end = pos2(p_end.x as f32, p_end.y as f32);
+        assert!(
+            canvas_rect.contains(scr_start) && canvas_rect.contains(scr_end),
+            "off-page start & in-page end must both be inside interactive canvas rect"
+        );
+
+        let preview_out = run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.048,
+            vec![
+                egui::Event::PointerMoved(scr_start),
+                egui::Event::PointerButton {
+                    pos: scr_start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(scr_end),
+            ],
+        );
+        // Mid-drag preview must extend left of page_rect (not clipped to page boundary!).
+        let page_left_x = xf.offset_x as f32;
+        let has_overhang_preview = preview_out.shapes.iter().any(|cs| {
+            let mut min_x = f32::INFINITY;
+            fn scan_min_x(shape: &egui::Shape, min_x: &mut f32) {
+                match shape {
+                    egui::Shape::Mesh(m) => {
+                        for v in &m.vertices {
+                            *min_x = min_x.min(v.pos.x);
+                        }
+                    }
+                    egui::Shape::Path(p) => {
+                        for pt in &p.points {
+                            *min_x = min_x.min(pt.x);
+                        }
+                    }
+                    egui::Shape::Vec(v) => v.iter().for_each(|c| scan_min_x(c, min_x)),
+                    _ => {}
+                }
+            }
+            scan_min_x(&cs.shape, &mut min_x);
+            min_x < page_left_x - 20.0
+        });
+        preview_out.drop_without_applying_deltas();
+        assert!(
+            has_overhang_preview,
+            "interactive shape preview must remain visible outside the white page border"
+        );
+
+        run_editor_frame_with_hooks(
+            &ctx,
+            &mut app,
+            0.064,
+            vec![egui::Event::PointerButton {
+                pos: scr_end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        )
+        .drop_without_applying_deltas();
+
+        assert_eq!(app.session.doc.shapes.len(), 1);
+        let committed = &app.session.doc.shapes[0];
+        assert!(
+            (committed.x1 - (-80.0)).abs() < 2.0 && (committed.x2 - 140.0).abs() < 2.0,
+            "shape coordinates must not clamp to page boundary: got x1={}, x2={}",
+            committed.x1,
+            committed.x2
+        );
+    }
+
+    #[test]
+    fn canvas_hit_testing_selects_most_recently_drawn_overlapping_element() {
+        let ctx = egui::Context::default();
+        let mut app = setup_editor_app(&ctx);
+        crate::activate_select_tool(&mut app);
+
+        // Case A: Draw Line Shape 0 FIRST, then crossing FountainPen Stroke SECOND -> Stroke wins at `(200, 210)`.
+        app.session
+            .execute(
+                "shape.insert",
+                &serde_json::json!({
+                    "kind": "Line",
+                    "x1": 140.0,
+                    "y1": 200.0,
+                    "x2": 260.0,
+                    "y2": 220.0,
+                }),
+            )
+            .unwrap();
+        let stroke_top = app
+            .session
+            .execute(
+                "stroke.draw",
+                &serde_json::json!({
+                    "kind": "FountainPen",
+                    "points": [
+                        { "x": 140.0, "y": 220.0, "pressure": 0.7 },
+                        { "x": 260.0, "y": 200.0, "pressure": 0.7 }
+                    ]
+                }),
+            )
+            .unwrap()["strokeId"]
+            .as_u64()
+            .unwrap();
+
+        // Case B: Draw FountainPen Stroke FIRST, then crossing Line Shape 1 SECOND -> Shape 1 wins at `(400, 210)`.
+        app.session
+            .execute(
+                "stroke.draw",
+                &serde_json::json!({
+                    "kind": "FountainPen",
+                    "points": [
+                        { "x": 340.0, "y": 220.0, "pressure": 0.7 },
+                        { "x": 460.0, "y": 200.0, "pressure": 0.7 }
+                    ]
+                }),
+            )
+            .unwrap();
+        app.session
+            .execute(
+                "shape.insert",
+                &serde_json::json!({
+                    "kind": "Line",
+                    "x1": 340.0,
+                    "y1": 200.0,
+                    "x2": 460.0,
+                    "y2": 220.0,
+                }),
+            )
+            .unwrap();
+
+        // Case C: Overlapping filled squares of equal size -> newer Shape 3 wins at `(275, 400)`.
+        for x_offset in [200.0_f64, 230.0_f64] {
+            app.session
+                .execute(
+                    "shape.insert",
+                    &serde_json::json!({
+                        "kind": "Rectangle",
+                        "x1": x_offset,
+                        "y1": 340.0,
+                        "x2": x_offset + 120.0,
+                        "y2": 460.0,
+                        "fill_color": papercraft_color::Color::from_rgba8(0x44, 0x88, 0xCC, 255),
+                    }),
+                )
+                .unwrap();
+        }
+
+        // Render once so caches populate cleanly.
+        run_editor_frame_with_hooks(&ctx, &mut app, 0.016, Vec::new())
+            .drop_without_applying_deltas();
+
+        let xf = page_affine(&app);
+        let click_at = |ctx: &egui::Context, app: &mut PaperCraftApp, t: f64, px: f64, py: f64| {
+            let s = xf.to_screen(Point::new(px, py));
+            let pos = pos2(s.x as f32, s.y as f32);
+            run_editor_frame_with_hooks(
+                ctx,
+                app,
+                t,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            )
+            .drop_without_applying_deltas();
+        };
+
+        // At `(200, 210)`, stroke_top (`z=2`) was drawn AFTER Shape 0 (`z=1`) -> must win!
+        click_at(&ctx, &mut app, 0.032, 200.0, 210.0);
+        assert_eq!(
+            app.view.selected_object,
+            Some(SelectedObject::Stroke(StrokeId(stroke_top)))
+        );
+
+        // At `(400, 210)`, Shape 1 (`z=4`) was drawn AFTER the second stroke (`z=3`) -> Shape 1 must win!
+        click_at(&ctx, &mut app, 0.048, 400.0, 210.0);
+        assert_eq!(app.view.selected_object, Some(SelectedObject::Shape(1)));
+
+        // At `(275, 400)`, filled Shape 3 (`z=6`) sits on top of same-sized filled Shape 2 (`z=5`).
+        click_at(&ctx, &mut app, 0.064, 275.0, 400.0);
+        assert_eq!(app.view.selected_object, Some(SelectedObject::Shape(3)));
     }
 }

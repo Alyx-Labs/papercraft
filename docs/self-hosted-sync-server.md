@@ -72,7 +72,7 @@ If you want to run your own sync server with zero command-line flags or environm
   - The tray icon shows a live status dot (**green** = running, **slate** = stopped, **red** = error).
   - **Left-click** the tray icon to open and focus the control window; **right-click** to open the tray menu (`Open Control Window`, `Hide Window`, `Start Server` / `Stop Server`, `Restart Server`, `Copy Server Address`, `Open Data Folder`, `Quit PaperCraft Server`).
   - Closing the control window (`X` or **Hide to Tray**) hides the window while keeping the sync server running in the background. Choose **Quit** (or **Quit PaperCraft Server** in the tray menu) to flush `redb` and exit cleanly.
-- **Launch automatically at system startup**: Enabled by default under **App Updates & System**, registering per-user login startup with `--autostart` so PaperCraft Server opens quietly in the system tray at sign-in (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` on Windows, `~/Library/LaunchAgents/com.alyxlabs.papercraft.server.plist` on macOS, and `~/.config/autostart/papercraft-server.desktop` on Linux).
+- **Launch automatically at system startup**: Enabled by default under **App Updates & System**, registering per-user login startup with `--autostart` (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` on Windows, `~/Library/LaunchAgents/com.alyxlabs.papercraft.server.plist` on macOS, and `~/.config/autostart/papercraft-server.desktop` on Linux). By default it runs quietly in the system tray until you open the window manually; check **Open control window at system startup** if you want the window to appear at sign-in.
 - **Safe setting updates**: Edits save automatically to `server_control_config.json` next to the executable. When runtime settings change while the server is running, a banner prompts you with **Apply & Restart** or **Revert**.
 
 ### Plain-English Settings Mapping (`server_control_config.json`)
@@ -92,6 +92,7 @@ Every control in `papercraft-server` maps directly to `server_control_config.jso
 | **Check for updates automatically on startup** *(App Updates & System)* | `auto_check_updates` | `true` | — (GUI update check) |
 | **Create Desktop shortcut automatically** *(App Updates & System)* | `auto_create_desktop_shortcut` | `true` | — (GUI Desktop shortcut sync) |
 | **Launch automatically at system startup** *(App Updates & System)* | `launch_at_login` | `true` | `--autostart` (OS per-user login autostart) |
+| **Open control window at system startup** *(App Updates & System)* | `open_window_at_login` | `false` | — (Controls whether `--autostart` opens the window or stays hidden in tray) |
 | **Light / Dark theme toggle** (header icon) | `theme` | `"Dark"` (`"Light"` / `"Dark"`) | — (GUI appearance) |
 
 - **Environment variable import on first launch**: If `server_control_config.json` does not yet exist when `papercraft-server` first starts, any `PAPERCRAFT_*` (or legacy `NOTECRAFT_*`) environment variables already set in your environment are imported automatically as initial defaults.

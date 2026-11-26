@@ -856,24 +856,89 @@ pub fn render_document(
             pixel_width: surface.width(),
             pixel_height: surface.height(),
             png_bytes: std::sync::Arc::clone(&tpl.png_bytes),
+            z_order: 0,
         };
         draw_page_image(&mut surface, &bg_img);
     } else {
         render_paper(&mut surface, doc);
     }
-    for image in &doc.images {
-        draw_page_image(&mut surface, image);
+    let live_is_hl =
+        live_stroke.is_some_and(|(pen, _)| pen.kind == papercraft_doc::PenKind::Highlighter);
+    let mut drew_live_hl = false;
+    for step in doc.page_paint_steps() {
+        match step {
+            papercraft_doc::PagePaintStep::Images(indices) => {
+                for idx in indices {
+                    if let Some(image) = doc.images.get(idx) {
+                        draw_page_image(&mut surface, image);
+                    }
+                }
+            }
+            papercraft_doc::PagePaintStep::Highlighters(indices) => {
+                for idx in indices {
+                    if let Some(stroke) = doc.strokes.get(idx) {
+                        render_stroke_to_surface(
+                            &mut surface,
+                            &stroke.pen,
+                            &stroke.smoothed_points,
+                        );
+                    }
+                }
+                if live_is_hl
+                    && !drew_live_hl
+                    && let Some((pen, samples)) = live_stroke
+                {
+                    render_stroke_to_surface(&mut surface, pen, samples);
+                    drew_live_hl = true;
+                }
+            }
+            papercraft_doc::PagePaintStep::InkRun(indices) => {
+                if live_is_hl
+                    && !drew_live_hl
+                    && let Some((pen, samples)) = live_stroke
+                {
+                    render_stroke_to_surface(&mut surface, pen, samples);
+                    drew_live_hl = true;
+                }
+                for idx in indices {
+                    if let Some(stroke) = doc.strokes.get(idx) {
+                        render_stroke_to_surface(
+                            &mut surface,
+                            &stroke.pen,
+                            &stroke.smoothed_points,
+                        );
+                    }
+                }
+            }
+            papercraft_doc::PagePaintStep::Text(idx) => {
+                if live_is_hl
+                    && !drew_live_hl
+                    && let Some((pen, samples)) = live_stroke
+                {
+                    render_stroke_to_surface(&mut surface, pen, samples);
+                    drew_live_hl = true;
+                }
+                if let Some(item) = doc.texts.get(idx) {
+                    draw_text_item(&mut surface, doc.width, item);
+                }
+            }
+            papercraft_doc::PagePaintStep::Shape(idx) => {
+                if live_is_hl
+                    && !drew_live_hl
+                    && let Some((pen, samples)) = live_stroke
+                {
+                    render_stroke_to_surface(&mut surface, pen, samples);
+                    drew_live_hl = true;
+                }
+                if let Some(shape) = doc.shapes.get(idx) {
+                    draw_shape(&mut surface, shape);
+                }
+            }
+        }
     }
-    for stroke in &doc.strokes {
-        render_stroke_to_surface(&mut surface, &stroke.pen, &stroke.smoothed_points);
-    }
-    for item in &doc.texts {
-        draw_text_item(&mut surface, doc.width, item);
-    }
-    for shape in &doc.shapes {
-        draw_shape(&mut surface, shape);
-    }
-    if let Some((pen, samples)) = live_stroke {
+    if let Some((pen, samples)) = live_stroke
+        && (!live_is_hl || !drew_live_hl)
+    {
         render_stroke_to_surface(&mut surface, pen, samples);
     }
     surface
@@ -1025,6 +1090,7 @@ mod tests {
             pixel_width: 2,
             pixel_height: 2,
             png_bytes: Arc::new(png_bytes),
+            z_order: 0,
         }));
 
         let id = doc.alloc_stroke_id();
@@ -1093,5 +1159,86 @@ mod tests {
         let surface = render_document(&doc, None);
         assert_eq!(surface.pixel_u8(100, 15), [220, 30, 30, 255]);
         assert_eq!(surface.pixel_u8(100, 85), [30, 30, 220, 255]);
+    }
+
+    #[test]
+    fn cpu_compositor_renders_draw_order_keeps_highlighter_below_foreground_and_clips_to_sheet() {
+        use papercraft_doc::{GeometricShape, PenKind, ShapeKind};
+
+        let mut doc = Document::new(240, 200);
+        doc.paper_color = PaperColor::PureWhite;
+
+        // 1. Filled red rectangle crossing left boundary (`-40..120`), z_order = 1.
+        doc.shapes.push(Arc::new(GeometricShape {
+            kind: ShapeKind::Rectangle,
+            x1: -40.0,
+            y1: 60.0,
+            x2: 120.0,
+            y2: 140.0,
+            fill_color: Some(Color::from_rgba8(220, 30, 30, 255)),
+            color: Color::from_rgba8(220, 30, 30, 255),
+            width: 2.0,
+            z_order: 1,
+            ..GeometricShape::default()
+        }));
+
+        // 2. Blue ink stroke drawn AFTER square across `(40, 100)..(160, 100)`, z_order = 2.
+        let mut pen_blue = PenSettings::ball_pen();
+        pen_blue.color = Color::from_rgba8(20, 60, 230, 255);
+        pen_blue.size = 10.0;
+        let blue_id = doc.alloc_stroke_id();
+        let blue_pts = vec![
+            StrokeSample::from_xy_pressure(40.0, 100.0, 1.0),
+            StrokeSample::from_xy_pressure(160.0, 100.0, 1.0),
+        ];
+        doc.strokes.push(Arc::new(
+            InkStroke::new(blue_id, pen_blue, blue_pts.clone(), blue_pts).with_z_order(2),
+        ));
+
+        // 3. Green filled circle drawn AFTER blue stroke at `(100, 100)` region (`90..150, 75..125`), z_order = 3.
+        doc.shapes.push(Arc::new(GeometricShape {
+            kind: ShapeKind::Ellipse,
+            x1: 90.0,
+            y1: 75.0,
+            x2: 150.0,
+            y2: 125.0,
+            fill_color: Some(Color::from_rgba8(20, 190, 60, 255)),
+            color: Color::from_rgba8(20, 190, 60, 255),
+            width: 2.0,
+            z_order: 3,
+            ..GeometricShape::default()
+        }));
+
+        // 4. Yellow highlighter drawn LAST across `(10, 40)..(210, 40)` and overlapping shapes, z_order = 4.
+        let mut hl = PenSettings {
+            kind: PenKind::Highlighter,
+            size: 32.0,
+            color: Color::from_rgba8(255, 230, 0, 160),
+            ..PenSettings::default()
+        };
+        hl.pressure_enabled = false;
+        let hl_id = doc.alloc_stroke_id();
+        let hl_pts = vec![
+            StrokeSample::from_xy_pressure(10.0, 65.0, 1.0),
+            StrokeSample::from_xy_pressure(210.0, 65.0, 1.0),
+        ];
+        doc.strokes.push(Arc::new(
+            InkStroke::new(hl_id, hl, hl_pts.clone(), hl_pts).with_z_order(4),
+        ));
+
+        let surface = render_document(&doc, None);
+        assert_eq!(surface.width(), 240);
+        assert_eq!(surface.height(), 200);
+        // Inside red square away from blue line & green ellipse (`x=60, y=120`) -> solid red
+        assert_eq!(surface.pixel_u8(60, 120), [220, 30, 30, 255]);
+        // At `(60, 100)`: blue ink stroke sits ON TOP of red square!
+        assert_eq!(surface.pixel_u8(60, 100), [20, 60, 230, 255]);
+        // At `(115, 100)`: green ellipse sits ON TOP of BOTH red square and blue ink!
+        assert_eq!(surface.pixel_u8(115, 100), [20, 190, 60, 255]);
+        // At `(40, 65)`: opaque red square (`z=1`) sits ON TOP of yellow highlighter (`z=4`)!
+        assert_eq!(surface.pixel_u8(40, 65), [220, 30, 30, 255]);
+        // Outside square on paper `(180, 65)`: highlighter is visible on paper!
+        let hl_px = surface.pixel_u8(180, 65);
+        assert!(hl_px[0] > 240 && hl_px[1] > 220 && hl_px[2] < 160);
     }
 }

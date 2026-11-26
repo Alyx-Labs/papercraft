@@ -874,7 +874,7 @@ fn render_autostart_section(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &
         ui,
         "srv_autostart_switch",
         "Launch automatically at system startup",
-        "Start PaperCraft Server quietly in the system tray when you sign in to your computer.",
+        "Start PaperCraft Server automatically when you sign in to your computer.",
         &mut autostart_on,
         t,
     );
@@ -896,6 +896,34 @@ fn render_autostart_section(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &
         ui.add_space(4.0);
         ui.add(egui::Label::new(egui::RichText::new(msg).size(11.0).color(t.danger_fg)).wrap());
     }
+
+    ui.add_space(6.0);
+    let autostart_enabled = ctrl.draft_settings.launch_at_login;
+    let title_color = if autostart_enabled {
+        t.text
+    } else {
+        t.text_muted
+    };
+    ui.indent("srv_autostart_window_indent", |ui| {
+        ui.add_enabled_ui(autostart_enabled, |ui| {
+            ui.checkbox(
+                &mut ctrl.draft_settings.open_window_at_login,
+                egui::RichText::new("Open control window at system startup")
+                    .size(12.0)
+                    .color(title_color),
+            );
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "Leave unchecked to keep PaperCraft Server hidden in the system tray when your computer starts. Open it anytime from the tray icon.",
+                    )
+                    .size(11.0)
+                    .color(t.text_muted),
+                )
+                .wrap(),
+            );
+        });
+    });
 }
 
 fn render_update_status_details(
@@ -1932,7 +1960,7 @@ fn render_advanced_card(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Toke
         );
         ui.label(
             egui::RichText::new(
-                "Also hides this window on manual launches (automatic system startup always opens quietly in the tray).",
+                "Hides this window on manual launches too (use \"Open control window at system startup\" below to control sign-in launches).",
             )
             .size(11.0)
             .color(t.text_muted),
@@ -2965,5 +2993,126 @@ mod tests {
         let (reloaded, warning) = crate::settings::ServerControlSettings::load_or_init(&cfg_path);
         assert!(warning.is_none());
         assert!(reloaded.launch_at_login);
+    }
+
+    #[test]
+    fn autostart_window_checkbox_renders_below_autostart_and_persists_when_enabled() {
+        let dir = temp_dir("autostart-window-checkbox");
+        let cfg_path = dir.0.join(CONFIG_FILE_NAME);
+        let settings = crate::settings::ServerControlSettings {
+            data_dir: dir.0.join("vault").to_string_lossy().into_owned(),
+            port: 18950,
+            auto_start_server: false,
+            theme: UiTheme::Dark,
+            ..Default::default()
+        };
+        settings.save_atomic(&cfg_path).unwrap();
+
+        let mut ctrl = ServerController::new(cfg_path.clone(), false);
+        assert!(ctrl.draft_settings.launch_at_login);
+        assert!(!ctrl.draft_settings.open_window_at_login);
+
+        let find_rect = |shapes: &[egui::epaint::ClippedShape], needle: &str| -> Option<Rect> {
+            fn visit(shape: &Shape, needle: &str) -> Option<Rect> {
+                match shape {
+                    Shape::Text(t) if t.galley.text().contains(needle) => {
+                        Some(Rect::from_min_size(t.pos, t.galley.size()))
+                    }
+                    Shape::Vec(items) => items.iter().find_map(|s| visit(s, needle)),
+                    _ => None,
+                }
+            }
+            shapes.iter().find_map(|c| visit(&c.shape, needle))
+        };
+
+        let ctx = egui::Context::default();
+        apply_visuals(&ctx, ctrl.theme());
+        let tokens = Tokens::for_theme(ctrl.theme());
+        let idle = papercraft_updater::UpdateStatus::Idle;
+        let run_frame = |ctrl: &mut ServerController, t: f64, events: Vec<egui::Event>| {
+            let out = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(620.0, 1750.0))),
+                    time: Some(t),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let _ = render_window_with_update_status(ctrl, ui, &tokens, &idle);
+                },
+            );
+            let shapes = out.shapes.clone();
+            out.drop_without_applying_deltas();
+            shapes
+        };
+
+        let _ = run_frame(&mut ctrl, 1.0, Vec::new());
+        let shapes = run_frame(&mut ctrl, 1.05, Vec::new());
+        let y_autostart = find_text_y(&shapes, "Launch automatically at system startup").unwrap();
+        let chk_rect = find_rect(&shapes, "Open control window at system startup").unwrap();
+        assert!(y_autostart < chk_rect.min.y);
+
+        // Clicking when `launch_at_login` is enabled toggles and saves `open_window_at_login`.
+        let pos = chk_rect.center();
+        let _ = run_frame(
+            &mut ctrl,
+            1.10,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let shapes_checked = run_frame(
+            &mut ctrl,
+            1.14,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(ctrl.draft_settings.open_window_at_login);
+
+        let (reloaded, warning) = crate::settings::ServerControlSettings::load_or_init(&cfg_path);
+        assert!(warning.is_none());
+        assert!(reloaded.open_window_at_login);
+
+        // When `launch_at_login` is disabled, clicking the checkbox does not toggle it.
+        ctrl.set_launch_at_login_enabled(false);
+        let shapes_disabled = run_frame(&mut ctrl, 1.20, Vec::new());
+        let pos_disabled = find_rect(&shapes_disabled, "Open control window at system startup")
+            .unwrap()
+            .center();
+        let _ = run_frame(
+            &mut ctrl,
+            1.25,
+            vec![
+                egui::Event::PointerMoved(pos_disabled),
+                egui::Event::PointerButton {
+                    pos: pos_disabled,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = run_frame(
+            &mut ctrl,
+            1.29,
+            vec![egui::Event::PointerButton {
+                pos: pos_disabled,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(ctrl.draft_settings.open_window_at_login);
+        let _ = shapes_checked;
     }
 }

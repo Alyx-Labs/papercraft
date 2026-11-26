@@ -752,6 +752,29 @@ fn hash_page_into(hasher: &mut Sha256, page: &NotebookPage) {
             }
         }
     }
+    let has_layer_z = page.strokes.iter().any(|s| s.z_order > 0)
+        || page.texts.iter().any(|t| t.z_order > 0)
+        || page.shapes.iter().any(|s| s.z_order > 0)
+        || page.images.iter().any(|im| im.z_order > 0);
+    if has_layer_z {
+        hasher.update([0xD6]);
+        hasher.update((page.strokes.len() as u64).to_le_bytes());
+        for stroke in &page.strokes {
+            hasher.update(stroke.z_order.to_le_bytes());
+        }
+        hasher.update((page.texts.len() as u64).to_le_bytes());
+        for text in &page.texts {
+            hasher.update(text.z_order.to_le_bytes());
+        }
+        hasher.update((page.shapes.len() as u64).to_le_bytes());
+        for shape in &page.shapes {
+            hasher.update(shape.z_order.to_le_bytes());
+        }
+        hasher.update((page.images.len() as u64).to_le_bytes());
+        for img in &page.images {
+            hasher.update(img.z_order.to_le_bytes());
+        }
+    }
 }
 
 fn hash_document_body_into(hasher: &mut Sha256, doc: &Document) {

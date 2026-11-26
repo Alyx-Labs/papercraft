@@ -69,9 +69,14 @@ jobs:
             local appdir="${bin_name}.AppDir"
 
             rm -rf "${appdir}"
-            mkdir -p "${appdir}/usr/bin" "${appdir}/usr/share/icons/hicolor/256x256/apps"
+            mkdir -p "${appdir}/usr/bin" "${appdir}/usr/share/icons/hicolor/256x256/apps" "${appdir}/usr/share/licenses/${bin_name}"
             cp "${bin_src}" "${appdir}/usr/bin/${bin_name}"
             chmod +x "${appdir}/usr/bin/${bin_name}"
+            cp LICENSE-MIT LICENSE-APACHE NOTICE ATTRIBUTION.md apps/papercraft/assets/branding/LICENSE-brand.txt \
+              "${appdir}/usr/share/licenses/${bin_name}/"
+            cp crates/compose/assets/fonts/LICENSE "${appdir}/usr/share/licenses/${bin_name}/Roboto-LICENSE.txt"
+            cp crates/ui-egui/assets/fonts/OFL.txt "${appdir}/usr/share/licenses/${bin_name}/BricolageGrotesque-OFL.txt"
+            cp crates/ui-egui/assets/icons/lucide/LICENSE "${appdir}/usr/share/licenses/${bin_name}/Lucide-LICENSE.txt"
 
             # TODO(branding): Use a dedicated papercraft-server icon PNG once designed.
             cp apps/papercraft/assets/branding/papercraft-256.png "${appdir}/${bin_name}.png"
@@ -146,12 +151,17 @@ jobs:
             local app_bundle="${stage}/${app_name}.app"
 
             rm -rf "${stage}" "${out_dmg}" "${out_tar}"
-            mkdir -p "${app_bundle}/Contents/MacOS" "${app_bundle}/Contents/Resources"
+            mkdir -p "${app_bundle}/Contents/MacOS" "${app_bundle}/Contents/Resources/licenses"
             cp "${bin_src}" "${app_bundle}/Contents/MacOS/${bin_name}"
             chmod +x "${app_bundle}/Contents/MacOS/${bin_name}"
             # TODO(branding): Use a dedicated papercraft-server.icns icon once designed.
             cp apps/papercraft/assets/branding/papercraft.icns \
               "${app_bundle}/Contents/Resources/papercraft.icns"
+            cp LICENSE-MIT LICENSE-APACHE NOTICE ATTRIBUTION.md apps/papercraft/assets/branding/LICENSE-brand.txt \
+              "${app_bundle}/Contents/Resources/licenses/"
+            cp crates/compose/assets/fonts/LICENSE "${app_bundle}/Contents/Resources/licenses/Roboto-LICENSE.txt"
+            cp crates/ui-egui/assets/fonts/OFL.txt "${app_bundle}/Contents/Resources/licenses/BricolageGrotesque-OFL.txt"
+            cp crates/ui-egui/assets/icons/lucide/LICENSE "${app_bundle}/Contents/Resources/licenses/Lucide-LICENSE.txt"
 
             cat > "${app_bundle}/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -251,8 +261,12 @@ jobs:
         run: trunk build --release
       - name: Package web bundle
         run: |
-          mkdir -p web-pkg
+          mkdir -p web-pkg/licenses
           cp -r dist/* web-pkg/
+          cp LICENSE-MIT LICENSE-APACHE NOTICE ATTRIBUTION.md apps/papercraft/assets/branding/LICENSE-brand.txt web-pkg/licenses/
+          cp crates/compose/assets/fonts/LICENSE web-pkg/licenses/Roboto-LICENSE.txt
+          cp crates/ui-egui/assets/fonts/OFL.txt web-pkg/licenses/BricolageGrotesque-OFL.txt
+          cp crates/ui-egui/assets/icons/lucide/LICENSE web-pkg/licenses/Lucide-LICENSE.txt
           (cd web-pkg && zip -r ../papercraft-web.zip .)
       - uses: actions/upload-artifact@v4
         with:

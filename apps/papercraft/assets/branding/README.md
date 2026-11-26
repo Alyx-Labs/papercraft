@@ -10,3 +10,7 @@ the desktop window icon. The Windows `.ico` is embedded in the executable by
 `build.rs`.
 
 The generator is part of the Rust workspace and needs no separate image tools.
+
+## Trademark & Brand License
+
+All files in this directory are proprietary brand assets of **Alyx Labs** and are **not** covered by PaperCraft's `MIT OR Apache-2.0` code license. See [`LICENSE-brand.txt`](LICENSE-brand.txt) before redistributing, modifying, or forking PaperCraft.

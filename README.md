@@ -450,4 +450,12 @@ The optional sync server hashes account passwords with Argon2id, stores token ha
 
 ## License
 
-PaperCraft is available under either the [MIT License](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option. Vendored icons and the embedded font retain their separate license notices in their asset directories.
+PaperCraft's source code is available under either the [MIT License](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option.
+
+### Brand & Trademarks
+
+The **Alyx Labs**, **PaperCraft**, **Paper Craft**, and **PaperCraft Server** names, wordmarks, official domains (`papercraft.ink`, `web.papercraft.ink`), bundle identifiers (`com.alyxlabs.*`), brand artwork in [`apps/papercraft/assets/branding/`](apps/papercraft/assets/branding/), and brand illustration in [`crates/ui-egui/assets/illustrations/welcome-sea.png`](crates/ui-egui/assets/illustrations/welcome-sea.png) are proprietary trademarks and brand assets of **Alyx Labs**. They are **not** open source and are governed separately by [`LICENSE-brand.txt`](apps/papercraft/assets/branding/LICENSE-brand.txt). If you distribute a fork or modified build, you must remove or replace these brand assets and use your own name and logo.
+
+### Third-Party Notices
+
+Vendored icons, embedded fonts, and other third-party materials retain their separate licenses, summarized in [`NOTICE`](NOTICE) and detailed in [`ATTRIBUTION.md`](ATTRIBUTION.md).

@@ -1635,15 +1635,23 @@ fn draw_sidebar_footer(ui: &mut egui::Ui, t: &Tokens) -> bool {
         Sense::hover(),
     );
     let row_rect = Rect::from_min_max(pos2(rect.left(), rect.top() + 6.0), rect.right_bottom());
-    let version_text = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let version_text = crate::display_version_label();
     let version_color = t.text_muted.gamma_multiply(0.75);
     let version_galley =
         ui.painter()
             .layout_no_wrap(version_text, FontId::proportional(10.5), version_color);
+    let version_size = version_galley.size();
     let version_pos = pos2(
-        row_rect.right() - version_galley.size().x,
-        row_rect.center().y - version_galley.size().y * 0.5,
+        row_rect.right() - version_size.x,
+        row_rect.center().y - version_size.y * 0.5,
     );
+    let version_rect = Rect::from_min_size(version_pos, version_size);
+    ui.interact(
+        version_rect,
+        ui.make_persistent_id("papercraft_home_sidebar_version_info"),
+        Sense::hover(),
+    )
+    .on_hover_text(crate::ALPHA_STATUS_TOOLTIP);
 
     let icon_dim = 12.5_f32;
     let icon_gap = 5.0_f32;
@@ -2678,8 +2686,8 @@ mod tests {
         let mut app = PaperCraftApp::new(papercraft_engine::Session::default(), hooks);
         let ctx = egui::Context::default();
         let viewport = Vec2::new(1280.0, 800.0);
-        let expected_version = format!("v{}", env!("CARGO_PKG_VERSION"));
-        assert_eq!(expected_version, "v0.5.1");
+        let expected_version = crate::display_version_label();
+        assert_eq!(expected_version, "v0.5.1 · Unstable Alpha");
 
         let mut sidebar_rect = Rect::NOTHING;
         let mut website_rect = None;

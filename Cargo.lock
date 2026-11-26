@@ -3139,6 +3139,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tray-icon",
+ "winit",
  "winres",
 ]
 

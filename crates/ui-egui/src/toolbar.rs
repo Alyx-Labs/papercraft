@@ -6058,93 +6058,122 @@ fn paint_element_preview(
     let oy = rect.center().y - h * scale * 0.5;
     let to_pos = |pt: Point| egui::pos2(ox + (pt.x as f32) * scale, oy + (pt.y as f32) * scale);
 
-    if !el.images.is_empty() {
-        let clipped = painter.with_clip_rect(rect);
-        for image in &el.images {
-            let clean = image.sanitized();
-            let Some(handle) =
-                crate::canvas::cached_page_image_texture(ui.ctx(), "papercraft_elem_prev", image)
-            else {
-                continue;
-            };
-            let corners_page = clean.corners();
-            let corners = [
-                to_pos(corners_page[0]),
-                to_pos(corners_page[1]),
-                to_pos(corners_page[2]),
-                to_pos(corners_page[3]),
-            ];
-            crate::canvas::paint_textured_image_quad(&clipped, handle.id(), corners);
-        }
-    }
-
-    for shape in &el.shapes {
-        let shape = shape.sanitized();
-        let stroke_c =
-            to_color32(paper_color.resolve_ink_color(theme, auto_contrast, shape.color, false));
-        let fill_c = shape
-            .fill_color
-            .map(|fc| to_color32(paper_color.resolve_ink_color(theme, auto_contrast, fc, false)));
-        let sw = (shape.width * scale).clamp(1.0, 2.5);
-        for (points, closed) in shape.path_segments() {
-            if points.len() < 2 {
-                continue;
+    for step in papercraft_doc::page_paint_steps(&el.strokes, &el.shapes, &el.texts, &el.images) {
+        match step {
+            papercraft_doc::PagePaintStep::Images(indices) => {
+                let clipped = painter.with_clip_rect(rect);
+                for idx in indices {
+                    let Some(image) = el.images.get(idx) else {
+                        continue;
+                    };
+                    let clean = image.sanitized();
+                    let Some(handle) = crate::canvas::cached_page_image_texture(
+                        ui.ctx(),
+                        "papercraft_elem_prev",
+                        image,
+                    ) else {
+                        continue;
+                    };
+                    let corners_page = clean.corners();
+                    let corners = [
+                        to_pos(corners_page[0]),
+                        to_pos(corners_page[1]),
+                        to_pos(corners_page[2]),
+                        to_pos(corners_page[3]),
+                    ];
+                    crate::canvas::paint_textured_image_quad(&clipped, handle.id(), corners);
+                }
             }
-            let pts: Vec<egui::Pos2> = points.into_iter().map(to_pos).collect();
-            if closed && let Some(fc) = fill_c {
-                crate::canvas::paint_polygon_fill(painter, &pts, fc);
+            papercraft_doc::PagePaintStep::Highlighters(indices)
+            | papercraft_doc::PagePaintStep::InkRun(indices) => {
+                for idx in indices {
+                    let Some(stroke) = el.strokes.get(idx) else {
+                        continue;
+                    };
+                    let is_hl = stroke.pen.kind == PenKind::Highlighter;
+                    let c = to_color32(paper_color.resolve_ink_color(
+                        theme,
+                        auto_contrast,
+                        stroke.pen.color,
+                        is_hl,
+                    ));
+                    let sw = (stroke.pen.size * scale).clamp(1.0, 3.0);
+                    if stroke.smoothed_points.len() >= 2 {
+                        let pts: Vec<egui::Pos2> = stroke
+                            .smoothed_points
+                            .iter()
+                            .map(|p| to_pos(p.point()))
+                            .collect();
+                        painter.add(egui::Shape::line(pts, Stroke::new(sw, c)));
+                    }
+                }
             }
-            if shape.color.a > 0.0 && stroke_c.a() > 0 {
-                crate::canvas::paint_polyline_with_style(
-                    painter,
-                    &pts,
-                    closed,
-                    sw,
-                    stroke_c,
-                    shape.line_style,
-                );
+            papercraft_doc::PagePaintStep::Shape(idx) => {
+                let Some(shape) = el.shapes.get(idx) else {
+                    continue;
+                };
+                let shape = shape.sanitized();
+                let stroke_c = to_color32(paper_color.resolve_ink_color(
+                    theme,
+                    auto_contrast,
+                    shape.color,
+                    false,
+                ));
+                let fill_c = shape.fill_color.map(|fc| {
+                    to_color32(paper_color.resolve_ink_color(theme, auto_contrast, fc, false))
+                });
+                let sw = (shape.width * scale).clamp(1.0, 2.5);
+                for (points, closed) in shape.path_segments() {
+                    if points.len() < 2 {
+                        continue;
+                    }
+                    let pts: Vec<egui::Pos2> = points.into_iter().map(to_pos).collect();
+                    if closed && let Some(fc) = fill_c {
+                        crate::canvas::paint_polygon_fill(painter, &pts, fc);
+                    }
+                    if shape.color.a > 0.0 && stroke_c.a() > 0 {
+                        crate::canvas::paint_polyline_with_style(
+                            painter,
+                            &pts,
+                            closed,
+                            sw,
+                            stroke_c,
+                            shape.line_style,
+                        );
+                    }
+                }
             }
-        }
-    }
-    for stroke in &el.strokes {
-        let is_hl = stroke.pen.kind == PenKind::Highlighter;
-        let c = to_color32(paper_color.resolve_ink_color(
-            theme,
-            auto_contrast,
-            stroke.pen.color,
-            is_hl,
-        ));
-        let sw = (stroke.pen.size * scale).clamp(1.0, 3.0);
-        if stroke.smoothed_points.len() >= 2 {
-            let pts: Vec<egui::Pos2> = stroke
-                .smoothed_points
-                .iter()
-                .map(|p| to_pos(p.point()))
-                .collect();
-            painter.add(egui::Shape::line(pts, Stroke::new(sw, c)));
-        }
-    }
-    for txt in &el.texts {
-        let c = to_color32(paper_color.resolve_ink_color(theme, auto_contrast, txt.color, false));
-        let first_line = txt.text.lines().next().unwrap_or("");
-        if !first_line.is_empty() {
-            let preview_txt: String = first_line.chars().take(12).collect();
-            let font_sz = (txt.size * scale).clamp(7.5, 11.5);
-            painter.text(
-                to_pos(Point::new(txt.x, txt.y)),
-                egui::Align2::LEFT_TOP,
-                preview_txt,
-                FontId::proportional(font_sz),
-                c,
-            );
-        } else if el.shapes.is_empty() && el.strokes.is_empty() && el.images.is_empty() {
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "Text",
-                FontId::proportional(10.0),
-                t.text_muted,
-            );
+            papercraft_doc::PagePaintStep::Text(idx) => {
+                let Some(txt) = el.texts.get(idx) else {
+                    continue;
+                };
+                let c = to_color32(paper_color.resolve_ink_color(
+                    theme,
+                    auto_contrast,
+                    txt.color,
+                    false,
+                ));
+                let first_line = txt.text.lines().next().unwrap_or("");
+                if !first_line.is_empty() {
+                    let preview_txt: String = first_line.chars().take(12).collect();
+                    let font_sz = (txt.size * scale).clamp(7.5, 11.5);
+                    painter.text(
+                        to_pos(Point::new(txt.x, txt.y)),
+                        egui::Align2::LEFT_TOP,
+                        preview_txt,
+                        FontId::proportional(font_sz),
+                        c,
+                    );
+                } else if el.shapes.is_empty() && el.strokes.is_empty() && el.images.is_empty() {
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Text",
+                        FontId::proportional(10.0),
+                        t.text_muted,
+                    );
+                }
+            }
         }
     }
 }

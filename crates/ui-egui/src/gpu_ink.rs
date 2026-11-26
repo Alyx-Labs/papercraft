@@ -181,6 +181,7 @@ pub(crate) struct GpuStrokeSceneCache {
     strokes: HashMap<StrokeId, CachedScalableStroke>,
     hl_chunks: Vec<Arc<GpuChunkData>>,
     ink_chunks: Vec<Arc<GpuChunkData>>,
+    ink_run_ranges: Vec<std::ops::Range<usize>>,
     overlay_hl_ids: Vec<StrokeId>,
     last_sync_sig: Option<(usize, u64, usize, Option<StrokeId>, usize)>,
     pending_zoom_rebake_since_s: Option<f64>,
@@ -192,6 +193,7 @@ impl GpuStrokeSceneCache {
         self.strokes.clear();
         self.hl_chunks.clear();
         self.ink_chunks.clear();
+        self.ink_run_ranges.clear();
         self.overlay_hl_ids.clear();
         self.last_sync_sig = None;
         self.pending_zoom_rebake_since_s = None;
@@ -1099,6 +1101,24 @@ fn sync_chunk_list(cache: &mut GpuStrokeSceneCache, is_hl: bool, ordered_ids: &[
         }
     }
 
+    if pos < total {
+        append_chunks_for_ids(cache, ordered_ids, pos, total, &mut new_chunks);
+    }
+
+    if is_hl {
+        cache.hl_chunks = new_chunks;
+    } else {
+        cache.ink_chunks = new_chunks;
+    }
+}
+
+fn append_chunks_for_ids(
+    cache: &mut GpuStrokeSceneCache,
+    ordered_ids: &[StrokeId],
+    mut pos: usize,
+    total: usize,
+    out: &mut Vec<Arc<GpuChunkData>>,
+) {
     let mut next_chunk_id = cache.next_chunk_id;
     while pos < total {
         let mut entries: Vec<&CachedScalableStroke> = Vec::with_capacity(MAX_CHUNK_STROKES);
@@ -1117,16 +1137,63 @@ fn sync_chunk_list(cache: &mut GpuStrokeSceneCache, is_hl: bool, ordered_ids: &[
         }
         if !entries.is_empty() {
             next_chunk_id = next_chunk_id.saturating_add(1);
-            new_chunks.push(build_chunk_from_entries(next_chunk_id, None, &entries));
+            out.push(build_chunk_from_entries(next_chunk_id, None, &entries));
         }
     }
     cache.next_chunk_id = next_chunk_id;
+}
 
-    if is_hl {
-        cache.hl_chunks = new_chunks;
-    } else {
-        cache.ink_chunks = new_chunks;
+fn sync_ink_run_chunks(cache: &mut GpuStrokeSceneCache, runs: &[Vec<StrokeId>]) {
+    if runs.is_empty() {
+        cache.ink_chunks.clear();
+        cache.ink_run_ranges.clear();
+        return;
     }
+    if runs.len() == 1 {
+        sync_chunk_list(cache, false, &runs[0]);
+        cache.ink_run_ranges.clear();
+        cache.ink_run_ranges.push(0..cache.ink_chunks.len());
+        return;
+    }
+
+    let old_chunks = std::mem::take(&mut cache.ink_chunks);
+    let mut new_chunks: Vec<Arc<GpuChunkData>> =
+        Vec::with_capacity(old_chunks.len().max(runs.len()));
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(runs.len());
+    let mut old_cursor = 0_usize;
+
+    for run_ids in runs {
+        let start = new_chunks.len();
+        let mut pos = 0_usize;
+        let total = run_ids.len();
+        while old_cursor < old_chunks.len() {
+            let old = &old_chunks[old_cursor];
+            let len = old.strokes.len();
+            if len == 0 || pos + len > total {
+                break;
+            }
+            let matches = old.strokes.iter().enumerate().all(|(i, old_arc)| {
+                cache
+                    .strokes
+                    .get(&run_ids[pos + i])
+                    .is_some_and(|e| Arc::ptr_eq(&e.source, old_arc))
+            });
+            if matches {
+                new_chunks.push(Arc::clone(old));
+                pos += len;
+                old_cursor += 1;
+            } else {
+                break;
+            }
+        }
+        if pos < total {
+            append_chunks_for_ids(cache, run_ids, pos, total, &mut new_chunks);
+        }
+        ranges.push(start..new_chunks.len());
+    }
+
+    cache.ink_chunks = new_chunks;
+    cache.ink_run_ranges = ranges;
 }
 
 fn build_overlay_highlighters(
@@ -1244,8 +1311,24 @@ fn active_drag_stroke_ids(app: &PaperCraftApp) -> HashSet<StrokeId> {
     ids
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GpuInkPhase {
+    /// Syncs chunk buffers + overlays, bakes highlighters (and single-run ink), and paints highlighters (Band 1).
+    FrameSyncAndHighlighters,
+    /// Composites the baked fullscreen ink layer when Band 2 has a single contiguous InkRun.
+    BakedInk,
+    /// Draws a contiguous InkRun slice directly into the active pass when ink is interleaved with shapes/text.
+    InkRunChunks { start: usize, end: usize },
+    /// Draws selected/dragged overlay ink on top of Band 2.
+    InkOverlay,
+}
+
+#[derive(Clone)]
 struct GpuInkPaintCallback {
+    phase: GpuInkPhase,
+    single_ink_run: bool,
     avail_rect: Rect,
+    vis_page_rect: papercraft_geom::Rect,
     page_key: (usize, usize),
     color_key: (UiTheme, bool, PaperColor),
     zoom: f32,
@@ -1259,6 +1342,15 @@ struct GpuInkPaintCallback {
     ink_chunks: Vec<Arc<GpuChunkData>>,
     overlay_hl: Option<Arc<GpuOverlayHighlighters>>,
     overlay_ink: Option<Arc<GpuByteMesh>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedGpuScene {
+    pub(crate) avail_rect: Rect,
+    pub(crate) single_ink_run: bool,
+    pub(crate) ink_run_ranges: Vec<std::ops::Range<usize>>,
+    pub(crate) has_overlay_ink: bool,
+    base_callback: GpuInkPaintCallback,
 }
 
 fn viewport_px_from_rect(
@@ -2132,7 +2224,7 @@ fn execute_full_rebake(
         pad_px,
     );
     let has_hl = !cb.hl_chunks.is_empty();
-    let has_ink = !cb.ink_chunks.is_empty();
+    let has_ink = cb.single_ink_run && !cb.ink_chunks.is_empty();
     if has_hl {
         if res.hl_layers[res.hl_active].is_none() {
             res.hl_layers[res.hl_active] =
@@ -2438,6 +2530,9 @@ impl CallbackTrait for GpuInkPaintCallback {
         egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
+        if self.phase != GpuInkPhase::FrameSyncAndHighlighters {
+            return Vec::new();
+        }
         let Some(res) = callback_resources.get_mut::<GpuInkResources>() else {
             return Vec::new();
         };
@@ -2510,7 +2605,11 @@ impl CallbackTrait for GpuInkPaintCallback {
         );
 
         let cur_hl_ids: Vec<u64> = self.hl_chunks.iter().map(|c| c.id).collect();
-        let cur_ink_ids: Vec<u64> = self.ink_chunks.iter().map(|c| c.id).collect();
+        let cur_ink_ids: Vec<u64> = if self.single_ink_run {
+            self.ink_chunks.iter().map(|c| c.id).collect()
+        } else {
+            Vec::new()
+        };
         let action = decide_layer_action(self, res, &fm, &cur_hl_ids, &cur_ink_ids);
         match action {
             LayerAction::None => {}
@@ -2573,51 +2672,82 @@ impl CallbackTrait for GpuInkPaintCallback {
             return;
         }
 
-        if res.baked.has_hl
-            && let Some(layer) = &res.hl_layers[res.hl_active]
-        {
-            render_pass.set_pipeline(&res.composite_pipeline);
-            render_pass.set_bind_group(0, &res.comp_hl_uniform_bg, &[]);
-            render_pass.set_bind_group(1, &layer.linear_bg, &[]);
-            render_pass.set_vertex_buffer(0, res.quad_vb.slice(..));
-            render_pass.set_index_buffer(res.quad_ib.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..6, 0, 0..1);
-        }
+        match self.phase {
+            GpuInkPhase::FrameSyncAndHighlighters => {
+                if res.baked.has_hl
+                    && let Some(layer) = &res.hl_layers[res.hl_active]
+                {
+                    render_pass.set_pipeline(&res.composite_pipeline);
+                    render_pass.set_bind_group(0, &res.comp_hl_uniform_bg, &[]);
+                    render_pass.set_bind_group(1, &layer.linear_bg, &[]);
+                    render_pass.set_vertex_buffer(0, res.quad_vb.slice(..));
+                    render_pass.set_index_buffer(res.quad_ib.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..6, 0, 0..1);
+                }
 
-        let overlay_hl_layer = match res.overlay_hl_target {
-            OverlayHlTarget::None => None,
-            OverlayHlTarget::Scratch => res.hl_scratch_layer.as_ref(),
-            OverlayHlTarget::OverlayLayer => res.hl_overlay_layer.as_ref(),
-        };
-        if let Some(layer) = overlay_hl_layer {
-            render_pass.set_pipeline(&res.composite_pipeline);
-            render_pass.set_bind_group(0, &res.overlay_comp_uniform_bg, &[]);
-            render_pass.set_bind_group(1, &layer.linear_bg, &[]);
-            render_pass.set_vertex_buffer(0, res.quad_vb.slice(..));
-            render_pass.set_index_buffer(res.quad_ib.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..6, 0, 0..1);
-        }
-
-        if res.baked.has_ink
-            && let Some(layer) = &res.ink_layers[res.ink_active]
-        {
-            render_pass.set_pipeline(&res.composite_pipeline);
-            render_pass.set_bind_group(0, &res.comp_ink_uniform_bg, &[]);
-            render_pass.set_bind_group(1, &layer.linear_bg, &[]);
-            render_pass.set_vertex_buffer(0, res.quad_vb.slice(..));
-            render_pass.set_index_buffer(res.quad_ib.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..6, 0, 0..1);
-        }
-
-        if let Some(ink) = &self.overlay_ink
-            && let (Some(vb), Some(ib)) = (&res.overlay_ink_vb.buffer, &res.overlay_ink_ib.buffer)
-            && ink.index_count > 0
-        {
-            render_pass.set_pipeline(&res.stroke_overlay_pipeline);
-            render_pass.set_bind_group(0, &res.overlay_uniform_bg, &[]);
-            render_pass.set_vertex_buffer(0, vb.slice(..));
-            render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..ink.index_count, 0, 0..1);
+                let overlay_hl_layer = match res.overlay_hl_target {
+                    OverlayHlTarget::None => None,
+                    OverlayHlTarget::Scratch => res.hl_scratch_layer.as_ref(),
+                    OverlayHlTarget::OverlayLayer => res.hl_overlay_layer.as_ref(),
+                };
+                if let Some(layer) = overlay_hl_layer {
+                    render_pass.set_pipeline(&res.composite_pipeline);
+                    render_pass.set_bind_group(0, &res.overlay_comp_uniform_bg, &[]);
+                    render_pass.set_bind_group(1, &layer.linear_bg, &[]);
+                    render_pass.set_vertex_buffer(0, res.quad_vb.slice(..));
+                    render_pass.set_index_buffer(res.quad_ib.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..6, 0, 0..1);
+                }
+            }
+            GpuInkPhase::BakedInk => {
+                if self.single_ink_run
+                    && res.baked.has_ink
+                    && let Some(layer) = &res.ink_layers[res.ink_active]
+                {
+                    render_pass.set_pipeline(&res.composite_pipeline);
+                    render_pass.set_bind_group(0, &res.comp_ink_uniform_bg, &[]);
+                    render_pass.set_bind_group(1, &layer.linear_bg, &[]);
+                    render_pass.set_vertex_buffer(0, res.quad_vb.slice(..));
+                    render_pass.set_index_buffer(res.quad_ib.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..6, 0, 0..1);
+                }
+            }
+            GpuInkPhase::InkRunChunks { start, end } => {
+                let slice = self.ink_chunks.get(start..end).unwrap_or(&[]);
+                if !slice.is_empty() {
+                    render_pass.set_pipeline(&res.stroke_overlay_pipeline);
+                    render_pass.set_bind_group(0, &res.overlay_uniform_bg, &[]);
+                    for chunk in slice {
+                        if !chunk.bounds.is_empty() && !chunk.bounds.intersects(self.vis_page_rect)
+                        {
+                            continue;
+                        }
+                        if let Some(bufs) = res.chunk_buffers.get(&chunk.id)
+                            && bufs.index_count > 0
+                        {
+                            render_pass.set_vertex_buffer(0, bufs.vertex_buffer.slice(..));
+                            render_pass.set_index_buffer(
+                                bufs.index_buffer.slice(..),
+                                wgpu::IndexFormat::Uint32,
+                            );
+                            render_pass.draw_indexed(0..bufs.index_count, 0, 0..1);
+                        }
+                    }
+                }
+            }
+            GpuInkPhase::InkOverlay => {
+                if let Some(ink) = &self.overlay_ink
+                    && let (Some(vb), Some(ib)) =
+                        (&res.overlay_ink_vb.buffer, &res.overlay_ink_ib.buffer)
+                    && ink.index_count > 0
+                {
+                    render_pass.set_pipeline(&res.stroke_overlay_pipeline);
+                    render_pass.set_bind_group(0, &res.overlay_uniform_bg, &[]);
+                    render_pass.set_vertex_buffer(0, vb.slice(..));
+                    render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..ink.index_count, 0, 0..1);
+                }
+            }
         }
     }
 }
@@ -2635,16 +2765,17 @@ pub(crate) fn init_wgpu_state(
     app.wgpu_enabled = true;
 }
 
-pub(crate) fn paint_committed_strokes_gpu(
+pub(crate) fn prepare_gpu_stroke_scene(
     app: &mut PaperCraftApp,
     p: &egui::Painter,
     avail_rect: Rect,
     xf: Affine2,
     page_key: (usize, usize),
     color_key: (UiTheme, bool, PaperColor),
-) {
+    paint_steps: &[papercraft_doc::PagePaintStep],
+) -> Option<PreparedGpuScene> {
     if !avail_rect.is_positive() {
-        return;
+        return None;
     }
 
     let dragging_ids = active_drag_stroke_ids(app);
@@ -2671,7 +2802,7 @@ pub(crate) fn paint_committed_strokes_gpu(
 
     if need_sync {
         let mut hl_ids = Vec::new();
-        let mut ink_ids = Vec::new();
+        let mut ink_runs: Vec<Vec<StrokeId>> = Vec::new();
         let mut overlay_hl_ids = Vec::new();
         let mut overlay_ink_ids = Vec::new();
 
@@ -2684,17 +2815,37 @@ pub(crate) fn paint_committed_strokes_gpu(
                 let built = build_cached_scalable_stroke(stroke, color_key);
                 cache.strokes.insert(stroke.id, built);
             }
-            let is_hl = stroke.pen.kind == PenKind::Highlighter;
-            if dragging_ids.contains(&stroke.id) {
-                if is_hl {
-                    overlay_hl_ids.push(stroke.id);
-                } else {
-                    overlay_ink_ids.push(stroke.id);
+        }
+
+        for step in paint_steps {
+            match step {
+                papercraft_doc::PagePaintStep::Highlighters(indices) => {
+                    for &idx in indices {
+                        if let Some(stroke) = app.session.doc.strokes.get(idx) {
+                            if dragging_ids.contains(&stroke.id) {
+                                overlay_hl_ids.push(stroke.id);
+                            } else {
+                                hl_ids.push(stroke.id);
+                            }
+                        }
+                    }
                 }
-            } else if is_hl {
-                hl_ids.push(stroke.id);
-            } else {
-                ink_ids.push(stroke.id);
+                papercraft_doc::PagePaintStep::InkRun(indices) => {
+                    let mut run_ids = Vec::with_capacity(indices.len());
+                    for &idx in indices {
+                        if let Some(stroke) = app.session.doc.strokes.get(idx) {
+                            if dragging_ids.contains(&stroke.id) {
+                                overlay_ink_ids.push(stroke.id);
+                            } else {
+                                run_ids.push(stroke.id);
+                            }
+                        }
+                    }
+                    ink_runs.push(run_ids);
+                }
+                papercraft_doc::PagePaintStep::Images(_)
+                | papercraft_doc::PagePaintStep::Shape(_)
+                | papercraft_doc::PagePaintStep::Text(_) => {}
             }
         }
 
@@ -2705,7 +2856,7 @@ pub(crate) fn paint_committed_strokes_gpu(
         }
 
         sync_chunk_list(cache, true, &hl_ids);
-        sync_chunk_list(cache, false, &ink_ids);
+        sync_ink_run_chunks(cache, &ink_runs);
         cache.overlay_hl_ids = overlay_hl_ids;
         cache.last_sync_sig = Some(sync_sig);
 
@@ -2743,6 +2894,17 @@ pub(crate) fn paint_committed_strokes_gpu(
             )
         });
 
+    let overlay_hl = live_overlay_hl.or_else(|| app.canvas_cache.gpu_overlay_hl.clone());
+    let has_overlay_ink = app
+        .canvas_cache
+        .gpu_overlay_ink
+        .as_ref()
+        .is_some_and(|m| m.index_count > 0);
+    let has_hl_or_strokes = !strokes_empty || overlay_hl.is_some() || has_overlay_ink;
+    if !has_hl_or_strokes {
+        return None;
+    }
+
     let now_s = p.ctx().input(|i| i.time);
     let zoom_bits = app.view.zoom.to_bits();
     let cache = &mut app.canvas_cache.gpu_scene;
@@ -2769,25 +2931,98 @@ pub(crate) fn paint_committed_strokes_gpu(
         true
     };
 
-    let overlay_hl = live_overlay_hl.or_else(|| app.canvas_cache.gpu_overlay_hl.clone());
-    let callback = egui_wgpu::Callback::new_paint_callback(
+    let inv_s = 1.0 / xf.scale.max(1e-6);
+    let vis_min_x = (f64::from(avail_rect.left()) - xf.offset_x) * inv_s;
+    let vis_min_y = (f64::from(avail_rect.top()) - xf.offset_y) * inv_s;
+    let vis_max_x = (f64::from(avail_rect.right()) - xf.offset_x) * inv_s;
+    let vis_max_y = (f64::from(avail_rect.bottom()) - xf.offset_y) * inv_s;
+    let vis_page_rect = if vis_min_x.is_finite()
+        && vis_min_y.is_finite()
+        && vis_max_x.is_finite()
+        && vis_max_y.is_finite()
+    {
+        papercraft_geom::Rect::new(
+            vis_min_x.min(vis_max_x) - 32.0,
+            vis_min_y.min(vis_max_y) - 32.0,
+            (vis_max_x - vis_min_x).abs() + 64.0,
+            (vis_max_y - vis_min_y).abs() + 64.0,
+        )
+    } else {
+        papercraft_geom::Rect::EMPTY
+    };
+
+    let ink_run_ranges = cache.ink_run_ranges.clone();
+    let single_ink_run = ink_run_ranges.len() <= 1;
+    let base_callback = GpuInkPaintCallback {
+        phase: GpuInkPhase::FrameSyncAndHighlighters,
+        single_ink_run,
         avail_rect,
-        GpuInkPaintCallback {
-            avail_rect,
-            page_key,
-            color_key,
-            zoom: app.view.zoom,
-            scale: xf.scale,
-            offset_x: xf.offset_x,
-            offset_y: xf.offset_y,
-            zoom_settled,
-            hl_chunks: cache.hl_chunks.clone(),
-            ink_chunks: cache.ink_chunks.clone(),
-            overlay_hl,
-            overlay_ink: app.canvas_cache.gpu_overlay_ink.clone(),
-        },
-    );
-    p.add(egui::Shape::Callback(callback));
+        vis_page_rect,
+        page_key,
+        color_key,
+        zoom: app.view.zoom,
+        scale: xf.scale,
+        offset_x: xf.offset_x,
+        offset_y: xf.offset_y,
+        zoom_settled,
+        hl_chunks: cache.hl_chunks.clone(),
+        ink_chunks: cache.ink_chunks.clone(),
+        overlay_hl,
+        overlay_ink: app.canvas_cache.gpu_overlay_ink.clone(),
+    };
+    Some(PreparedGpuScene {
+        avail_rect,
+        single_ink_run,
+        ink_run_ranges,
+        has_overlay_ink,
+        base_callback,
+    })
+}
+
+pub(crate) fn emit_gpu_scene_phase(
+    p: &egui::Painter,
+    scene: &PreparedGpuScene,
+    phase: GpuInkPhase,
+) {
+    let mut cb = scene.base_callback.clone();
+    cb.phase = phase;
+    p.add(egui::Shape::Callback(
+        egui_wgpu::Callback::new_paint_callback(scene.avail_rect, cb),
+    ));
+}
+
+#[allow(dead_code)]
+pub(crate) fn paint_committed_strokes_gpu(
+    app: &mut PaperCraftApp,
+    p: &egui::Painter,
+    avail_rect: Rect,
+    xf: Affine2,
+    page_key: (usize, usize),
+    color_key: (UiTheme, bool, PaperColor),
+) {
+    let steps = app.session.doc.page_paint_steps();
+    let Some(scene) = prepare_gpu_stroke_scene(app, p, avail_rect, xf, page_key, color_key, &steps)
+    else {
+        return;
+    };
+    emit_gpu_scene_phase(p, &scene, GpuInkPhase::FrameSyncAndHighlighters);
+    if scene.single_ink_run {
+        emit_gpu_scene_phase(p, &scene, GpuInkPhase::BakedInk);
+    } else {
+        for r in &scene.ink_run_ranges {
+            emit_gpu_scene_phase(
+                p,
+                &scene,
+                GpuInkPhase::InkRunChunks {
+                    start: r.start,
+                    end: r.end,
+                },
+            );
+        }
+    }
+    if scene.has_overlay_ink {
+        emit_gpu_scene_phase(p, &scene, GpuInkPhase::InkOverlay);
+    }
 }
 
 #[cfg(test)]
@@ -2819,6 +3054,7 @@ mod tests {
             raw_points: Arc::clone(&pts_arc),
             smoothed_points: pts_arc,
             bounds,
+            z_order: 0,
         })
     }
 

@@ -306,6 +306,7 @@ mod tests {
             pixel_width: 640,
             pixel_height: 480,
             png_bytes: Arc::new(fake_png.clone()),
+            z_order: 0,
         };
         doc.images.push(Arc::new(image.clone()));
         doc.sync_active_to_pages();
@@ -647,5 +648,58 @@ mod tests {
         let from_json = load_document_bytes(json_str.as_bytes()).unwrap();
         assert_eq!(from_json.id, doc.id);
         assert_eq!(from_json.meta_updated_at_ms, doc.meta_updated_at_ms);
+    }
+
+    #[test]
+    fn binary_v2_and_json_preserve_element_z_order_across_reopen() {
+        use papercraft_doc::{
+            GeometricShape, InkStroke, PageImage, PenSettings, StrokeSample, TextItem,
+        };
+
+        let mut doc = Document::new(800, 1000);
+        let pts = vec![
+            StrokeSample::from_xy_pressure(40.0, 50.0, 0.6),
+            StrokeSample::from_xy_pressure(140.0, 90.0, 0.8),
+        ];
+        doc.shapes.push(Arc::new(GeometricShape {
+            z_order: 1,
+            x1: 20.0,
+            y1: 20.0,
+            x2: 120.0,
+            y2: 120.0,
+            ..GeometricShape::default()
+        }));
+        let id = doc.alloc_stroke_id();
+        doc.strokes.push(Arc::new(
+            InkStroke::new(id, PenSettings::fountain_pen(), pts.clone(), pts).with_z_order(2),
+        ));
+        doc.texts.push(Arc::new(TextItem {
+            text: "Layer 3".into(),
+            x: 30.0,
+            y: 30.0,
+            z_order: 3,
+            ..TextItem::default()
+        }));
+        let fake_png = vec![137u8, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4];
+        doc.images.push(Arc::new(PageImage {
+            png_bytes: Arc::new(fake_png),
+            z_order: 4,
+            ..PageImage::default()
+        }));
+        doc.sync_active_to_pages();
+
+        let bin = save_document_bytes(&doc).unwrap();
+        let from_bin = load_document_bytes(&bin).unwrap();
+        assert_eq!(from_bin.shapes[0].z_order, 1);
+        assert_eq!(from_bin.strokes[0].z_order, 2);
+        assert_eq!(from_bin.texts[0].z_order, 3);
+        assert_eq!(from_bin.images[0].z_order, 4);
+
+        let json_str = save_document_compact(&doc).unwrap();
+        let from_json = load_document_bytes(json_str.as_bytes()).unwrap();
+        assert_eq!(from_json.shapes[0].z_order, 1);
+        assert_eq!(from_json.strokes[0].z_order, 2);
+        assert_eq!(from_json.texts[0].z_order, 3);
+        assert_eq!(from_json.images[0].z_order, 4);
     }
 }

@@ -1,0 +1,62 @@
+PaperCraft & Alyx Labs brand assets: license
+
+The Alyx Labs, PaperCraft, Paper Craft, and PaperCraft Server names,
+wordmarks, official domains (including papercraft.ink and web.papercraft.ink),
+reverse-DNS bundle identifiers (com.alyxlabs.*), and brand visual assets
+(the "PaperCraft Marks"), including every file in
+apps/papercraft/assets/branding/ in every color, size, and format, as well as
+the official brand illustration at
+crates/ui-egui/assets/illustrations/welcome-sea.png, are owned by Alyx Labs.
+They are trademarks and proprietary brand assets and are NOT open source.
+
+They are not covered by PaperCraft's MIT OR Apache-2.0 software license, and
+nothing in LICENSE-MIT, LICENSE-APACHE, NOTICE, ATTRIBUTION.md, or any other
+file of this repository grants any open-source right to them.
+
+Permission
+
+Alyx Labs grants a limited, non-exclusive, non-transferable, revocable,
+royalty-free permission to use the PaperCraft Marks only:
+1. as part of unmodified copies of this repository; and
+2. within official PaperCraft and PaperCraft Server builds, official
+   documentation, and the official web deployment (https://web.papercraft.ink/),
+   to identify PaperCraft as made by Alyx Labs and to link to
+   https://github.com/Alyx-Labs/papercraft or https://papercraft.ink/.
+
+Conditions
+
+This permission holds only while every one of these conditions is true:
+- The marks are used exactly as supplied in this repository. Do not redraw,
+  recolor, crop, stretch, rotate, animate, outline, add effects to them,
+  extract parts of them, or combine them with any other name, mark, or
+  artwork (except automated size/icon-format generation via
+  `cargo xtask branding` from an unmodified `logo.png` in an unmodified copy).
+- They are used only in the context of official PaperCraft software, and only
+  to state that Alyx Labs makes it. They must never suggest that Alyx Labs
+  made, sponsors, endorses, certifies, or supports any other product, service,
+  fork, modified version, third-party plug-in, organization, or person.
+- Neither the PaperCraft Marks nor the PaperCraft or Alyx Labs names appear in
+  the name, logo, icon, bundle identifier, domain, social media handle,
+  package listing, app-store listing, advertising, or marketing of anything
+  other than official PaperCraft releases by Alyx Labs.
+
+Forks and modified versions
+
+If you distribute or publish a modified version of PaperCraft or PaperCraft
+Server, or any derivative work based on this repository, you must remove the
+PaperCraft Marks from it (or replace them with your own — for example, replace
+apps/papercraft/assets/branding/logo.png and regenerate derived icons with
+`cargo xtask branding`, replace
+crates/ui-egui/assets/illustrations/welcome-sea.png, and change the product
+names and `com.alyxlabs.*` identifiers) and must not call it PaperCraft or
+Alyx Labs or present it as an Alyx Labs product.
+
+You may state truthfully in plain text that your work is based on PaperCraft by
+Alyx Labs (for example, linking to https://github.com/Alyx-Labs/papercraft). A
+fork kept solely to propose changes back to the upstream repository may keep
+the marks unchanged.
+
+Everything else
+
+Any use not expressly permitted here requires prior written permission from
+Alyx Labs (https://github.com/Alyx-Labs/papercraft).

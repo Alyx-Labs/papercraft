@@ -1482,17 +1482,10 @@ fn cmd_text_insert(session: &mut Session, id: &str, params: &Value) -> Result<Va
         }
         _ => None,
     };
-    if p.x < 0.0
-        || p.y < 0.0
-        || p.x > f64::from(session.doc.width)
-        || p.y > f64::from(session.doc.height)
-    {
-        return Err(invalid(id, "text position must be inside the active page"));
-    }
     if p.text.chars().count() > MAX_TEXT_CHARS {
         return Err(invalid(id, "text exceeds the maximum character limit"));
     }
-    let item = TextItem {
+    let mut item = TextItem {
         text: p.text,
         x: p.x,
         y: p.y,
@@ -1506,6 +1499,7 @@ fn cmd_text_insert(session: &mut Session, id: &str, params: &Value) -> Result<Va
         link_url,
         alignment: p.alignment.unwrap_or_default(),
         spans: p.spans.unwrap_or_default(),
+        z_order: 0,
     }
     .sanitized();
     if item.text.trim().is_empty() {
@@ -1523,6 +1517,7 @@ fn cmd_text_insert(session: &mut Session, id: &str, params: &Value) -> Result<Va
 
     let before = Arc::clone(&session.doc);
     let mut next = (*session.doc).clone();
+    item.z_order = next.alloc_z_order();
     next.texts.push(Arc::new(item));
     next.sync_active_to_pages();
     let text_count = next.texts.len();
@@ -1696,14 +1691,7 @@ fn cmd_shape_insert(session: &mut Session, id: &str, params: &Value) -> Result<V
     if !(p.x1.is_finite() && p.y1.is_finite() && p.x2.is_finite() && p.y2.is_finite()) {
         return Err(invalid(id, "shape coordinates must be finite"));
     }
-    let max_x = f64::from(session.doc.width);
-    let max_y = f64::from(session.doc.height);
-    if [p.x1, p.x2].iter().any(|x| *x < 0.0 || *x > max_x)
-        || [p.y1, p.y2].iter().any(|y| *y < 0.0 || *y > max_y)
-    {
-        return Err(invalid(id, "shape must stay inside the active page"));
-    }
-    if (p.x2 - p.x1).hypot(p.y2 - p.y1) < 1.0 {
+    if p.kind != ShapeKind::Polygon && (p.x2 - p.x1).hypot(p.y2 - p.y1) < 1.0 {
         return Err(invalid(id, "shape must be at least one page point long"));
     }
     if session.doc.shapes.len() >= MAX_PAGE_SHAPES {
@@ -1729,7 +1717,7 @@ fn cmd_shape_insert(session: &mut Session, id: &str, params: &Value) -> Result<V
     } else {
         Vec::new()
     };
-    let shape = GeometricShape {
+    let mut shape = GeometricShape {
         kind: p.kind,
         x1: p.x1,
         y1: p.y1,
@@ -1742,11 +1730,16 @@ fn cmd_shape_insert(session: &mut Session, id: &str, params: &Value) -> Result<V
         fill_color: p.fill_color,
         line_style: p.line_style.unwrap_or_default(),
         points,
+        z_order: 0,
     }
     .sanitized();
+    if (shape.x2 - shape.x1).hypot(shape.y2 - shape.y1) < 1.0 {
+        return Err(invalid(id, "shape must be at least one page point long"));
+    }
 
     let before = Arc::clone(&session.doc);
     let mut next = (*session.doc).clone();
+    shape.z_order = next.alloc_z_order();
     next.shapes.push(Arc::new(shape));
     next.sync_active_to_pages();
     let shape_count = next.shapes.len();
@@ -2009,14 +2002,16 @@ fn resolve_image_placement(
     };
     let max_x = (page_w - width).max(0.0);
     let max_y = (page_h - height).max(0.0);
-    let default_x = p
-        .center_x
-        .map_or((page_w - width) * 0.5, |cx| cx - width * 0.5);
-    let default_y = p
-        .center_y
-        .map_or((page_h - height) * 0.5, |cy| cy - height * 0.5);
-    let x = p.x.unwrap_or(default_x).clamp(0.0, max_x);
-    let y = p.y.unwrap_or(default_y).clamp(0.0, max_y);
+    let x = match (p.x, p.center_x) {
+        (Some(x), _) => x,
+        (None, Some(cx)) => cx - width * 0.5,
+        (None, None) => ((page_w - width) * 0.5).clamp(0.0, max_x),
+    };
+    let y = match (p.y, p.center_y) {
+        (Some(y), _) => y,
+        (None, Some(cy)) => cy - height * 0.5,
+        (None, None) => ((page_h - height) * 0.5).clamp(0.0, max_y),
+    };
     Ok((x, y, width, height))
 }
 
@@ -2037,7 +2032,7 @@ fn cmd_image_insert(session: &mut Session, id: &str, params: &Value) -> Result<V
         return Err(invalid(id, "active page total image payload limit reached"));
     }
     let (x, y, width, height) = resolve_image_placement(&session.doc, px_w, px_h, &p, id)?;
-    let image = PageImage {
+    let mut image = PageImage {
         x,
         y,
         width,
@@ -2046,11 +2041,13 @@ fn cmd_image_insert(session: &mut Session, id: &str, params: &Value) -> Result<V
         pixel_width: px_w,
         pixel_height: px_h,
         png_bytes: Arc::new(png_bytes),
+        z_order: 0,
     }
     .sanitized();
 
     let before = Arc::clone(&session.doc);
     let mut next = (*session.doc).clone();
+    image.z_order = next.alloc_z_order();
     next.images.push(Arc::new(image));
     next.sync_active_to_pages();
     let image_count = next.images.len();
@@ -6573,7 +6570,12 @@ fn cmd_stroke_recognize_shape(
         }
         let before = Arc::clone(&session.doc);
         let mut next = (*session.doc).clone();
+        let replaced_z = next.strokes.iter().find(|s| s.id == sid).map(|s| s.z_order);
         next.strokes.retain(|s| s.id != sid);
+        let mut shape = shape;
+        shape.z_order = replaced_z
+            .filter(|&z| z > 0)
+            .unwrap_or_else(|| next.alloc_z_order());
         let shape_index = next.shapes.len();
         next.shapes.push(Arc::new(shape.clone()));
         next.sync_active_to_pages();
@@ -6778,6 +6780,7 @@ fn build_clipboard_from_selection(
             shift_pts(st.raw_points.as_slice()),
             shift_pts(st.smoothed_points.as_slice()),
         )
+        .with_z_order(st.z_order)
     };
     let strokes = raw_strokes.iter().map(shift_stroke).collect();
     let shapes = raw_shapes
@@ -6864,7 +6867,76 @@ fn stamp_clipboard_onto_doc(
         image_indices: Vec::with_capacity(bundle.images.len()),
     };
 
-    for st in &bundle.strokes {
+    #[derive(Clone, Copy)]
+    enum BundleSlot {
+        Stroke(usize),
+        Shape(usize),
+        Text(usize),
+        Image(usize),
+    }
+
+    let mut ranked_slots: Vec<(papercraft_doc::LayerPaintRank, BundleSlot)> = Vec::with_capacity(
+        bundle.strokes.len() + bundle.shapes.len() + bundle.texts.len() + bundle.images.len(),
+    );
+    for (idx, st) in bundle.strokes.iter().enumerate() {
+        let kind = if st.pen.kind == PenKind::Highlighter {
+            papercraft_doc::LayerElementKind::Highlighter
+        } else {
+            papercraft_doc::LayerElementKind::Ink
+        };
+        ranked_slots.push((
+            papercraft_doc::element_layer_rank(kind, st.z_order, idx),
+            BundleSlot::Stroke(idx),
+        ));
+    }
+    for (idx, sh) in bundle.shapes.iter().enumerate() {
+        ranked_slots.push((
+            papercraft_doc::element_layer_rank(
+                papercraft_doc::LayerElementKind::Shape,
+                sh.z_order,
+                idx,
+            ),
+            BundleSlot::Shape(idx),
+        ));
+    }
+    for (idx, tx) in bundle.texts.iter().enumerate() {
+        ranked_slots.push((
+            papercraft_doc::element_layer_rank(
+                papercraft_doc::LayerElementKind::Text,
+                tx.z_order,
+                idx,
+            ),
+            BundleSlot::Text(idx),
+        ));
+    }
+    for (idx, im) in bundle.images.iter().enumerate() {
+        ranked_slots.push((
+            papercraft_doc::element_layer_rank(
+                papercraft_doc::LayerElementKind::Image,
+                im.z_order,
+                idx,
+            ),
+            BundleSlot::Image(idx),
+        ));
+    }
+    ranked_slots.sort_unstable_by_key(|a| a.0);
+
+    let base_z = next.max_z_order_on_page();
+    let mut stroke_z = vec![0_u64; bundle.strokes.len()];
+    let mut shape_z = vec![0_u64; bundle.shapes.len()];
+    let mut text_z = vec![0_u64; bundle.texts.len()];
+    let mut image_z = vec![0_u64; bundle.images.len()];
+    for (offset, (_, slot)) in ranked_slots.into_iter().enumerate() {
+        let z = base_z.saturating_add(offset as u64 + 1).max(1);
+        match slot {
+            BundleSlot::Stroke(i) => stroke_z[i] = z,
+            BundleSlot::Shape(i) => shape_z[i] = z,
+            BundleSlot::Text(i) => text_z[i] = z,
+            BundleSlot::Image(i) => image_z[i] = z,
+        }
+    }
+
+    for (idx, st) in bundle.strokes.iter().enumerate() {
         let new_id = next.alloc_stroke_id();
         let xform = |pts: &[StrokeSample]| -> Vec<StrokeSample> {
             pts.iter()
@@ -6882,12 +6954,13 @@ fn stamp_clipboard_onto_doc(
             pen.sanitized(),
             xform(st.raw_points.as_slice()),
             xform(st.smoothed_points.as_slice()),
-        );
+        )
+        .with_z_order(stroke_z[idx]);
         next.strokes.push(Arc::new(stroke));
         out.stroke_ids.push(new_id);
     }
 
-    for sh in &bundle.shapes {
+    for (b_idx, sh) in bundle.shapes.iter().enumerate() {
         let mut shape = sh.clone();
         shape.x1 = dst_x + shape.x1 * scale;
         shape.y1 = dst_y + shape.y1 * scale;
@@ -6899,28 +6972,31 @@ fn stamp_clipboard_onto_doc(
         }
         shape.width = (f64::from(shape.width) * scale) as f32;
         shape.curve *= scale;
+        shape.z_order = shape_z[b_idx];
         let idx = next.shapes.len();
         next.shapes.push(Arc::new(shape.sanitized()));
         out.shape_indices.push(idx);
     }
 
-    for tx in &bundle.texts {
+    for (b_idx, tx) in bundle.texts.iter().enumerate() {
         let mut text = tx.clone();
         text.x = dst_x + text.x * scale;
         text.y = dst_y + text.y * scale;
         text.size = (f64::from(text.size) * scale).clamp(6.0, 120.0) as f32;
         text.max_width = text.max_width.map(|w| (f64::from(w) * scale) as f32);
+        text.z_order = text_z[b_idx];
         let idx = next.texts.len();
         next.texts.push(Arc::new(text.sanitized()));
         out.text_indices.push(idx);
     }
 
-    for im in &bundle.images {
+    for (b_idx, im) in bundle.images.iter().enumerate() {
         let mut img = im.clone();
         img.x = dst_x + img.x * scale;
         img.y = dst_y + img.y * scale;
         img.width = (img.width * scale).max(16.0);
         img.height = (img.height * scale).max(16.0);
+        img.z_order = image_z[b_idx];
         let idx = next.images.len();
         next.images.push(Arc::new(img.sanitized()));
         out.image_indices.push(idx);
@@ -7020,14 +7096,12 @@ fn cmd_selection_paste(
         return Err(invalid(id, "paste coordinates must be finite"));
     }
 
-    let page_w = f64::from(session.doc.width);
-    let page_h = f64::from(session.doc.height);
-    let dst_x = p.target_x.unwrap_or_else(|| {
-        (clip.origin_x + p.offset_x.unwrap_or(28.0)).clamp(0.0, (page_w - clip.width).max(0.0))
-    });
-    let dst_y = p.target_y.unwrap_or_else(|| {
-        (clip.origin_y + p.offset_y.unwrap_or(28.0)).clamp(0.0, (page_h - clip.height).max(0.0))
-    });
+    let dst_x = p
+        .target_x
+        .unwrap_or_else(|| clip.origin_x + p.offset_x.unwrap_or(28.0));
+    let dst_y = p
+        .target_y
+        .unwrap_or_else(|| clip.origin_y + p.offset_y.unwrap_or(28.0));
 
     let before = Arc::clone(&session.doc);
     let mut next = (*session.doc).clone();
@@ -7064,12 +7138,8 @@ fn cmd_selection_duplicate(
     }
     let sel = validate_targets_list(&session.doc, id, &p.targets)?;
     let bundle = build_clipboard_from_selection(&session.doc, &sel);
-    let page_w = f64::from(session.doc.width);
-    let page_h = f64::from(session.doc.height);
-    let dst_x =
-        (bundle.origin_x + p.offset_x.unwrap_or(28.0)).clamp(0.0, (page_w - bundle.width).max(0.0));
-    let dst_y = (bundle.origin_y + p.offset_y.unwrap_or(28.0))
-        .clamp(0.0, (page_h - bundle.height).max(0.0));
+    let dst_x = bundle.origin_x + p.offset_x.unwrap_or(28.0);
+    let dst_y = bundle.origin_y + p.offset_y.unwrap_or(28.0);
 
     let before = Arc::clone(&session.doc);
     let mut next = (*session.doc).clone();
@@ -7196,10 +7266,8 @@ fn cmd_element_place(
     let page_h = f64::from(session.doc.height);
     let center_x = p.x.unwrap_or(page_w * 0.5);
     let center_y = p.y.unwrap_or(page_h * 0.5);
-    let dst_x =
-        (center_x - found.width * 0.5 * scale).clamp(0.0, (page_w - found.width * scale).max(0.0));
-    let dst_y = (center_y - found.height * 0.5 * scale)
-        .clamp(0.0, (page_h - found.height * scale).max(0.0));
+    let dst_x = center_x - found.width * 0.5 * scale;
+    let dst_y = center_y - found.height * 0.5 * scale;
 
     let bundle = PageSelectionClipboard {
         origin_x: dst_x,

@@ -251,6 +251,7 @@ const EXT_TAG_LIBRARY_META: u8 = 5;
 const EXT_TAG_PAGE_EXTRAS_AND_TEMPLATES: u8 = 6;
 const EXT_TAG_SHAPES_AND_RICH_TEXT: u8 = 7;
 const EXT_TAG_DOCUMENT_IDENTITY: u8 = 8;
+const EXT_TAG_ELEMENT_Z_ORDER: u8 = 9;
 
 fn write_f32(out: &mut Vec<u8>, v: f32) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -529,6 +530,7 @@ fn read_page_image(r: &mut Reader<'_>) -> Result<Arc<PageImage>, FormatError> {
             pixel_width,
             pixel_height,
             png_bytes: Arc::new(png_bytes),
+            z_order: 0,
         }
         .sanitized(),
     ))
@@ -588,6 +590,81 @@ fn write_page_extensions(out: &mut Vec<u8>, doc: &Document, pages: &[NotebookPag
     write_library_meta_extension(out, doc);
     write_page_extras_extension(out, &doc.image_templates, pages);
     write_document_identity_extension(out, doc);
+    write_element_z_order_extension(out, pages);
+}
+
+fn write_z_order_entries<T>(out: &mut Vec<u8>, items: &[T], z_fn: impl Fn(&T) -> u64) {
+    let entries: Vec<(usize, u64)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, item)| {
+            let z = z_fn(item);
+            (z > 0).then_some((idx, z))
+        })
+        .collect();
+    write_varint(out, entries.len() as u64);
+    for (idx, z) in entries {
+        write_varint(out, idx as u64);
+        write_varint(out, z);
+    }
+}
+
+fn read_z_order_entries<T: Clone>(
+    r: &mut Reader<'_>,
+    items: &mut [Arc<T>],
+    label: &str,
+    set_fn: impl Fn(&mut T, u64),
+) -> Result<(), FormatError> {
+    let count = r.read_varint_usize(items.len(), label)?;
+    let max_idx = items.len().saturating_sub(1);
+    for _ in 0..count {
+        let idx = r.read_varint_usize(max_idx, label)?;
+        let z = r.read_varint()?;
+        if let Some(slot) = items.get_mut(idx) {
+            set_fn(Arc::make_mut(slot), z);
+        }
+    }
+    Ok(())
+}
+
+fn write_element_z_order_extension(out: &mut Vec<u8>, pages: &[NotebookPage]) {
+    let has_z = pages.iter().any(|p| {
+        p.strokes.iter().any(|s| s.z_order > 0)
+            || p.texts.iter().any(|t| t.z_order > 0)
+            || p.shapes.iter().any(|s| s.z_order > 0)
+            || p.images.iter().any(|im| im.z_order > 0)
+    });
+    if !has_z {
+        return;
+    }
+    out.push(EXT_TAG_ELEMENT_Z_ORDER);
+    for page in pages {
+        write_z_order_entries(out, &page.strokes, |s| s.z_order);
+        write_z_order_entries(out, &page.texts, |t| t.z_order);
+        write_z_order_entries(out, &page.shapes, |s| s.z_order);
+        write_z_order_entries(out, &page.images, |im| im.z_order);
+    }
+}
+
+fn read_element_z_order_extension(
+    r: &mut Reader<'_>,
+    pages: &mut [NotebookPage],
+) -> Result<(), FormatError> {
+    for page in pages {
+        read_z_order_entries(r, &mut page.strokes, "stroke z_order", |s, z| {
+            s.z_order = z;
+        })?;
+        read_z_order_entries(r, &mut page.texts, "text z_order", |t, z| {
+            t.z_order = z;
+        })?;
+        read_z_order_entries(r, &mut page.shapes, "shape z_order", |s, z| {
+            s.z_order = z;
+        })?;
+        read_z_order_entries(r, &mut page.images, "image z_order", |im, z| {
+            im.z_order = z;
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -958,6 +1035,7 @@ fn read_page_extensions(
     let mut seen_page_extras = false;
     let mut seen_shapes_rich_text = false;
     let mut seen_identity = false;
+    let mut seen_element_z_order = false;
     while r.has_remaining() {
         let tag = r.read_u8()?;
         match tag {
@@ -992,6 +1070,10 @@ fn read_page_extensions(
             EXT_TAG_DOCUMENT_IDENTITY if !seen_identity => {
                 seen_identity = true;
                 read_document_identity_extension(r, &mut ext)?;
+            }
+            EXT_TAG_ELEMENT_Z_ORDER if !seen_element_z_order => {
+                seen_element_z_order = true;
+                read_element_z_order_extension(r, pages)?;
             }
             _ => {
                 return Err(FormatError::BinaryCorrupt(format!(

@@ -930,7 +930,7 @@ fn system_workspace_info(app: &PaperCraftApp) -> (String, Option<String>) {
 }
 
 fn draw_system_info_card(app: &PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
-    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let version = crate::display_version_label();
     let platform = system_platform_label();
     let renderer = system_renderer_label(app.wgpu_enabled);
     let (workspace, workspace_tip) = system_workspace_info(app);
@@ -959,7 +959,14 @@ fn draw_system_info_card(app: &PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 5.0;
-                draw_system_info_row(ui, "Version", &version, true, None, t);
+                draw_system_info_row(
+                    ui,
+                    "Version",
+                    &version,
+                    true,
+                    Some(crate::ALPHA_STATUS_TOOLTIP),
+                    t,
+                );
                 draw_system_info_row(ui, "Platform", &platform, false, None, t);
                 draw_system_info_row(ui, "Renderer", renderer, false, None, t);
                 draw_system_info_row(
@@ -1481,7 +1488,8 @@ mod tests {
         let (_, sys_texts) = render_inspector_tab(&mut app, SettingsTab::System);
         assert!(sys_texts.contains("System Info"));
         assert!(sys_texts.contains("Version"));
-        assert!(sys_texts.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(sys_texts.contains(&crate::display_version_label()));
+        assert!(sys_texts.contains("Unstable Alpha"));
         assert!(sys_texts.contains("Platform"));
         assert!(sys_texts.contains("Renderer"));
         assert!(sys_texts.contains("Workspace"));

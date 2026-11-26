@@ -490,10 +490,11 @@ impl Session {
             return None;
         }
         if let Some(shape) = live.recognized_shape {
-            let clean = shape.sanitized();
+            let mut clean = shape.sanitized();
             if self.doc.shapes.len() < MAX_PAGE_SHAPES {
                 let before = Arc::clone(&self.doc);
                 let mut next = (*self.doc).clone();
+                clean.z_order = next.alloc_z_order();
                 let index = next.shapes.len();
                 next.shapes.push(Arc::new(clean.clone()));
                 next.sync_active_to_pages();
@@ -547,12 +548,10 @@ impl Session {
         let before = Arc::clone(&self.doc);
         let mut next = (*self.doc).clone();
         let id = next.alloc_stroke_id();
-        next.strokes.push(Arc::new(InkStroke::new(
-            id,
-            pen,
-            raw_points,
-            smoothed_points,
-        )));
+        let z_order = next.alloc_z_order();
+        next.strokes.push(Arc::new(
+            InkStroke::new(id, pen, raw_points, smoothed_points).with_z_order(z_order),
+        ));
         let now = papercraft_sync_protocol::now_unix_ms();
         if next.created_at_ms == 0 {
             next.created_at_ms = now;
@@ -1366,8 +1365,8 @@ mod tests {
         assert_eq!(clr["clearedImages"], 2);
         assert!(s.doc.images.is_empty());
 
-        // Center placement coordinates center the image on (center_x, center_y), clamp to page bounds,
-        // preserve explicit top-left x/y precedence, and reject non-finite coordinates.
+        // Center placement coordinates center the image on (center_x, center_y), allowing placement
+        // to cross outside page bounds while still preserving explicit top-left x/y precedence.
         let large_png = papercraft_raster::png_encode(120, 60, &[180u8; 120 * 60 * 4]).unwrap();
         s.execute(
             "image.insert",
@@ -1383,9 +1382,10 @@ mod tests {
             &serde_json::json!({ "bytes": large_png, "center_x": 10.0, "center_y": 15.0 }),
         )
         .unwrap();
-        let clamped = &s.doc.images[1];
-        assert!((clamped.x - 0.0).abs() < 1e-6);
-        assert!((clamped.y - 0.0).abs() < 1e-6);
+        let overhang = &s.doc.images[1];
+        assert!((overhang.center().x - 10.0).abs() < 1e-6);
+        assert!((overhang.center().y - 15.0).abs() < 1e-6);
+        assert!(overhang.x < 0.0 && overhang.y < 0.0);
 
         s.execute(
             "image.insert",
@@ -1402,7 +1402,7 @@ mod tests {
         assert!((explicit.x - 95.0).abs() < 1e-6);
         assert!((explicit.y - 105.0).abs() < 1e-6);
 
-        // Extreme finite coordinates clamp cleanly inside page bounds without producing NaN.
+        // Extreme finite coordinates sanitize cleanly to finite bounded values without producing NaN.
         let extreme_res = s
             .execute(
                 "image.insert",
@@ -1412,8 +1412,7 @@ mod tests {
         let extreme_idx = extreme_res["imageIndex"].as_u64().unwrap() as usize;
         let extreme = &s.doc.images[extreme_idx];
         assert!(extreme.x.is_finite() && extreme.y.is_finite());
-        assert!((extreme.x - (f64::from(s.doc.width) - extreme.width)).abs() < 1e-6);
-        assert!((extreme.y - 0.0).abs() < 1e-6);
+        assert!(extreme.x.abs() <= 1e6 && extreme.y.abs() <= 1e6);
     }
 
     #[test]
@@ -2692,5 +2691,156 @@ mod tests {
         assert_eq!(unlock_res["read_only"], serde_json::json!(false));
         assert!(!s.is_read_only());
         assert!(s.execute("page.add", &serde_json::json!({})).is_ok());
+    }
+
+    #[test]
+    fn shapes_and_text_can_start_and_extend_outside_page_bounds() {
+        let mut s = Session::default();
+        let w = f64::from(s.doc.width);
+        let h = f64::from(s.doc.height);
+
+        let left_res = s
+            .execute(
+                "shape.insert",
+                &serde_json::json!({
+                    "kind": "Rectangle",
+                    "x1": -90.0,
+                    "y1": -45.0,
+                    "x2": 140.0,
+                    "y2": 180.0,
+                }),
+            )
+            .expect("shape crossing top-left page edge must succeed");
+        assert_eq!(left_res["shapeIndex"], 0);
+        assert_eq!(s.doc.shapes[0].x1, -90.0);
+        assert_eq!(s.doc.shapes[0].y1, -45.0);
+
+        s.execute(
+            "shape.insert",
+            &serde_json::json!({
+                "kind": "Ellipse",
+                "x1": w - 30.0,
+                "y1": h - 20.0,
+                "x2": w + 120.0,
+                "y2": h + 85.0,
+            }),
+        )
+        .expect("shape extending past bottom-right edge must succeed");
+        assert_eq!(s.doc.shapes[1].x2, w + 120.0);
+        assert_eq!(s.doc.shapes[1].y2, h + 85.0);
+
+        s.execute(
+            "text.insert",
+            &serde_json::json!({
+                "text": "Margin note",
+                "x": -110.0,
+                "y": 40.0,
+            }),
+        )
+        .expect("text outside left page boundary must succeed");
+        assert_eq!(s.doc.texts[0].x, -110.0);
+    }
+
+    #[test]
+    fn automatic_z_order_tracks_creation_and_preserves_eraser_split_and_highlighter_band() {
+        let mut s = Session::default();
+        let s1 = s
+            .execute(
+                "stroke.draw",
+                &serde_json::json!({
+                    "kind": "FountainPen",
+                    "points": [
+                        { "x": 100.0, "y": 150.0, "pressure": 0.7 },
+                        { "x": 220.0, "y": 150.0, "pressure": 0.7 },
+                        { "x": 340.0, "y": 150.0, "pressure": 0.7 }
+                    ]
+                }),
+            )
+            .unwrap()["strokeId"]
+            .as_u64()
+            .unwrap();
+        s.execute(
+            "shape.insert",
+            &serde_json::json!({
+                "kind": "Rectangle",
+                "x1": 120.0,
+                "y1": 110.0,
+                "x2": 320.0,
+                "y2": 210.0,
+            }),
+        )
+        .unwrap();
+        s.execute(
+            "text.insert",
+            &serde_json::json!({
+                "text": "Top Text",
+                "x": 150.0,
+                "y": 160.0,
+            }),
+        )
+        .unwrap();
+        let s2 = s
+            .execute(
+                "stroke.draw",
+                &serde_json::json!({
+                    "kind": "BallPen",
+                    "points": [
+                        { "x": 110.0, "y": 130.0, "pressure": 0.7 },
+                        { "x": 310.0, "y": 130.0, "pressure": 0.7 }
+                    ]
+                }),
+            )
+            .unwrap()["strokeId"]
+            .as_u64()
+            .unwrap();
+
+        let z_s1 = s
+            .doc
+            .strokes
+            .iter()
+            .find(|st| st.id.0 == s1)
+            .unwrap()
+            .z_order;
+        let z_shape = s.doc.shapes[0].z_order;
+        let z_text = s.doc.texts[0].z_order;
+        let z_s2 = s
+            .doc
+            .strokes
+            .iter()
+            .find(|st| st.id.0 == s2)
+            .unwrap()
+            .z_order;
+        assert!(z_s1 > 0 && z_s1 < z_shape && z_shape < z_text && z_text < z_s2);
+
+        // Precision-splitting the older stroke s1 must preserve its z_order (`z_s1`), keeping both
+        // split pieces behind the square and text drawn later.
+        s.execute(
+            "stroke.erase",
+            &serde_json::json!({
+                "mode": "PrecisionEraser",
+                "path": [{ "x": 220.0, "y": 150.0, "radius": 12.0 }]
+            }),
+        )
+        .unwrap();
+        let split_pieces: Vec<_> = s.doc.strokes.iter().filter(|st| st.id.0 != s2).collect();
+        assert!(
+            split_pieces.len() >= 2,
+            "s1 should split into >= 2 segments"
+        );
+        assert!(split_pieces.iter().all(|st| st.z_order == z_s1));
+
+        // Duplicating `[shape, text]` stamps copies strictly above everything on the page in relative order.
+        s.execute(
+            "selection.duplicate",
+            &serde_json::json!({
+                "targets": [
+                    { "kind": "shape", "index": 0 },
+                    { "kind": "text", "index": 0 }
+                ]
+            }),
+        )
+        .unwrap();
+        assert!(s.doc.shapes[1].z_order > z_s2);
+        assert!(s.doc.texts[1].z_order > s.doc.shapes[1].z_order);
     }
 }

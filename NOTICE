@@ -1,0 +1,34 @@
+PaperCraft
+Copyright (c) 2026 Alyx Labs and the PaperCraft contributors.
+
+Licensed under the MIT License or the Apache License, Version 2.0, at your
+option (LICENSE-MIT, LICENSE-APACHE).
+
+Brand and trademarks
+The Alyx Labs, PaperCraft, Paper Craft, and PaperCraft Server names,
+wordmarks, official domains (papercraft.ink, web.papercraft.ink), bundle
+identifiers (com.alyxlabs.*), logos and icons in
+apps/papercraft/assets/branding/, and brand illustration in
+crates/ui-egui/assets/illustrations/welcome-sea.png are proprietary
+trademarks and brand assets of Alyx Labs. They are not open source and are
+not covered by the software licenses above; their terms are in
+apps/papercraft/assets/branding/LICENSE-brand.txt.
+
+Third-party material
+This product bundles third-party material under its own licenses, listed
+below. Per-file details, sources, and copyright notices are in ATTRIBUTION.md.
+
+- Roboto font family (crates/compose/assets/fonts/Roboto-*.ttf) —
+  Apache License, Version 2.0. See crates/compose/assets/fonts/LICENSE.
+- Bricolage Grotesque Bold font
+  (crates/ui-egui/assets/fonts/BricolageGrotesque-Bold.ttf) —
+  SIL Open Font License 1.1. See crates/ui-egui/assets/fonts/OFL.txt.
+- Lucide outline SVG icons (crates/ui-egui/assets/icons/lucide/*.svg,
+  pinned at lucide-static v1.72.0) — ISC License (icons derived from Feather
+  are also under the MIT License). See crates/ui-egui/assets/icons/lucide/LICENSE
+  and docs/ICONOGRAPHY.md.
+- Default egui embedded fonts (bundled via epaint_default_fonts v0.37.0 when
+  the `default_fonts` feature is enabled):
+  * Ubuntu-Light — Ubuntu Font Licence Version 1.0.
+  * Hack-Regular — MIT License and Bitstream Vera License.
+  * egui-icons (subset of emoji-icon-font by John Slegers) — MIT License.

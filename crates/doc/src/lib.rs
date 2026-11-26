@@ -175,6 +175,9 @@ pub struct TextItem {
     /// Span-level rich formatting ranges over `text` UTF-8 byte offsets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spans: Vec<TextSpan>,
+    /// Monotonic per-page creation draw order (`0` indicates legacy default layer order).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub z_order: u64,
 }
 
 /// Font families available for page text.
@@ -212,6 +215,7 @@ impl Default for TextItem {
             link_url: None,
             alignment: TextAlignment::Left,
             spans: Vec::new(),
+            z_order: 0,
         }
     }
 }
@@ -557,6 +561,7 @@ impl TextItem {
             link_url: self.link_url.as_deref().and_then(sanitize_link_url),
             alignment: self.alignment,
             spans,
+            z_order: self.z_order,
         }
     }
 
@@ -1004,13 +1009,19 @@ impl TextItem {
 }
 
 /// Computes the maximum horizontal text width from `x` to the page's right margin.
+///
+/// When `x` sits beyond the right edge of the sheet, returns a sensible default wrap
+/// column width instead of collapsing to the minimum text box width.
 pub fn text_max_page_width(page_width: u32, x: f64) -> f32 {
     let width = f64::from(page_width);
-    let safe_x = if x.is_finite() {
-        x.clamp(0.0, width)
-    } else {
-        0.0
-    };
+    if !x.is_finite() {
+        return (width - TEXT_PAGE_RIGHT_MARGIN_PT).max(16.0) as f32;
+    }
+    if x >= width {
+        return (width - TEXT_PAGE_RIGHT_MARGIN_PT).clamp(f64::from(MIN_TEXT_BOX_WIDTH), 360.0)
+            as f32;
+    }
+    let safe_x = x.clamp(0.0, width);
     (width - safe_x - TEXT_PAGE_RIGHT_MARGIN_PT).max(16.0) as f32
 }
 
@@ -1469,6 +1480,9 @@ pub struct GeometricShape {
     /// Vertices in page coordinates for `ShapeKind::Polygon` prior to `angle_degrees` rotation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub points: Vec<Point>,
+    /// Monotonic per-page creation draw order (`0` indicates legacy default layer order).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub z_order: u64,
 }
 
 impl Default for GeometricShape {
@@ -1486,6 +1500,7 @@ impl Default for GeometricShape {
             fill_color: None,
             line_style: ShapeLineStyle::Solid,
             points: Vec::new(),
+            z_order: 0,
         }
     }
 }
@@ -1553,6 +1568,7 @@ impl GeometricShape {
             fill_color: self.fill_color.map(|c| c.sanitized()).filter(|c| c.a > 0.0),
             line_style: self.line_style,
             points,
+            z_order: self.z_order,
         }
     }
 
@@ -2016,6 +2032,9 @@ pub struct PageImage {
     pub pixel_height: u32,
     #[serde(with = "arc_base64_bytes")]
     pub png_bytes: Arc<Vec<u8>>,
+    /// Monotonic per-page creation draw order (`0` indicates legacy default layer order).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub z_order: u64,
 }
 
 impl Default for PageImage {
@@ -2029,6 +2048,7 @@ impl Default for PageImage {
             pixel_width: 1,
             pixel_height: 1,
             png_bytes: Arc::new(Vec::new()),
+            z_order: 0,
         }
     }
 }
@@ -2067,6 +2087,7 @@ impl PageImage {
             } else {
                 Arc::clone(&self.png_bytes)
             },
+            z_order: self.z_order,
         }
     }
 
@@ -4174,6 +4195,8 @@ struct InkStrokeWire {
     smoothed_points: Arc<Vec<StrokeSample>>,
     #[serde(default)]
     bounds: Option<Rect>,
+    #[serde(default)]
+    z_order: u64,
 }
 
 /// One committed ink stroke in a PaperCraft page.
@@ -4186,6 +4209,9 @@ pub struct InkStroke {
     pub smoothed_points: Arc<Vec<StrokeSample>>,
     #[serde(skip_serializing)]
     pub bounds: Rect,
+    /// Monotonic per-page creation draw order (`0` indicates legacy default layer order).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub z_order: u64,
 }
 
 impl<'de> Deserialize<'de> for InkStroke {
@@ -4204,6 +4230,7 @@ impl<'de> Deserialize<'de> for InkStroke {
             raw_points: wire.raw_points,
             smoothed_points: wire.smoothed_points,
             bounds,
+            z_order: wire.z_order,
         })
     }
 }
@@ -4223,7 +4250,15 @@ impl InkStroke {
             raw_points: Arc::new(raw_points),
             smoothed_points: Arc::new(smoothed_points),
             bounds,
+            z_order: 0,
         }
+    }
+
+    /// Assigns an explicit per-page draw-order rank to this stroke.
+    #[must_use]
+    pub fn with_z_order(mut self, z_order: u64) -> Self {
+        self.z_order = z_order;
+        self
     }
 
     /// Returns a copy with sanitized pen settings and finite point coordinates.
@@ -4271,6 +4306,7 @@ impl InkStroke {
             clean_pts(self.raw_points.as_slice()),
             clean_pts(self.smoothed_points.as_slice()),
         )
+        .with_z_order(self.z_order)
     }
 }
 
@@ -4284,6 +4320,207 @@ fn is_zero_u8(value: &u8) -> bool {
 
 fn is_zero_i64(value: &i64) -> bool {
     *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Visual stacking band on a page (`Images -> Highlighters -> Foreground`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PageLayerBand {
+    /// Raster images sit above paper/PDF backgrounds and below highlighters and foreground items.
+    Image = 0,
+    /// Highlighter strokes remain in an isolated layer behind normal ink, shapes, and text.
+    Highlighter = 1,
+    /// Normal ink strokes, geometric shapes, and rich text boxes interleaved in creation draw order.
+    Foreground = 2,
+}
+
+/// Kind of drawable element on a page for layer-rank sorting and hit-test ranking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LayerElementKind {
+    Image,
+    Highlighter,
+    Ink,
+    Text,
+    Shape,
+}
+
+/// Totally-ordered sort key `(band, explicit_flag, legacy_tier, z_order, kind_tie, index)`
+/// so greater values always paint later (higher / on top).
+pub type LayerPaintRank = (u8, u8, u8, u64, u8, usize);
+
+/// Contiguous paint batch produced after ordering all elements on a page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PagePaintStep {
+    /// Sorted image indices in `page.images` (Band 0).
+    Images(Vec<usize>),
+    /// Sorted highlighter stroke indices in `page.strokes` (Band 1).
+    Highlighters(Vec<usize>),
+    /// Contiguous run of non-highlighter stroke indices in `page.strokes` (Band 2).
+    InkRun(Vec<usize>),
+    /// Geometric shape index in `page.shapes` (Band 2).
+    Shape(usize),
+    /// Rich text item index in `page.texts` (Band 2).
+    Text(usize),
+}
+
+/// Computes the canonical back-to-front draw rank for an element on a page.
+#[must_use]
+pub const fn element_layer_rank(
+    kind: LayerElementKind,
+    z_order: u64,
+    index: usize,
+) -> LayerPaintRank {
+    let band = match kind {
+        LayerElementKind::Image => PageLayerBand::Image as u8,
+        LayerElementKind::Highlighter => PageLayerBand::Highlighter as u8,
+        LayerElementKind::Ink | LayerElementKind::Text | LayerElementKind::Shape => {
+            PageLayerBand::Foreground as u8
+        }
+    };
+    let kind_tie = match kind {
+        LayerElementKind::Image | LayerElementKind::Highlighter | LayerElementKind::Ink => 0,
+        LayerElementKind::Text => 1,
+        LayerElementKind::Shape => 2,
+    };
+    let explicit = if z_order > 0 { 1 } else { 0 };
+    let legacy_tier = if explicit != 0 { 0 } else { kind_tie };
+    (band, explicit, legacy_tier, z_order, kind_tie, index)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForegroundKind {
+    Ink,
+    Shape,
+    Text,
+}
+
+/// Orders all elements in a page or sticker back-to-front using automatic draw order
+/// with the fixed highlighter band (`Images -> Highlighters -> Foreground [Ink/Shape/Text]`).
+pub fn page_paint_steps<St, Sh, Tx, Im>(
+    strokes: &[St],
+    shapes: &[Sh],
+    texts: &[Tx],
+    images: &[Im],
+) -> Vec<PagePaintStep>
+where
+    St: std::borrow::Borrow<InkStroke>,
+    Sh: std::borrow::Borrow<GeometricShape>,
+    Tx: std::borrow::Borrow<TextItem>,
+    Im: std::borrow::Borrow<PageImage>,
+{
+    let mut steps = Vec::new();
+
+    if !images.is_empty() {
+        let mut img_ranked: Vec<(LayerPaintRank, usize)> = images
+            .iter()
+            .enumerate()
+            .map(|(idx, im)| {
+                (
+                    element_layer_rank(LayerElementKind::Image, im.borrow().z_order, idx),
+                    idx,
+                )
+            })
+            .collect();
+        img_ranked.sort_unstable_by_key(|a| a.0);
+        steps.push(PagePaintStep::Images(
+            img_ranked.into_iter().map(|(_, idx)| idx).collect(),
+        ));
+    }
+
+    let mut hl_ranked: Vec<(LayerPaintRank, usize)> = Vec::new();
+    let mut fg_ranked: Vec<(LayerPaintRank, ForegroundKind, usize)> =
+        Vec::with_capacity(strokes.len() + shapes.len() + texts.len());
+
+    for (idx, st) in strokes.iter().enumerate() {
+        let st = st.borrow();
+        if st.pen.kind == PenKind::Highlighter {
+            hl_ranked.push((
+                element_layer_rank(LayerElementKind::Highlighter, st.z_order, idx),
+                idx,
+            ));
+        } else {
+            fg_ranked.push((
+                element_layer_rank(LayerElementKind::Ink, st.z_order, idx),
+                ForegroundKind::Ink,
+                idx,
+            ));
+        }
+    }
+    for (idx, sh) in shapes.iter().enumerate() {
+        fg_ranked.push((
+            element_layer_rank(LayerElementKind::Shape, sh.borrow().z_order, idx),
+            ForegroundKind::Shape,
+            idx,
+        ));
+    }
+    for (idx, tx) in texts.iter().enumerate() {
+        fg_ranked.push((
+            element_layer_rank(LayerElementKind::Text, tx.borrow().z_order, idx),
+            ForegroundKind::Text,
+            idx,
+        ));
+    }
+
+    if !hl_ranked.is_empty() {
+        hl_ranked.sort_unstable_by_key(|a| a.0);
+        steps.push(PagePaintStep::Highlighters(
+            hl_ranked.into_iter().map(|(_, idx)| idx).collect(),
+        ));
+    }
+
+    if !fg_ranked.is_empty() {
+        fg_ranked.sort_unstable_by_key(|a| a.0);
+        let mut ink_run: Vec<usize> = Vec::new();
+        for (_, kind, idx) in fg_ranked {
+            match kind {
+                ForegroundKind::Ink => ink_run.push(idx),
+                ForegroundKind::Shape => {
+                    if !ink_run.is_empty() {
+                        steps.push(PagePaintStep::InkRun(std::mem::take(&mut ink_run)));
+                    }
+                    steps.push(PagePaintStep::Shape(idx));
+                }
+                ForegroundKind::Text => {
+                    if !ink_run.is_empty() {
+                        steps.push(PagePaintStep::InkRun(std::mem::take(&mut ink_run)));
+                    }
+                    steps.push(PagePaintStep::Text(idx));
+                }
+            }
+        }
+        if !ink_run.is_empty() {
+            steps.push(PagePaintStep::InkRun(ink_run));
+        }
+    }
+
+    steps
+}
+
+/// Returns the maximum `z_order` present across a page's slices.
+pub fn max_z_order_across<St, Sh, Tx, Im>(
+    strokes: &[St],
+    shapes: &[Sh],
+    texts: &[Tx],
+    images: &[Im],
+) -> u64
+where
+    St: std::borrow::Borrow<InkStroke>,
+    Sh: std::borrow::Borrow<GeometricShape>,
+    Tx: std::borrow::Borrow<TextItem>,
+    Im: std::borrow::Borrow<PageImage>,
+{
+    let s_max = strokes
+        .iter()
+        .map(|s| s.borrow().z_order)
+        .max()
+        .unwrap_or(0);
+    let sh_max = shapes.iter().map(|s| s.borrow().z_order).max().unwrap_or(0);
+    let t_max = texts.iter().map(|t| t.borrow().z_order).max().unwrap_or(0);
+    let im_max = images.iter().map(|i| i.borrow().z_order).max().unwrap_or(0);
+    s_max.max(sh_max).max(t_max).max(im_max)
 }
 
 /// Maximum sanitized title length for a notebook.
@@ -5238,6 +5475,16 @@ impl NotebookPage {
             custom_template_id: None,
         }
     }
+
+    /// Returns the highest draw-order rank currently present on this page.
+    pub fn max_z_order(&self) -> u64 {
+        max_z_order_across(&self.strokes, &self.shapes, &self.texts, &self.images)
+    }
+
+    /// Builds sorted back-to-front draw batches for this page.
+    pub fn paint_steps(&self) -> Vec<PagePaintStep> {
+        page_paint_steps(&self.strokes, &self.shapes, &self.texts, &self.images)
+    }
 }
 
 /// Pure PaperCraft multi-page notebook document.
@@ -5737,6 +5984,21 @@ impl Document {
             self.custom_image_backdrop = page.custom_image_backdrop;
             self.custom_template_id = page.custom_template_id;
         }
+    }
+
+    /// Returns the highest draw-order rank currently used on the active page.
+    pub fn max_z_order_on_page(&self) -> u64 {
+        max_z_order_across(&self.strokes, &self.shapes, &self.texts, &self.images)
+    }
+
+    /// Allocates the next strictly-increasing draw-order rank for the active page.
+    pub fn alloc_z_order(&self) -> u64 {
+        self.max_z_order_on_page().saturating_add(1).max(1)
+    }
+
+    /// Builds sorted back-to-front draw batches for the active page.
+    pub fn page_paint_steps(&self) -> Vec<PagePaintStep> {
+        page_paint_steps(&self.strokes, &self.shapes, &self.texts, &self.images)
     }
 
     /// Returns the embedded PDF and 0-based PDF page index referenced by `page`, if any.
@@ -6463,12 +6725,10 @@ fn rotate_page_90_cw(page: &mut NotebookPage) {
             .copied()
             .map(|s| rotate_sample_90_cw(s, old_h_f64))
             .collect();
-        *stroke = Arc::new(InkStroke::new(
-            stroke.id,
-            stroke.pen.clone(),
-            raw_points,
-            smoothed_points,
-        ));
+        *stroke = Arc::new(
+            InkStroke::new(stroke.id, stroke.pen.clone(), raw_points, smoothed_points)
+                .with_z_order(stroke.z_order),
+        );
     }
 
     for text in &mut page.texts {
@@ -7147,6 +7407,7 @@ fn builtin_image_sticker(id: &str, name: &str, size: f64, png_bytes: &[u8]) -> S
             pixel_width,
             pixel_height,
             png_bytes: Arc::new(png_bytes.to_vec()),
+            z_order: 0,
         }],
     }
 }
@@ -8539,6 +8800,7 @@ mod tests {
             pixel_width: 0,
             pixel_height: 99999,
             png_bytes: Arc::new(vec![137, 80, 78, 71, 13, 10, 26, 10]),
+            z_order: 0,
         };
         let clean = dirty.sanitized();
         assert_eq!(clean.x, 0.0);
@@ -8558,6 +8820,7 @@ mod tests {
             pixel_width: 4,
             pixel_height: 2,
             png_bytes: Arc::new(vec![1, 2, 3, 4, 5]),
+            z_order: 0,
         };
         let b = rotated.bounds();
         assert!((b.x - 130.0).abs() < 1e-6);
@@ -9329,5 +9592,111 @@ mod tests {
             serde_json::from_str(&encoded).expect("deserialize studio config");
         assert!(!decoded.auto_create_desktop_shortcut);
         assert!(!decoded.sanitized().auto_create_desktop_shortcut);
+    }
+
+    #[test]
+    fn layer_ordering_ranks_interleaved_elements_and_keeps_highlighters_below_foreground() {
+        let mut doc = Document::new(800, 1000);
+        // Legacy elements (z_order == 0) always follow legacy order: Image -> HL -> Ink -> Text -> Shape.
+        doc.shapes.push(Arc::new(GeometricShape {
+            kind: ShapeKind::Rectangle,
+            x1: 10.0,
+            y1: 10.0,
+            x2: 100.0,
+            y2: 100.0,
+            z_order: 0,
+            ..GeometricShape::default()
+        }));
+        doc.texts.push(Arc::new(TextItem {
+            text: "Legacy".into(),
+            z_order: 0,
+            ..TextItem::default()
+        }));
+        let legacy_ink = InkStroke::new(
+            StrokeId(1),
+            PenSettings::ball_pen(),
+            vec![StrokeSample::from_xy_pressure(20.0, 20.0, 0.5)],
+            vec![StrokeSample::from_xy_pressure(40.0, 40.0, 0.5)],
+        );
+        doc.strokes.push(Arc::new(legacy_ink));
+        assert_eq!(
+            doc.page_paint_steps(),
+            vec![
+                PagePaintStep::InkRun(vec![0]),
+                PagePaintStep::Text(0),
+                PagePaintStep::Shape(0),
+            ]
+        );
+
+        // Explicit creation order interleaves Ink, Shape, and Text while pinning highlighters to Band 1.
+        let mut ordered = Document::new(800, 1000);
+        let png = vec![137, 80, 78, 71, 13, 10, 26, 10];
+        ordered.images.push(Arc::new(PageImage {
+            png_bytes: Arc::new(png),
+            z_order: 10,
+            ..PageImage::default()
+        }));
+        ordered.shapes.push(Arc::new(GeometricShape {
+            kind: ShapeKind::Rectangle,
+            x1: 20.0,
+            y1: 20.0,
+            x2: 120.0,
+            y2: 120.0,
+            z_order: 1,
+            ..GeometricShape::default()
+        }));
+        let s_ink_1 = InkStroke::new(
+            StrokeId(1),
+            PenSettings::fountain_pen(),
+            vec![StrokeSample::from_xy_pressure(20.0, 20.0, 0.7)],
+            vec![StrokeSample::from_xy_pressure(60.0, 60.0, 0.7)],
+        )
+        .with_z_order(2);
+        ordered.strokes.push(Arc::new(s_ink_1));
+        ordered.texts.push(Arc::new(TextItem {
+            text: "Middle".into(),
+            z_order: 3,
+            ..TextItem::default()
+        }));
+        let s_ink_2 = InkStroke::new(
+            StrokeId(2),
+            PenSettings::ball_pen(),
+            vec![StrokeSample::from_xy_pressure(30.0, 30.0, 0.7)],
+            vec![StrokeSample::from_xy_pressure(80.0, 80.0, 0.7)],
+        )
+        .with_z_order(4);
+        ordered.strokes.push(Arc::new(s_ink_2));
+        // Highlighter drawn LAST (`z_order = 99`) still paints above images and behind ink/shapes/text.
+        let hl_pen = PenSettings {
+            kind: PenKind::Highlighter,
+            ..PenSettings::default()
+        };
+        let s_hl = InkStroke::new(
+            StrokeId(3),
+            hl_pen,
+            vec![StrokeSample::from_xy_pressure(20.0, 40.0, 0.7)],
+            vec![StrokeSample::from_xy_pressure(100.0, 40.0, 0.7)],
+        )
+        .with_z_order(99);
+        ordered.strokes.push(Arc::new(s_hl));
+
+        assert_eq!(
+            ordered.page_paint_steps(),
+            vec![
+                PagePaintStep::Images(vec![0]),
+                PagePaintStep::Highlighters(vec![2]),
+                PagePaintStep::Shape(0),
+                PagePaintStep::InkRun(vec![0]),
+                PagePaintStep::Text(0),
+                PagePaintStep::InkRun(vec![1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_max_page_width_handles_offpage_positions_cleanly() {
+        assert_eq!(text_max_page_width(800, 750.0), 42.0);
+        assert_eq!(text_max_page_width(800, -120.0), 792.0);
+        assert_eq!(text_max_page_width(800, 920.0), 360.0);
     }
 }

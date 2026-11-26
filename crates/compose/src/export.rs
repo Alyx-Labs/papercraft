@@ -612,11 +612,29 @@ fn format_svg_path_data(segs: &[PathSeg]) -> String {
     d
 }
 
-fn append_svg_strokes(out: &mut String, doc: &Document) {
-    let _ = writeln!(out, "  <g id=\"ink-strokes\">");
+fn append_svg_stroke_indices(
+    out: &mut String,
+    strokes: &[Arc<InkStroke>],
+    indices: &[usize],
+    group_id: Option<&str>,
+) {
+    if indices.is_empty() {
+        return;
+    }
+    match group_id {
+        Some(id) => {
+            let _ = writeln!(out, "  <g id=\"{id}\">");
+        }
+        None => {
+            let _ = writeln!(out, "  <g>");
+        }
+    }
     let mut active_style: Option<([u8; 3], u16, bool)> = None;
 
-    for stroke in &doc.strokes {
+    for &idx in indices {
+        let Some(stroke) = strokes.get(idx) else {
+            continue;
+        };
         let (segs, color, alpha) = build_stroke_path(stroke);
         if segs.is_empty() || alpha <= 1e-4 {
             continue;
@@ -842,30 +860,59 @@ fn append_svg_text_run(
     }
 }
 
-fn append_svg_text(out: &mut String, doc: &Document) {
-    if doc.texts.is_empty() {
+fn append_svg_page_defs(out: &mut String, w: u32, h: u32, include_fonts: bool) {
+    if include_fonts {
+        let font_reg = base64_encode(include_bytes!("../assets/fonts/Roboto-Regular.ttf"));
+        let font_bold = base64_encode(include_bytes!("../assets/fonts/Roboto-Bold.ttf"));
+        let font_italic = base64_encode(include_bytes!("../assets/fonts/Roboto-Italic.ttf"));
+        let font_bold_italic =
+            base64_encode(include_bytes!("../assets/fonts/Roboto-BoldItalic.ttf"));
+        let license = xml_escape(include_str!("../assets/fonts/LICENSE"));
+        let _ = writeln!(
+            out,
+            "  <metadata>Embedded Roboto font family license: {license}</metadata>"
+        );
+        let _ = writeln!(
+            out,
+            "  <defs>\
+            <clipPath id=\"page-clip\"><rect x=\"0\" y=\"0\" width=\"{w}\" height=\"{h}\"/></clipPath>\
+            <style>\
+            @font-face{{font-family:PaperCraftText;font-style:normal;font-weight:400;src:url(data:font/ttf;base64,{font_reg}) format('truetype');}}\
+            @font-face{{font-family:PaperCraftText;font-style:normal;font-weight:700;src:url(data:font/ttf;base64,{font_bold}) format('truetype');}}\
+            @font-face{{font-family:PaperCraftText;font-style:italic;font-weight:400;src:url(data:font/ttf;base64,{font_italic}) format('truetype');}}\
+            @font-face{{font-family:PaperCraftText;font-style:italic;font-weight:700;src:url(data:font/ttf;base64,{font_bold_italic}) format('truetype');}}\
+            </style></defs>"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "  <defs><clipPath id=\"page-clip\"><rect x=\"0\" y=\"0\" width=\"{w}\" height=\"{h}\"/></clipPath></defs>"
+        );
+    }
+}
+
+fn append_svg_text_indices(
+    out: &mut String,
+    doc_width: u32,
+    texts: &[Arc<TextItem>],
+    indices: &[usize],
+    group_id: Option<&str>,
+) {
+    if indices.is_empty() {
         return;
     }
-    let font_reg = base64_encode(include_bytes!("../assets/fonts/Roboto-Regular.ttf"));
-    let font_bold = base64_encode(include_bytes!("../assets/fonts/Roboto-Bold.ttf"));
-    let font_italic = base64_encode(include_bytes!("../assets/fonts/Roboto-Italic.ttf"));
-    let font_bold_italic = base64_encode(include_bytes!("../assets/fonts/Roboto-BoldItalic.ttf"));
-    let license = xml_escape(include_str!("../assets/fonts/LICENSE"));
-    let _ = writeln!(
-        out,
-        "  <metadata>Embedded Roboto font family license: {license}</metadata>"
-    );
-    let _ = writeln!(
-        out,
-        "  <defs><style>\
-        @font-face{{font-family:PaperCraftText;font-style:normal;font-weight:400;src:url(data:font/ttf;base64,{font_reg}) format('truetype');}}\
-        @font-face{{font-family:PaperCraftText;font-style:normal;font-weight:700;src:url(data:font/ttf;base64,{font_bold}) format('truetype');}}\
-        @font-face{{font-family:PaperCraftText;font-style:italic;font-weight:400;src:url(data:font/ttf;base64,{font_italic}) format('truetype');}}\
-        @font-face{{font-family:PaperCraftText;font-style:italic;font-weight:700;src:url(data:font/ttf;base64,{font_bold_italic}) format('truetype');}}\
-        </style></defs>"
-    );
-    let _ = writeln!(out, "  <g id=\"page-text\">");
-    for item in &doc.texts {
+    match group_id {
+        Some(id) => {
+            let _ = writeln!(out, "  <g id=\"{id}\">");
+        }
+        None => {
+            let _ = writeln!(out, "  <g>");
+        }
+    }
+    for &idx in indices {
+        let Some(item) = texts.get(idx) else {
+            continue;
+        };
         let item = item.as_ref().sanitized();
         let color = item.color.sanitized();
         let font_family = svg_font_family(item.font);
@@ -910,7 +957,7 @@ fn append_svg_text(out: &mut String, doc: &Document) {
                 fmt_number(item.y)
             );
         }
-        let max_w = item.effective_max_width(doc.width);
+        let max_w = item.effective_max_width(doc_width);
         let lines =
             papercraft_doc::wrap_styled_text_lines_with(&item, max_w, |ch, ch_font, ch_size| {
                 export_approx_char_w_for(ch, ch_font, ch_size).max(1.0)
@@ -1017,15 +1064,33 @@ fn append_svg_text(out: &mut String, doc: &Document) {
     let _ = writeln!(out, "  </g>");
 }
 
-fn append_svg_shapes(out: &mut String, shapes: &[std::sync::Arc<GeometricShape>]) {
-    if shapes.is_empty() {
+fn append_svg_shape_indices(
+    out: &mut String,
+    shapes: &[std::sync::Arc<GeometricShape>],
+    indices: &[usize],
+    group_id: Option<&str>,
+) {
+    if indices.is_empty() {
         return;
     }
-    let _ = writeln!(
-        out,
-        "  <g id=\"geometric-shapes\" fill=\"none\" stroke-linecap=\"round\" stroke-linejoin=\"round\">"
-    );
-    for item in shapes {
+    match group_id {
+        Some(id) => {
+            let _ = writeln!(
+                out,
+                "  <g id=\"{id}\" fill=\"none\" stroke-linecap=\"round\" stroke-linejoin=\"round\">"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "  <g fill=\"none\" stroke-linecap=\"round\" stroke-linejoin=\"round\">"
+            );
+        }
+    }
+    for &idx in indices {
+        let Some(item) = shapes.get(idx) else {
+            continue;
+        };
         let shape = item.as_ref().sanitized();
         let mut path = String::new();
         for (points, closed) in shape.path_segments() {
@@ -1091,12 +1156,15 @@ fn append_svg_shapes(out: &mut String, shapes: &[std::sync::Arc<GeometricShape>]
     let _ = writeln!(out, "  </g>");
 }
 
-fn append_svg_images(out: &mut String, images: &[Arc<PageImage>]) {
-    if images.is_empty() {
+fn append_svg_image_indices(out: &mut String, images: &[Arc<PageImage>], indices: &[usize]) {
+    if indices.is_empty() {
         return;
     }
     let _ = writeln!(out, "  <g id=\"page-images\">");
-    for img in images {
+    for &idx in indices {
+        let Some(img) = images.get(idx) else {
+            continue;
+        };
         let clean = img.sanitized();
         if clean.png_bytes.is_empty() {
             continue;
@@ -1237,10 +1305,60 @@ pub fn render_document_svg(doc: &Document) -> String {
     if !append_svg_pdf_backdrop(&mut out, doc) {
         append_svg_paper(&mut out, doc);
     }
-    append_svg_images(&mut out, &doc.images);
-    append_svg_strokes(&mut out, doc);
-    append_svg_text(&mut out, doc);
-    append_svg_shapes(&mut out, &doc.shapes);
+    append_svg_page_defs(&mut out, w, h, !doc.texts.is_empty());
+    let _ = writeln!(
+        out,
+        "  <g id=\"page-content\" clip-path=\"url(#page-clip)\">"
+    );
+    let steps = doc.page_paint_steps();
+    let mut emitted_ink_id = false;
+    let mut emitted_text_id = false;
+    let mut emitted_shape_id = false;
+    let mut i = 0_usize;
+    while i < steps.len() {
+        match &steps[i] {
+            papercraft_doc::PagePaintStep::Images(indices) => {
+                append_svg_image_indices(&mut out, &doc.images, indices);
+                i += 1;
+            }
+            papercraft_doc::PagePaintStep::Highlighters(indices) => {
+                append_svg_stroke_indices(
+                    &mut out,
+                    &doc.strokes,
+                    indices,
+                    Some("ink-highlighters"),
+                );
+                i += 1;
+            }
+            papercraft_doc::PagePaintStep::InkRun(indices) => {
+                let id = (!emitted_ink_id).then_some("ink-strokes");
+                emitted_ink_id = true;
+                append_svg_stroke_indices(&mut out, &doc.strokes, indices, id);
+                i += 1;
+            }
+            papercraft_doc::PagePaintStep::Text(_) => {
+                let mut indices = Vec::new();
+                while let Some(papercraft_doc::PagePaintStep::Text(idx)) = steps.get(i) {
+                    indices.push(*idx);
+                    i += 1;
+                }
+                let id = (!emitted_text_id).then_some("page-text");
+                emitted_text_id = true;
+                append_svg_text_indices(&mut out, doc.width, &doc.texts, &indices, id);
+            }
+            papercraft_doc::PagePaintStep::Shape(_) => {
+                let mut indices = Vec::new();
+                while let Some(papercraft_doc::PagePaintStep::Shape(idx)) = steps.get(i) {
+                    indices.push(*idx);
+                    i += 1;
+                }
+                let id = (!emitted_shape_id).then_some("geometric-shapes");
+                emitted_shape_id = true;
+                append_svg_shape_indices(&mut out, &doc.shapes, &indices, id);
+            }
+        }
+    }
+    let _ = writeln!(out, "  </g>");
     out.push_str("</svg>\n");
     out
 }
@@ -1314,49 +1432,54 @@ fn append_pdf_shape_paths(out: &mut String, segments: &[(Vec<Point>, bool)]) {
     }
 }
 
+fn append_pdf_shape_item(out: &mut String, item: &GeometricShape, states: &mut Vec<(bool, u8)>) {
+    let shape = item.sanitized();
+    let segments = shape.path_segments();
+    if !segments.iter().any(|(points, _)| points.len() >= 2) {
+        return;
+    }
+    if shape.is_closed()
+        && let Some(fill) = shape.fill_color
+        && fill.a > 0.0
+    {
+        out.push_str("q\n");
+        if fill.a < 0.995 {
+            let state = register_pdf_state(states, false, fill.a);
+            let _ = writeln!(out, "/GS{state} gs");
+        }
+        let _ = writeln!(out, "{} rg", color_rgb_pdf(fill));
+        append_pdf_shape_paths(out, &segments);
+        out.push_str("f\nQ\n");
+    }
+    if shape.color.a > 0.0 {
+        out.push_str("q\n");
+        if shape.color.a < 0.995 {
+            let state = register_pdf_state(states, false, shape.color.a);
+            let _ = writeln!(out, "/GS{state} gs");
+        }
+        let dash_cmd = match shape.line_style.dash_pattern(shape.width) {
+            Some((d, g)) => format!("[{d:.2} {g:.2}] 0 d "),
+            None => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            "{} RG {:.3} w 1 J 1 j {dash_cmd}",
+            color_rgb_pdf(shape.color),
+            shape.width
+        );
+        append_pdf_shape_paths(out, &segments);
+        out.push_str("S\nQ\n");
+    }
+}
+
+#[allow(dead_code)]
 fn append_pdf_shapes(
     out: &mut String,
     shapes: &[std::sync::Arc<GeometricShape>],
     states: &mut Vec<(bool, u8)>,
 ) {
     for item in shapes {
-        let shape = item.as_ref().sanitized();
-        let segments = shape.path_segments();
-        if !segments.iter().any(|(points, _)| points.len() >= 2) {
-            continue;
-        }
-        if shape.is_closed()
-            && let Some(fill) = shape.fill_color
-            && fill.a > 0.0
-        {
-            out.push_str("q\n");
-            if fill.a < 0.995 {
-                let state = register_pdf_state(states, false, fill.a);
-                let _ = writeln!(out, "/GS{state} gs");
-            }
-            let _ = writeln!(out, "{} rg", color_rgb_pdf(fill));
-            append_pdf_shape_paths(out, &segments);
-            out.push_str("f\nQ\n");
-        }
-        if shape.color.a > 0.0 {
-            out.push_str("q\n");
-            if shape.color.a < 0.995 {
-                let state = register_pdf_state(states, false, shape.color.a);
-                let _ = writeln!(out, "/GS{state} gs");
-            }
-            let dash_cmd = match shape.line_style.dash_pattern(shape.width) {
-                Some((d, g)) => format!("[{d:.2} {g:.2}] 0 d "),
-                None => String::new(),
-            };
-            let _ = writeln!(
-                out,
-                "{} RG {:.3} w 1 J 1 j {dash_cmd}",
-                color_rgb_pdf(shape.color),
-                shape.width
-            );
-            append_pdf_shape_paths(out, &segments);
-            out.push_str("S\nQ\n");
-        }
+        append_pdf_shape_item(out, item, states);
     }
 }
 
@@ -1740,24 +1863,76 @@ fn prepare_pdf_page_images(page: &NotebookPage, next_obj_id: &mut usize) -> Vec<
     entries
 }
 
+fn append_pdf_image_entry(out: &mut String, entry: &PdfImageEntry) {
+    let img = &entry.page_image;
+    let center = img.center();
+    let (sin, cos) = img.angle_degrees.to_radians().sin_cos();
+    let w = img.width;
+    let h = img.height;
+    let a = w * cos;
+    let b = w * sin;
+    let c = h * sin;
+    let d = -h * cos;
+    let e = center.x - 0.5 * w * cos - 0.5 * h * sin;
+    let f = center.y - 0.5 * w * sin + 0.5 * h * cos;
+    let _ = writeln!(
+        out,
+        "q {a:.4} {b:.4} {c:.4} {d:.4} {e:.4} {f:.4} cm /{} Do Q",
+        entry.xobj_name
+    );
+}
+
+fn append_pdf_stroke_run(
+    out: &mut String,
+    strokes: &[Arc<InkStroke>],
+    indices: &[usize],
+    states: &mut Vec<(bool, u8)>,
+) {
+    let mut active_gs: Option<usize> = None;
+    let mut active_rgb: Option<[u8; 3]> = None;
+
+    for &idx in indices {
+        let Some(stroke) = strokes.get(idx) else {
+            continue;
+        };
+        let (segs, color, alpha) = build_stroke_path(stroke);
+        if segs.is_empty() || alpha <= 1e-4 {
+            continue;
+        }
+        let is_hi = stroke.pen.kind == PenKind::Highlighter;
+        let needs_gs = is_hi || alpha < 0.995;
+        let next_gs = needs_gs.then(|| register_pdf_state(states, is_hi, alpha));
+
+        if next_gs != active_gs {
+            if active_gs.is_some() {
+                out.push_str("Q\n");
+                active_rgb = None;
+            }
+            if let Some(gs_idx) = next_gs {
+                let _ = writeln!(out, "q /GS{gs_idx} gs");
+                active_rgb = None;
+            }
+            active_gs = next_gs;
+        }
+
+        let [r, g, b, _] = color.to_rgba8();
+        let rgb_key = [r, g, b];
+        if active_rgb != Some(rgb_key) {
+            let _ = writeln!(out, "{} rg", color_rgb_pdf(color));
+            active_rgb = Some(rgb_key);
+        }
+        append_pdf_path(out, &segs);
+    }
+
+    if active_gs.is_some() {
+        out.push_str("Q\n");
+    }
+}
+
+#[allow(dead_code)]
 fn append_pdf_images(out: &mut String, entries: &[PdfImageEntry]) {
     for entry in entries {
-        let img = &entry.page_image;
-        let center = img.center();
-        let (sin, cos) = img.angle_degrees.to_radians().sin_cos();
-        let w = img.width;
-        let h = img.height;
-        let a = w * cos;
-        let b = w * sin;
-        let c = h * sin;
-        let d = -h * cos;
-        let e = center.x - 0.5 * w * cos - 0.5 * h * sin;
-        let f = center.y - 0.5 * w * sin + 0.5 * h * cos;
-        let _ = writeln!(
-            out,
-            "q {a:.4} {b:.4} {c:.4} {d:.4} {e:.4} {f:.4} cm /{} Do Q",
-            entry.xobj_name
-        );
+        append_pdf_image_entry(out, entry);
     }
 }
 
@@ -1811,6 +1986,7 @@ fn build_pdf_backdrop_entry(
             pixel_width: rendered.width,
             pixel_height: rendered.height,
             png_bytes: Arc::new(Vec::new()),
+            z_order: 0,
         },
     }
 }
@@ -1955,6 +2131,7 @@ fn render_grouped_pdf_backdrops(
                 pixel_width: out_w,
                 pixel_height: out_h,
                 png_bytes: Arc::new(Vec::new()),
+                z_order: 0,
             },
         });
     }
@@ -1985,6 +2162,7 @@ fn build_pdf_page_stream(
     paper_xobj_name: &str,
     images: &[PdfImageEntry],
 ) -> (Vec<u8>, Vec<(bool, u8)>) {
+    let w = page.width.clamp(64, 8192);
     let h = page.height.clamp(64, 8192);
     let pt_h = f64::from(h) * 0.5;
 
@@ -1993,47 +2171,44 @@ fn build_pdf_page_stream(
         let _ = writeln!(out, "/{paper_xobj_name} Do");
     }
     let _ = writeln!(out, "q 0.5 0 0 -0.5 0 {pt_h:.3} cm");
-    append_pdf_images(&mut out, images);
+    if let Some(bg) = images.first().filter(|e| e.xobj_name == "Bg0") {
+        append_pdf_image_entry(&mut out, bg);
+    }
+    // Clip all page elements strictly to the printable visual sheet boundary.
+    let _ = writeln!(out, "0 0 {w} {h} re W n");
 
     let mut states = Vec::new();
-    let mut active_gs: Option<usize> = None;
-    let mut active_rgb: Option<[u8; 3]> = None;
-
-    for stroke in &page.strokes {
-        let (segs, color, alpha) = build_stroke_path(stroke);
-        if segs.is_empty() || alpha <= 1e-4 {
-            continue;
-        }
-        let is_hi = stroke.pen.kind == PenKind::Highlighter;
-        let needs_gs = is_hi || alpha < 0.995;
-        let next_gs = needs_gs.then(|| register_pdf_state(&mut states, is_hi, alpha));
-
-        if next_gs != active_gs {
-            if active_gs.is_some() {
-                out.push_str("Q\n");
-                active_rgb = None;
+    for step in page.paint_steps() {
+        match step {
+            papercraft_doc::PagePaintStep::Images(indices) => {
+                for idx in indices {
+                    let target_name = format!("Im{idx}");
+                    if let Some(entry) = images.iter().find(|e| e.xobj_name == target_name) {
+                        append_pdf_image_entry(&mut out, entry);
+                    }
+                }
             }
-            if let Some(gs_idx) = next_gs {
-                let _ = writeln!(out, "q /GS{gs_idx} gs");
-                active_rgb = None;
+            papercraft_doc::PagePaintStep::Highlighters(indices)
+            | papercraft_doc::PagePaintStep::InkRun(indices) => {
+                append_pdf_stroke_run(&mut out, &page.strokes, &indices, &mut states);
             }
-            active_gs = next_gs;
+            papercraft_doc::PagePaintStep::Text(idx) => {
+                if let Some(item) = page.texts.get(idx) {
+                    append_pdf_text(
+                        &mut out,
+                        page.width,
+                        std::slice::from_ref(item),
+                        &mut states,
+                    );
+                }
+            }
+            papercraft_doc::PagePaintStep::Shape(idx) => {
+                if let Some(shape) = page.shapes.get(idx) {
+                    append_pdf_shape_item(&mut out, shape, &mut states);
+                }
+            }
         }
-
-        let [r, g, b, _] = color.to_rgba8();
-        let rgb_key = [r, g, b];
-        if active_rgb != Some(rgb_key) {
-            let _ = writeln!(out, "{} rg", color_rgb_pdf(color));
-            active_rgb = Some(rgb_key);
-        }
-        append_pdf_path(&mut out, &segs);
     }
-
-    if active_gs.is_some() {
-        out.push_str("Q\n");
-    }
-    append_pdf_text(&mut out, page.width, &page.texts, &mut states);
-    append_pdf_shapes(&mut out, &page.shapes, &mut states);
     out.push_str("Q\n");
     (out.into_bytes(), states)
 }
@@ -2418,6 +2593,7 @@ mod tests {
             pixel_width: 2,
             pixel_height: 2,
             png_bytes: Arc::new(png_bytes),
+            z_order: 0,
         }));
 
         let svg = render_document_svg(&doc);
@@ -2757,5 +2933,95 @@ mod tests {
         let parsed =
             hayro::hayro_syntax::Pdf::new(Arc::new(pdf)).expect("generated PDF should parse");
         assert_eq!(parsed.pages().len(), 1);
+    }
+
+    #[test]
+    fn svg_and_pdf_export_clip_to_printable_sheet_and_follow_layer_order() {
+        use papercraft_color::Color;
+        use papercraft_doc::{GeometricShape, InkStroke, PenKind, ShapeKind, StrokeSample};
+
+        let mut doc = Document::new(600, 800);
+        // 1. Filled rectangle extending outside page bounds (`z_order = 1`).
+        doc.shapes.push(Arc::new(GeometricShape {
+            kind: ShapeKind::Rectangle,
+            x1: -60.0,
+            y1: 50.0,
+            x2: 180.0,
+            y2: 200.0,
+            fill_color: Some(Color::from_rgba8(220, 30, 30, 255)),
+            color: Color::from_rgba8(220, 30, 30, 255),
+            z_order: 1,
+            ..GeometricShape::default()
+        }));
+        // 2. Blue ink stroke drawn AFTER square (`z_order = 2`).
+        let mut blue_pen = PenSettings::ball_pen();
+        blue_pen.color = Color::from_rgba8(20, 60, 230, 255);
+        let blue_id = doc.alloc_stroke_id();
+        let pts = vec![
+            StrokeSample::from_xy_pressure(20.0, 120.0, 0.8),
+            StrokeSample::from_xy_pressure(160.0, 120.0, 0.8),
+        ];
+        doc.strokes.push(Arc::new(
+            InkStroke::new(blue_id, blue_pen, pts.clone(), pts).with_z_order(2),
+        ));
+        // 3. Yellow highlighter drawn LAST (`z_order = 3`) -> must still appear BEFORE shape & ink.
+        let hl_pen = PenSettings {
+            kind: PenKind::Highlighter,
+            color: Color::from_rgba8(255, 220, 0, 160),
+            ..PenSettings::default()
+        };
+        let hl_id = doc.alloc_stroke_id();
+        let hl_pts = vec![
+            StrokeSample::from_xy_pressure(20.0, 90.0, 0.8),
+            StrokeSample::from_xy_pressure(160.0, 90.0, 0.8),
+        ];
+        doc.strokes.push(Arc::new(
+            InkStroke::new(hl_id, hl_pen, hl_pts.clone(), hl_pts).with_z_order(3),
+        ));
+        doc.sync_active_to_pages();
+
+        let svg = render_document_svg(&doc);
+        assert!(
+            svg.contains("<clipPath id=\"page-clip\"><rect x=\"0\" y=\"0\" width=\"600\" height=\"800\"/></clipPath>"),
+            "missing strict SVG sheet clipPath: {svg}"
+        );
+        assert!(
+            svg.contains("<g id=\"page-content\" clip-path=\"url(#page-clip)\">"),
+            "missing clipped page content group: {svg}"
+        );
+        let pos_hl = svg
+            .find("id=\"ink-highlighters\"")
+            .expect("SVG highlighters");
+        let pos_shape = svg.find("id=\"geometric-shapes\"").expect("SVG shapes");
+        let pos_ink = svg.find("id=\"ink-strokes\"").expect("SVG ink");
+        assert!(
+            pos_hl < pos_shape && pos_shape < pos_ink,
+            "expected HL < Shape < Ink in SVG: hl={pos_hl}, shape={pos_shape}, ink={pos_ink}"
+        );
+
+        let (stream_bytes, _) = build_pdf_page_stream(&doc.pages[0], "Paper", &[]);
+        let stream = String::from_utf8_lossy(&stream_bytes);
+        assert!(
+            stream.contains("0 0 600 800 re W n"),
+            "PDF stream must explicitly clip content to printable sheet bounds: {stream}"
+        );
+        let (_, hl_color, _) = build_stroke_path(&doc.pages[0].strokes[1]);
+        let (_, blue_color, _) = build_stroke_path(&doc.pages[0].strokes[0]);
+        let hl_rgb = color_rgb_pdf(hl_color);
+        let red_rgb = color_rgb_pdf(Color::from_rgba8(220, 30, 30, 255));
+        let blue_rgb = color_rgb_pdf(blue_color);
+        let pdf_hl = stream
+            .find(&format!("{hl_rgb} rg"))
+            .unwrap_or_else(|| panic!("missing highlighter fill `{hl_rgb} rg` in PDF:\n{stream}"));
+        let pdf_shape = stream
+            .find(&format!("{red_rgb} rg"))
+            .unwrap_or_else(|| panic!("missing red shape fill `{red_rgb} rg` in PDF:\n{stream}"));
+        let pdf_blue = stream
+            .find(&format!("{blue_rgb} rg"))
+            .unwrap_or_else(|| panic!("missing blue ink fill `{blue_rgb} rg` in PDF:\n{stream}"));
+        assert!(
+            pdf_hl < pdf_shape && pdf_shape < pdf_blue,
+            "expected HL < Shape < Ink in PDF: hl={pdf_hl}, shape={pdf_shape}, ink={pdf_blue}"
+        );
     }
 }

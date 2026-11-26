@@ -94,7 +94,16 @@ pub struct ServerController {
 }
 
 impl ServerController {
+    #[cfg(test)]
     pub fn new(config_path: PathBuf, allow_auto_start: bool) -> Self {
+        Self::new_for_launch(config_path, allow_auto_start, false)
+    }
+
+    pub fn new_for_launch(
+        config_path: PathBuf,
+        allow_auto_start: bool,
+        autostart_launch: bool,
+    ) -> Self {
         let is_first_launch = !config_path.exists();
         let (settings, mut load_warning) = ServerControlSettings::load_or_init(&config_path);
         if allow_auto_start
@@ -103,7 +112,7 @@ impl ServerController {
         {
             load_warning = Some(err);
         }
-        let start_visible = !settings.start_in_tray;
+        let start_visible = settings.initial_window_visible(autostart_launch);
         let auto_start = allow_auto_start && settings.auto_start_server;
         let (server_stopped_tx, server_stopped_rx) = mpsc::channel();
 
@@ -1094,5 +1103,36 @@ mod tests {
             ctrl3.autostart_feedback.as_ref(),
             Some(&(true, "Registry write denied".to_string()))
         );
+    }
+
+    #[test]
+    fn controller_launch_visibility_respects_autostart_and_open_window_setting() {
+        let dir = temp_dir("autostart_visibility");
+        let cfg_path = dir.0.join(CONFIG_FILE_NAME);
+
+        // Default config: autostart launches stay hidden in tray; manual launches open visibly.
+        let hidden_autostart = ServerController::new_for_launch(cfg_path.clone(), false, true);
+        assert!(!hidden_autostart.window_visible);
+        let manual_visible = ServerController::new_for_launch(cfg_path.clone(), false, false);
+        assert!(manual_visible.window_visible);
+
+        // Enabling `open_window_at_login` opens the window even on `--autostart`.
+        let mut settings = ServerControlSettings {
+            data_dir: dir.0.join("vault").to_string_lossy().into_owned(),
+            auto_start_server: false,
+            open_window_at_login: true,
+            ..ServerControlSettings::default()
+        };
+        settings.save_atomic(&cfg_path).unwrap();
+        let visible_autostart = ServerController::new_for_launch(cfg_path.clone(), false, true);
+        assert!(visible_autostart.window_visible);
+
+        // `start_in_tray` affects manual launches without blocking explicit `open_window_at_login`.
+        settings.start_in_tray = true;
+        settings.save_atomic(&cfg_path).unwrap();
+        let manual_tray = ServerController::new_for_launch(cfg_path.clone(), false, false);
+        assert!(!manual_tray.window_visible);
+        let autostart_override = ServerController::new_for_launch(cfg_path, false, true);
+        assert!(autostart_override.window_visible);
     }
 }

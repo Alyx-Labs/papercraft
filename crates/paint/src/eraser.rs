@@ -156,7 +156,9 @@ fn split_stroke_precision(
         // Split pieces keep natural smooth ends without re-applying long original start/end tapers excessively.
         piece_pen.start_taper_px = piece_pen.start_taper_px.min(4.0);
         piece_pen.end_taper_px = piece_pen.end_taper_px.min(4.0);
-        out.push(Arc::new(InkStroke::new(id, piece_pen, run.clone(), run)));
+        out.push(Arc::new(
+            InkStroke::new(id, piece_pen, run.clone(), run).with_z_order(stroke.z_order),
+        ));
     }
     (out, true)
 }

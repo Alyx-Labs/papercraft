@@ -42,6 +42,13 @@ jobs:
       - name: Build GitHub Pages bundle
         working-directory: apps/papercraft-web
         run: trunk build --release --public-url ./
+      - name: Copy license and brand notices into Pages bundle
+        run: |
+          mkdir -p dist/licenses
+          cp LICENSE-MIT LICENSE-APACHE NOTICE ATTRIBUTION.md apps/papercraft/assets/branding/LICENSE-brand.txt dist/licenses/
+          cp crates/compose/assets/fonts/LICENSE dist/licenses/Roboto-LICENSE.txt
+          cp crates/ui-egui/assets/fonts/OFL.txt dist/licenses/BricolageGrotesque-OFL.txt
+          cp crates/ui-egui/assets/icons/lucide/LICENSE dist/licenses/Lucide-LICENSE.txt
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
