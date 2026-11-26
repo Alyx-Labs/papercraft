@@ -32,6 +32,7 @@ pub enum ActiveModal {
     AppUpdate,
     KeyboardShortcuts,
     WelcomeBanner,
+    FirstNotebookDataNotice,
 }
 
 struct DialogSpec {
@@ -84,6 +85,7 @@ impl ActiveModal {
             Self::AppUpdate => 16,
             Self::KeyboardShortcuts => 17,
             Self::WelcomeBanner => 18,
+            Self::FirstNotebookDataNotice => 19,
         }
     }
 
@@ -208,6 +210,13 @@ impl ActiveModal {
                 width: 700.0,
                 min_body_height: 0.0,
             },
+            Self::FirstNotebookDataNotice => DialogSpec {
+                icon: Icon::Lock,
+                title: "Your notebooks stay private",
+                subtitle: "How your data is saved and protected:",
+                width: 700.0,
+                min_body_height: 0.0,
+            },
         }
     }
 }
@@ -318,7 +327,8 @@ pub(crate) fn open(app: &mut PaperCraftApp, target: ActiveModal) {
         | ActiveModal::SyncConflict
         | ActiveModal::AppUpdate
         | ActiveModal::KeyboardShortcuts
-        | ActiveModal::WelcomeBanner => {}
+        | ActiveModal::WelcomeBanner
+        | ActiveModal::FirstNotebookDataNotice => {}
         ActiveModal::FirstAccessNickname => {
             app.view.first_access_error = None;
             app.view.first_access_focus_pending = true;
@@ -350,10 +360,21 @@ pub(crate) fn open(app: &mut PaperCraftApp, target: ActiveModal) {
             }
         }
     }
-    app.view.active_modal = Some(target);
-    let initial_step = active_step_index(app, target);
+    let resolved_target = if target == ActiveModal::NewNotebook
+        && app.session.should_show_first_notebook_data_notice()
+    {
+        ActiveModal::FirstNotebookDataNotice
+    } else {
+        target
+    };
+    app.view.active_modal = Some(resolved_target);
+    let initial_step = active_step_index(app, resolved_target);
     app.view.motion.modal_flow.sync(
-        (app.view.modal_open_seq, target.id_tag(), initial_step),
+        (
+            app.view.modal_open_seq,
+            resolved_target.id_tag(),
+            initial_step,
+        ),
         initial_step as isize,
     );
     app.view.motion.modal_subflow.reset();
@@ -629,6 +650,13 @@ fn show_inner_with_motion(
             motion.backdrop_eased,
             motion.interactive,
         ),
+        ActiveModal::FirstNotebookDataNotice => crate::data_privacy_modal::show(
+            app,
+            ui,
+            motion.eased,
+            motion.backdrop_eased,
+            motion.interactive,
+        ),
     }
 }
 
@@ -669,7 +697,8 @@ fn modal_steps(active: ActiveModal) -> Option<&'static [ModalStepSpec]> {
         | ActiveModal::TagColor
         | ActiveModal::AppUpdate
         | ActiveModal::KeyboardShortcuts
-        | ActiveModal::WelcomeBanner => None,
+        | ActiveModal::WelcomeBanner
+        | ActiveModal::FirstNotebookDataNotice => None,
     }
 }
 

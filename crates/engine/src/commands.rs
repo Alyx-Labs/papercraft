@@ -527,6 +527,11 @@ const COMMANDS: &[CommandSpec] = &[
         description: "Mark the release welcome banner as seen for the active build version",
     },
     CommandSpec {
+        id: "profile.dismissFirstNotebookDataNotice",
+        label: "Dismiss First-Notebook Data Notice",
+        description: "Mark the first-notebook data & privacy notice as seen on this device",
+    },
+    CommandSpec {
         id: "profile.create",
         label: "Create Local Profile",
         description: "Create a new isolated local-only profile on this device",
@@ -1353,6 +1358,9 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
         "sync.migrateLocalAccount" => cmd_sync_migrate_local_account(session, id, params),
         "profile.completeFirstAccess" => cmd_profile_complete_first_access(session, id, params),
         "profile.dismissWelcomeBanner" => cmd_profile_dismiss_welcome_banner(session),
+        "profile.dismissFirstNotebookDataNotice" => {
+            cmd_profile_dismiss_first_notebook_data_notice(session)
+        }
         "profile.create" => cmd_profile_create(session, id, params),
         "profile.rename" => cmd_profile_rename(session, id, params),
         "profile.switch" => cmd_profile_switch(session, id, params),
@@ -1394,6 +1402,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
                     | "profile.create"
                     | "profile.completeFirstAccess"
                     | "profile.dismissWelcomeBanner"
+                    | "profile.dismissFirstNotebookDataNotice"
                     | "profile.rename"
                     | "profile.switch"
                     | "profile.delete"
@@ -6359,6 +6368,15 @@ fn cmd_profile_dismiss_welcome_banner(session: &mut Session) -> Result<Value, En
         "welcomeBannerSeen": !session.should_show_welcome_banner(),
         "welcomeBannerSeenVersion": session.welcome_banner_seen_version(),
         "needsInitialNickname": session.needs_initial_nickname(),
+    }))
+}
+
+fn cmd_profile_dismiss_first_notebook_data_notice(
+    session: &mut Session,
+) -> Result<Value, EngineError> {
+    session.dismiss_first_notebook_data_notice();
+    Ok(json!({
+        "firstNotebookDataNoticeSeen": !session.should_show_first_notebook_data_notice(),
     }))
 }
 

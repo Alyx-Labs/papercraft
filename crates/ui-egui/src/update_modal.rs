@@ -11,10 +11,12 @@ use crate::theme::Tokens;
 /// Renders the Software Update dialog body. Returns `true` when the modal should close.
 pub(crate) fn render_body(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> bool {
     let status = app.updater.status().clone();
-    let current_ver = app.updater.config().map_or_else(
-        || env!("CARGO_PKG_VERSION").to_string(),
-        |c| c.current_version.to_string(),
-    );
+    let current_ver = app
+        .updater
+        .config()
+        .map_or_else(crate::display_version_label, |c| {
+            papercraft_doc::format_alpha_version(&c.current_version.to_string())
+        });
     let is_custom_feed = app.updater.config().is_some_and(|c| c.is_custom_feed);
 
     match status {
@@ -27,7 +29,7 @@ pub(crate) fn render_body(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens
                 Icon::RotateCw,
                 "Checking for updates...",
                 &format!(
-                    "Current version: v{current_ver} · Platform: {}",
+                    "Current version: {current_ver} · Platform: {}",
                     current_platform_label()
                 ),
                 true,
@@ -41,10 +43,10 @@ pub(crate) fn render_body(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens
                 .is_some_and(|cfg| cfg.current_version > latest_version);
             let subtitle = if is_ahead {
                 format!(
-                    "Running v{current_ver} — newer than the latest published release (v{latest_version})."
+                    "Running {current_ver} — newer than the latest published release (v{latest_version})."
                 )
             } else {
-                format!("Running v{current_ver} (latest published release: v{latest_version}).")
+                format!("Running {current_ver} (latest published release: v{latest_version}).")
             };
             draw_status_box(
                 ui,
@@ -61,8 +63,8 @@ pub(crate) fn render_body(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens
         UpdateStatus::Available(update) => {
             draw_release_header_card(
                 ui,
-                &update.current_version.to_string(),
-                &update.version.to_string(),
+                &papercraft_doc::format_alpha_version(&update.current_version.to_string()),
+                &format!("v{}", update.version),
                 update.asset.size_bytes,
                 update.is_custom_feed || is_custom_feed,
                 t,
@@ -85,8 +87,8 @@ pub(crate) fn render_body(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens
         } => {
             draw_release_header_card(
                 ui,
-                &update.current_version.to_string(),
-                &update.version.to_string(),
+                &papercraft_doc::format_alpha_version(&update.current_version.to_string()),
+                &format!("v{}", update.version),
                 update.asset.size_bytes,
                 update.is_custom_feed || is_custom_feed,
                 t,
@@ -101,8 +103,8 @@ pub(crate) fn render_body(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens
         UpdateStatus::ReadyToInstall { update, .. } => {
             draw_release_header_card(
                 ui,
-                &update.current_version.to_string(),
-                &update.version.to_string(),
+                &papercraft_doc::format_alpha_version(&update.current_version.to_string()),
+                &format!("v{}", update.version),
                 update.asset.size_bytes,
                 update.is_custom_feed || is_custom_feed,
                 t,
@@ -238,7 +240,7 @@ fn draw_release_header_card(
                 let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
                 paint_icon(ui.painter(), icon_rect, Icon::MoveDown, t.accent);
                 ui.label(
-                    RichText::new(format!("v{current_ver} -> v{new_ver}"))
+                    RichText::new(format!("{current_ver} -> {new_ver}"))
                         .size(14.0)
                         .strong()
                         .color(t.text),

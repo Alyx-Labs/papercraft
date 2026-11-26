@@ -14,6 +14,7 @@ pub mod account_modal;
 pub mod canvas;
 pub mod color_picker;
 pub mod customization_modals;
+pub mod data_privacy_modal;
 pub mod export_modal;
 pub mod folder_modals;
 pub(crate) mod gpu_ink;
@@ -55,15 +56,13 @@ use serde_json::json;
 pub(crate) const WEBSITE_URL: &str = "https://papercraft.ink/";
 /// Public source repository URL displayed in Profile download links.
 pub(crate) const GITHUB_REPO_URL: &str = "https://github.com/Alyx-Labs/papercraft";
-/// Short stability tag shown beside the application version in the UI.
-pub(crate) const ALPHA_STATUS_LABEL: &str = "Unstable Alpha";
 /// Plain-English explanation shown when hovering over the version label.
 pub(crate) const ALPHA_STATUS_TOOLTIP: &str =
     "PaperCraft is still an unstable alpha build — expect rough edges and breaking changes.";
 
-/// Formats the user-visible application version with its stability stage.
+/// Formats the user-visible application version (e.g. `"v0.5.1-alpha"`).
 pub(crate) fn display_version_label() -> String {
-    format!("v{} · {ALPHA_STATUS_LABEL}", env!("CARGO_PKG_VERSION"))
+    papercraft_doc::format_alpha_version(env!("CARGO_PKG_VERSION"))
 }
 
 /// Top-level workspace screen mode.
@@ -1726,7 +1725,9 @@ impl PaperCraftApp {
                 if matches!(
                     self.view.active_modal,
                     Some(
-                        modal::ActiveModal::FirstAccessNickname | modal::ActiveModal::WelcomeBanner
+                        modal::ActiveModal::FirstAccessNickname
+                            | modal::ActiveModal::WelcomeBanner
+                            | modal::ActiveModal::FirstNotebookDataNotice
                     )
                 ) {
                     return;

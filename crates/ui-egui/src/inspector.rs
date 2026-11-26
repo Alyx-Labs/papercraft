@@ -654,7 +654,7 @@ fn draw_app_updates_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens)
                 .inner_margin(Margin::symmetric(8, 3))
                 .show(ui, |ui| {
                     ui.label(
-                        RichText::new(format!("v{current_ver}"))
+                        RichText::new(papercraft_doc::format_alpha_version(&current_ver))
                             .size(11.5)
                             .strong()
                             .monospace()
@@ -1489,7 +1489,7 @@ mod tests {
         assert!(sys_texts.contains("System Info"));
         assert!(sys_texts.contains("Version"));
         assert!(sys_texts.contains(&crate::display_version_label()));
-        assert!(sys_texts.contains("Unstable Alpha"));
+        assert!(sys_texts.contains("-alpha"));
         assert!(sys_texts.contains("Platform"));
         assert!(sys_texts.contains("Renderer"));
         assert!(sys_texts.contains("Workspace"));

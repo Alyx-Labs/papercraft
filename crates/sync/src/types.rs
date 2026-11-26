@@ -112,6 +112,8 @@ pub struct GlobalSyncState {
     #[serde(default)]
     pub welcome_banner_seen_version: Option<String>,
     #[serde(default)]
+    pub first_notebook_data_notice_seen: bool,
+    #[serde(default)]
     pub client_id: String,
 }
 
@@ -127,6 +129,7 @@ impl GlobalSyncState {
             needs_initial_nickname: false,
             welcome_banner_seen: false,
             welcome_banner_seen_version: None,
+            first_notebook_data_notice_seen: false,
             client_id: uuid::Uuid::new_v4().to_string(),
         }
     }

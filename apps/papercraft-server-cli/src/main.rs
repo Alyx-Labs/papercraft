@@ -192,7 +192,10 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
             .await
             .map_err(|e| format!("failed to bind {}: {e}", config.bind_addr))?;
 
-        println!("PaperCraft Server v{}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "PaperCraft Server {}",
+            papercraft_doc::format_alpha_version(env!("CARGO_PKG_VERSION"))
+        );
         println!("  Server ID    : {}", meta.server_id);
         println!("  Data Dir     : {}", config.data_dir.display());
         println!("  Database     : {}", db_path.display());

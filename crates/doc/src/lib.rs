@@ -259,6 +259,20 @@ fn is_valid_host_and_tld(candidate: &str) -> bool {
     valid_labels && tld_ok
 }
 
+/// Formats a version string (e.g. `"0.5.1"` or `"0.5.2-alpha"`) as `"v0.5.1-alpha"`,
+/// preserving any existing prerelease tag without duplicating `-alpha`.
+pub fn format_alpha_version(raw: &str) -> String {
+    let clean = raw.trim().trim_start_matches(['v', 'V']);
+    if clean.is_empty() {
+        return "v0.0.0-alpha".to_string();
+    }
+    if clean.contains('-') {
+        format!("v{clean}")
+    } else {
+        format!("v{clean}-alpha")
+    }
+}
+
 /// Validates and normalizes an external link URL (`http://`, `https://`, `mailto:`, `www.`, or bare domain).
 pub fn sanitize_link_url(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
@@ -9698,5 +9712,14 @@ mod tests {
         assert_eq!(text_max_page_width(800, 750.0), 42.0);
         assert_eq!(text_max_page_width(800, -120.0), 792.0);
         assert_eq!(text_max_page_width(800, 920.0), 360.0);
+    }
+
+    #[test]
+    fn format_alpha_version_normalizes_bare_and_prerelease_tags() {
+        assert_eq!(format_alpha_version("0.5.1"), "v0.5.1-alpha");
+        assert_eq!(format_alpha_version("v0.5.1"), "v0.5.1-alpha");
+        assert_eq!(format_alpha_version("0.5.2-alpha"), "v0.5.2-alpha");
+        assert_eq!(format_alpha_version("V0.6.0-rc.1"), "v0.6.0-rc.1");
+        assert_eq!(format_alpha_version(""), "v0.0.0-alpha");
     }
 }

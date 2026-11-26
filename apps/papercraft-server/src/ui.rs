@@ -791,7 +791,8 @@ fn render_updates_card_with_status(
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.label(
                 egui::RichText::new(format!(
-                    "Installed version: v{current_ver} · {}",
+                    "Installed version: {} · {}",
+                    papercraft_doc::format_alpha_version(&current_ver),
                     papercraft_updater::PUBLISHER_NAME
                 ))
                 .size(12.0)

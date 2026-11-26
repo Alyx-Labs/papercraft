@@ -23,9 +23,42 @@ const CTA_HOVER: Color32 = Color32::from_rgb(0x0E, 0x80, 0xBF);
 const CARD_RADIUS: u8 = 22;
 const PREFERRED_WIDTH: f32 = 700.0;
 
-struct FeatureItem {
-    icon: Icon,
-    label: &'static str,
+#[derive(Clone, Copy)]
+pub(crate) struct IllustratedModalTheme {
+    pub(crate) top_bg: Color32,
+    pub(crate) top_title: Color32,
+    pub(crate) top_close_hover: Color32,
+    pub(crate) bottom_bg: Color32,
+    pub(crate) bottom_text: Color32,
+    pub(crate) badge_bg: Color32,
+    pub(crate) badge_icon: Color32,
+    pub(crate) cta_bg: Color32,
+    pub(crate) cta_hover: Color32,
+    pub(crate) cta_focus_ring: Color32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FeatureItem {
+    pub(crate) icon: Icon,
+    pub(crate) label: &'static str,
+}
+
+pub(crate) struct IllustratedModalSpec {
+    pub(crate) modal: ActiveModal,
+    pub(crate) title: &'static str,
+    pub(crate) body_heading: &'static str,
+    pub(crate) cta_label: &'static str,
+    pub(crate) illustration_cache_key: &'static str,
+    pub(crate) illustration_png: &'static [u8],
+    pub(crate) fallback_icon: Icon,
+    pub(crate) features: [FeatureItem; 4],
+    pub(crate) theme: IllustratedModalTheme,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IllustratedModalAction {
+    Close,
+    Cta,
 }
 
 const FEATURES: [FeatureItem; 4] = [
@@ -47,35 +80,58 @@ const FEATURES: [FeatureItem; 4] = [
     },
 ];
 
+const WELCOME_SPEC: IllustratedModalSpec = IllustratedModalSpec {
+    modal: ActiveModal::WelcomeBanner,
+    title: "Study deeper with PaperCraft",
+    body_heading: "Built for calm, distraction-free daily study:",
+    cta_label: "Start Studying",
+    illustration_cache_key: "papercraft-welcome-sea-illustration",
+    illustration_png: WELCOME_SEA_PNG,
+    fallback_icon: Icon::Notebook,
+    features: FEATURES,
+    theme: IllustratedModalTheme {
+        top_bg: TOP_BG,
+        top_title: TOP_TITLE,
+        top_close_hover: TOP_CLOSE_HOVER,
+        bottom_bg: BOTTOM_BG,
+        bottom_text: BOTTOM_TEXT,
+        badge_bg: BADGE_BG,
+        badge_icon: TOP_TITLE,
+        cta_bg: CTA_BG,
+        cta_hover: CTA_HOVER,
+        cta_focus_ring: Color32::WHITE,
+    },
+};
+
 #[derive(Clone)]
 enum CachedWelcomeArt {
     Ready(egui::TextureHandle),
     Failed,
 }
 
-fn welcome_sea_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let cache_id = egui::Id::unique("papercraft-welcome-sea-illustration");
+fn load_illustration_texture(
+    ctx: &egui::Context,
+    cache_key: &'static str,
+    png_bytes: &'static [u8],
+) -> Option<egui::TextureHandle> {
+    let cache_id = egui::Id::unique(cache_key);
     if let Some(cached) = ctx.data_mut(|d| d.get_temp::<CachedWelcomeArt>(cache_id)) {
         return match cached {
             CachedWelcomeArt::Ready(tex) => Some(tex),
             CachedWelcomeArt::Failed => None,
         };
     }
-    let decoded = match image::load_from_memory(WELCOME_SEA_PNG) {
+    let decoded = match image::load_from_memory(png_bytes) {
         Ok(img) => img.into_rgba8(),
         Err(err) => {
-            log::warn!("Could not decode welcome sea illustration PNG: {err}");
+            log::warn!("Could not decode illustration PNG `{cache_key}`: {err}");
             ctx.data_mut(|d| d.insert_temp(cache_id, CachedWelcomeArt::Failed));
             return None;
         }
     };
     let size = [decoded.width() as usize, decoded.height() as usize];
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
-    let tex = ctx.load_texture(
-        "papercraft-welcome-sea-illustration",
-        color_image,
-        egui::TextureOptions::LINEAR,
-    );
+    let tex = ctx.load_texture(cache_key, color_image, egui::TextureOptions::LINEAR);
     ctx.data_mut(|d| d.insert_temp(cache_id, CachedWelcomeArt::Ready(tex.clone())));
     Some(tex)
 }
@@ -103,6 +159,23 @@ pub(crate) fn show(
     backdrop_eased: f32,
     interactive: bool,
 ) -> ModalMetrics {
+    let (metrics, action) =
+        show_illustrated_modal(app, ui, &WELCOME_SPEC, eased, backdrop_eased, interactive);
+    if interactive && action.is_some() {
+        dismiss(app);
+    }
+    metrics
+}
+
+/// Renders a two-tone illustrated onboarding modal and returns which action button was clicked.
+pub(crate) fn show_illustrated_modal(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    spec: &IllustratedModalSpec,
+    eased: f32,
+    backdrop_eased: f32,
+    interactive: bool,
+) -> (ModalMetrics, Option<IllustratedModalAction>) {
     app.install_rich_fonts_if_needed(ui.ctx());
     let ctx = ui.ctx().clone();
     let viewport = ctx.content_rect();
@@ -110,10 +183,7 @@ pub(crate) fn show(
     let is_dark_theme = app.session.prefs.theme == papercraft_doc::UiTheme::Dark;
 
     let backdrop_id = ui.make_persistent_id("papercraft_modal_backdrop");
-    let modal_id = ui.make_persistent_id((
-        "papercraft_modal_surface",
-        ActiveModal::WelcomeBanner.id_tag(),
-    ));
+    let modal_id = ui.make_persistent_id(("papercraft_modal_surface", spec.modal.id_tag()));
 
     let _backdrop_resp = egui::Area::new(backdrop_id)
         .order(egui::Order::Middle)
@@ -132,7 +202,7 @@ pub(crate) fn show(
         })
         .inner;
 
-    let mut should_dismiss = false;
+    let mut action = None;
     let mut close_btn_rect = Rect::NOTHING;
     let mut body_rect = Rect::NOTHING;
     let mut footer_rect = Rect::NOTHING;
@@ -161,38 +231,40 @@ pub(crate) fn show(
                     ui.spacing_mut().item_spacing = Vec2::ZERO;
 
                     let (close_clicked, x_rect) =
-                        draw_top_header(ui, dialog_width, viewport.height());
+                        draw_top_header(ui, spec, dialog_width, viewport.height());
                     close_btn_rect = x_rect;
                     if close_clicked {
-                        should_dismiss = true;
+                        action = Some(IllustratedModalAction::Close);
                     }
 
-                    let (cta_clicked, b_rect, f_rect) = draw_bottom_section(ui, dialog_width);
+                    let (cta_clicked, b_rect, f_rect) = draw_bottom_section(ui, spec, dialog_width);
                     body_rect = b_rect;
                     footer_rect = f_rect;
                     if cta_clicked {
-                        should_dismiss = true;
+                        action = Some(IllustratedModalAction::Cta);
                     }
                 });
         });
 
     let modal_rect = modal_resp.response.rect;
-    // Outside clicks are absorbed by the backdrop and must not dismiss the welcome banner;
-    // only an explicit modal button click closes it.
-    if interactive && should_dismiss {
-        dismiss(app);
-    }
-
-    ModalMetrics {
+    // Outside clicks are absorbed by the backdrop and must not dismiss illustrated onboarding modals;
+    // only an explicit modal button click closes them.
+    let metrics = ModalMetrics {
         modal_rect,
         close_btn_rect,
         body_rect,
         footer_rect,
         inner_margin: 0.0,
-    }
+    };
+    (metrics, action)
 }
 
-fn draw_top_header(ui: &mut egui::Ui, width: f32, viewport_h: f32) -> (bool, Rect) {
+fn draw_top_header(
+    ui: &mut egui::Ui,
+    spec: &IllustratedModalSpec,
+    width: f32,
+    viewport_h: f32,
+) -> (bool, Rect) {
     let mut close_clicked = false;
     let mut close_rect = Rect::NOTHING;
     let top_pad: i8 = if viewport_h < 600.0 { 18 } else { 26 };
@@ -200,9 +272,10 @@ fn draw_top_header(ui: &mut egui::Ui, width: f32, viewport_h: f32) -> (bool, Rec
     let side_pad: i8 = 24;
     let inner_w = (width - f32::from(side_pad) * 2.0).max(200.0);
     let art_w = if viewport_h < 600.0 { 164.0 } else { 224.0 };
+    let theme = &spec.theme;
 
     egui::Frame::NONE
-        .fill(TOP_BG)
+        .fill(theme.top_bg)
         .corner_radius(CornerRadius {
             nw: CARD_RADIUS,
             ne: CARD_RADIUS,
@@ -229,12 +302,12 @@ fn draw_top_header(ui: &mut egui::Ui, width: f32, viewport_h: f32) -> (bool, Rec
                     |ui| {
                         ui.add(
                             egui::Label::new(
-                                RichText::new("Study deeper with PaperCraft")
+                                RichText::new(spec.title)
                                     .font(FontId::new(
                                         25.0,
                                         FontFamily::Name(BRAND_DISPLAY_FAMILY.into()),
                                     ))
-                                    .color(TOP_TITLE),
+                                    .color(theme.top_title),
                             )
                             .selectable(false)
                             .wrap(),
@@ -244,10 +317,18 @@ fn draw_top_header(ui: &mut egui::Ui, width: f32, viewport_h: f32) -> (bool, Rec
                 let (btn_rect, resp) = ui.allocate_exact_size(Vec2::splat(close_w), Sense::click());
                 close_rect = btn_rect;
                 if resp.hovered() {
-                    ui.painter()
-                        .circle_filled(btn_rect.center(), close_w * 0.5, TOP_CLOSE_HOVER);
+                    ui.painter().circle_filled(
+                        btn_rect.center(),
+                        close_w * 0.5,
+                        theme.top_close_hover,
+                    );
                 }
-                paint_icon(ui.painter(), btn_rect.shrink(6.0), Icon::Close, TOP_TITLE);
+                paint_icon(
+                    ui.painter(),
+                    btn_rect.shrink(6.0),
+                    Icon::Close,
+                    theme.top_title,
+                );
                 let resp = resp
                     .on_hover_cursor(CursorIcon::PointingHand)
                     .on_hover_text("Close");
@@ -257,15 +338,17 @@ fn draw_top_header(ui: &mut egui::Ui, width: f32, viewport_h: f32) -> (bool, Rec
             });
 
             ui.add_space(if viewport_h < 600.0 { 4.0 } else { 8.0 });
-            draw_sea_illustration(ui, inner_w, art_w);
+            draw_illustration(ui, spec, inner_w, art_w);
         });
 
     (close_clicked, close_rect)
 }
 
-fn draw_sea_illustration(ui: &mut egui::Ui, inner_w: f32, art_w: f32) {
+fn draw_illustration(ui: &mut egui::Ui, spec: &IllustratedModalSpec, inner_w: f32, art_w: f32) {
     let clamped_w = art_w.min(inner_w);
-    if let Some(tex) = welcome_sea_texture(ui.ctx()) {
+    if let Some(tex) =
+        load_illustration_texture(ui.ctx(), spec.illustration_cache_key, spec.illustration_png)
+    {
         let tex_size = tex.size_vec2();
         let aspect = if tex_size.x > 0.0 {
             tex_size.y / tex_size.x
@@ -280,21 +363,32 @@ fn draw_sea_illustration(ui: &mut egui::Ui, inner_w: f32, art_w: f32) {
     } else {
         let (fallback_rect, _) = ui.allocate_exact_size(Vec2::new(inner_w, 120.0), Sense::hover());
         let badge = Rect::from_center_size(fallback_rect.center(), Vec2::splat(76.0));
-        ui.painter().circle_filled(badge.center(), 38.0, BADGE_BG);
-        paint_icon(ui.painter(), badge.shrink(20.0), Icon::Notebook, TOP_TITLE);
+        ui.painter()
+            .circle_filled(badge.center(), 38.0, spec.theme.badge_bg);
+        paint_icon(
+            ui.painter(),
+            badge.shrink(20.0),
+            spec.fallback_icon,
+            spec.theme.top_title,
+        );
     }
 }
 
-fn draw_bottom_section(ui: &mut egui::Ui, width: f32) -> (bool, Rect, Rect) {
+fn draw_bottom_section(
+    ui: &mut egui::Ui,
+    spec: &IllustratedModalSpec,
+    width: f32,
+) -> (bool, Rect, Rect) {
     let mut cta_clicked = false;
     let mut body_rect = Rect::NOTHING;
     let mut footer_rect = Rect::NOTHING;
     let side_pad_f = if width >= 620.0 { 68.0 } else { 24.0 };
     let side_pad = side_pad_f as i8;
     let inner_w = (width - side_pad_f * 2.0).max(200.0);
+    let theme = &spec.theme;
 
     egui::Frame::NONE
-        .fill(BOTTOM_BG)
+        .fill(theme.bottom_bg)
         .corner_radius(CornerRadius {
             nw: 0,
             ne: 0,
@@ -319,22 +413,22 @@ fn draw_bottom_section(ui: &mut egui::Ui, width: f32) -> (bool, Rect, Rect) {
                     ui.set_max_width(inner_w);
                     ui.add(
                         egui::Label::new(
-                            RichText::new("Built for calm, distraction-free daily study:")
+                            RichText::new(spec.body_heading)
                                 .size(16.0)
                                 .strong()
-                                .color(BOTTOM_TEXT),
+                                .color(theme.bottom_text),
                         )
                         .selectable(false)
                         .wrap(),
                     );
                     ui.add_space(22.0);
-                    draw_feature_grid(ui, inner_w);
+                    draw_feature_grid(ui, &spec.features, theme, inner_w);
                 },
             );
             body_rect = body_resp.response.rect;
 
             ui.add_space(26.0);
-            let (clicked, btn_rect) = draw_cta_button(ui, inner_w);
+            let (clicked, btn_rect) = draw_cta_button(ui, spec.cta_label, theme, inner_w);
             footer_rect = btn_rect;
             if clicked {
                 cta_clicked = true;
@@ -344,20 +438,25 @@ fn draw_bottom_section(ui: &mut egui::Ui, width: f32) -> (bool, Rect, Rect) {
     (cta_clicked, body_rect, footer_rect)
 }
 
-fn draw_feature_grid(ui: &mut egui::Ui, inner_w: f32) {
+fn draw_feature_grid(
+    ui: &mut egui::Ui,
+    features: &[FeatureItem; 4],
+    theme: &IllustratedModalTheme,
+    inner_w: f32,
+) {
     let badge_dim = 42.0_f32;
     let icon_gap = 14.0_f32;
     let two_cols = inner_w >= 420.0;
     if two_cols {
         let min_col_gap = 24.0_f32;
         let max_text_w = ((inner_w - min_col_gap) * 0.5 - badge_dim - icon_gap).max(80.0);
-        let galleys: Vec<_> = FEATURES
+        let galleys: Vec<_> = features
             .iter()
             .map(|item| {
                 ui.painter().layout(
                     item.label.to_string(),
                     FontId::proportional(13.5),
-                    BOTTOM_TEXT,
+                    theme.bottom_text,
                     max_text_w,
                 )
             })
@@ -378,14 +477,16 @@ fn draw_feature_grid(ui: &mut egui::Ui, inner_w: f32) {
             paint_feature_tile(
                 ui,
                 left_rect,
-                FEATURES[left_idx].icon,
+                features[left_idx].icon,
                 std::sync::Arc::clone(&galleys[left_idx]),
+                theme,
             );
             paint_feature_tile(
                 ui,
                 right_rect,
-                FEATURES[right_idx].icon,
+                features[right_idx].icon,
                 std::sync::Arc::clone(&galleys[right_idx]),
+                theme,
             );
             if row_idx + 1 < row_pairs.len() {
                 ui.add_space(18.0);
@@ -393,17 +494,17 @@ fn draw_feature_grid(ui: &mut egui::Ui, inner_w: f32) {
         }
     } else {
         let text_w = (inner_w - badge_dim - icon_gap).max(80.0);
-        for (idx, item) in FEATURES.iter().enumerate() {
+        for (idx, item) in features.iter().enumerate() {
             let galley = ui.painter().layout(
                 item.label.to_string(),
                 FontId::proportional(13.5),
-                BOTTOM_TEXT,
+                theme.bottom_text,
                 text_w,
             );
             let row_h = badge_dim.max(galley.size().y);
             let (row_rect, _) = ui.allocate_exact_size(Vec2::new(inner_w, row_h), Sense::hover());
-            paint_feature_tile(ui, row_rect, item.icon, galley);
-            if idx + 1 < FEATURES.len() {
+            paint_feature_tile(ui, row_rect, item.icon, galley, theme);
+            if idx + 1 < features.len() {
                 ui.add_space(14.0);
             }
         }
@@ -415,37 +516,52 @@ fn paint_feature_tile(
     tile_rect: Rect,
     icon: Icon,
     galley: std::sync::Arc<egui::Galley>,
+    theme: &IllustratedModalTheme,
 ) {
     let badge_dim = 42.0_f32;
     let icon_gap = 14.0_f32;
     let badge_center = pos2(tile_rect.left() + badge_dim * 0.5, tile_rect.center().y);
     let badge_rect = Rect::from_center_size(badge_center, Vec2::splat(badge_dim));
     ui.painter()
-        .circle_filled(badge_center, badge_dim * 0.5, BADGE_BG);
-    paint_icon(ui.painter(), badge_rect.shrink(11.0), icon, TOP_TITLE);
+        .circle_filled(badge_center, badge_dim * 0.5, theme.badge_bg);
+    paint_icon(
+        ui.painter(),
+        badge_rect.shrink(11.0),
+        icon,
+        theme.badge_icon,
+    );
 
     let text_pos = pos2(
         badge_rect.right() + icon_gap,
         tile_rect.center().y - galley.size().y * 0.5,
     );
-    ui.painter().galley(text_pos, galley, BOTTOM_TEXT);
+    ui.painter().galley(text_pos, galley, theme.bottom_text);
 }
 
-fn draw_cta_button(ui: &mut egui::Ui, width: f32) -> (bool, Rect) {
+fn draw_cta_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    theme: &IllustratedModalTheme,
+    width: f32,
+) -> (bool, Rect) {
     let height = 44.0_f32;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
-    let fill = if resp.hovered() { CTA_HOVER } else { CTA_BG };
+    let fill = if resp.hovered() {
+        theme.cta_hover
+    } else {
+        theme.cta_bg
+    };
     ui.painter().rect_filled(rect, CornerRadius::same(22), fill);
     if resp.has_focus() {
         ui.painter().rect_stroke(
             rect,
             CornerRadius::same(22),
-            Stroke::new(2.0, Color32::WHITE),
+            Stroke::new(2.0, theme.cta_focus_ring),
             egui::StrokeKind::Outside,
         );
     }
     let galley = ui.painter().layout_no_wrap(
-        "Start Studying".to_string(),
+        label.to_string(),
         FontId::proportional(15.0),
         Color32::WHITE,
     );

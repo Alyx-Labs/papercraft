@@ -8,7 +8,7 @@
   Write across pages, choose your paper, and export your notes in a few clicks.
 </p>
 <p align="center">
-  <a href="https://github.com/Alyx-Labs/papercraft/releases/latest"><img alt="Release v0.5.1" src="https://img.shields.io/badge/release-v0.5.1%20(alpha)-f59e0b?style=flat-square"></a>
+  <a href="https://github.com/Alyx-Labs/papercraft/releases/latest"><img alt="Release v0.5.1-alpha" src="https://img.shields.io/badge/release-v0.5.1--alpha-f59e0b?style=flat-square"></a>
   <a href="#downloads"><img alt="Downloads for Windows, Linux, and macOS" src="https://img.shields.io/badge/downloads-Windows%20%7C%20Linux%20%7C%20macOS-10b981?style=flat-square"></a>
   <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust-b7410e?style=flat-square&logo=rust">
   <a href="https://web.papercraft.ink/"><img alt="Live Web Demo" src="https://img.shields.io/badge/live%20demo-web.papercraft.ink-2f7bf5?style=flat-square"></a>
@@ -78,7 +78,7 @@ PaperCraft is built around three simple principles:
 
 > **Live Web Demo:** Try PaperCraft directly in your browser at **[https://web.papercraft.ink/](https://web.papercraft.ink/)** — runs 100% client-side via WebAssembly with no installation required.
 
-Pre-built binaries are published on [GitHub Releases (`v0.5.1`)](https://github.com/Alyx-Labs/papercraft/releases/latest) for **Windows**, **Linux**, and **macOS**. PaperCraft ships as **two separate standalone apps**—install the Desktop App on its own for offline note-taking, and add the Server only if you want self-hosted multi-device sync:
+Pre-built binaries are published on [GitHub Releases (`v0.5.1-alpha`)](https://github.com/Alyx-Labs/papercraft/releases/latest) for **Windows**, **Linux**, and **macOS**. PaperCraft ships as **two separate standalone apps**—install the Desktop App on its own for offline note-taking, and add the Server only if you want self-hosted multi-device sync:
 
 <table>
   <tr>
@@ -454,7 +454,7 @@ PaperCraft's source code is available under either the [MIT License](LICENSE-MIT
 
 ### Brand & Trademarks
 
-The **Alyx Labs**, **PaperCraft**, **Paper Craft**, and **PaperCraft Server** names, wordmarks, official domains (`papercraft.ink`, `web.papercraft.ink`), bundle identifiers (`com.alyxlabs.*`), brand artwork in [`apps/papercraft/assets/branding/`](apps/papercraft/assets/branding/), and brand illustration in [`crates/ui-egui/assets/illustrations/welcome-sea.png`](crates/ui-egui/assets/illustrations/welcome-sea.png) are proprietary trademarks and brand assets of **Alyx Labs**. They are **not** open source and are governed separately by [`LICENSE-brand.txt`](apps/papercraft/assets/branding/LICENSE-brand.txt). If you distribute a fork or modified build, you must remove or replace these brand assets and use your own name and logo.
+The **Alyx Labs**, **PaperCraft**, **Paper Craft**, and **PaperCraft Server** names, wordmarks, official domains (`papercraft.ink`, `web.papercraft.ink`), bundle identifiers (`com.alyxlabs.*`), brand artwork in [`apps/papercraft/assets/branding/`](apps/papercraft/assets/branding/), and brand illustrations in [`crates/ui-egui/assets/illustrations/`](crates/ui-egui/assets/illustrations/) are proprietary trademarks and brand assets of **Alyx Labs**. They are **not** open source and are governed separately by [`LICENSE-brand.txt`](apps/papercraft/assets/branding/LICENSE-brand.txt). If you distribute a fork or modified build, you must remove or replace these brand assets and use your own name and logo.
 
 ### Third-Party Notices
 

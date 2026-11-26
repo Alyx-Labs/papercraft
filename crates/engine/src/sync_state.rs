@@ -440,6 +440,26 @@ impl Session {
         self.dismiss_welcome_banner_for_version(env!("CARGO_PKG_VERSION"));
     }
 
+    /// Returns `true` when the first-notebook data & privacy notice has not yet been dismissed
+    /// on a persisted Desktop or Web workspace.
+    pub fn should_show_first_notebook_data_notice(&self) -> bool {
+        if !self.is_sync_persistence_enabled() {
+            return false;
+        }
+        !self.sync.global.first_notebook_data_notice_seen
+    }
+
+    /// Marks the first-notebook data & privacy notice as seen and persists global state.
+    pub fn dismiss_first_notebook_data_notice(&mut self) {
+        if self.sync.global.first_notebook_data_notice_seen {
+            return;
+        }
+        self.sync.global.first_notebook_data_notice_seen = true;
+        self.sync_persist_global_state();
+        self.save_current_web_bundle();
+        self.bump_revision();
+    }
+
     pub fn offline_edits_pending(&self) -> bool {
         self.sync.manifest.offline_edits_pending
     }
@@ -3599,6 +3619,32 @@ mod tests {
         let reopened_web = Session::open_web_cache(Some(&saved_web));
         assert!(!reopened_web.should_show_welcome_banner());
         assert!(reopened_web.should_show_welcome_banner_for_version("99.0.0"));
+    }
+
+    #[test]
+    fn first_notebook_data_notice_shows_once_on_persisted_desktop_and_web_sessions() {
+        let ephemeral = Session::default();
+        assert!(!ephemeral.should_show_first_notebook_data_notice());
+
+        let dir = temp_dir("first_notebook_data_notice");
+        let mut desktop = Session::open_desktop_library(dir.0.clone());
+        assert!(desktop.should_show_first_notebook_data_notice());
+        desktop
+            .execute("profile.dismissFirstNotebookDataNotice", &json!({}))
+            .unwrap();
+        assert!(!desktop.should_show_first_notebook_data_notice());
+
+        let reopened_desktop = Session::open_desktop_library(dir.0.clone());
+        assert!(!reopened_desktop.should_show_first_notebook_data_notice());
+
+        let mut web = Session::open_web_cache(None);
+        assert!(web.should_show_first_notebook_data_notice());
+        web.execute("profile.dismissFirstNotebookDataNotice", &json!({}))
+            .unwrap();
+        assert!(!web.should_show_first_notebook_data_notice());
+        let saved_web = web.export_web_cache_json().unwrap();
+        let reopened_web = Session::open_web_cache(Some(&saved_web));
+        assert!(!reopened_web.should_show_first_notebook_data_notice());
     }
 
     #[test]
