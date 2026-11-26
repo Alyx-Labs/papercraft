@@ -8,7 +8,7 @@ use papercraft_doc::{
     CustomPaperTemplate, CustomTemplateKind, Document, EmbeddedImageTemplate, EmbeddedPdf,
     PdfPageBackdrop, UiTheme, UserStudioConfig, sanitize_notebook_id, sanitize_notebook_title,
 };
-use papercraft_format::{load_document_bytes, save_document_bytes};
+use papercraft_format::{load_document_bytes, save_document_bytes_fast};
 use papercraft_sync::{ActiveWorkspaceTarget, GlobalSyncState, OwnerId, SyncManifest};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -417,7 +417,7 @@ pub fn encode_detached_notebook(
     }
 
     stripped.load_active_from_pages();
-    let v2_bytes = save_document_bytes(&stripped)
+    let v2_bytes = save_document_bytes_fast(&stripped)
         .map_err(|err| format!("failed encoding detached notebook body: {err}"))?;
     let meta_json = serde_json::to_vec(&table)
         .map_err(|err| format!("failed encoding detached blob table: {err}"))?;
@@ -1124,6 +1124,9 @@ impl Session {
             return;
         }
         self.sync_active_notebook_slot();
+        if urgent_override {
+            self.library.promote_view_dirty_to_dirty();
+        }
         self.sync_flush_dirty_flags_to_manifest();
         self.sync_reconcile_folders();
         self.ensure_active_web_ids();
@@ -1170,9 +1173,7 @@ impl Session {
             let mut live_nb_ids = HashSet::with_capacity(count);
 
             for idx in 0..count {
-                let mut doc_snapshot = (*self.notebooks[idx]).clone();
-                doc_snapshot.sync_active_to_pages();
-                let nb_id = sanitize_notebook_id(&doc_snapshot.id);
+                let nb_id = sanitize_notebook_id(&self.notebooks[idx].id);
                 let edit_gen = self.sync.slot_edit_gen[idx];
                 let slot_dirty = self.library.slot_dirty[idx];
                 let tracked_gen = tracked_ws.notebooks.get(&nb_id).copied();
@@ -1180,6 +1181,8 @@ impl Session {
                 let changed = slot_dirty || tracked_gen != Some(edit_gen);
 
                 if changed {
+                    let mut doc_snapshot = (*self.notebooks[idx]).clone();
+                    doc_snapshot.sync_active_to_pages();
                     let doc_arc = Arc::new(doc_snapshot);
                     self.notebooks[idx] = Arc::clone(&doc_arc);
                     if idx == self.active_notebook {
@@ -1189,6 +1192,7 @@ impl Session {
                         .put_notebooks
                         .insert((ws_key.clone(), nb_id.clone()), doc_arc);
                     self.library.slot_dirty[idx] = false;
+                    self.library.slot_view_dirty[idx] = false;
                     tracked_ws.notebooks.insert(nb_id.clone(), edit_gen);
                     if is_new {
                         delta.urgent = true;
@@ -1871,5 +1875,41 @@ mod tests {
         assert_eq!(reopened.notebooks.len(), 5);
         assert_eq!(reopened.trashed_notebooks.len(), 1);
         assert!(!reopened.notebooks[0].strokes.is_empty());
+    }
+
+    #[test]
+    fn page_select_skips_eager_autosave_and_sync_until_urgent_flush() {
+        let mut session = Session::open_web_storage(None);
+        session.complete_first_access_nickname("Tester").unwrap();
+        session
+            .execute("page.add", &serde_json::json!({}))
+            .expect("add page 2");
+        let _initial_delta = session.take_web_storage_delta(false);
+        let slot = session.active_notebook;
+        assert!(!session.has_pending_web_storage_changes());
+        assert!(!session.library.slot_dirty[slot]);
+        // Simulate an already-synced cloud slot so we can verify page.select does not re-dirty sync.
+        session.sync.slot_dirty_hash[slot] = false;
+
+        // Switching pages marks only view-dirty, not storage-dirty or cloud sync dirty.
+        session
+            .execute("page.select", &serde_json::json!({ "index": 0 }))
+            .expect("select page 1");
+        assert_eq!(session.doc.active_page_index(), 0);
+        assert!(!session.has_pending_web_storage_changes());
+        assert!(!session.library.slot_dirty[slot]);
+        assert!(!session.sync.slot_dirty_hash[slot]);
+        assert!(session.library.slot_view_dirty[slot]);
+
+        let non_urgent = session.take_web_storage_delta(false);
+        assert!(non_urgent.put_notebooks.is_empty());
+        assert!(session.library.slot_view_dirty[slot]);
+
+        // An urgent flush (e.g. exit / visibility hidden) promotes view-dirty and persists page index.
+        let urgent = session.take_web_storage_delta(true);
+        assert_eq!(urgent.put_notebooks.len(), 1);
+        assert!(!session.library.slot_view_dirty[slot]);
+        let saved_doc = urgent.put_notebooks.values().next().unwrap();
+        assert_eq!(saved_doc.active_page_index(), 0);
     }
 }

@@ -19,9 +19,9 @@ pub use export::{
     render_document_svg,
 };
 pub use pdf::{
-    PdfDocumentSummary, PdfError, PdfPageMetrics, PdfPageRenderer, RenderedPdfPage, inspect_pdf,
-    pdf_pt_to_page_size, render_pdf_batch_exact_rgba, render_pdf_page_exact_rgba,
-    render_pdf_page_png, render_pdf_page_rgba, with_pdf_renderer,
+    PdfDocumentSummary, PdfError, PdfPageMetrics, PdfPageRenderer, RenderedPdfPage,
+    clear_pdf_cache, inspect_pdf, pdf_pt_to_page_size, render_pdf_batch_exact_rgba,
+    render_pdf_page_exact_rgba, render_pdf_page_png, render_pdf_page_rgba, with_pdf_renderer,
 };
 
 use papercraft_color::BlendMode;

@@ -2908,6 +2908,13 @@ fn cmd_page_add(session: &mut Session, id: &str, params: &Value) -> Result<Value
 
 fn cmd_page_select(session: &mut Session, id: &str, params: &Value) -> Result<Value, EngineError> {
     let p: SelectIndexParams = parse_params(id, params)?;
+    let page_count = session.doc.page_count();
+    if p.index < page_count && p.index == session.doc.active_page_index() {
+        return Ok(json!({
+            "pageIndex": p.index,
+            "pageCount": page_count
+        }));
+    }
     session.cancel_live_stroke();
     session.cancel_live_eraser();
     let mut next = (*session.doc).clone();
@@ -2915,7 +2922,7 @@ fn cmd_page_select(session: &mut Session, id: &str, params: &Value) -> Result<Va
         return Err(invalid(id, "page index out of bounds"));
     }
     session.doc = Arc::new(next);
-    session.mark_active_dirty();
+    session.mark_active_view_dirty();
     session.bump_revision();
     Ok(json!({
         "pageIndex": session.doc.active_page_index(),

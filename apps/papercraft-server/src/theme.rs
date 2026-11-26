@@ -35,6 +35,8 @@ pub struct Tokens {
     pub success_border: Color32,
     pub success_bg: Color32,
     pub warning_fg: Color32,
+    pub warning_border: Color32,
+    pub warning_bg: Color32,
 }
 
 impl Tokens {
@@ -73,6 +75,8 @@ impl Tokens {
             success_border: Color32::from_rgb(0x9E, 0xDE, 0xB8),
             success_bg: Color32::from_rgb(0xEC, 0xFD, 0xF3),
             warning_fg: Color32::from_rgb(0xB4, 0x53, 0x09),
+            warning_border: Color32::from_rgb(0xE8, 0xC5, 0x9B),
+            warning_bg: Color32::from_rgb(0xFE, 0xF7, 0xEC),
         }
     }
 
@@ -104,6 +108,8 @@ impl Tokens {
             success_border: Color32::from_rgb(0x23, 0x5B, 0x3B),
             success_bg: Color32::from_rgb(0x14, 0x2B, 0x1E),
             warning_fg: Color32::from_rgb(0xF5, 0x9E, 0x0B),
+            warning_border: Color32::from_rgb(0x61, 0x44, 0x17),
+            warning_bg: Color32::from_rgb(0x2B, 0x22, 0x14),
         }
     }
 }

@@ -1,12 +1,11 @@
 use std::collections::HashMap;
-use std::io::{self, Write};
 use std::ops::Range;
 
+use papercraft_doc::NotebookPage;
 use papercraft_sync_protocol::{
     AcceptedFolderSync, ConflictNotebookSync, LocalNotebookChange, MAX_PUSH_BATCH_SIZE,
     RemoteFolderRecord, RemoteNotebookRecord, RemotePrefsRecord, SyncPullResponse, SyncPushRequest,
-    SyncPushResponse, canonical_document_body_hash, canonical_document_hash,
-    canonical_document_meta_hash, canonical_document_page_hashes, now_unix_ms,
+    SyncPushResponse, canonical_document_all_hashes, canonical_document_page_hashes, now_unix_ms,
 };
 
 use crate::client::SyncHttpClient;
@@ -240,17 +239,13 @@ fn build_pending_changes(
         if doc.id.is_empty() {
             doc.id = snap.notebook_id.clone();
         }
+        let hashes = canonical_document_all_hashes(&doc);
         let content_hash = if snap.content_hash.is_empty() {
-            canonical_document_hash(&doc)
+            hashes.content_hash
         } else {
             snap.content_hash.clone()
         };
-        let body_hash = canonical_document_body_hash(&doc);
-        let meta_hash = canonical_document_meta_hash(&doc);
-        page_hashes_map.insert(
-            snap.notebook_id.clone(),
-            canonical_document_page_hashes(&doc),
-        );
+        page_hashes_map.insert(snap.notebook_id.clone(), hashes.page_hashes);
         let updated_at_ms = doc.updated_at_ms.max(now);
         let meta_updated_at_ms = doc.meta_updated_at_ms.max(updated_at_ms);
         changes.push(LocalNotebookChange {
@@ -260,8 +255,8 @@ fn build_pending_changes(
             updated_at_ms,
             deleted_at_ms: None,
             content_hash,
-            body_hash,
-            meta_hash,
+            body_hash: hashes.body_hash,
+            meta_hash: hashes.meta_hash,
             meta_updated_at_ms,
             document: Some(doc),
         });
@@ -284,26 +279,58 @@ fn build_pending_changes(
     (changes, page_hashes_map)
 }
 
-struct ByteCounter(usize);
-
-impl Write for ByteCounter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0 = self.0.saturating_add(buf.len());
-        Ok(buf.len())
+fn estimate_page_json_bytes(page: &NotebookPage) -> usize {
+    let mut total = 160usize;
+    for stroke in &page.strokes {
+        total = total.saturating_add(160usize.saturating_add(stroke.smoothed_points.len() * 48));
     }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+    for text in &page.texts {
+        total = total.saturating_add(160usize.saturating_add(text.text.len()));
     }
+    for shape in &page.shapes {
+        total = total.saturating_add(128usize.saturating_add(shape.points.len() * 24));
+    }
+    for img in &page.images {
+        total = total.saturating_add(160usize.saturating_add((img.png_bytes.len() * 4) / 3));
+    }
+    total
 }
 
 fn estimate_change_bytes(change: &LocalNotebookChange) -> usize {
-    let mut counter = ByteCounter(0);
-    if serde_json::to_writer(&mut counter, change).is_ok() {
-        counter.0.max(1)
-    } else {
-        1
+    let mut total = 256usize
+        .saturating_add(change.notebook_id.len())
+        .saturating_add(change.content_hash.len())
+        .saturating_add(change.body_hash.len())
+        .saturating_add(change.meta_hash.len());
+    let Some(ref doc) = change.document else {
+        return total.max(1);
+    };
+    total = total
+        .saturating_add(512)
+        .saturating_add(doc.title.len())
+        .saturating_add(doc.folder_path.len())
+        .saturating_add(doc.id.len());
+    for tag in &doc.tags {
+        total = total.saturating_add(tag.len().saturating_add(4));
     }
+    for pdf in &doc.pdf_documents {
+        total = total
+            .saturating_add(64)
+            .saturating_add(pdf.name.len())
+            .saturating_add((pdf.bytes.len() * 4) / 3);
+    }
+    for tpl in &doc.image_templates {
+        total = total
+            .saturating_add(64)
+            .saturating_add(tpl.name.len())
+            .saturating_add((tpl.png_bytes.len() * 4) / 3);
+    }
+    for idx in 0..doc.page_count() {
+        if let Some(page_bytes) = doc.with_resolved_page(idx, estimate_page_json_bytes) {
+            total = total.saturating_add(page_bytes);
+        }
+    }
+    total.max(1)
 }
 
 fn plan_push_chunk_ranges(

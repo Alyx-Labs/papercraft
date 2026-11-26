@@ -8,9 +8,10 @@ use egui::{
     Color32, CornerRadius, FontId, Mesh, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Vec2, pos2,
 };
 use papercraft_doc::{
-    Document, GeometricShape, InkStroke, ListItemKind, PageImage, PaperColor, PaperTemplate,
-    PenKind, PenSettings, ShapeKind, StrokeId, StrokeSample, TextAlignment, TextFont, TextItem,
-    TextSpan, TextStyleAttr, UiTheme, normalize_text_spans, parse_list_line_prefix,
+    Document, GeometricShape, InkStroke, ListItemKind, PageImage, PagePaintStep, PaperColor,
+    PaperTemplate, PenKind, PenSettings, ShapeKind, StrokeId, StrokeSample, TextAlignment,
+    TextFont, TextItem, TextSpan, TextStyleAttr, UiTheme, normalize_text_spans,
+    parse_list_line_prefix,
 };
 use papercraft_engine::ToolKind;
 use papercraft_geom::{Affine2, Point};
@@ -207,6 +208,23 @@ struct SelectionBoundsCache {
     stroke_bounds_at_origin: Option<Rect>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveRibbonCacheKey {
+    preview_generation: u64,
+    raw_len: usize,
+    preview_len: usize,
+    first_pt_bits: Option<[u64; 2]>,
+    zoom_bits: u32,
+    pan_bits: [u64; 2],
+    color_key: (UiTheme, bool, PaperColor),
+}
+
+#[derive(Clone)]
+struct LiveRibbonCache {
+    key: LiveRibbonCacheKey,
+    mesh: Arc<Mesh>,
+}
+
 /// Cached screen-space geometry for paper ruling, committed ink strokes, shapes, and text.
 #[derive(Clone, Default)]
 pub(crate) struct CanvasRenderCache {
@@ -215,6 +233,9 @@ pub(crate) struct CanvasRenderCache {
     shapes: CommittedShapeCache,
     texts: CommittedTextCache,
     last_ribbon_sync_key: Option<RibbonSyncKey>,
+    paint_steps_key: Option<(usize, usize, u64)>,
+    paint_steps: Arc<Vec<PagePaintStep>>,
+    live_ribbon: Option<LiveRibbonCache>,
     pub(crate) gpu_scene: crate::gpu_ink::GpuStrokeSceneCache,
     pub(crate) gpu_overlay_hl: Option<Arc<crate::gpu_ink::GpuOverlayHighlighters>>,
     pub(crate) gpu_overlay_ink: Option<Arc<crate::gpu_ink::GpuByteMesh>>,
@@ -9557,8 +9578,13 @@ fn paint_committed_page_scene(
     t: &Tokens,
     modifiers: egui::Modifiers,
 ) {
-    let steps = app.session.doc.page_paint_steps();
     let (page_key, color_key) = sync_page_stroke_cache_context(app);
+    let steps_key = (page_key.0, page_key.1, app.session.revision);
+    if app.canvas_cache.paint_steps_key != Some(steps_key) {
+        app.canvas_cache.paint_steps = Arc::new(app.session.doc.page_paint_steps());
+        app.canvas_cache.paint_steps_key = Some(steps_key);
+    }
+    let steps = Arc::clone(&app.canvas_cache.paint_steps);
     let gpu_scene = if app.wgpu_enabled {
         crate::gpu_ink::prepare_gpu_stroke_scene(
             app, p, avail_rect, xf, page_key, color_key, &steps,
@@ -9595,7 +9621,7 @@ fn paint_committed_page_scene(
     let mut emitted_band1 = false;
     let mut ink_run_cursor = 0_usize;
 
-    for step in &steps {
+    for step in steps.iter() {
         match step {
             papercraft_doc::PagePaintStep::Images(indices) => {
                 paint_committed_image_indices(app, ctx, p, xf, indices);
@@ -9904,6 +9930,8 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             let avail = ui.available_rect_before_wrap();
             let dt = ui.ctx().input(|i| i.stable_dt);
+            let prev_zoom = app.view.zoom;
+            let prev_pan = app.view.pan;
             advance_canvas_camera(app, ui, avail, dt);
             app.view.last_canvas_rect = Some(avail);
 
@@ -9928,6 +9956,14 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
                 if has_active_live(app) {
                     finish_active_stroke(app);
                 }
+            }
+            if app.view.pan_dragging
+                || app.view.motion.camera_glide.is_some()
+                || (app.view.zoom - prev_zoom).abs() > 1e-6
+                || (app.view.pan[0] - prev_pan[0]).abs() > 0.25
+                || (app.view.pan[1] - prev_pan[1]).abs() > 0.25
+            {
+                crate::pdf_view::note_canvas_camera_motion(ui.ctx());
             }
 
             let xf = page_affine(app);
@@ -10019,17 +10055,50 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
                         t.accent,
                     );
                 } else if live.pen.kind != PenKind::Highlighter {
-                    let preview = live.preview_samples();
-                    let feather = (0.9 / app.view.zoom.max(0.25)).clamp(0.3, 2.5);
-                    let mut display_pen = live.pen.clone();
-                    display_pen.color = eff_paper_color.resolve_ink_color(
-                        theme,
-                        auto_contrast,
-                        live.pen.color,
-                        false,
-                    );
-                    paint_live_ribbon(&p, &display_pen, &preview, xf, feather);
+                    let key = LiveRibbonCacheKey {
+                        preview_generation: live.preview_generation,
+                        raw_len: live.raw_points.len(),
+                        preview_len: live.smoothed_preview.len(),
+                        first_pt_bits: live
+                            .raw_points
+                            .first()
+                            .map(|s| [s.x.to_bits(), s.y.to_bits()]),
+                        zoom_bits: app.view.zoom.to_bits(),
+                        pan_bits: [app.view.pan[0].to_bits(), app.view.pan[1].to_bits()],
+                        color_key: (theme, auto_contrast, eff_paper_color),
+                    };
+                    if let Some(cached) = &app.canvas_cache.live_ribbon
+                        && cached.key == key
+                    {
+                        p.add(Shape::Mesh(Arc::clone(&cached.mesh)));
+                    } else {
+                        let preview = live.preview_samples();
+                        let feather = (0.9 / app.view.zoom.max(0.25)).clamp(0.3, 2.5);
+                        let mut display_pen = live.pen.clone();
+                        display_pen.color = eff_paper_color.resolve_ink_color(
+                            theme,
+                            auto_contrast,
+                            live.pen.color,
+                            false,
+                        );
+                        if let Some(mesh) =
+                            build_live_ribbon_mesh(&display_pen, &preview, xf, feather)
+                        {
+                            let mesh_arc = Arc::new(mesh);
+                            p.add(Shape::Mesh(Arc::clone(&mesh_arc)));
+                            app.canvas_cache.live_ribbon = Some(LiveRibbonCache {
+                                key,
+                                mesh: mesh_arc,
+                            });
+                        } else {
+                            app.canvas_cache.live_ribbon = None;
+                        }
+                    }
+                } else {
+                    app.canvas_cache.live_ribbon = None;
                 }
+            } else {
+                app.canvas_cache.live_ribbon = None;
             }
             paint_laser_pointer(app, ui.ctx(), &p, xf);
 

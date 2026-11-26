@@ -38,6 +38,7 @@ pub(crate) struct LibraryState {
     pub(crate) dir: Option<PathBuf>,
     pub(crate) slot_files: Vec<Option<PathBuf>>,
     pub(crate) slot_dirty: Vec<bool>,
+    pub(crate) slot_view_dirty: Vec<bool>,
     pub(crate) next_seq: u64,
 }
 
@@ -45,6 +46,7 @@ impl LibraryState {
     pub(crate) fn sync_len(&mut self, count: usize) {
         self.slot_files.resize_with(count, || None);
         self.slot_dirty.resize(count, false);
+        self.slot_view_dirty.resize(count, false);
     }
 
     pub(crate) fn mark_dirty(&mut self, index: usize, count: usize) {
@@ -54,10 +56,28 @@ impl LibraryState {
         }
     }
 
+    pub(crate) fn mark_view_dirty(&mut self, index: usize, count: usize) {
+        self.sync_len(count);
+        if let Some(slot) = self.slot_view_dirty.get_mut(index) {
+            *slot = true;
+        }
+    }
+
+    pub(crate) fn promote_view_dirty_to_dirty(&mut self) {
+        let len = self.slot_dirty.len().min(self.slot_view_dirty.len());
+        for idx in 0..len {
+            if self.slot_view_dirty[idx] {
+                self.slot_dirty[idx] = true;
+                self.slot_view_dirty[idx] = false;
+            }
+        }
+    }
+
     pub(crate) fn push_slot(&mut self, path: Option<PathBuf>, dirty: bool, new_count: usize) {
         if self.slot_files.len() + 1 == new_count {
             self.slot_files.push(path);
             self.slot_dirty.push(dirty);
+            self.slot_view_dirty.push(false);
         } else {
             self.sync_len(new_count);
             if let Some(last) = self.slot_files.last_mut() {
@@ -65,6 +85,9 @@ impl LibraryState {
             }
             if let Some(last) = self.slot_dirty.last_mut() {
                 *last = dirty;
+            }
+            if let Some(last) = self.slot_view_dirty.last_mut() {
+                *last = false;
             }
         }
     }
@@ -78,6 +101,9 @@ impl LibraryState {
         }
         if index < self.slot_dirty.len() {
             self.slot_dirty.remove(index);
+        }
+        if index < self.slot_view_dirty.len() {
+            self.slot_view_dirty.remove(index);
         }
     }
 
@@ -528,6 +554,7 @@ impl Session {
                     dir: Some(dir.clone()),
                     slot_files: vec![None],
                     slot_dirty: vec![false],
+                    slot_view_dirty: vec![false],
                     next_seq: 0,
                 };
                 session.trashed_notebooks = read_trash_entries(&dir);
@@ -569,6 +596,7 @@ impl Session {
             dir: Some(dir),
             slot_files: files,
             slot_dirty: vec![false; count],
+            slot_view_dirty: vec![false; count],
             next_seq: count as u64,
         };
         if let Some(ref library_dir) = session.library.dir {
@@ -607,6 +635,7 @@ impl Session {
             dir: dir.clone(),
             slot_files: vec![None; count],
             slot_dirty: vec![dir.is_some(); count],
+            slot_view_dirty: vec![false; count],
             next_seq: 0,
         };
         if let Some(ref lib_dir) = dir {
@@ -678,6 +707,7 @@ impl Session {
                 }
             };
             self.library.slot_dirty[idx] = false;
+            self.library.slot_view_dirty[idx] = false;
             out.push((idx, path, Arc::clone(&self.notebooks[idx])));
         }
         Ok(out)

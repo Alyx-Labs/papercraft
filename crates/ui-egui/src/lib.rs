@@ -2864,6 +2864,10 @@ impl PaperCraftApp {
         self.last_ctx = Some(ctx.clone());
         self.install_rich_fonts_if_needed(&ctx);
         self.sync_ui_scale_before_render(&ctx);
+        pdf_view::set_writing_active(
+            &ctx,
+            self.session.live_stroke.is_some() || self.session.live_eraser.is_some(),
+        );
         pdf_view::pump_completed_renders(&ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.poll_async_pdf_import(&ctx);

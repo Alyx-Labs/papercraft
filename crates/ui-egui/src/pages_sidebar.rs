@@ -183,6 +183,14 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> SidebarM
             .max_height(scroll_h)
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
+                let scroll_y_id = ui.make_persistent_id("papercraft_pages_sidebar_scroll_y");
+                let prev_scroll_y = ui.ctx().data(|d| d.get_temp::<f32>(scroll_y_id));
+                if prev_scroll_y.is_some_and(|y| (y - viewport.min.y).abs() > 0.5) {
+                    crate::pdf_view::note_sidebar_scroll_motion(ui.ctx());
+                }
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(scroll_y_id, viewport.min.y));
+
                 let tiles = draw_thumbnail_grid(
                     app,
                     ui,
@@ -503,6 +511,23 @@ fn update_grid_layout_settled(
     settled
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct GridRowMetricsKey {
+    notebook: usize,
+    revision: u64,
+    bookmarked_only: bool,
+    visible_len: usize,
+    sheet_w_bits: u32,
+    chrome_h_bits: u32,
+    row_gap_bits: u32,
+}
+
+#[derive(Clone)]
+struct CachedGridRowMetrics {
+    key: GridRowMetricsKey,
+    metrics: std::sync::Arc<(Vec<f32>, Vec<f32>, f32)>,
+}
+
 fn draw_thumbnail_grid(
     app: &mut PaperCraftApp,
     ui: &mut egui::Ui,
@@ -552,15 +577,47 @@ fn draw_thumbnail_grid(
         .data(|d| d.get_temp::<f32>(grid_chrome_h_id(ui)))
         .unwrap_or(40.0);
 
-    let (row_tops, row_heights, total_h) = compute_grid_row_metrics(
-        &app.session.doc,
-        visible_indices,
-        sheet_w,
-        cached_chrome_h,
-        row_gap,
+    let metrics_key = GridRowMetricsKey {
+        notebook: app.session.active_notebook,
+        revision: app.session.revision,
+        bookmarked_only: app.view.pages_bookmarked_only,
+        visible_len: visible_indices.len(),
+        sheet_w_bits: sheet_w.to_bits(),
+        chrome_h_bits: cached_chrome_h.to_bits(),
+        row_gap_bits: row_gap.to_bits(),
+    };
+    let metrics_cache_id = ui.make_persistent_id("papercraft_pages_grid_row_metrics");
+    let cached_metrics = ui
+        .ctx()
+        .data(|d| d.get_temp::<CachedGridRowMetrics>(metrics_cache_id))
+        .filter(|entry| entry.key == metrics_key)
+        .map(|entry| std::sync::Arc::clone(&entry.metrics))
+        .unwrap_or_else(|| {
+            let computed = std::sync::Arc::new(compute_grid_row_metrics(
+                &app.session.doc,
+                visible_indices,
+                sheet_w,
+                cached_chrome_h,
+                row_gap,
+            ));
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(
+                    metrics_cache_id,
+                    CachedGridRowMetrics {
+                        key: metrics_key,
+                        metrics: std::sync::Arc::clone(&computed),
+                    },
+                );
+            });
+            computed
+        });
+    let (row_tops, row_heights, total_h) = (
+        cached_metrics.0.as_slice(),
+        cached_metrics.1.as_slice(),
+        cached_metrics.2,
     );
     let total_rows = row_tops.len();
-    let (first_vis, last_vis) = visible_row_bounds(&row_tops, &row_heights, viewport);
+    let (first_vis, last_vis) = visible_row_bounds(row_tops, row_heights, viewport);
     let content_origin = ui.cursor().left_top();
 
     if first_vis > 0 {
@@ -751,7 +808,10 @@ fn paint_page_sheet_contents(
             scope: opts.stroke_cache_scope,
             theme,
             auto_contrast,
-            defer_rebuild: app.view.selection_drag.is_some(),
+            defer_rebuild: app.view.selection_drag.is_some()
+                || app.session.live_stroke.is_some()
+                || app.session.live_eraser.is_some()
+                || crate::pdf_view::is_sidebar_scroll_active(ui.ctx()),
         },
     );
 }
@@ -2256,45 +2316,50 @@ fn paint_thumbnail_foreground_cached(
             && arcs_match(&e.shape_sources, &page.shapes)
     });
 
-    if !exact_hit && !(target.defer_rebuild && entry.is_some()) {
-        let appended = entry
-            .as_mut()
-            .is_some_and(|e| try_append_thumb_stroke(e, &key, sheet_rect, page));
-        if !appended {
-            let (maybe_img, built_shapes) = build_thumbnail_foreground_assets(
-                ui.painter(),
-                sheet_rect,
-                page,
-                target.theme,
-                target.auto_contrast,
-            );
-            let (stroke_image, stroke_texture) = if let Some(img) = maybe_img {
-                let tex = ui.ctx().load_texture(
-                    format!(
-                        "thumb_fg_{}_{}_{}",
-                        target.scope, target.notebook_idx, target.page_idx
-                    ),
-                    img.clone(),
-                    egui::TextureOptions::LINEAR,
-                );
-                (Some(img), Some(tex))
-            } else {
-                (None, None)
-            };
-            entry = Some(ThumbForegroundCache {
-                key,
-                stroke_sources: page.strokes.clone(),
-                text_sources: page.texts.clone(),
-                shape_sources: page.shapes.clone(),
-                stroke_image,
-                stroke_texture,
-                cached_origin: sheet_rect.min,
-                shapes: std::sync::Arc::new(built_shapes),
-            });
-        }
-        if let Some(updated) = &entry {
+    if !exact_hit {
+        if target.defer_rebuild && entry.is_some() {
             ui.ctx()
-                .data_mut(|d| d.insert_temp(cache_id, updated.clone()));
+                .request_repaint_after(std::time::Duration::from_millis(120));
+        } else {
+            let appended = entry
+                .as_mut()
+                .is_some_and(|e| try_append_thumb_stroke(e, &key, sheet_rect, page));
+            if !appended {
+                let (maybe_img, built_shapes) = build_thumbnail_foreground_assets(
+                    ui.painter(),
+                    sheet_rect,
+                    page,
+                    target.theme,
+                    target.auto_contrast,
+                );
+                let (stroke_image, stroke_texture) = if let Some(img) = maybe_img {
+                    let tex = ui.ctx().load_texture(
+                        format!(
+                            "thumb_fg_{}_{}_{}",
+                            target.scope, target.notebook_idx, target.page_idx
+                        ),
+                        img.clone(),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    (Some(img), Some(tex))
+                } else {
+                    (None, None)
+                };
+                entry = Some(ThumbForegroundCache {
+                    key,
+                    stroke_sources: page.strokes.clone(),
+                    text_sources: page.texts.clone(),
+                    shape_sources: page.shapes.clone(),
+                    stroke_image,
+                    stroke_texture,
+                    cached_origin: sheet_rect.min,
+                    shapes: std::sync::Arc::new(built_shapes),
+                });
+            }
+            if let Some(updated) = &entry {
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(cache_id, updated.clone()));
+            }
         }
     }
 

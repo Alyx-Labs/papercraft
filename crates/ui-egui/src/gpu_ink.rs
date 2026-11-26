@@ -157,6 +157,8 @@ struct GpuChunkData {
     last_stroke_index_range: (u32, u32),
     vertex_bytes: Arc<Vec<u8>>,
     index_bytes: Arc<Vec<u8>>,
+    delta_vertex_offset: usize,
+    delta_index_offset: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -208,6 +210,8 @@ impl GpuStrokeSceneCache {
 struct GpuChunkBuffers {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    vertex_capacity: usize,
+    index_capacity: usize,
     index_count: u32,
 }
 
@@ -780,29 +784,81 @@ impl GpuInkResources {
     fn sync_chunk_buffers(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         hl_chunks: &[Arc<GpuChunkData>],
         ink_chunks: &[Arc<GpuChunkData>],
     ) {
         let mut active_ids = HashSet::with_capacity(hl_chunks.len() + ink_chunks.len());
         for chunk in hl_chunks.iter().chain(ink_chunks.iter()) {
             active_ids.insert(chunk.id);
-            self.chunk_buffers.entry(chunk.id).or_insert_with(|| {
-                let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("papercraft_chunk_vb"),
-                    contents: &chunk.vertex_bytes,
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("papercraft_chunk_ib"),
-                    contents: &chunk.index_bytes,
-                    usage: wgpu::BufferUsages::INDEX,
-                });
+        }
+
+        for chunk in hl_chunks.iter().chain(ink_chunks.iter()) {
+            if self.chunk_buffers.contains_key(&chunk.id) {
+                continue;
+            }
+            if let Some(parent_id) = chunk.parent_id
+                && !active_ids.contains(&parent_id)
+                && chunk.delta_vertex_offset <= chunk.vertex_bytes.len()
+                && chunk.delta_index_offset <= chunk.index_bytes.len()
+                && chunk.delta_vertex_offset.is_multiple_of(4)
+                && chunk.delta_index_offset.is_multiple_of(4)
+                && let Some(parent_entry) = self.chunk_buffers.get(&parent_id)
+                && parent_entry.vertex_capacity >= chunk.vertex_bytes.len()
+                && parent_entry.index_capacity >= chunk.index_bytes.len()
+                && let Some(mut reused) = self.chunk_buffers.remove(&parent_id)
+            {
+                let v_tail = &chunk.vertex_bytes[chunk.delta_vertex_offset..];
+                if !v_tail.is_empty() && v_tail.len().is_multiple_of(4) {
+                    queue.write_buffer(
+                        &reused.vertex_buffer,
+                        chunk.delta_vertex_offset as u64,
+                        v_tail,
+                    );
+                }
+                let i_tail = &chunk.index_bytes[chunk.delta_index_offset..];
+                if !i_tail.is_empty() && i_tail.len().is_multiple_of(4) {
+                    queue.write_buffer(
+                        &reused.index_buffer,
+                        chunk.delta_index_offset as u64,
+                        i_tail,
+                    );
+                }
+                reused.index_count = chunk.index_count;
+                self.chunk_buffers.insert(chunk.id, reused);
+                continue;
+            }
+
+            let vertex_capacity = chunk.vertex_bytes.len().max(16 * 1024).next_power_of_two();
+            let index_capacity = chunk.index_bytes.len().max(4 * 1024).next_power_of_two();
+            let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("papercraft_chunk_vb"),
+                size: vertex_capacity as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("papercraft_chunk_ib"),
+                size: index_capacity as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            if !chunk.vertex_bytes.is_empty() && chunk.vertex_bytes.len().is_multiple_of(4) {
+                queue.write_buffer(&vertex_buffer, 0, &chunk.vertex_bytes);
+            }
+            if !chunk.index_bytes.is_empty() && chunk.index_bytes.len().is_multiple_of(4) {
+                queue.write_buffer(&index_buffer, 0, &chunk.index_bytes);
+            }
+            self.chunk_buffers.insert(
+                chunk.id,
                 GpuChunkBuffers {
                     vertex_buffer,
                     index_buffer,
+                    vertex_capacity,
+                    index_capacity,
                     index_count: chunk.index_count,
-                }
-            });
+                },
+            );
         }
         self.chunk_buffers.retain(|id, _| active_ids.contains(id));
     }
@@ -1014,6 +1070,8 @@ fn build_chunk_from_entries(
         last_stroke_index_range: last_range,
         vertex_bytes: Arc::new(vertex_bytes),
         index_bytes: Arc::new(index_bytes),
+        delta_vertex_offset: 0,
+        delta_index_offset: 0,
     })
 }
 
@@ -1027,7 +1085,10 @@ fn try_append_tail_chunk(
         return None;
     }
     let added = cache.strokes.get(&tail_ids[tail_len])?;
-    if old_tail.vertex_count + added.mesh.vertices.len() > MAX_CHUNK_VERTS {
+    let next_total_verts = old_tail
+        .vertex_count
+        .checked_add(added.mesh.vertices.len())?;
+    if next_total_verts > MAX_CHUNK_VERTS {
         return None;
     }
     let prefix_matches = old_tail.strokes.iter().enumerate().all(|(i, old_arc)| {
@@ -1039,12 +1100,49 @@ fn try_append_tail_chunk(
     if !prefix_matches {
         return None;
     }
+
+    let mut vertex_bytes = Vec::with_capacity(next_total_verts * 20);
+    vertex_bytes.extend_from_slice(&old_tail.vertex_bytes);
+    let delta_vertex_offset = vertex_bytes.len();
+
+    let total_indices = old_tail.index_count as usize + added.mesh.indices.len();
+    let mut index_bytes = Vec::with_capacity(total_indices * 4);
+    index_bytes.extend_from_slice(&old_tail.index_bytes);
+    let delta_index_offset = index_bytes.len();
+
+    let base_v = old_tail.vertex_count as u32;
+    append_scalable_to_bytes(added, &mut vertex_bytes, &mut index_bytes, base_v);
+
+    let start_idx = old_tail.index_count;
+    let idx_len = added.mesh.indices.len() as u32;
+    let mut strokes = Vec::with_capacity(old_tail.strokes.len() + 1);
+    strokes.extend(old_tail.strokes.iter().cloned());
+    strokes.push(Arc::clone(&added.source));
+
+    let mut stroke_ranges = Vec::with_capacity(old_tail.stroke_ranges.len() + 1);
+    stroke_ranges.extend_from_slice(&old_tail.stroke_ranges);
+    stroke_ranges.push((added.bounds, start_idx, idx_len));
+
+    let mut bounds = old_tail.bounds;
+    if !added.bounds.is_empty() {
+        bounds = bounds.union(added.bounds);
+    }
+
     let id = cache.alloc_chunk_id();
-    let entries: Vec<&CachedScalableStroke> = tail_ids
-        .iter()
-        .filter_map(|sid| cache.strokes.get(sid))
-        .collect();
-    Some(build_chunk_from_entries(id, Some(old_tail.id), &entries))
+    Some(Arc::new(GpuChunkData {
+        id,
+        parent_id: Some(old_tail.id),
+        bounds,
+        strokes,
+        vertex_count: next_total_verts,
+        index_count: total_indices as u32,
+        stroke_ranges,
+        last_stroke_index_range: (start_idx, idx_len),
+        vertex_bytes: Arc::new(vertex_bytes),
+        index_bytes: Arc::new(index_bytes),
+        delta_vertex_offset,
+        delta_index_offset,
+    }))
 }
 
 fn sync_chunk_list(cache: &mut GpuStrokeSceneCache, is_hl: bool, ordered_ids: &[StrokeId]) {
@@ -2547,7 +2645,7 @@ impl CallbackTrait for GpuInkPaintCallback {
             (vp.height_px as u32).min(max_dim).max(1),
         ];
 
-        res.sync_chunk_buffers(device, &self.hl_chunks, &self.ink_chunks);
+        res.sync_chunk_buffers(device, queue, &self.hl_chunks, &self.ink_chunks);
         res.upload_overlays(
             device,
             queue,
@@ -3168,5 +3266,48 @@ mod tests {
         assert_eq!(overlay.ranges.len(), 2);
         assert!(overlay.ranges[0].2 > 0);
         assert!(overlay.ranges[1].2 > 0);
+    }
+
+    #[test]
+    fn incremental_try_append_tail_chunk_matches_full_rebuild_byte_for_byte() {
+        let color_key = (UiTheme::Light, true, PaperColor::PureWhite);
+        let mut cache = GpuStrokeSceneCache::default();
+        let s1 = make_test_stroke(1, PenKind::BallPen, 10.0, 12);
+        let s2 = make_test_stroke(2, PenKind::FountainPen, 80.0, 16);
+        let s3 = make_test_stroke(3, PenKind::Pencil, 160.0, 10);
+        cache
+            .strokes
+            .insert(s1.id, build_cached_scalable_stroke(&s1, color_key));
+        cache
+            .strokes
+            .insert(s2.id, build_cached_scalable_stroke(&s2, color_key));
+        cache
+            .strokes
+            .insert(s3.id, build_cached_scalable_stroke(&s3, color_key));
+
+        let entries_12 = [&cache.strokes[&s1.id], &cache.strokes[&s2.id]];
+        let chunk_12 = build_chunk_from_entries(1, None, &entries_12);
+        let appended = try_append_tail_chunk(&mut cache, &chunk_12, &[s1.id, s2.id, s3.id])
+            .expect("incremental append should succeed");
+
+        let entries_123 = [
+            &cache.strokes[&s1.id],
+            &cache.strokes[&s2.id],
+            &cache.strokes[&s3.id],
+        ];
+        let rebuilt = build_chunk_from_entries(appended.id, Some(chunk_12.id), &entries_123);
+
+        assert_eq!(appended.vertex_bytes, rebuilt.vertex_bytes);
+        assert_eq!(appended.index_bytes, rebuilt.index_bytes);
+        assert_eq!(appended.bounds, rebuilt.bounds);
+        assert_eq!(appended.stroke_ranges, rebuilt.stroke_ranges);
+        assert_eq!(
+            appended.last_stroke_index_range,
+            rebuilt.last_stroke_index_range
+        );
+        assert_eq!(appended.delta_vertex_offset, chunk_12.vertex_bytes.len());
+        assert_eq!(appended.delta_index_offset, chunk_12.index_bytes.len());
+        assert!(appended.delta_vertex_offset.is_multiple_of(4));
+        assert!(appended.delta_index_offset.is_multiple_of(4));
     }
 }

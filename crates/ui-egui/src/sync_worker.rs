@@ -19,8 +19,14 @@ use papercraft_sync_protocol::{
 use crate::PaperCraftApp;
 
 const AUTO_SYNC_DEBOUNCE_NORMAL_MS: f64 = 1_500.0;
+#[cfg(not(target_arch = "wasm32"))]
 const AUTO_SYNC_DEBOUNCE_MEDIUM_MS: f64 = 3_500.0;
+#[cfg(target_arch = "wasm32")]
+const AUTO_SYNC_DEBOUNCE_MEDIUM_MS: f64 = 6_000.0;
+#[cfg(not(target_arch = "wasm32"))]
 const AUTO_SYNC_DEBOUNCE_HEAVY_MS: f64 = 6_000.0;
+#[cfg(target_arch = "wasm32")]
+const AUTO_SYNC_DEBOUNCE_HEAVY_MS: f64 = 12_000.0;
 const SYNC_MEDIUM_PAYLOAD_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
 const SYNC_HEAVY_PAYLOAD_THRESHOLD_BYTES: usize = 32 * 1024 * 1024;
 const AUTO_SYNC_IDLE_PULL_MS: f64 = 12_000.0;

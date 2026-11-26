@@ -602,16 +602,29 @@ async fn web_refresh(
     Ok(session_from_auth(base, auth, device_name))
 }
 
+async fn yield_to_browser() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let cb: &js_sys::Function = resolve.unchecked_ref();
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(cb, 0);
+    });
+    let _ = JsFuture::from(promise).await;
+}
+
 async fn run_web_sync_cycle(
     session: &mut ActiveAccountSession,
     batch: &SyncBatch,
 ) -> Result<SyncCycleOutcome, SyncError> {
     let initial_access = session.access_token.clone();
+    yield_to_browser().await;
     let mut driver = SyncCycleDriver::new(batch);
 
     while let Some(req) = driver.next_push_request(batch) {
         let resp = push_with_refresh(session, &req).await?;
         driver.record_push_chunk_response(resp, batch);
+        yield_to_browser().await;
     }
 
     let (pull_resp, refreshed_on_pull) = pull_with_refresh(session, batch.client_cursor).await?;

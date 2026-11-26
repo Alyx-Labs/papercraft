@@ -1568,6 +1568,7 @@ impl Session {
     }
 
     fn flush_active_workspace_to_storage(&mut self) {
+        self.library.promote_view_dirty_to_dirty();
         self.sync_flush_dirty_flags_to_manifest();
         self.sync_reconcile_folders();
         let _ = self.save_library();

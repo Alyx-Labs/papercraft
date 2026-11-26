@@ -91,6 +91,9 @@ pub struct LiveStroke {
     pub stabilized_points: Vec<StrokeSample>,
     pub smoothed_preview: Vec<StrokeSample>,
     pub preview_dirty: bool,
+    pub preview_generation: u64,
+    frozen_stabilized_count: usize,
+    frozen_preview: Vec<StrokeSample>,
 }
 
 impl LiveStroke {
@@ -193,6 +196,7 @@ impl Session {
             library: library::LibraryState {
                 slot_files: vec![None],
                 slot_dirty: vec![false],
+                slot_view_dirty: vec![false],
                 ..Default::default()
             },
             sync: sync_state::SessionSyncState::default(),
@@ -329,6 +333,9 @@ impl Session {
             stabilized_points: stabilized,
             smoothed_preview: preview,
             preview_dirty: false,
+            preview_generation: 0,
+            frozen_stabilized_count: 0,
+            frozen_preview: Vec::new(),
         });
     }
 
@@ -353,7 +360,10 @@ impl Session {
         if live.straight_line
             && let (Some(&first), Some(&last)) = (live.raw_points.first(), live.raw_points.last())
         {
+            live.frozen_stabilized_count = 0;
+            live.frozen_preview.clear();
             live.smoothed_preview = densify_linear(&[first, last], 3.0);
+            live.preview_generation = live.preview_generation.wrapping_add(1);
         } else {
             refresh_live_preview(live);
         }
@@ -377,7 +387,10 @@ impl Session {
         live.raw_points.push(s);
         if straight && let Some(&first) = live.raw_points.first() {
             if refresh_now {
+                live.frozen_stabilized_count = 0;
+                live.frozen_preview.clear();
                 live.smoothed_preview = densify_linear(&[first, s], 3.0);
+                live.preview_generation = live.preview_generation.wrapping_add(1);
                 live.preview_dirty = false;
             } else {
                 live.preview_dirty = true;
@@ -440,7 +453,10 @@ impl Session {
         }
         live.straight_line = true;
         live.straight_line_locked = true;
+        live.frozen_stabilized_count = 0;
+        live.frozen_preview.clear();
         live.smoothed_preview = densify_linear(&[first, last], 3.0);
+        live.preview_generation = live.preview_generation.wrapping_add(1);
         live.preview_dirty = false;
         true
     }
@@ -678,6 +694,15 @@ impl Session {
         self.sync_mark_slot_dirty(self.active_notebook);
     }
 
+    /// Marks the active notebook slot as having view-only state (such as active page index)
+    /// that should be persisted on explicit/urgent workspace flushes without triggering
+    /// heavy immediate autosave or cloud sync on every page flip.
+    pub(crate) fn mark_active_view_dirty(&mut self) {
+        self.sync_active_notebook_slot();
+        self.library
+            .mark_view_dirty(self.active_notebook, self.notebooks.len());
+    }
+
     /// Updates `updated_at_ms` (and backfills `created_at_ms` if zero) on the active document.
     pub(crate) fn bump_active_doc_modified_timestamp(&mut self) {
         let now = papercraft_sync_protocol::now_unix_ms();
@@ -740,8 +765,84 @@ fn apply_live_eraser_step(session: &mut Session, live: &mut LiveEraser, seg: &[(
     }
 }
 
+const LIVE_PREVIEW_TAIL_KEEP: usize = 64;
+const LIVE_PREVIEW_FREEZE_STEP: usize = 32;
+const LIVE_PREVIEW_OVERLAP: usize = 16;
+
+fn nearest_sample_in_window(
+    samples: &[StrokeSample],
+    start: usize,
+    end: usize,
+    target: Point,
+) -> usize {
+    let hi = end.min(samples.len());
+    let lo = start.min(hi.saturating_sub(1));
+    let mut best_idx = lo;
+    let mut best_dist = f64::INFINITY;
+    for (idx, sample) in samples.iter().enumerate().take(hi).skip(lo) {
+        let dx = sample.x - target.x;
+        let dy = sample.y - target.y;
+        let dist = dx * dx + dy * dy;
+        if dist < best_dist {
+            best_dist = dist;
+            best_idx = idx;
+        }
+    }
+    best_idx
+}
+
+fn splice_live_preview_tail(frozen: &[StrokeSample], tail: Vec<StrokeSample>) -> Vec<StrokeSample> {
+    let Some(&anchor) = frozen.last() else {
+        return tail;
+    };
+    if tail.is_empty() {
+        return frozen.to_vec();
+    }
+    let window_end = (tail.len() / 2 + LIVE_PREVIEW_OVERLAP * 4).clamp(1, tail.len());
+    let join_idx = nearest_sample_in_window(&tail, 0, window_end, anchor.point());
+    let after = (join_idx + 1).min(tail.len());
+    let mut merged = Vec::with_capacity(frozen.len() + tail.len() - after);
+    merged.extend_from_slice(frozen);
+    merged.extend_from_slice(&tail[after..]);
+    merged
+}
+
 fn refresh_live_preview(live: &mut LiveStroke) {
-    live.smoothed_preview = finalize_smoothed_samples(&live.stabilized_points, &live.pen.smoothing);
+    let total = live.stabilized_points.len();
+    if live.frozen_stabilized_count == 0
+        && total <= LIVE_PREVIEW_TAIL_KEEP + LIVE_PREVIEW_FREEZE_STEP
+    {
+        live.smoothed_preview =
+            finalize_smoothed_samples(&live.stabilized_points, &live.pen.smoothing);
+        live.preview_generation = live.preview_generation.wrapping_add(1);
+        return;
+    }
+
+    let ctx_start = live
+        .frozen_stabilized_count
+        .saturating_sub(LIVE_PREVIEW_OVERLAP);
+    let tail = finalize_smoothed_samples(&live.stabilized_points[ctx_start..], &live.pen.smoothing);
+    live.smoothed_preview = splice_live_preview_tail(&live.frozen_preview, tail);
+
+    if total >= live.frozen_stabilized_count + LIVE_PREVIEW_TAIL_KEEP + LIVE_PREVIEW_FREEZE_STEP {
+        let next_frozen_count = total.saturating_sub(LIVE_PREVIEW_TAIL_KEEP);
+        let span_stab = (total - ctx_start).max(1);
+        let rel_stab = next_frozen_count.saturating_sub(ctx_start);
+        let base_len = live.frozen_preview.len();
+        let rem_preview = live.smoothed_preview.len().saturating_sub(base_len);
+        let approx_idx = base_len + (rem_preview * rel_stab) / span_stab;
+        let search_lo = approx_idx.saturating_sub(32).max(base_len);
+        let search_hi = (approx_idx + 33).min(live.smoothed_preview.len());
+        let target_pt = live.stabilized_points[next_frozen_count].point();
+        let split_idx =
+            nearest_sample_in_window(&live.smoothed_preview, search_lo, search_hi, target_pt);
+        if split_idx > base_len && split_idx + 1 < live.smoothed_preview.len() {
+            live.frozen_preview = live.smoothed_preview[..=split_idx].to_vec();
+            live.frozen_stabilized_count = next_frozen_count;
+        }
+    }
+
+    live.preview_generation = live.preview_generation.wrapping_add(1);
 }
 
 #[cfg(test)]
@@ -2890,5 +2991,41 @@ mod tests {
         };
         assert!(job.is_finished());
         assert!(pdf_bytes.starts_with(b"%PDF-"));
+    }
+
+    #[test]
+    fn incremental_live_preview_scales_across_long_stroke_and_commits_cleanly() {
+        let mut s = Session::default();
+        s.begin_live_stroke(StrokeSample::from_xy_pressure(50.0, 200.0, 0.5));
+        let mut prev_gen = s.live_stroke.as_ref().unwrap().preview_generation;
+        for i in 1u32..=400 {
+            let angle = f64::from(i) * 0.08;
+            let r = 20.0 + f64::from(i) * 0.4;
+            let mut pt = StrokeSample::from_xy_pressure(
+                200.0 + r * angle.cos(),
+                250.0 + r * angle.sin(),
+                0.6,
+            );
+            pt.time_ms = f64::from(i) * 8.0;
+            s.update_live_stroke_deferred(pt);
+            if i % 8 == 0 {
+                s.refresh_live_stroke_preview();
+                let live = s.live_stroke.as_ref().unwrap();
+                assert!(live.preview_generation > prev_gen);
+                prev_gen = live.preview_generation;
+                assert!(live.smoothed_preview.len() >= 2);
+                assert!(
+                    live.smoothed_preview
+                        .iter()
+                        .all(|smp| smp.x.is_finite() && smp.y.is_finite())
+                );
+            }
+        }
+        s.refresh_live_stroke_preview();
+        let preview = s.live_stroke.as_ref().unwrap().preview_samples();
+        assert!(preview.len() > 200);
+        assert!(s.live_stroke.as_ref().unwrap().frozen_stabilized_count > 0);
+        assert!(s.finish_live_stroke().is_some());
+        assert_eq!(s.doc.strokes.len(), 1);
     }
 }

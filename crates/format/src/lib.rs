@@ -84,6 +84,12 @@ pub fn save_document_bytes(doc: &Document) -> Result<Vec<u8>, FormatError> {
     binary::encode_binary_v2(doc)
 }
 
+/// Serializes a document into a `.pcraft` v2 binary container using fast zlib compression,
+/// suited for latency-sensitive local autosaves (e.g. IndexedDB persistence).
+pub fn save_document_bytes_fast(doc: &Document) -> Result<Vec<u8>, FormatError> {
+    binary::encode_binary_v2_with_compression(doc, Some(flate2::Compression::fast()))
+}
+
 /// Loads a `.pcraft` (or legacy `.ncraft`) document from compressed binary v2 bytes
 /// or legacy UTF-8 v1 JSON bytes.
 pub fn load_document_bytes(bytes: &[u8]) -> Result<Document, FormatError> {
@@ -701,5 +707,84 @@ mod tests {
         assert_eq!(from_json.strokes[0].z_order, 2);
         assert_eq!(from_json.texts[0].z_order, 3);
         assert_eq!(from_json.images[0].z_order, 4);
+    }
+
+    #[test]
+    fn fast_binary_save_round_trips_identically_across_multipage_rich_document() {
+        use papercraft_doc::{
+            EmbeddedPdf, GeometricShape, InkStroke, PageImage, PaperColor, PaperTemplate,
+            PdfPageBackdrop, PenSettings, StrokeSample, TextItem,
+        };
+
+        let mut doc = Document::new(900, 1200);
+        doc.title = "Fast Roundtrip".into();
+        doc.paper_template = PaperTemplate::Grid;
+        doc.paper_color = PaperColor::WarmCream;
+        doc.pdf_documents.push(EmbeddedPdf {
+            name: "ref.pdf".into(),
+            bytes: Arc::new(b"%PDF-1.4\n%%EOF\n".to_vec()),
+        });
+        doc.pdf_backdrop = Some(PdfPageBackdrop {
+            pdf_index: 0,
+            page_index: 0,
+        });
+        let pen = PenSettings::fountain_pen();
+        for _ in 0..4 {
+            let id = doc.alloc_stroke_id();
+            let pts = vec![
+                StrokeSample::from_xy_pressure(20.0, 20.0, 0.5),
+                StrokeSample::from_xy_pressure(100.0, 80.0, 0.9),
+            ];
+            doc.strokes
+                .push(Arc::new(InkStroke::new(id, pen.clone(), pts.clone(), pts)));
+        }
+        doc.texts.push(Arc::new(TextItem {
+            text: "Page 1".into(),
+            max_width: Some(250.0),
+            link_url: Some("https://papercraft.ink".into()),
+            ..TextItem::default()
+        }));
+        doc.shapes.push(Arc::new(GeometricShape {
+            x2: 180.0,
+            y2: 90.0,
+            ..GeometricShape::default()
+        }));
+        doc.images.push(Arc::new(PageImage {
+            png_bytes: Arc::new(vec![137, 80, 78, 71, 1, 2, 3, 4]),
+            ..PageImage::default()
+        }));
+
+        doc.add_page(Some(PaperTemplate::Dotted), None);
+        let id2 = doc.alloc_stroke_id();
+        let pts2 = vec![
+            StrokeSample::from_xy_pressure(15.0, 25.0, 0.6),
+            StrokeSample::from_xy_pressure(85.0, 65.0, 0.7),
+        ];
+        doc.strokes.push(Arc::new(InkStroke::new(
+            id2,
+            PenSettings::ball_pen(),
+            pts2.clone(),
+            pts2,
+        )));
+        doc.select_page(0);
+
+        let std_bytes = save_document_bytes(&doc).unwrap();
+        let fast_bytes = save_document_bytes_fast(&doc).unwrap();
+        let std_doc = load_document_bytes(&std_bytes).unwrap();
+        let fast_doc = load_document_bytes(&fast_bytes).unwrap();
+
+        assert_eq!(fast_doc.title, std_doc.title);
+        assert_eq!(fast_doc.active_page_index(), std_doc.active_page_index());
+        assert_eq!(fast_doc.page_count(), std_doc.page_count());
+        assert_eq!(fast_doc.pdf_documents.len(), std_doc.pdf_documents.len());
+        assert_eq!(fast_doc.strokes.len(), std_doc.strokes.len());
+        assert_eq!(fast_doc.texts[0].link_url, std_doc.texts[0].link_url);
+        assert_eq!(fast_doc.texts[0].max_width, std_doc.texts[0].max_width);
+        assert_eq!(fast_doc.shapes.len(), std_doc.shapes.len());
+        assert_eq!(fast_doc.images.len(), std_doc.images.len());
+        assert_eq!(
+            fast_doc.pages[1].strokes.len(),
+            std_doc.pages[1].strokes.len()
+        );
     }
 }

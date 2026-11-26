@@ -536,14 +536,14 @@ fn read_page_image(r: &mut Reader<'_>) -> Result<Arc<PageImage>, FormatError> {
     ))
 }
 
-fn write_page_extensions(out: &mut Vec<u8>, doc: &Document, pages: &[NotebookPage]) {
+fn write_page_extensions(out: &mut Vec<u8>, doc: &Document, pages: &ResolvedPagesRef<'_>) {
     let has_objects = pages
         .iter()
         .any(|p| !p.texts.is_empty() || !p.shapes.is_empty() || !p.images.is_empty());
     if has_objects {
         out.push(EXT_TAG_PAGE_OBJECTS);
         let mut has_custom_text_widths = false;
-        for page in pages {
+        for page in pages.iter() {
             let text_count = page.texts.len().min(MAX_PAGE_TEXT_ITEMS);
             write_varint(out, text_count as u64);
             for item in page.texts.iter().take(text_count) {
@@ -567,7 +567,7 @@ fn write_page_extensions(out: &mut Vec<u8>, doc: &Document, pages: &[NotebookPag
         }
         if has_custom_text_widths {
             out.push(EXT_TAG_TEXT_BOX_WIDTHS);
-            for page in pages {
+            for page in pages.iter() {
                 let text_count = page.texts.len().min(MAX_PAGE_TEXT_ITEMS);
                 let entries: Vec<(usize, f32)> = page
                     .texts
@@ -627,7 +627,7 @@ fn read_z_order_entries<T: Clone>(
     Ok(())
 }
 
-fn write_element_z_order_extension(out: &mut Vec<u8>, pages: &[NotebookPage]) {
+fn write_element_z_order_extension(out: &mut Vec<u8>, pages: &ResolvedPagesRef<'_>) {
     let has_z = pages.iter().any(|p| {
         p.strokes.iter().any(|s| s.z_order > 0)
             || p.texts.iter().any(|t| t.z_order > 0)
@@ -638,7 +638,7 @@ fn write_element_z_order_extension(out: &mut Vec<u8>, pages: &[NotebookPage]) {
         return;
     }
     out.push(EXT_TAG_ELEMENT_Z_ORDER);
-    for page in pages {
+    for page in pages.iter() {
         write_z_order_entries(out, &page.strokes, |s| s.z_order);
         write_z_order_entries(out, &page.texts, |t| t.z_order);
         write_z_order_entries(out, &page.shapes, |s| s.z_order);
@@ -742,7 +742,7 @@ fn read_library_meta_extension(
 fn write_page_extras_extension(
     out: &mut Vec<u8>,
     image_templates: &[EmbeddedImageTemplate],
-    pages: &[NotebookPage],
+    pages: &ResolvedPagesRef<'_>,
 ) {
     let has_extras = !image_templates.is_empty()
         || pages.iter().any(|p| {
@@ -764,7 +764,7 @@ fn write_page_extras_extension(
         write_varint(out, len as u64);
         out.extend_from_slice(&clean.png_bytes[..len]);
     }
-    for page in pages {
+    for page in pages.iter() {
         let rot = page.backdrop_rotation % 4;
         let tpl_id = page
             .custom_template_id
@@ -839,7 +839,11 @@ fn read_page_extras_extension(
     Ok(())
 }
 
-fn write_pdf_backdrops_extension(out: &mut Vec<u8>, pdfs: &[EmbeddedPdf], pages: &[NotebookPage]) {
+fn write_pdf_backdrops_extension(
+    out: &mut Vec<u8>,
+    pdfs: &[EmbeddedPdf],
+    pages: &ResolvedPagesRef<'_>,
+) {
     if pdfs.is_empty() && pages.iter().all(|p| p.pdf_backdrop.is_none()) {
         return;
     }
@@ -851,7 +855,7 @@ fn write_pdf_backdrops_extension(out: &mut Vec<u8>, pdfs: &[EmbeddedPdf], pages:
         write_varint(out, clean.bytes.len() as u64);
         out.extend_from_slice(&clean.bytes);
     }
-    for page in pages {
+    for page in pages.iter() {
         match page.pdf_backdrop {
             Some(backdrop) => {
                 out.push(1);
@@ -924,7 +928,7 @@ fn read_pdf_backdrops_extension(
     Ok(())
 }
 
-fn write_text_links_extension(out: &mut Vec<u8>, pages: &[NotebookPage]) {
+fn write_text_links_extension(out: &mut Vec<u8>, pages: &ResolvedPagesRef<'_>) {
     let has_links = pages.iter().any(|page| {
         page.texts
             .iter()
@@ -935,7 +939,7 @@ fn write_text_links_extension(out: &mut Vec<u8>, pages: &[NotebookPage]) {
         return;
     }
     out.push(EXT_TAG_TEXT_LINKS);
-    for page in pages {
+    for page in pages.iter() {
         let entries: Vec<(usize, String)> = page
             .texts
             .iter()
@@ -1085,7 +1089,7 @@ fn read_page_extensions(
     Ok(ext)
 }
 
-fn write_shapes_and_rich_text_extension(out: &mut Vec<u8>, pages: &[NotebookPage]) {
+fn write_shapes_and_rich_text_extension(out: &mut Vec<u8>, pages: &ResolvedPagesRef<'_>) {
     let any_shape_extras = pages.iter().any(|p| {
         p.shapes.iter().any(|s| {
             let s = s.sanitized();
@@ -1103,7 +1107,7 @@ fn write_shapes_and_rich_text_extension(out: &mut Vec<u8>, pages: &[NotebookPage
     }
 
     out.push(EXT_TAG_SHAPES_AND_RICH_TEXT);
-    for page in pages {
+    for page in pages.iter() {
         let shape_count = page.shapes.len().min(MAX_PAGE_SHAPES);
         write_varint(out, shape_count as u64);
         for shape in page.shapes.iter().take(shape_count) {
@@ -1742,26 +1746,70 @@ fn read_stroke_samples(r: &mut Reader<'_>) -> Result<Vec<StrokeSample>, FormatEr
     Ok(out)
 }
 
+struct ResolvedPagesRef<'a> {
+    pages: &'a [NotebookPage],
+    active_idx: usize,
+    active_snapshot: NotebookPage,
+}
+
+impl<'a> ResolvedPagesRef<'a> {
+    fn new(doc: &'a Document) -> Self {
+        Self {
+            pages: &doc.pages,
+            active_idx: doc.active_page_index(),
+            active_snapshot: doc.active_page_snapshot(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        if self.pages.is_empty() {
+            1
+        } else {
+            self.pages.len()
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &NotebookPage> + '_ {
+        let len = self.len();
+        (0..len).map(move |idx| {
+            if self.pages.is_empty() || idx == self.active_idx {
+                &self.active_snapshot
+            } else {
+                &self.pages[idx]
+            }
+        })
+    }
+}
+
 fn collect_pen_palette(
-    pages: &[NotebookPage],
+    pages: &ResolvedPagesRef<'_>,
 ) -> Result<(Vec<PenSettings>, Vec<Vec<usize>>), FormatError> {
     let mut palette: Vec<PenSettings> = Vec::new();
     let mut page_pen_indices: Vec<Vec<usize>> = Vec::with_capacity(pages.len());
+    let mut last_raw: Option<(PenSettings, usize)> = None;
 
-    for page in pages {
+    for page in pages.iter() {
         let mut indices = Vec::with_capacity(page.strokes.len());
         for stroke in &page.strokes {
-            let clean = stroke.pen.sanitized();
-            let idx = if let Some(pos) = palette.iter().position(|p| *p == clean) {
-                pos
+            let idx = if let Some((ref prev_raw, prev_idx)) = last_raw
+                && *prev_raw == stroke.pen
+            {
+                prev_idx
             } else {
-                if palette.len() >= MAX_PEN_PALETTE {
-                    return Err(FormatError::BinaryCorrupt(
-                        "document exceeded maximum pen palette entries".to_string(),
-                    ));
-                }
-                let pos = palette.len();
-                palette.push(clean);
+                let clean = stroke.pen.sanitized();
+                let pos = if let Some(pos) = palette.iter().position(|p| *p == clean) {
+                    pos
+                } else {
+                    if palette.len() >= MAX_PEN_PALETTE {
+                        return Err(FormatError::BinaryCorrupt(
+                            "document exceeded maximum pen palette entries".to_string(),
+                        ));
+                    }
+                    let pos = palette.len();
+                    palette.push(clean);
+                    pos
+                };
+                last_raw = Some((stroke.pen.clone(), pos));
                 pos
             };
             indices.push(idx);
@@ -1774,7 +1822,16 @@ fn collect_pen_palette(
 
 /// Encodes a [`Document`] into a compact zlib-compressed `.pcraft` v2 binary byte vector.
 pub fn encode_binary_v2(doc: &Document) -> Result<Vec<u8>, FormatError> {
-    let pages = doc.resolved_pages();
+    encode_binary_v2_with_compression(doc, None)
+}
+
+/// Encodes a [`Document`] into a `.pcraft` v2 binary container using an explicit zlib
+/// compression preset (`None` chooses automatically based on embedded assets and payload size).
+pub fn encode_binary_v2_with_compression(
+    doc: &Document,
+    compression: Option<Compression>,
+) -> Result<Vec<u8>, FormatError> {
+    let pages = ResolvedPagesRef::new(doc);
     let (palette, page_pen_indices) = collect_pen_palette(&pages)?;
 
     let mut raw = Vec::with_capacity(4096);
@@ -1818,12 +1875,14 @@ pub fn encode_binary_v2(doc: &Document) -> Result<Vec<u8>, FormatError> {
     out.extend_from_slice(&0u16.to_le_bytes());
 
     // Embedded PDFs already hold compressed streams; fast deflate avoids multi-second CPU stalls
-    // while standard stroke-only notebooks keep default compression.
-    let compression = if !doc.pdf_documents.is_empty() || raw.len() > 2 * 1024 * 1024 {
-        Compression::fast()
-    } else {
-        Compression::default()
-    };
+    // while standard stroke-only notebooks keep default compression unless overridden.
+    let compression = compression.unwrap_or_else(|| {
+        if !doc.pdf_documents.is_empty() || raw.len() > 2 * 1024 * 1024 {
+            Compression::fast()
+        } else {
+            Compression::default()
+        }
+    });
     let mut encoder = ZlibEncoder::new(out, compression);
     encoder
         .write_all(&raw)

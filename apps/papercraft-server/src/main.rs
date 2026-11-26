@@ -301,7 +301,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("PaperCraft Server")
             .with_app_id(papercraft_updater::AppId::PaperCraftServer.manifest_key())
-            .with_inner_size([560.0, 680.0])
+            .with_inner_size([1040.0, 700.0])
             .with_min_inner_size([460.0, 520.0])
             .with_visible(controller.window_visible)
             .with_active(controller.window_visible)

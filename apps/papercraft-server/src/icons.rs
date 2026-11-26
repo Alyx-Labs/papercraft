@@ -23,8 +23,6 @@ pub enum Icon {
     Settings,
     Sun,
     Moon,
-    ChevronDown,
-    ChevronRight,
     AlertCircle,
     Info,
     Close,
@@ -32,6 +30,9 @@ pub enum Icon {
     Trash,
     MoveDown,
     ExternalLink,
+    Globe,
+    Lock,
+    LockOpen,
 }
 
 fn icon_svg(icon: Icon) -> &'static str {
@@ -62,12 +63,6 @@ fn icon_svg(icon: Icon) -> &'static str {
         }
         Icon::Sun => include_str!("../../../crates/ui-egui/assets/icons/lucide/sun.svg"),
         Icon::Moon => include_str!("../../../crates/ui-egui/assets/icons/lucide/moon.svg"),
-        Icon::ChevronDown => {
-            include_str!("../../../crates/ui-egui/assets/icons/lucide/chevron-down.svg")
-        }
-        Icon::ChevronRight => {
-            include_str!("../../../crates/ui-egui/assets/icons/lucide/chevron-right.svg")
-        }
         Icon::AlertCircle => {
             include_str!("../../../crates/ui-egui/assets/icons/lucide/circle-exclamation-point.svg")
         }
@@ -80,6 +75,11 @@ fn icon_svg(icon: Icon) -> &'static str {
         }
         Icon::ExternalLink => {
             include_str!("../../../crates/ui-egui/assets/icons/lucide/arrow-up-right.svg")
+        }
+        Icon::Globe => include_str!("../../../crates/ui-egui/assets/icons/lucide/globe.svg"),
+        Icon::Lock => include_str!("../../../crates/ui-egui/assets/icons/lucide/lock.svg"),
+        Icon::LockOpen => {
+            include_str!("../../../crates/ui-egui/assets/icons/lucide/lock-open.svg")
         }
     }
 }
@@ -331,7 +331,25 @@ pub fn segmented_switch(
     let n = options.len();
     let gaps_total = seg_gap * n.saturating_sub(1) as f32;
     let track_w = ui.available_width().max(n as f32 * 64.0);
-    let seg_w = (track_w - track_pad * 2.0 - gaps_total).max(24.0) / n as f32;
+    let inner_w = (track_w - track_pad * 2.0 - gaps_total).max(n as f32 * 24.0);
+
+    let natural_widths: Vec<f32> = options
+        .iter()
+        .map(|opt| {
+            let text_w = ui
+                .painter()
+                .layout_no_wrap(
+                    opt.label.to_string(),
+                    FontId::proportional(11.8),
+                    Color32::WHITE,
+                )
+                .size()
+                .x;
+            let icon_w = if opt.icon.is_some() { 14.0 + 5.0 } else { 0.0 };
+            (icon_w + text_w + 16.0).max(24.0)
+        })
+        .collect();
+    let sum_natural: f32 = natural_widths.iter().sum();
 
     let track_id = ui.make_persistent_id(id_salt);
     let (track_rect, _) = ui.allocate_exact_size(Vec2::new(track_w, track_h), Sense::hover());
@@ -339,7 +357,22 @@ pub fn segmented_switch(
     let mut seg_rects = Vec::with_capacity(n);
     let mut x = track_rect.left() + track_pad;
     let seg_top = track_rect.top() + track_pad;
-    for _ in 0..n {
+    let slack_each = if sum_natural <= inner_w {
+        (inner_w - sum_natural) / n as f32
+    } else {
+        0.0
+    };
+    let scale = if sum_natural > inner_w && sum_natural > 0.0 {
+        inner_w / sum_natural
+    } else {
+        1.0
+    };
+    for &nat_w in &natural_widths {
+        let seg_w = if sum_natural <= inner_w {
+            nat_w + slack_each
+        } else {
+            (nat_w * scale).max(24.0)
+        };
         seg_rects.push(Rect::from_min_size(
             pos2(x, seg_top),
             Vec2::new(seg_w, seg_h),
@@ -458,6 +491,7 @@ fn paint_switch_pill_and_labels(ui: &egui::Ui, args: SwitchPaintArgs<'_>) {
         let fg = lerp_color(hovered_fg, t.accent, select_t);
         let galley = p.layout_no_wrap(opt.label.to_string(), FontId::proportional(11.8), fg);
         let seg_rect = args.seg_rects[idx];
+        let seg_painter = p.with_clip_rect(seg_rect);
         match opt.icon {
             Some(icon) => {
                 let icon_dim = 14.0_f32;
@@ -468,19 +502,19 @@ fn paint_switch_pill_and_labels(ui: &egui::Ui, args: SwitchPaintArgs<'_>) {
                     pos2(start_x + icon_dim * 0.5, seg_rect.center().y),
                     Vec2::splat(icon_dim),
                 );
-                paint_icon(p, icon_rect, icon, fg);
+                paint_icon(&seg_painter, icon_rect, icon, fg);
                 let text_pos = pos2(
                     start_x + icon_dim + gap,
                     seg_rect.center().y - galley.size().y * 0.5,
                 );
-                p.galley(text_pos, galley, fg);
+                seg_painter.galley(text_pos, galley, fg);
             }
             None => {
                 let text_pos = pos2(
                     seg_rect.center().x - galley.size().x * 0.5,
                     seg_rect.center().y - galley.size().y * 0.5,
                 );
-                p.galley(text_pos, galley, fg);
+                seg_painter.galley(text_pos, galley, fg);
             }
         }
     }
@@ -609,8 +643,6 @@ mod tests {
             Icon::Settings,
             Icon::Sun,
             Icon::Moon,
-            Icon::ChevronDown,
-            Icon::ChevronRight,
             Icon::AlertCircle,
             Icon::Info,
             Icon::Close,
@@ -618,6 +650,9 @@ mod tests {
             Icon::Trash,
             Icon::MoveDown,
             Icon::ExternalLink,
+            Icon::Globe,
+            Icon::Lock,
+            Icon::LockOpen,
         ];
         let rect = Rect::from_min_size(pos2(16.0, 16.0), Vec2::splat(16.0));
         for icon in all {

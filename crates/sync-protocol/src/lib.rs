@@ -10,7 +10,9 @@
     clippy::unreachable
 )]
 
-use papercraft_doc::{Document, InkStroke, NotebookPage, QuantizedSample, UserStudioConfig};
+use papercraft_doc::{
+    Document, InkStroke, NotebookPage, PenSettings, QuantizedSample, UserStudioConfig,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -675,50 +677,95 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     bytes_to_hex(&digest)
 }
 
-fn hash_len_bytes(hasher: &mut Sha256, bytes: &[u8]) {
-    hasher.update((bytes.len() as u64).to_le_bytes());
+trait HashSink {
+    fn update(&mut self, bytes: &[u8]);
+}
+
+impl HashSink for Sha256 {
+    fn update(&mut self, bytes: &[u8]) {
+        Digest::update(self, bytes);
+    }
+}
+
+struct MultiHasher<'a, const N: usize>([&'a mut Sha256; N]);
+
+impl<const N: usize> HashSink for MultiHasher<'_, N> {
+    fn update(&mut self, bytes: &[u8]) {
+        for h in &mut self.0 {
+            Digest::update(*h, bytes);
+        }
+    }
+}
+
+#[derive(Default)]
+struct PenHashCache {
+    last_raw: Option<PenSettings>,
+    last_bytes: Vec<u8>,
+}
+
+impl PenHashCache {
+    fn encoded_pen(&mut self, pen: &PenSettings) -> Option<&[u8]> {
+        let hit = self.last_raw.as_ref() == Some(pen);
+        if !hit {
+            let bytes = serde_json::to_vec(&pen.sanitized()).ok()?;
+            self.last_raw = Some(pen.clone());
+            self.last_bytes = bytes;
+        }
+        Some(&self.last_bytes)
+    }
+}
+
+fn hash_len_bytes<H: HashSink + ?Sized>(hasher: &mut H, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
 }
 
-fn hash_quantized_sample(hasher: &mut Sha256, q: QuantizedSample) {
-    hasher.update(q.x_centipx.to_le_bytes());
-    hasher.update(q.y_centipx.to_le_bytes());
-    hasher.update(q.pressure_q16.to_le_bytes());
-    hasher.update(q.tilt_x_cdeg.to_le_bytes());
-    hasher.update(q.tilt_y_cdeg.to_le_bytes());
-    hasher.update(q.rot_cdeg.to_le_bytes());
-    hasher.update(q.time_ms.to_le_bytes());
+fn hash_quantized_sample<H: HashSink + ?Sized>(hasher: &mut H, q: QuantizedSample) {
+    hasher.update(&q.x_centipx.to_le_bytes());
+    hasher.update(&q.y_centipx.to_le_bytes());
+    hasher.update(&q.pressure_q16.to_le_bytes());
+    hasher.update(&q.tilt_x_cdeg.to_le_bytes());
+    hasher.update(&q.tilt_y_cdeg.to_le_bytes());
+    hasher.update(&q.rot_cdeg.to_le_bytes());
+    hasher.update(&q.time_ms.to_le_bytes());
 }
 
-fn hash_stroke_into(hasher: &mut Sha256, stroke: &InkStroke) {
-    hasher.update(stroke.id.0.to_le_bytes());
-    let clean_pen = stroke.pen.sanitized();
-    if let Ok(pen_bytes) = serde_json::to_vec(&clean_pen) {
-        hash_len_bytes(hasher, &pen_bytes);
+fn hash_stroke_into<H: HashSink + ?Sized>(
+    hasher: &mut H,
+    stroke: &InkStroke,
+    pen_cache: &mut PenHashCache,
+) {
+    hasher.update(&stroke.id.0.to_le_bytes());
+    if let Some(pen_bytes) = pen_cache.encoded_pen(&stroke.pen) {
+        hash_len_bytes(hasher, pen_bytes);
     }
-    hasher.update((stroke.smoothed_points.len() as u64).to_le_bytes());
+    hasher.update(&(stroke.smoothed_points.len() as u64).to_le_bytes());
     for &sample in stroke.smoothed_points.iter() {
         hash_quantized_sample(hasher, sample.quantize());
     }
 }
 
-fn hash_page_into(hasher: &mut Sha256, page: &NotebookPage) {
-    hasher.update(page.width.clamp(64, 8192).to_le_bytes());
-    hasher.update(page.height.clamp(64, 8192).to_le_bytes());
+fn hash_page_into<H: HashSink + ?Sized>(
+    hasher: &mut H,
+    page: &NotebookPage,
+    pen_cache: &mut PenHashCache,
+) {
+    hasher.update(&page.width.clamp(64, 8192).to_le_bytes());
+    hasher.update(&page.height.clamp(64, 8192).to_le_bytes());
     if let Ok(tpl) = serde_json::to_vec(&page.paper_template) {
         hash_len_bytes(hasher, &tpl);
     }
     if let Ok(col) = serde_json::to_vec(&page.paper_color) {
         hash_len_bytes(hasher, &col);
     }
-    hasher.update((page.strokes.len() as u64).to_le_bytes());
+    hasher.update(&(page.strokes.len() as u64).to_le_bytes());
     for stroke in &page.strokes {
-        hash_stroke_into(hasher, stroke);
+        hash_stroke_into(hasher, stroke, pen_cache);
     }
     if let Some(backdrop) = page.pdf_backdrop {
-        hasher.update([0xD0]);
-        hasher.update((backdrop.pdf_index as u64).to_le_bytes());
-        hasher.update((backdrop.page_index as u64).to_le_bytes());
+        hasher.update(&[0xD0]);
+        hasher.update(&(backdrop.pdf_index as u64).to_le_bytes());
+        hasher.update(&(backdrop.page_index as u64).to_le_bytes());
     }
     let rot = page.backdrop_rotation % 4;
     if page.bookmarked
@@ -726,13 +773,13 @@ fn hash_page_into(hasher: &mut Sha256, page: &NotebookPage) {
         || page.custom_image_backdrop.is_some()
         || page.custom_template_id.is_some()
     {
-        hasher.update([0xD2]);
-        hasher.update([u8::from(page.bookmarked), rot]);
+        hasher.update(&[0xD2]);
+        hasher.update(&[u8::from(page.bookmarked), rot]);
         if let Some(img_idx) = page.custom_image_backdrop {
-            hasher.update([1]);
-            hasher.update((img_idx as u64).to_le_bytes());
+            hasher.update(&[1]);
+            hasher.update(&(img_idx as u64).to_le_bytes());
         } else {
-            hasher.update([0]);
+            hasher.update(&[0]);
         }
         if let Some(id) = &page.custom_template_id {
             hash_len_bytes(hasher, id.as_bytes());
@@ -741,14 +788,14 @@ fn hash_page_into(hasher: &mut Sha256, page: &NotebookPage) {
         }
     }
     if !page.shapes.is_empty() || !page.texts.is_empty() {
-        hasher.update([0xD5]);
-        hasher.update((page.shapes.len() as u64).to_le_bytes());
+        hasher.update(&[0xD5]);
+        hasher.update(&(page.shapes.len() as u64).to_le_bytes());
         for shape in &page.shapes {
             if let Ok(shape_bytes) = serde_json::to_vec(&shape.sanitized()) {
                 hash_len_bytes(hasher, &shape_bytes);
             }
         }
-        hasher.update((page.texts.len() as u64).to_le_bytes());
+        hasher.update(&(page.texts.len() as u64).to_le_bytes());
         for text in &page.texts {
             if let Ok(text_bytes) = serde_json::to_vec(&text.sanitized()) {
                 hash_len_bytes(hasher, &text_bytes);
@@ -760,50 +807,94 @@ fn hash_page_into(hasher: &mut Sha256, page: &NotebookPage) {
         || page.shapes.iter().any(|s| s.z_order > 0)
         || page.images.iter().any(|im| im.z_order > 0);
     if has_layer_z {
-        hasher.update([0xD6]);
-        hasher.update((page.strokes.len() as u64).to_le_bytes());
+        hasher.update(&[0xD6]);
+        hasher.update(&(page.strokes.len() as u64).to_le_bytes());
         for stroke in &page.strokes {
-            hasher.update(stroke.z_order.to_le_bytes());
+            hasher.update(&stroke.z_order.to_le_bytes());
         }
-        hasher.update((page.texts.len() as u64).to_le_bytes());
+        hasher.update(&(page.texts.len() as u64).to_le_bytes());
         for text in &page.texts {
-            hasher.update(text.z_order.to_le_bytes());
+            hasher.update(&text.z_order.to_le_bytes());
         }
-        hasher.update((page.shapes.len() as u64).to_le_bytes());
+        hasher.update(&(page.shapes.len() as u64).to_le_bytes());
         for shape in &page.shapes {
-            hasher.update(shape.z_order.to_le_bytes());
+            hasher.update(&shape.z_order.to_le_bytes());
         }
-        hasher.update((page.images.len() as u64).to_le_bytes());
+        hasher.update(&(page.images.len() as u64).to_le_bytes());
         for img in &page.images {
-            hasher.update(img.z_order.to_le_bytes());
+            hasher.update(&img.z_order.to_le_bytes());
         }
     }
 }
 
-fn hash_document_body_into(hasher: &mut Sha256, doc: &Document) {
-    hasher.update(doc.next_stroke_id.to_le_bytes());
-
-    let pages = doc.resolved_pages();
-    hasher.update((pages.len() as u64).to_le_bytes());
-    for page in &pages {
-        hash_page_into(hasher, page);
-    }
+fn hash_pdf_documents_into<H: HashSink + ?Sized>(hasher: &mut H, doc: &Document) {
     if !doc.pdf_documents.is_empty() {
-        hasher.update([0xD1]);
-        hasher.update((doc.pdf_documents.len() as u64).to_le_bytes());
+        hasher.update(&[0xD1]);
+        hasher.update(&(doc.pdf_documents.len() as u64).to_le_bytes());
         for pdf in &doc.pdf_documents {
             hash_len_bytes(hasher, pdf.name.as_bytes());
             hash_len_bytes(hasher, pdf.bytes.as_slice());
         }
     }
+}
+
+fn hash_image_templates_into<H: HashSink + ?Sized>(hasher: &mut H, doc: &Document) {
     if !doc.image_templates.is_empty() {
-        hasher.update([0xD4]);
-        hasher.update((doc.image_templates.len() as u64).to_le_bytes());
+        hasher.update(&[0xD4]);
+        hasher.update(&(doc.image_templates.len() as u64).to_le_bytes());
         for tpl in &doc.image_templates {
             hash_len_bytes(hasher, tpl.name.as_bytes());
             hash_len_bytes(hasher, tpl.png_bytes.as_slice());
         }
     }
+}
+
+fn hash_doc_folder_tags_into<H: HashSink + ?Sized>(hasher: &mut H, doc: &Document) {
+    let folder = papercraft_doc::sanitize_folder_path(&doc.folder_path);
+    let tags = papercraft_doc::sanitize_notebook_tags(&doc.tags);
+    if !folder.is_empty() || doc.favorite || !tags.is_empty() {
+        hasher.update(&[0xD3]);
+        hash_len_bytes(hasher, folder.as_bytes());
+        hasher.update(&[u8::from(doc.favorite)]);
+        hasher.update(&(tags.len() as u64).to_le_bytes());
+        for tag in &tags {
+            hash_len_bytes(hasher, tag.as_bytes());
+        }
+    }
+}
+
+fn hash_page_images_into(hasher: &mut Sha256, page: &NotebookPage) {
+    if !page.images.is_empty() {
+        Digest::update(hasher, [0xD7]);
+        Digest::update(hasher, (page.images.len() as u64).to_le_bytes());
+        for img in &page.images {
+            let clean = img.sanitized();
+            Digest::update(hasher, clean.x.to_bits().to_le_bytes());
+            Digest::update(hasher, clean.y.to_bits().to_le_bytes());
+            Digest::update(hasher, clean.width.to_bits().to_le_bytes());
+            Digest::update(hasher, clean.height.to_bits().to_le_bytes());
+            Digest::update(hasher, clean.angle_degrees.to_bits().to_le_bytes());
+            Digest::update(hasher, clean.pixel_width.to_le_bytes());
+            Digest::update(hasher, clean.pixel_height.to_le_bytes());
+            Digest::update(hasher, clean.z_order.to_le_bytes());
+            hash_len_bytes(hasher, &clean.png_bytes);
+        }
+    }
+}
+
+fn hash_document_body_into(hasher: &mut Sha256, doc: &Document) {
+    Digest::update(hasher, doc.next_stroke_id.to_le_bytes());
+
+    let page_count = doc.page_count();
+    Digest::update(hasher, (page_count as u64).to_le_bytes());
+    let mut pen_cache = PenHashCache::default();
+    for idx in 0..page_count {
+        doc.with_resolved_page(idx, |page| {
+            hash_page_into(hasher, page, &mut pen_cache);
+        });
+    }
+    hash_pdf_documents_into(hasher, doc);
+    hash_image_templates_into(hasher, doc);
 }
 
 fn hash_document_meta_into(hasher: &mut Sha256, doc: &Document) {
@@ -815,8 +906,94 @@ fn hash_document_meta_into(hasher: &mut Sha256, doc: &Document) {
     let folder = papercraft_doc::sanitize_folder_path(&doc.folder_path);
     let tags = papercraft_doc::sanitize_notebook_tags(&doc.tags);
     hash_len_bytes(hasher, folder.as_bytes());
-    hasher.update([u8::from(doc.favorite)]);
-    hasher.update((tags.len() as u64).to_le_bytes());
+    Digest::update(hasher, [u8::from(doc.favorite)]);
+    Digest::update(hasher, (tags.len() as u64).to_le_bytes());
+    for tag in &tags {
+        hash_len_bytes(hasher, tag.as_bytes());
+    }
+}
+
+/// Combined canonical hashes for a [`Document`] computed in a single pass over all pages
+/// and embedded binary assets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentCanonicalHashes {
+    pub content_hash: String,
+    pub body_hash: String,
+    pub meta_hash: String,
+    pub page_hashes: Vec<String>,
+}
+
+/// Computes `canonical_document_hash`, `canonical_document_body_hash`, `canonical_document_meta_hash`,
+/// and `canonical_document_page_hashes` in a single pass over `doc`.
+pub fn canonical_document_all_hashes(doc: &Document) -> DocumentCanonicalHashes {
+    let mut doc_hasher = Sha256::new();
+    Digest::update(&mut doc_hasher, b"papercraft-doc-canonical-v2");
+    let mut body_hasher = Sha256::new();
+    Digest::update(&mut body_hasher, b"papercraft-doc-body-v1");
+    let mut meta_hasher = Sha256::new();
+    Digest::update(&mut meta_hasher, b"papercraft-doc-meta-v1");
+
+    let clean_title = papercraft_doc::sanitize_notebook_title(&doc.title);
+    {
+        let mut title_pair = MultiHasher([&mut doc_hasher, &mut meta_hasher]);
+        hash_len_bytes(&mut title_pair, clean_title.as_bytes());
+        if let Ok(cover_bytes) = serde_json::to_vec(&doc.cover) {
+            hash_len_bytes(&mut title_pair, &cover_bytes);
+        }
+    }
+
+    hash_document_meta_after_title_cover(&mut meta_hasher, doc);
+
+    let active_idx = u64::try_from(doc.active_page_index()).unwrap_or(0);
+    Digest::update(&mut doc_hasher, active_idx.to_le_bytes());
+    let next_stroke_id = doc.next_stroke_id.to_le_bytes();
+    Digest::update(&mut doc_hasher, next_stroke_id);
+    Digest::update(&mut body_hasher, next_stroke_id);
+
+    let page_count = doc.page_count();
+    let page_count_bytes = (page_count as u64).to_le_bytes();
+    Digest::update(&mut doc_hasher, page_count_bytes);
+    Digest::update(&mut body_hasher, page_count_bytes);
+
+    let mut page_hashes = Vec::with_capacity(page_count);
+    let mut pen_cache = PenHashCache::default();
+    for idx in 0..page_count {
+        doc.with_resolved_page(idx, |page| {
+            let mut page_hasher = Sha256::new();
+            Digest::update(&mut page_hasher, b"papercraft-page-canonical-v1");
+            {
+                let mut multi = MultiHasher([&mut body_hasher, &mut doc_hasher, &mut page_hasher]);
+                hash_page_into(&mut multi, page, &mut pen_cache);
+            }
+            hash_page_images_into(&mut page_hasher, page);
+            page_hashes.push(bytes_to_hex(&page_hasher.finalize()));
+        });
+    }
+
+    {
+        let mut pdf_pair = MultiHasher([&mut body_hasher, &mut doc_hasher]);
+        hash_pdf_documents_into(&mut pdf_pair, doc);
+    }
+    hash_doc_folder_tags_into(&mut doc_hasher, doc);
+    {
+        let mut tpl_pair = MultiHasher([&mut body_hasher, &mut doc_hasher]);
+        hash_image_templates_into(&mut tpl_pair, doc);
+    }
+
+    DocumentCanonicalHashes {
+        content_hash: bytes_to_hex(&doc_hasher.finalize()),
+        body_hash: bytes_to_hex(&body_hasher.finalize()),
+        meta_hash: bytes_to_hex(&meta_hasher.finalize()),
+        page_hashes,
+    }
+}
+
+fn hash_document_meta_after_title_cover(hasher: &mut Sha256, doc: &Document) {
+    let folder = papercraft_doc::sanitize_folder_path(&doc.folder_path);
+    let tags = papercraft_doc::sanitize_notebook_tags(&doc.tags);
+    hash_len_bytes(hasher, folder.as_bytes());
+    Digest::update(hasher, [u8::from(doc.favorite)]);
+    Digest::update(hasher, (tags.len() as u64).to_le_bytes());
     for tag in &tags {
         hash_len_bytes(hasher, tag.as_bytes());
     }
@@ -826,7 +1003,7 @@ fn hash_document_meta_into(hasher: &mut Sha256, doc: &Document) {
 /// content (excluding notebook metadata like title, cover, folder, favorite, or tags).
 pub fn canonical_document_body_hash(doc: &Document) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"papercraft-doc-body-v1");
+    Digest::update(&mut hasher, b"papercraft-doc-body-v1");
     hash_document_body_into(&mut hasher, doc);
     bytes_to_hex(&hasher.finalize())
 }
@@ -835,7 +1012,7 @@ pub fn canonical_document_body_hash(doc: &Document) -> String {
 /// `folder_path`, `favorite`, and `tags`) for Last-Write-Wins metadata conflict resolution.
 pub fn canonical_document_meta_hash(doc: &Document) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"papercraft-doc-meta-v1");
+    Digest::update(&mut hasher, b"papercraft-doc-meta-v1");
     hash_document_meta_into(&mut hasher, doc);
     bytes_to_hex(&hasher.finalize())
 }
@@ -844,48 +1021,27 @@ pub fn canonical_document_meta_hash(doc: &Document) -> String {
 /// invariant across `.ncraft` v2 binary save/load and active-page serialization deduplication.
 pub fn canonical_document_hash(doc: &Document) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"papercraft-doc-canonical-v2");
+    Digest::update(&mut hasher, b"papercraft-doc-canonical-v2");
     let clean_title = papercraft_doc::sanitize_notebook_title(&doc.title);
     hash_len_bytes(&mut hasher, clean_title.as_bytes());
     if let Ok(cover_bytes) = serde_json::to_vec(&doc.cover) {
         hash_len_bytes(&mut hasher, &cover_bytes);
     }
     let active_idx = u64::try_from(doc.active_page_index()).unwrap_or(0);
-    hasher.update(active_idx.to_le_bytes());
-    hasher.update(doc.next_stroke_id.to_le_bytes());
+    Digest::update(&mut hasher, active_idx.to_le_bytes());
+    Digest::update(&mut hasher, doc.next_stroke_id.to_le_bytes());
 
-    let pages = doc.resolved_pages();
-    hasher.update((pages.len() as u64).to_le_bytes());
-    for page in &pages {
-        hash_page_into(&mut hasher, page);
+    let page_count = doc.page_count();
+    Digest::update(&mut hasher, (page_count as u64).to_le_bytes());
+    let mut pen_cache = PenHashCache::default();
+    for idx in 0..page_count {
+        doc.with_resolved_page(idx, |page| {
+            hash_page_into(&mut hasher, page, &mut pen_cache);
+        });
     }
-    if !doc.pdf_documents.is_empty() {
-        hasher.update([0xD1]);
-        hasher.update((doc.pdf_documents.len() as u64).to_le_bytes());
-        for pdf in &doc.pdf_documents {
-            hash_len_bytes(&mut hasher, pdf.name.as_bytes());
-            hash_len_bytes(&mut hasher, pdf.bytes.as_slice());
-        }
-    }
-    let folder = papercraft_doc::sanitize_folder_path(&doc.folder_path);
-    let tags = papercraft_doc::sanitize_notebook_tags(&doc.tags);
-    if !folder.is_empty() || doc.favorite || !tags.is_empty() {
-        hasher.update([0xD3]);
-        hash_len_bytes(&mut hasher, folder.as_bytes());
-        hasher.update([u8::from(doc.favorite)]);
-        hasher.update((tags.len() as u64).to_le_bytes());
-        for tag in &tags {
-            hash_len_bytes(&mut hasher, tag.as_bytes());
-        }
-    }
-    if !doc.image_templates.is_empty() {
-        hasher.update([0xD4]);
-        hasher.update((doc.image_templates.len() as u64).to_le_bytes());
-        for tpl in &doc.image_templates {
-            hash_len_bytes(&mut hasher, tpl.name.as_bytes());
-            hash_len_bytes(&mut hasher, tpl.png_bytes.as_slice());
-        }
-    }
+    hash_pdf_documents_into(&mut hasher, doc);
+    hash_doc_folder_tags_into(&mut hasher, doc);
+    hash_image_templates_into(&mut hasher, doc);
     bytes_to_hex(&hasher.finalize())
 }
 
@@ -893,34 +1049,29 @@ pub fn canonical_document_hash(doc: &Document) -> String {
 /// text items, vector shapes, raster images, paper style, templates, and backdrops.
 pub fn canonical_page_hash(page: &NotebookPage) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"papercraft-page-canonical-v1");
-    hash_page_into(&mut hasher, page);
-    if !page.images.is_empty() {
-        hasher.update([0xD7]);
-        hasher.update((page.images.len() as u64).to_le_bytes());
-        for img in &page.images {
-            let clean = img.sanitized();
-            hasher.update(clean.x.to_bits().to_le_bytes());
-            hasher.update(clean.y.to_bits().to_le_bytes());
-            hasher.update(clean.width.to_bits().to_le_bytes());
-            hasher.update(clean.height.to_bits().to_le_bytes());
-            hasher.update(clean.angle_degrees.to_bits().to_le_bytes());
-            hasher.update(clean.pixel_width.to_le_bytes());
-            hasher.update(clean.pixel_height.to_le_bytes());
-            hasher.update(clean.z_order.to_le_bytes());
-            hash_len_bytes(&mut hasher, &clean.png_bytes);
-        }
-    }
+    Digest::update(&mut hasher, b"papercraft-page-canonical-v1");
+    let mut pen_cache = PenHashCache::default();
+    hash_page_into(&mut hasher, page, &mut pen_cache);
+    hash_page_images_into(&mut hasher, page);
     bytes_to_hex(&hasher.finalize())
 }
 
-/// Computes deterministic per-page hashes across `doc.resolved_pages()` for 3-way page conflict
-/// merging in Offline-First sync sessions.
+/// Computes deterministic per-page hashes across `doc` pages for 3-way page conflict
+/// merging in Offline-First sync sessions without cloning the full page vector.
 pub fn canonical_document_page_hashes(doc: &Document) -> Vec<String> {
-    doc.resolved_pages()
-        .iter()
-        .map(canonical_page_hash)
-        .collect()
+    let page_count = doc.page_count();
+    let mut out = Vec::with_capacity(page_count);
+    let mut pen_cache = PenHashCache::default();
+    for idx in 0..page_count {
+        doc.with_resolved_page(idx, |page| {
+            let mut hasher = Sha256::new();
+            Digest::update(&mut hasher, b"papercraft-page-canonical-v1");
+            hash_page_into(&mut hasher, page, &mut pen_cache);
+            hash_page_images_into(&mut hasher, page);
+            out.push(bytes_to_hex(&hasher.finalize()));
+        });
+    }
+    out
 }
 
 /// Computes a deterministic SHA-256 content hash for [`UserStudioConfig`].
@@ -1172,5 +1323,80 @@ mod tests {
         assert_eq!(next_hashes.len(), 2);
         assert_eq!(next_hashes[0], base_hashes[0]);
         assert_ne!(next_hashes[1], base_hashes[1]);
+    }
+
+    #[test]
+    fn canonical_document_all_hashes_matches_standalone_functions_bit_for_bit() {
+        use papercraft_doc::{
+            EmbeddedImageTemplate, EmbeddedPdf, GeometricShape, NotebookCover, PageImage,
+            PaperColor, PaperTemplate, PdfPageBackdrop, StrokeSample, TextItem,
+        };
+        use std::sync::Arc;
+
+        let mut doc = Document::new(1200, 1600);
+        doc.title = "Hash Parity Notebook".to_string();
+        doc.cover = NotebookCover::default();
+        doc.folder_path = "Math/LinearAlgebra".to_string();
+        doc.favorite = true;
+        doc.tags = vec!["exam".to_string(), "notes".to_string()];
+        doc.pdf_documents.push(EmbeddedPdf {
+            name: "slides.pdf".to_string(),
+            bytes: Arc::new(b"%PDF-1.4\n%%EOF\n".to_vec()),
+        });
+        doc.image_templates.push(EmbeddedImageTemplate {
+            name: "grid.png".to_string(),
+            png_bytes: Arc::new(vec![137, 80, 78, 71, 1, 2, 3]),
+        });
+        doc.pdf_backdrop = Some(PdfPageBackdrop {
+            pdf_index: 0,
+            page_index: 0,
+        });
+        doc.bookmarked = true;
+        doc.backdrop_rotation = 3;
+        doc.custom_image_backdrop = Some(0);
+        doc.custom_template_id = Some("tpl_1".to_string());
+
+        let pts = vec![
+            StrokeSample::from_xy_pressure(10.0, 20.0, 0.5),
+            StrokeSample::from_xy_pressure(50.0, 70.0, 0.9),
+        ];
+        for _ in 0..3 {
+            let id = doc.alloc_stroke_id();
+            doc.strokes.push(Arc::new(
+                InkStroke::new(id, PenSettings::fountain_pen(), pts.clone(), pts.clone())
+                    .with_z_order(1),
+            ));
+        }
+        doc.texts.push(Arc::new(TextItem {
+            text: "Eigenvalues".to_string(),
+            z_order: 2,
+            ..TextItem::default()
+        }));
+        doc.shapes.push(Arc::new(GeometricShape {
+            x2: 120.0,
+            y2: 80.0,
+            z_order: 3,
+            ..GeometricShape::default()
+        }));
+        doc.images.push(Arc::new(PageImage {
+            png_bytes: Arc::new(vec![137, 80, 78, 71, 9, 8]),
+            z_order: 4,
+            ..PageImage::default()
+        }));
+
+        doc.add_page(Some(PaperTemplate::Grid), Some(PaperColor::WarmCream));
+        let id2 = doc.alloc_stroke_id();
+        doc.strokes.push(Arc::new(InkStroke::new(
+            id2,
+            PenSettings::ball_pen(),
+            pts.clone(),
+            pts,
+        )));
+
+        let all = canonical_document_all_hashes(&doc);
+        assert_eq!(all.content_hash, canonical_document_hash(&doc));
+        assert_eq!(all.body_hash, canonical_document_body_hash(&doc));
+        assert_eq!(all.meta_hash, canonical_document_meta_hash(&doc));
+        assert_eq!(all.page_hashes, canonical_document_page_hashes(&doc));
     }
 }

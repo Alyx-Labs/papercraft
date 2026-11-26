@@ -20,15 +20,10 @@ const COPY_FEEDBACK_DURATION: Duration = Duration::from_millis(2400);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ControlTab {
     #[default]
-    Server,
+    Overview,
     Users,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum UsersViewMode {
-    #[default]
-    Active,
     Trash,
+    Settings,
 }
 
 /// Builds the exact manual confirmation phrase (`delete <username>`).
@@ -93,7 +88,6 @@ pub struct ServerController {
     pub trashed_users_snapshot: Vec<TrashedUserSummary>,
     pub users_error: Option<String>,
     pub active_tab: ControlTab,
-    pub users_view_mode: UsersViewMode,
     pub user_search: String,
     pub pending_delete_user: Option<String>,
     pub delete_confirm_input: String,
@@ -104,7 +98,6 @@ pub struct ServerController {
     last_stats_refresh: Option<Instant>,
     pub copied_url_feedback: Option<(String, Instant)>,
     pub notice_banner: Option<NoticeBanner>,
-    pub advanced_open: bool,
     pub window_visible: bool,
     pub allow_close: bool,
     pub pending_folder_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
@@ -157,8 +150,7 @@ impl ServerController {
             users_snapshot: Vec::new(),
             trashed_users_snapshot: Vec::new(),
             users_error: None,
-            active_tab: ControlTab::Server,
-            users_view_mode: UsersViewMode::Active,
+            active_tab: ControlTab::Overview,
             user_search: String::new(),
             pending_delete_user: None,
             delete_confirm_input: String::new(),
@@ -172,7 +164,6 @@ impl ServerController {
                 tone: NoticeTone::Warning,
                 text,
             }),
-            advanced_open: false,
             window_visible: start_visible,
             allow_close: false,
             pending_folder_rx: None,
@@ -536,14 +527,6 @@ impl ServerController {
         }
     }
 
-    pub fn set_users_view_mode(&mut self, mode: UsersViewMode) {
-        if self.users_view_mode != mode {
-            self.users_view_mode = mode;
-            self.cancel_user_action();
-            self.refresh_users();
-        }
-    }
-
     pub fn request_delete_user(&mut self, user_id: &str) {
         self.pending_delete_user = Some(user_id.to_string());
         self.pending_reset_user = None;
@@ -655,8 +638,8 @@ impl ServerController {
                 if self.is_running() {
                     self.refresh_stats();
                 }
-                if self.trashed_users_snapshot.is_empty() {
-                    self.users_view_mode = UsersViewMode::Active;
+                if self.trashed_users_snapshot.is_empty() && self.active_tab == ControlTab::Trash {
+                    self.active_tab = ControlTab::Users;
                 }
             }
             Err(err) => {
@@ -705,7 +688,8 @@ impl ServerController {
     pub fn set_active_tab(&mut self, tab: ControlTab) {
         if self.active_tab != tab {
             self.active_tab = tab;
-            if tab == ControlTab::Users {
+            self.cancel_user_action();
+            if matches!(tab, ControlTab::Users | ControlTab::Trash) {
                 self.refresh_users();
             }
         }
@@ -988,7 +972,7 @@ mod tests {
         settings.save_atomic(&cfg_path).unwrap();
 
         let mut ctrl = ServerController::new(cfg_path, false);
-        assert_eq!(ctrl.active_tab, ControlTab::Server);
+        assert_eq!(ctrl.active_tab, ControlTab::Overview);
         assert_eq!(ctrl.users_snapshot.len(), 1);
         assert_eq!(ctrl.users_snapshot[0].username, "alice");
         assert_eq!(ctrl.users_snapshot[0].display_name, "Alice Smith");
@@ -1144,11 +1128,11 @@ mod tests {
         assert_eq!(ctrl.trashed_users_snapshot[0].user_id, bob_id);
 
         // Restore Bob from Trash back into active users.
-        ctrl.set_users_view_mode(UsersViewMode::Trash);
+        ctrl.set_active_tab(ControlTab::Trash);
         ctrl.restore_trashed_user(&bob_id);
         assert_eq!(ctrl.users_snapshot.len(), 2);
         assert!(ctrl.trashed_users_snapshot.is_empty());
-        assert_eq!(ctrl.users_view_mode, UsersViewMode::Active);
+        assert_eq!(ctrl.active_tab, ControlTab::Users);
         assert_eq!(
             ctrl.notice_banner.as_ref().map(|b| b.tone),
             Some(NoticeTone::Success)

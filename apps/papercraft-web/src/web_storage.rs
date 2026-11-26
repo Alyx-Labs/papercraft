@@ -45,8 +45,8 @@ const META_KEY_SCHEMA: &str = "schema";
 const META_KEY_GLOBAL: &str = "global";
 const BROADCAST_CHANNEL_NAME: &str = "papercraft_storage_sync_v1";
 
-const DEBOUNCE_TRAILING_MS: i32 = 400;
-const DEBOUNCE_MAX_WAIT_MS: f64 = 2_000.0;
+const DEBOUNCE_TRAILING_MS: i32 = 1_500;
+const DEBOUNCE_MAX_WAIT_MS: f64 = 10_000.0;
 const ESTIMATE_REFRESH_MIN_MS: f64 = 30_000.0;
 const PEER_STALE_MS: f64 = 90_000.0;
 const GC_IDLE_DELAY_MS: i32 = 2_500;
@@ -473,8 +473,8 @@ impl WebStorageController {
 
     fn schedule_debounced_flush(&self) {
         let mut st = self.inner.borrow_mut();
-        if st.debounce_timer_id.is_some() {
-            return;
+        if let Some(old_id) = st.debounce_timer_id.take() {
+            clear_window_timeout(old_id);
         }
         let ctrl = self.clone();
         let cb = Closure::once(move || {
