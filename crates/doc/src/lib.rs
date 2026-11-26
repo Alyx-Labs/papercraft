@@ -5499,6 +5499,15 @@ impl NotebookPage {
     pub fn paint_steps(&self) -> Vec<PagePaintStep> {
         page_paint_steps(&self.strokes, &self.shapes, &self.texts, &self.images)
     }
+
+    /// Returns `true` when the page contains any user annotations (strokes, text boxes, shapes, or images).
+    #[must_use]
+    pub fn has_annotations(&self) -> bool {
+        !self.strokes.is_empty()
+            || !self.texts.is_empty()
+            || !self.shapes.is_empty()
+            || !self.images.is_empty()
+    }
 }
 
 /// Pure PaperCraft multi-page notebook document.
@@ -6558,6 +6567,16 @@ impl Document {
             *slot = self.active_page_snapshot();
         }
         pages
+    }
+
+    /// Returns the 0-based page indices containing at least one stroke, text box, shape, or image.
+    #[must_use]
+    pub fn annotated_page_indices(&self) -> Vec<usize> {
+        self.resolved_pages()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, page)| page.has_annotations().then_some(idx))
+            .collect()
     }
 
     /// Invokes `f` on resolved page `index` without cloning the full page list.

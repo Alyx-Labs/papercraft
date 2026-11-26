@@ -7,9 +7,9 @@ use std::sync::Arc;
 use image::ImageDecoder;
 use papercraft_color::Color;
 use papercraft_compose::{
-    PdfDocumentSummary, PdfError, PdfPageRenderer, RenderedPdfPage, export_notebook_pdf,
-    export_notebook_pdf_pages, inspect_pdf, render_document, render_document_svg,
-    render_pdf_page_rgba, with_pdf_renderer,
+    PdfDocumentSummary, PdfError, PdfExportSession, PdfExportStep, PdfPageRenderer,
+    RenderedPdfPage, export_notebook_pdf, export_notebook_pdf_pages, inspect_pdf, render_document,
+    render_document_svg, render_pdf_page_rgba, with_pdf_renderer,
 };
 use papercraft_doc::{
     BUILTIN_PALETTE_CLASSIC_ID, BufferAveraging, BufferPreprocessor, ColorPalettePreset,
@@ -4775,6 +4775,37 @@ impl Session {
     ) -> Result<RenderedPdfPage, PdfError> {
         render_pdf_page_rgba(bytes, page_index, max_w, max_h)
     }
+    /// Returns the 0-based page indices containing at least one annotation (strokes, text, shapes, or images).
+    #[must_use]
+    pub fn annotated_page_indices(&self) -> Vec<usize> {
+        self.doc.annotated_page_indices()
+    }
+
+    /// Snapshots the active notebook (with live page edits synced) for non-blocking background PDF export.
+    #[must_use]
+    pub fn snapshot_for_pdf_export(&self) -> Arc<Document> {
+        let mut snap = Arc::clone(&self.doc);
+        Arc::make_mut(&mut snap).sync_active_to_pages();
+        snap
+    }
+
+    /// Validates `pages` selection (or selects all pages when `None`) and starts an incremental [`PdfExportJob`].
+    pub fn start_pdf_export_job(
+        &self,
+        pages: Option<&[usize]>,
+    ) -> Result<PdfExportJob, EngineError> {
+        let ordered = if let Some(indices) = pages {
+            Some(validate_page_selection_ordered(
+                "export.pdf",
+                indices,
+                self.doc.page_count(),
+            )?)
+        } else {
+            None
+        };
+        Ok(PdfExportJob::new(self.snapshot_for_pdf_export(), ordered))
+    }
+
     /// Exports all pages (or selected 0-based `pages`) of the active notebook as PDF bytes without touching the filesystem.
     pub fn export_pdf_bytes(&mut self) -> Result<Vec<u8>, EngineError> {
         self.export_pdf_bytes_for_pages(None)
@@ -5007,6 +5038,49 @@ pub struct PackageImportSummary {
     pub updated_notebooks: usize,
     pub imported_trashed: usize,
     pub source_name: String,
+}
+
+/// Incremental, non-blocking PDF export handle exposed by `papercraft-engine` for UI/background runners.
+pub struct PdfExportJob {
+    inner: PdfExportSession,
+}
+
+impl PdfExportJob {
+    /// Creates an incremental export job for `doc` over all pages (`None`) or unique `page_indices`.
+    #[must_use]
+    pub fn new(doc: Arc<Document>, page_indices: Option<Vec<usize>>) -> Self {
+        Self {
+            inner: PdfExportSession::new(doc, page_indices),
+        }
+    }
+
+    /// Total number of pages scheduled in this export job.
+    #[must_use]
+    pub fn total_pages(&self) -> usize {
+        self.inner.total_pages()
+    }
+
+    /// Number of pages completed so far.
+    #[must_use]
+    pub fn done_pages(&self) -> usize {
+        self.inner.done_pages()
+    }
+
+    /// True once final bytes have been emitted.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.inner.is_finished()
+    }
+
+    /// Advances by 1 page (or emits final PDF bytes once all pages are processed).
+    pub fn step_one(&mut self) -> PdfExportStep {
+        self.inner.step_one()
+    }
+
+    /// Advances up to `max_pages.max(1)` pages and returns progress or final bytes.
+    pub fn step_batch(&mut self, max_pages: usize) -> PdfExportStep {
+        self.inner.step_batch(max_pages)
+    }
 }
 
 fn insert_or_update_packaged_notebook(

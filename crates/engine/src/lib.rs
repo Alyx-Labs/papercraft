@@ -16,13 +16,13 @@ pub mod sync_state;
 pub mod web_storage;
 
 pub use commands::{
-    PackageImportSummary, PdfImportMode, PreparedPdfImport, prepare_pdf_import_from_bytes,
-    prepare_pdf_import_from_path,
+    PackageImportSummary, PdfExportJob, PdfImportMode, PreparedPdfImport,
+    prepare_pdf_import_from_bytes, prepare_pdf_import_from_path,
 };
 pub use library::{TrashedNotebook, default_library_dir};
 pub use papercraft_compose::{
-    PdfDocumentSummary, PdfError, PdfPageRenderer, ROBOTO_BOLD_ITALIC_TTF, ROBOTO_BOLD_TTF,
-    ROBOTO_ITALIC_TTF, ROBOTO_REGULAR_TTF, RenderedPdfPage,
+    PdfDocumentSummary, PdfError, PdfExportStep, PdfPageRenderer, ROBOTO_BOLD_ITALIC_TTF,
+    ROBOTO_BOLD_TTF, ROBOTO_ITALIC_TTF, ROBOTO_REGULAR_TTF, RenderedPdfPage,
 };
 pub use papercraft_format::looks_like_package_bytes;
 
@@ -2843,5 +2843,52 @@ mod tests {
         .unwrap();
         assert!(s.doc.shapes[1].z_order > z_s2);
         assert!(s.doc.texts[1].z_order > s.doc.shapes[1].z_order);
+    }
+
+    #[test]
+    fn annotated_page_indices_and_pdf_export_job_step_cleanly() {
+        let mut s = Session::default();
+        let _ = s.execute("page.add", &serde_json::json!({})).unwrap();
+        let _ = s.execute("page.add", &serde_json::json!({})).unwrap();
+        let _ = s.execute("page.add", &serde_json::json!({})).unwrap();
+
+        assert!(s.annotated_page_indices().is_empty());
+
+        s.execute("page.select", &serde_json::json!({ "index": 0 }))
+            .unwrap();
+        s.execute(
+            "stroke.draw",
+            &serde_json::json!({
+                "kind": "BallPen",
+                "points": [
+                    { "x": 20.0, "y": 20.0, "pressure": 0.6 },
+                    { "x": 80.0, "y": 20.0, "pressure": 0.6 }
+                ]
+            }),
+        )
+        .unwrap();
+        s.execute("page.select", &serde_json::json!({ "index": 2 }))
+            .unwrap();
+        s.execute(
+            "text.insert",
+            &serde_json::json!({ "text": "Marked", "x": 50.0, "y": 50.0 }),
+        )
+        .unwrap();
+
+        let annotated = s.annotated_page_indices();
+        assert_eq!(annotated, vec![0, 2]);
+
+        let mut job = s.start_pdf_export_job(Some(&annotated)).unwrap();
+        assert_eq!(job.total_pages(), 2);
+        assert_eq!(job.done_pages(), 0);
+        assert_eq!(
+            job.step_one(),
+            PdfExportStep::InProgress { done: 1, total: 2 }
+        );
+        let PdfExportStep::Finished(pdf_bytes) = job.step_one() else {
+            panic!("expected finished PDF on 2nd step");
+        };
+        assert!(job.is_finished());
+        assert!(pdf_bytes.starts_with(b"%PDF-"));
     }
 }

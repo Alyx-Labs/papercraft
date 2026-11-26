@@ -447,7 +447,20 @@ fn trigger_blob_download(filename: &str, mime: &str, bytes: &[u8]) -> Result<(),
     let _ = body.append_child(&anchor);
     anchor.click();
     anchor.remove();
-    let _ = web_sys::Url::revoke_object_url(&url);
+    // Defer revoking the Blob URL briefly so Safari/Firefox finish streaming large 25+ MB PDFs.
+    let url_to_revoke = url.clone();
+    let revoke_cb = Closure::once_into_js(move || {
+        let _ = web_sys::Url::revoke_object_url(&url_to_revoke);
+    });
+    if window
+        .set_timeout_with_callback_and_timeout_and_arguments_0(
+            revoke_cb.as_ref().unchecked_ref(),
+            10_000,
+        )
+        .is_err()
+    {
+        let _ = web_sys::Url::revoke_object_url(&url);
+    }
     Ok(())
 }
 

@@ -42,13 +42,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
 
 use papercraft_doc::{
     Document, InkStroke, MAX_TEXT_CHARS, PenKind, ShapeKind, StrokeId, TextItem,
     base64_encode_bytes, sanitize_link_url,
 };
-use papercraft_engine::Session;
+use papercraft_engine::{PdfExportJob, PdfExportStep, Session};
 use papercraft_paint::RibbonMesh;
 use serde_json::json;
 
@@ -248,6 +250,28 @@ fn is_picked_package(picked: &PickedOpenFile) -> bool {
     }
 }
 
+/// Quick page scope selection shown inside the Export Notebook modal for multi-page formats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExportPageScope {
+    #[default]
+    AllPages,
+    CurrentPage,
+    AnnotatedOnly,
+    PageRange,
+    SidebarSelection,
+}
+
+/// Live progress snapshot exposed to the Export modal while a non-blocking PDF export runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PdfExportProgressView {
+    pub pages_done: usize,
+    pub pages_total: usize,
+    pub separate_files: bool,
+    pub file_index: usize,
+    pub file_total: usize,
+    pub cancelling: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct ViewState {
     pub screen: AppScreen,
@@ -378,8 +402,11 @@ pub struct ViewState {
     pub export_path_stem: String,
     pub export_format: FileDialogKind,
     pub export_target_pages: Option<Vec<usize>>,
+    pub export_page_scope: ExportPageScope,
+    pub export_page_range_draft: String,
     pub export_separate_files: bool,
     pub export_feedback: Option<(bool, String)>,
+    pub pdf_export_progress: Option<PdfExportProgressView>,
     pub notebook_title_draft: String,
     pub notebook_cover_draft: papercraft_doc::NotebookCover,
     pub new_notebook_step: usize,
@@ -561,8 +588,11 @@ impl Default for ViewState {
             export_path_stem: "exports/Quick_Notes".to_string(),
             export_format: FileDialogKind::Pdf,
             export_target_pages: None,
+            export_page_scope: ExportPageScope::AllPages,
+            export_page_range_draft: String::new(),
             export_separate_files: false,
             export_feedback: None,
+            pdf_export_progress: None,
             notebook_title_draft: "Quick Notes".to_string(),
             notebook_cover_draft: papercraft_doc::NotebookCover::ClassicNavy,
             new_notebook_step: 0,
@@ -943,6 +973,124 @@ struct PendingPdfImportState {
     rx: mpsc::Receiver<Result<papercraft_engine::PreparedPdfImport, String>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+struct DesktopPdfExportState {
+    cancel_flag: Arc<AtomicBool>,
+    pages_done: Arc<AtomicUsize>,
+    pages_total: usize,
+    file_index: Arc<AtomicUsize>,
+    file_total: usize,
+    separate_files: bool,
+    cancelling: bool,
+    rx: mpsc::Receiver<Result<String, String>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct DesktopPdfWorkerArgs<'a> {
+    doc: Arc<Document>,
+    path: &'a std::path::Path,
+    pages: &'a [usize],
+    separate_files: bool,
+    cancel_flag: &'a AtomicBool,
+    pages_done: &'a AtomicUsize,
+    file_index: &'a AtomicUsize,
+    ctx: &'a egui::Context,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_pdf_file_bytes(dest: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = dest.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to prepare export folder: {err}"))?;
+    }
+    std::fs::write(dest, bytes).map_err(|err| format!("Failed to write PDF file: {err}"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_desktop_pdf_export_worker(args: DesktopPdfWorkerArgs<'_>) -> Result<String, String> {
+    if !args.separate_files {
+        let mut job = PdfExportJob::new(args.doc, Some(args.pages.to_vec()));
+        let bytes = loop {
+            if args.cancel_flag.load(Ordering::Relaxed) {
+                return Err("Export cancelled.".to_string());
+            }
+            match job.step_one() {
+                PdfExportStep::InProgress { done, .. } => {
+                    args.pages_done.store(done, Ordering::Relaxed);
+                    args.ctx.request_repaint();
+                }
+                PdfExportStep::Finished(bytes) => break bytes,
+            }
+        };
+        if args.cancel_flag.load(Ordering::Relaxed) {
+            return Err("Export cancelled.".to_string());
+        }
+        write_pdf_file_bytes(args.path, &bytes)?;
+        let count = args.pages.len().max(1);
+        return Ok(format!(
+            "Exported {count}-page PDF to `{}` ({} bytes).",
+            args.path.to_string_lossy(),
+            bytes.len()
+        ));
+    }
+
+    for (order_idx, &page_idx) in args.pages.iter().enumerate() {
+        if args.cancel_flag.load(Ordering::Relaxed) {
+            return Err("Export cancelled.".to_string());
+        }
+        args.file_index.store(order_idx, Ordering::Relaxed);
+        let mut job = PdfExportJob::new(Arc::clone(&args.doc), Some(vec![page_idx]));
+        let bytes = loop {
+            if args.cancel_flag.load(Ordering::Relaxed) {
+                return Err("Export cancelled.".to_string());
+            }
+            if let PdfExportStep::Finished(bytes) = job.step_one() {
+                break bytes;
+            }
+        };
+        if args.cancel_flag.load(Ordering::Relaxed) {
+            return Err("Export cancelled.".to_string());
+        }
+        let dest = export_modal::numbered_export_path(
+            args.path,
+            order_idx,
+            page_idx,
+            FileDialogKind::Pdf.extension(),
+        );
+        write_pdf_file_bytes(&dest, &bytes)?;
+        args.pages_done.store(order_idx + 1, Ordering::Relaxed);
+        args.ctx.request_repaint();
+    }
+    Ok(format!(
+        "Exported {} separate {} files in selection order.",
+        args.pages.len(),
+        FileDialogKind::Pdf.extension()
+    ))
+}
+
+enum ChunkedPdfExportState {
+    Single {
+        job: PdfExportJob,
+        file_name: String,
+        total_pages: usize,
+    },
+    Separate {
+        doc: Arc<Document>,
+        pages: Vec<usize>,
+        next_idx: usize,
+        current_job: Option<PdfExportJob>,
+        title_stem: String,
+    },
+}
+
+enum ActivePdfExport {
+    #[cfg(not(target_arch = "wasm32"))]
+    DesktopThread(DesktopPdfExportState),
+    Chunked(Box<ChunkedPdfExportState>),
+}
+
 /// Top-level `eframe::App` wrapping the headless [`Session`].
 pub struct PaperCraftApp {
     pub session: Session,
@@ -962,6 +1110,8 @@ pub struct PaperCraftApp {
     startup_desktop_shortcut_synced: bool,
     #[cfg(not(target_arch = "wasm32"))]
     pdf_import_job: Option<PendingPdfImportState>,
+    active_pdf_export: Option<ActivePdfExport>,
+    pub(crate) pdf_export_stepped_in_show_ui: bool,
     last_ctx: Option<egui::Context>,
     frame_counter: u64,
     last_saved_cache_state: Option<WebCacheStateKey>,
@@ -1046,6 +1196,8 @@ impl PaperCraftApp {
             startup_desktop_shortcut_synced: false,
             #[cfg(not(target_arch = "wasm32"))]
             pdf_import_job: None,
+            active_pdf_export: None,
+            pdf_export_stepped_in_show_ui: false,
             last_ctx: None,
             frame_counter: 0,
             last_saved_cache_state: None,
@@ -1289,6 +1441,330 @@ impl PaperCraftApp {
                 true
             }
             Err(_) => false,
+        }
+    }
+
+    pub(crate) fn is_pdf_export_active(&self) -> bool {
+        self.active_pdf_export.is_some()
+    }
+
+    pub(crate) fn cancel_active_pdf_export_silently(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ActivePdfExport::DesktopThread(state)) = self.active_pdf_export.take() {
+            state.cancel_flag.store(true, Ordering::Relaxed);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.active_pdf_export = None;
+        }
+        self.view.pdf_export_progress = None;
+    }
+
+    pub(crate) fn cancel_active_pdf_export(&mut self) {
+        self.cancel_active_pdf_export_silently();
+        let msg = "Export cancelled.".to_string();
+        self.session.last_export_status = Some(msg.clone());
+        self.view.export_feedback = Some((false, msg));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn start_desktop_pdf_export(
+        &mut self,
+        path: PathBuf,
+        pages: Option<Vec<usize>>,
+        separate_files: bool,
+        ctx: egui::Context,
+    ) -> Result<(), String> {
+        let doc = self.session.snapshot_for_pdf_export();
+        let page_list = pages.unwrap_or_else(|| (0..doc.page_count().max(1)).collect());
+        if page_list.is_empty() {
+            return Err("No pages selected for export.".to_string());
+        }
+        let pages_total = page_list.len();
+        let file_total = if separate_files { pages_total } else { 1 };
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let pages_done = Arc::new(AtomicUsize::new(0));
+        let file_index = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+
+        let t_cancel = Arc::clone(&cancel_flag);
+        let t_done = Arc::clone(&pages_done);
+        let t_file_idx = Arc::clone(&file_index);
+        let spawned = std::thread::Builder::new()
+            .name("papercraft-pdf-export".to_string())
+            .spawn(move || {
+                let res = run_desktop_pdf_export_worker(DesktopPdfWorkerArgs {
+                    doc,
+                    path: &path,
+                    pages: &page_list,
+                    separate_files,
+                    cancel_flag: &t_cancel,
+                    pages_done: &t_done,
+                    file_index: &t_file_idx,
+                    ctx: &ctx,
+                });
+                let _ = tx.send(res);
+                ctx.request_repaint();
+            });
+        if spawned.is_err() {
+            return Err("Could not start background PDF export worker.".to_string());
+        }
+        self.active_pdf_export = Some(ActivePdfExport::DesktopThread(DesktopPdfExportState {
+            cancel_flag,
+            pages_done,
+            pages_total,
+            file_index,
+            file_total,
+            separate_files,
+            cancelling: false,
+            rx,
+        }));
+        self.view.pdf_export_progress = Some(PdfExportProgressView {
+            pages_done: 0,
+            pages_total,
+            separate_files,
+            file_index: 0,
+            file_total,
+            cancelling: false,
+        });
+        self.view.export_feedback = None;
+        Ok(())
+    }
+
+    pub(crate) fn start_chunked_pdf_export_single(
+        &mut self,
+        file_name: String,
+        pages: Option<&[usize]>,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        let job = self
+            .session
+            .start_pdf_export_job(pages)
+            .map_err(|err| err.to_string())?;
+        let total_pages = job.total_pages().max(1);
+        self.active_pdf_export = Some(ActivePdfExport::Chunked(Box::new(
+            ChunkedPdfExportState::Single {
+                job,
+                file_name,
+                total_pages,
+            },
+        )));
+        self.view.pdf_export_progress = Some(PdfExportProgressView {
+            pages_done: 0,
+            pages_total: total_pages,
+            separate_files: false,
+            file_index: 0,
+            file_total: 1,
+            cancelling: false,
+        });
+        self.view.export_feedback = None;
+        ctx.request_repaint();
+        Ok(())
+    }
+
+    pub(crate) fn start_chunked_pdf_export_separate(
+        &mut self,
+        title_stem: String,
+        pages: Vec<usize>,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        if pages.is_empty() {
+            return Err("No pages selected for export.".to_string());
+        }
+        let doc = self.session.snapshot_for_pdf_export();
+        let total = pages.len();
+        self.active_pdf_export = Some(ActivePdfExport::Chunked(Box::new(
+            ChunkedPdfExportState::Separate {
+                doc,
+                pages,
+                next_idx: 0,
+                current_job: None,
+                title_stem,
+            },
+        )));
+        self.view.pdf_export_progress = Some(PdfExportProgressView {
+            pages_done: 0,
+            pages_total: total,
+            separate_files: true,
+            file_index: 0,
+            file_total: total,
+            cancelling: false,
+        });
+        self.view.export_feedback = None;
+        ctx.request_repaint();
+        Ok(())
+    }
+
+    pub(crate) fn poll_async_pdf_export(&mut self, ctx: &egui::Context) {
+        let Some(active) = self.active_pdf_export.take() else {
+            return;
+        };
+        match active {
+            #[cfg(not(target_arch = "wasm32"))]
+            ActivePdfExport::DesktopThread(mut state) => match state.rx.try_recv() {
+                Ok(Ok(status)) => {
+                    self.view.pdf_export_progress = None;
+                    if state.cancelling || state.cancel_flag.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    self.session.last_export_status = Some(status);
+                    self.view.export_feedback = None;
+                    if self.view.active_modal == Some(modal::ActiveModal::Export) {
+                        modal::close(self);
+                    }
+                }
+                Ok(Err(err)) => {
+                    self.view.pdf_export_progress = None;
+                    if state.cancelling || state.cancel_flag.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    self.session.last_export_status = Some(err.clone());
+                    self.view.export_feedback = Some((true, err));
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    let done = state.pages_done.load(Ordering::Relaxed);
+                    let file_idx = state.file_index.load(Ordering::Relaxed);
+                    if state.cancel_flag.load(Ordering::Relaxed) {
+                        state.cancelling = true;
+                    }
+                    self.view.pdf_export_progress = Some(PdfExportProgressView {
+                        pages_done: done.min(state.pages_total),
+                        pages_total: state.pages_total,
+                        separate_files: state.separate_files,
+                        file_index: file_idx.min(state.file_total),
+                        file_total: state.file_total,
+                        cancelling: state.cancelling,
+                    });
+                    self.active_pdf_export = Some(ActivePdfExport::DesktopThread(state));
+                    ctx.request_repaint_after(std::time::Duration::from_millis(60));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.view.pdf_export_progress = None;
+                    if !state.cancelling && !state.cancel_flag.load(Ordering::Relaxed) {
+                        let msg = "PDF export stopped unexpectedly.".to_string();
+                        self.session.last_export_status = Some(msg.clone());
+                        self.view.export_feedback = Some((true, msg));
+                    }
+                }
+            },
+            ActivePdfExport::Chunked(mut state) => {
+                const FRAME_BUDGET_MS: i64 = 12;
+                const MAX_STEPS_PER_FRAME: usize = 16;
+                let start_ms = papercraft_sync_protocol::now_unix_ms();
+                let mut steps = 0usize;
+
+                loop {
+                    steps += 1;
+                    let mut yield_frame = false;
+                    match state.as_mut() {
+                        ChunkedPdfExportState::Single {
+                            job,
+                            file_name,
+                            total_pages,
+                        } => match job.step_one() {
+                            PdfExportStep::InProgress { done, total } => {
+                                self.view.pdf_export_progress = Some(PdfExportProgressView {
+                                    pages_done: done,
+                                    pages_total: total.max(1),
+                                    separate_files: false,
+                                    file_index: 0,
+                                    file_total: 1,
+                                    cancelling: false,
+                                });
+                            }
+                            PdfExportStep::Finished(bytes) => {
+                                let name = file_name.clone();
+                                let count = *total_pages;
+                                let byte_len = bytes.len();
+                                if let Some(save_bytes) = self.hooks.save_bytes_dialog.as_mut() {
+                                    save_bytes(FileDialogKind::Pdf, &name, bytes);
+                                }
+                                self.view.pdf_export_progress = None;
+                                self.session.last_export_status =
+                                    Some(format!("Prepared {count}-page PDF ({byte_len} bytes)."));
+                                self.view.export_feedback = None;
+                                if self.view.active_modal == Some(modal::ActiveModal::Export) {
+                                    modal::close(self);
+                                }
+                                return;
+                            }
+                        },
+                        ChunkedPdfExportState::Separate {
+                            doc,
+                            pages,
+                            next_idx,
+                            current_job,
+                            title_stem,
+                        } => {
+                            let total = pages.len().max(1);
+                            let idx = *next_idx;
+                            if idx >= pages.len() {
+                                self.view.pdf_export_progress = None;
+                                self.session.last_export_status = Some(format!(
+                                    "Prepared {} separate {} files in selection order.",
+                                    pages.len(),
+                                    FileDialogKind::Pdf.extension()
+                                ));
+                                self.view.export_feedback = None;
+                                if self.view.active_modal == Some(modal::ActiveModal::Export) {
+                                    modal::close(self);
+                                }
+                                return;
+                            }
+                            let page_idx = pages[idx];
+                            let job = current_job.get_or_insert_with(|| {
+                                PdfExportJob::new(Arc::clone(doc), Some(vec![page_idx]))
+                            });
+                            if let PdfExportStep::Finished(bytes) = job.step_one() {
+                                let file_name = export_modal::numbered_export_filename(
+                                    title_stem,
+                                    idx,
+                                    page_idx,
+                                    FileDialogKind::Pdf.extension(),
+                                );
+                                if let Some(save_bytes) = self.hooks.save_bytes_dialog.as_mut() {
+                                    save_bytes(FileDialogKind::Pdf, &file_name, bytes);
+                                }
+                                *current_job = None;
+                                *next_idx = idx + 1;
+                                if *next_idx >= pages.len() {
+                                    self.view.pdf_export_progress = None;
+                                    self.session.last_export_status = Some(format!(
+                                        "Prepared {} separate {} files in selection order.",
+                                        pages.len(),
+                                        FileDialogKind::Pdf.extension()
+                                    ));
+                                    self.view.export_feedback = None;
+                                    if self.view.active_modal == Some(modal::ActiveModal::Export) {
+                                        modal::close(self);
+                                    }
+                                    return;
+                                }
+                                self.view.pdf_export_progress = Some(PdfExportProgressView {
+                                    pages_done: *next_idx,
+                                    pages_total: total,
+                                    separate_files: true,
+                                    file_index: *next_idx,
+                                    file_total: total,
+                                    cancelling: false,
+                                });
+                                // Yield to the browser after each separate download so Cancel stays responsive.
+                                yield_frame = true;
+                            }
+                        }
+                    }
+
+                    let elapsed_ms =
+                        papercraft_sync_protocol::now_unix_ms().saturating_sub(start_ms);
+                    if yield_frame || steps >= MAX_STEPS_PER_FRAME || elapsed_ms >= FRAME_BUDGET_MS
+                    {
+                        break;
+                    }
+                }
+
+                self.active_pdf_export = Some(ActivePdfExport::Chunked(state));
+                ctx.request_repaint();
+            }
         }
     }
 
@@ -1870,6 +2346,10 @@ impl PaperCraftApp {
                 {
                     self.view.account.clear_pending_delete_profile();
                     self.view.account.clear_pending_forget_server();
+                } else if self.view.active_modal == Some(modal::ActiveModal::Export)
+                    && self.is_pdf_export_active()
+                {
+                    self.cancel_active_pdf_export();
                 } else {
                     modal::close(self);
                 }
@@ -2382,6 +2862,8 @@ impl PaperCraftApp {
         pdf_view::pump_completed_renders(&ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.poll_async_pdf_import(&ctx);
+        self.poll_async_pdf_export(&ctx);
+        self.pdf_export_stepped_in_show_ui = true;
         #[cfg(not(target_arch = "wasm32"))]
         self.pump_updater(&ctx);
         let (events, now_s, raw_dt) = ctx.input(|i| (i.events.clone(), i.time, i.stable_dt));
@@ -2797,6 +3279,7 @@ impl eframe::App for PaperCraftApp {
     }
 
     fn on_exit(&mut self) {
+        self.cancel_active_pdf_export_silently();
         self.session.cancel_live_stroke();
         self.session.cancel_live_eraser();
         self.sync_worker.shutdown();

@@ -1801,18 +1801,21 @@ fn build_pdf_paper_xobject_stream(
     out.into_bytes()
 }
 
-struct PdfImageEntry {
-    xobj_name: String,
-    obj_id: usize,
-    smask_obj_id: Option<usize>,
-    width: u32,
-    height: u32,
-    rgb_bytes: Vec<u8>,
-    alpha_bytes: Option<Vec<u8>>,
-    page_image: PageImage,
+pub(crate) struct PdfImageEntry {
+    pub(crate) xobj_name: String,
+    pub(crate) obj_id: usize,
+    pub(crate) smask_obj_id: Option<usize>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rgb_bytes: Vec<u8>,
+    pub(crate) alpha_bytes: Option<Vec<u8>>,
+    pub(crate) page_image: PageImage,
 }
 
-fn prepare_pdf_page_images(page: &NotebookPage, next_obj_id: &mut usize) -> Vec<PdfImageEntry> {
+pub(crate) fn prepare_pdf_page_images(
+    page: &NotebookPage,
+    next_obj_id: &mut usize,
+) -> Vec<PdfImageEntry> {
     let mut entries = Vec::new();
     for (idx, image) in page.images.iter().enumerate() {
         let clean = image.sanitized();
@@ -1929,13 +1932,6 @@ fn append_pdf_stroke_run(
     }
 }
 
-#[allow(dead_code)]
-fn append_pdf_images(out: &mut String, entries: &[PdfImageEntry]) {
-    for entry in entries {
-        append_pdf_image_entry(out, entry);
-    }
-}
-
 fn emit_pdf_image_objects(pdf: &mut Vec<u8>, offsets: &mut [usize], entries: &[PdfImageEntry]) {
     for entry in entries {
         if let (Some(smask_id), Some(alpha)) = (entry.smask_obj_id, &entry.alpha_bytes) {
@@ -1991,189 +1987,99 @@ fn build_pdf_backdrop_entry(
     }
 }
 
-fn render_grouped_pdf_backdrops(
+fn render_single_pdf_backdrop_fallback(
     doc: &Document,
-    pages: &[NotebookPage],
-    next_obj_id: &mut usize,
-) -> Vec<Option<PdfImageEntry>> {
-    let mut entries: Vec<Option<PdfImageEntry>> =
-        std::iter::repeat_with(|| None).take(pages.len()).collect();
-    if !doc.pdf_documents.is_empty() {
-        struct PdfRenderRequest {
-            doc_page_idx: usize,
-            pdf_page: usize,
-            px_w: u32,
-            px_h: u32,
-            rot: u8,
-        }
-        let mut by_pdf: Vec<Vec<PdfRenderRequest>> =
-            (0..doc.pdf_documents.len()).map(|_| Vec::new()).collect();
-        for (doc_page_idx, page) in pages.iter().enumerate() {
-            if let Some(backdrop) = page.pdf_backdrop
-                && let Some(bucket) = by_pdf.get_mut(backdrop.pdf_index)
-            {
-                let rot = page.backdrop_rotation % 4;
-                let (req_w, req_h) = if rot.is_multiple_of(2) {
-                    (page.width, page.height)
-                } else {
-                    (page.height, page.width)
-                };
-                let (px_w, px_h) = fit_pdf_export_pixels(req_w, req_h, 2400);
-                bucket.push(PdfRenderRequest {
-                    doc_page_idx,
-                    pdf_page: backdrop.page_index,
-                    px_w,
-                    px_h,
-                    rot,
-                });
-            }
-        }
-
-        for (pdf_idx, items) in by_pdf.into_iter().enumerate() {
-            if items.is_empty() {
-                continue;
-            }
-            let Some(pdf_src) = doc.pdf_documents.get(pdf_idx) else {
-                continue;
-            };
-            let requests: Vec<(usize, u32, u32)> =
-                items.iter().map(|r| (r.pdf_page, r.px_w, r.px_h)).collect();
-            let Ok(rendered_pages) =
-                crate::pdf::render_pdf_batch_exact_rgba(Arc::clone(&pdf_src.bytes), &requests)
-            else {
-                continue;
-            };
-            for (req, rendered_opt) in items.into_iter().zip(rendered_pages) {
-                let doc_page_idx = req.doc_page_idx;
-                let rot = req.rot;
-                if let Some(mut rendered) = rendered_opt {
-                    if !rot.is_multiple_of(4) {
-                        let (rot_rgba, rw, rh) = crate::rotate_rgba_quarter_turns(
-                            &rendered.rgba,
-                            rendered.width,
-                            rendered.height,
-                            rot,
-                        );
-                        rendered.rgba = rot_rgba;
-                        rendered.width = rw;
-                        rendered.height = rh;
-                    }
-                    let obj_id = *next_obj_id;
-                    *next_obj_id += 1;
-                    entries[doc_page_idx] = Some(build_pdf_backdrop_entry(
-                        &pages[doc_page_idx],
-                        rendered,
-                        obj_id,
-                    ));
-                }
-            }
-        }
-    }
-
-    for (doc_page_idx, page) in pages.iter().enumerate() {
-        if entries[doc_page_idx].is_some() {
-            continue;
-        }
-        let Some(img_idx) = page.custom_image_backdrop else {
-            continue;
-        };
-        let Some(tpl) = doc.image_templates.get(img_idx) else {
-            continue;
-        };
-        let Ok(decoded) = image::load_from_memory(&tpl.png_bytes) else {
-            continue;
-        };
-        let rgba_img = decoded.to_rgba8();
-        let (w, h) = (rgba_img.width(), rgba_img.height());
-        if w == 0 || h == 0 {
-            continue;
-        }
-        let rot = page.backdrop_rotation % 4;
-        let (raw, out_w, out_h) = if rot == 0 {
-            (rgba_img.into_raw(), w, h)
-        } else {
-            crate::rotate_rgba_quarter_turns(rgba_img.as_raw(), w, h, rot)
-        };
-        let obj_id = *next_obj_id;
-        *next_obj_id += 1;
-        let pixel_count = (out_w as usize).saturating_mul(out_h as usize);
-        let mut rgb_bytes = Vec::with_capacity(pixel_count.saturating_mul(3));
-        let mut alpha_bytes = Vec::with_capacity(pixel_count);
-        let mut has_transparency = false;
-        for px in raw.as_chunks::<4>().0 {
-            rgb_bytes.extend_from_slice(&px[0..3]);
-            alpha_bytes.push(px[3]);
-            if px[3] < 255 {
-                has_transparency = true;
-            }
-        }
-        let smask_obj_id = if has_transparency {
-            let id = *next_obj_id;
-            *next_obj_id += 1;
-            Some(id)
-        } else {
-            None
-        };
-        entries[doc_page_idx] = Some(PdfImageEntry {
-            xobj_name: "Bg0".to_string(),
-            obj_id,
-            smask_obj_id,
-            width: out_w,
-            height: out_h,
-            rgb_bytes,
-            alpha_bytes: has_transparency.then_some(alpha_bytes),
-            page_image: PageImage {
-                x: 0.0,
-                y: 0.0,
-                width: f64::from(page.width.clamp(64, 8192)),
-                height: f64::from(page.height.clamp(64, 8192)),
-                angle_degrees: 0.0,
-                pixel_width: out_w,
-                pixel_height: out_h,
-                png_bytes: Arc::new(Vec::new()),
-                z_order: 0,
-            },
-        });
-    }
-
-    entries
-}
-
-fn prepare_pdf_page_entries(
-    doc: &Document,
-    pages: &[NotebookPage],
-    next_obj_id: &mut usize,
-) -> Vec<Vec<PdfImageEntry>> {
-    let backdrops = render_grouped_pdf_backdrops(doc, pages, next_obj_id);
-    let mut out = Vec::with_capacity(pages.len());
-    for (page, backdrop_opt) in pages.iter().zip(backdrops) {
-        let mut page_entries = Vec::new();
-        if let Some(bg) = backdrop_opt {
-            page_entries.push(bg);
-        }
-        page_entries.extend(prepare_pdf_page_images(page, next_obj_id));
-        out.push(page_entries);
-    }
-    out
-}
-
-fn build_pdf_page_stream(
     page: &NotebookPage,
-    paper_xobj_name: &str,
+    writer: &mut PdfWriterState,
+) -> Option<PdfImageEntry> {
+    let backdrop = page.pdf_backdrop?;
+    let pdf_src = doc.pdf_documents.get(backdrop.pdf_index)?;
+    let rot = page.backdrop_rotation % 4;
+    let (req_w, req_h) = if rot.is_multiple_of(2) {
+        (page.width, page.height)
+    } else {
+        (page.height, page.width)
+    };
+    let (px_w, px_h) = fit_pdf_export_pixels(req_w, req_h, 2400);
+    let mut rendered = crate::pdf::render_pdf_page_exact_rgba(
+        Arc::clone(&pdf_src.bytes),
+        backdrop.page_index,
+        px_w,
+        px_h,
+    )
+    .ok()?;
+    if !rot.is_multiple_of(4) {
+        let (rot_rgba, rw, rh) =
+            crate::rotate_rgba_quarter_turns(&rendered.rgba, rendered.width, rendered.height, rot);
+        rendered.rgba = rot_rgba;
+        rendered.width = rw;
+        rendered.height = rh;
+    }
+    let obj_id = writer.alloc_obj_id();
+    Some(build_pdf_backdrop_entry(page, rendered, obj_id))
+}
+
+fn decode_single_custom_image_backdrop(
+    doc: &Document,
+    page: &NotebookPage,
+    writer: &mut PdfWriterState,
+) -> Option<PdfImageEntry> {
+    let img_idx = page.custom_image_backdrop?;
+    let tpl = doc.image_templates.get(img_idx)?;
+    let decoded = image::load_from_memory(&tpl.png_bytes).ok()?;
+    let rgba_img = decoded.to_rgba8();
+    let (w, h) = (rgba_img.width(), rgba_img.height());
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let rot = page.backdrop_rotation % 4;
+    let (raw, out_w, out_h) = if rot == 0 {
+        (rgba_img.into_raw(), w, h)
+    } else {
+        crate::rotate_rgba_quarter_turns(rgba_img.as_raw(), w, h, rot)
+    };
+    let obj_id = writer.alloc_obj_id();
+    let pixel_count = (out_w as usize).saturating_mul(out_h as usize);
+    let mut rgb_bytes = Vec::with_capacity(pixel_count.saturating_mul(3));
+    let mut alpha_bytes = Vec::with_capacity(pixel_count);
+    let mut has_transparency = false;
+    for px in raw.as_chunks::<4>().0 {
+        rgb_bytes.extend_from_slice(&px[0..3]);
+        alpha_bytes.push(px[3]);
+        if px[3] < 255 {
+            has_transparency = true;
+        }
+    }
+    let smask_obj_id = has_transparency.then(|| writer.alloc_obj_id());
+    Some(PdfImageEntry {
+        xobj_name: "Bg0".to_string(),
+        obj_id,
+        smask_obj_id,
+        width: out_w,
+        height: out_h,
+        rgb_bytes,
+        alpha_bytes: has_transparency.then_some(alpha_bytes),
+        page_image: PageImage {
+            x: 0.0,
+            y: 0.0,
+            width: f64::from(page.width.clamp(64, 8192)),
+            height: f64::from(page.height.clamp(64, 8192)),
+            angle_degrees: 0.0,
+            pixel_width: out_w,
+            pixel_height: out_h,
+            png_bytes: Arc::new(Vec::new()),
+            z_order: 0,
+        },
+    })
+}
+
+pub(crate) fn append_pdf_overlay_body(
+    page: &NotebookPage,
     images: &[PdfImageEntry],
 ) -> (Vec<u8>, Vec<(bool, u8)>) {
     let w = page.width.clamp(64, 8192);
     let h = page.height.clamp(64, 8192);
-    let pt_h = f64::from(h) * 0.5;
-
     let mut out = String::with_capacity(2048);
-    if !images.first().is_some_and(|e| e.xobj_name == "Bg0") {
-        let _ = writeln!(out, "/{paper_xobj_name} Do");
-    }
-    let _ = writeln!(out, "q 0.5 0 0 -0.5 0 {pt_h:.3} cm");
-    if let Some(bg) = images.first().filter(|e| e.xobj_name == "Bg0") {
-        append_pdf_image_entry(&mut out, bg);
-    }
     // Clip all page elements strictly to the printable visual sheet boundary.
     let _ = writeln!(out, "0 0 {w} {h} re W n");
 
@@ -2209,21 +2115,49 @@ fn build_pdf_page_stream(
             }
         }
     }
-    out.push_str("Q\n");
     (out.into_bytes(), states)
 }
 
-fn format_pdf_resources(
-    states: &[(bool, u8)],
+fn build_pdf_page_stream(
+    page: &NotebookPage,
     paper_xobj_name: &str,
-    paper_obj_id: usize,
+    images: &[PdfImageEntry],
+) -> (Vec<u8>, Vec<(bool, u8)>) {
+    let h = page.height.clamp(64, 8192);
+    let pt_h = f64::from(h) * 0.5;
+
+    let mut head = String::with_capacity(256);
+    if !images.first().is_some_and(|e| e.xobj_name == "Bg0") && !paper_xobj_name.is_empty() {
+        let _ = writeln!(head, "/{paper_xobj_name} Do");
+    }
+    let _ = writeln!(head, "q 0.5 0 0 -0.5 0 {pt_h:.3} cm");
+    if let Some(bg) = images.first().filter(|e| e.xobj_name == "Bg0") {
+        append_pdf_image_entry(&mut head, bg);
+    }
+
+    let (overlay, states) = append_pdf_overlay_body(page, images);
+    let mut out = head.into_bytes();
+    out.extend_from_slice(&overlay);
+    out.extend_from_slice(b"Q\n");
+    (out, states)
+}
+
+pub(crate) fn format_pdf_overlay_resources(
+    states: &[(bool, u8)],
+    paper_ref: Option<(&str, usize)>,
     images: &[PdfImageEntry],
 ) -> String {
-    let mut res = format!("<< /XObject << /{paper_xobj_name} {paper_obj_id} 0 R");
-    for entry in images {
-        let _ = write!(res, " /{} {} 0 R", entry.xobj_name, entry.obj_id);
+    let mut res = String::from("<<");
+    if paper_ref.is_some() || !images.is_empty() {
+        res.push_str(" /XObject <<");
+        if let Some((paper_xobj_name, paper_obj_id)) = paper_ref {
+            let _ = write!(res, " /{paper_xobj_name} {paper_obj_id} 0 R");
+        }
+        for entry in images {
+            let _ = write!(res, " /{} {} 0 R", entry.xobj_name, entry.obj_id);
+        }
+        res.push_str(" >>");
     }
-    res.push_str(" >>");
     if !states.is_empty() {
         res.push_str(" /ExtGState <<");
         for (idx, &(is_hi, alpha_q)) in states.iter().enumerate() {
@@ -2253,140 +2187,431 @@ fn append_pdf_stream_object(pdf: &mut Vec<u8>, obj_id: usize, dict_extra: &str, 
 }
 
 #[derive(Clone, Copy, PartialEq)]
-struct PaperTemplateKey {
+pub(crate) struct PaperTemplateKey {
     w: u32,
     h: u32,
     template: PaperTemplate,
     color: PaperColor,
 }
 
-/// Exports every page in `doc` as a self-contained pure-Rust multi-page PDF 1.4 byte vector
-/// with shared paper Form XObjects, smooth Cubic Bezier stroke outlines, and FlateDecode streams.
-pub fn export_notebook_pdf(doc: &Document) -> Vec<u8> {
-    let pages = doc.resolved_pages();
-    export_notebook_pdf_slice(doc, &pages)
+pub(crate) struct PdfWriterCheckpoint {
+    pdf_len: usize,
+    offsets_len: usize,
+    page_ids_len: usize,
+    template_objs_len: usize,
+    shared_q_stream_id: Option<usize>,
+    remapped_log_len: usize,
+    copied_counts: Vec<usize>,
 }
 
-/// Exports only the requested 0-based `page_indices` from `doc` as a multi-page PDF 1.4 byte vector.
-/// Out-of-bounds or duplicate indices are ignored; empty selections fall back to all pages.
-pub fn export_notebook_pdf_pages(doc: &Document, page_indices: &[usize]) -> Vec<u8> {
-    let all_pages = doc.resolved_pages();
-    if page_indices.is_empty() {
-        return export_notebook_pdf_slice(doc, &all_pages);
-    }
-    let mut seen = std::collections::HashSet::new();
-    let mut selected = Vec::with_capacity(page_indices.len().min(all_pages.len()));
-    for &idx in page_indices {
-        if idx < all_pages.len() && seen.insert(idx) {
-            selected.push(all_pages[idx].clone());
-        }
-    }
-    if selected.is_empty() {
-        return export_notebook_pdf_slice(doc, &all_pages);
-    }
-    export_notebook_pdf_slice(doc, &selected)
+pub(crate) struct PdfWriterState {
+    pub(crate) pdf: Vec<u8>,
+    pub(crate) offsets: Vec<usize>,
+    pub(crate) page_obj_ids: Vec<usize>,
+    pub(crate) template_obj_ids: Vec<(PaperTemplateKey, usize)>,
+    pub(crate) shared_q_stream_id: Option<usize>,
+    remapped_objs: std::collections::HashMap<(usize, u32, i32), usize>,
+    remapped_log: Vec<(usize, u32, i32)>,
+    copied_count_per_pdf: Vec<usize>,
 }
 
-fn export_notebook_pdf_slice(doc: &Document, pages: &[NotebookPage]) -> Vec<u8> {
-    let page_count = pages.len();
-
-    let mut template_keys: Vec<PaperTemplateKey> = Vec::new();
-    let mut page_template_idx = Vec::with_capacity(page_count);
-    for page in pages {
-        let key = PaperTemplateKey {
-            w: page.width.clamp(64, 8192),
-            h: page.height.clamp(64, 8192),
-            template: page.paper_template,
-            color: page.paper_color,
-        };
-        let idx = if let Some(pos) = template_keys.iter().position(|k| *k == key) {
-            pos
-        } else {
-            let pos = template_keys.len();
-            template_keys.push(key);
-            pos
-        };
-        page_template_idx.push(idx);
-    }
-
-    let first_template_obj = 3usize;
-    let first_page_obj = first_template_obj + template_keys.len();
-    let mut next_extra_obj = first_page_obj + page_count * 2;
-    let page_images = prepare_pdf_page_entries(doc, pages, &mut next_extra_obj);
-    let total_objs = next_extra_obj - 1;
-    let mut offsets = vec![0usize; total_objs + 1];
-
-    let mut pdf = Vec::with_capacity(page_count * 2048);
-    pdf.extend_from_slice(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n%PaperCraft\n");
-
-    offsets[1] = pdf.len();
-    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-
-    let mut kids = String::new();
-    for i in 0..page_count {
-        let page_obj_id = first_page_obj + i * 2;
-        if i > 0 {
-            kids.push(' ');
+impl PdfWriterState {
+    fn new(version: (u8, u8), expected_pages: usize) -> Self {
+        let mut pdf = Vec::with_capacity(expected_pages.clamp(1, 512).saturating_mul(2048));
+        let _ = writeln!(pdf, "%PDF-{}.{}", version.0, version.1);
+        pdf.extend_from_slice(b"%\xE2\xE3\xCF\xD3\n%PaperCraft\n");
+        Self {
+            pdf,
+            offsets: vec![0usize; 3],
+            page_obj_ids: Vec::with_capacity(expected_pages),
+            template_obj_ids: Vec::new(),
+            shared_q_stream_id: None,
+            remapped_objs: std::collections::HashMap::new(),
+            remapped_log: Vec::new(),
+            copied_count_per_pdf: Vec::new(),
         }
-        let _ = write!(kids, "{page_obj_id} 0 R");
     }
-    offsets[2] = pdf.len();
-    let pages_obj =
-        format!("2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {page_count} >>\nendobj\n");
-    pdf.extend_from_slice(pages_obj.as_bytes());
 
-    for (t_idx, key) in template_keys.iter().enumerate() {
-        let obj_id = first_template_obj + t_idx;
-        offsets[obj_id] = pdf.len();
+    pub(crate) fn checkpoint(&self) -> PdfWriterCheckpoint {
+        PdfWriterCheckpoint {
+            pdf_len: self.pdf.len(),
+            offsets_len: self.offsets.len(),
+            page_ids_len: self.page_obj_ids.len(),
+            template_objs_len: self.template_obj_ids.len(),
+            shared_q_stream_id: self.shared_q_stream_id,
+            remapped_log_len: self.remapped_log.len(),
+            copied_counts: self.copied_count_per_pdf.clone(),
+        }
+    }
+
+    pub(crate) fn rollback(&mut self, cp: PdfWriterCheckpoint) {
+        self.pdf.truncate(cp.pdf_len);
+        self.offsets.truncate(cp.offsets_len);
+        self.page_obj_ids.truncate(cp.page_ids_len);
+        self.template_obj_ids.truncate(cp.template_objs_len);
+        self.shared_q_stream_id = cp.shared_q_stream_id;
+        for key in self.remapped_log.drain(cp.remapped_log_len..) {
+            self.remapped_objs.remove(&key);
+        }
+        self.copied_count_per_pdf = cp.copied_counts;
+    }
+
+    pub(crate) fn alloc_obj_id(&mut self) -> usize {
+        let id = self.offsets.len();
+        self.offsets.push(0);
+        id
+    }
+
+    pub(crate) fn emit_raw_object(&mut self, obj_id: usize, body: &[u8]) {
+        self.offsets[obj_id] = self.pdf.len();
+        let head = format!("{obj_id} 0 obj\n");
+        self.pdf.extend_from_slice(head.as_bytes());
+        self.pdf.extend_from_slice(body);
+        self.pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    pub(crate) fn emit_stream_object(
+        &mut self,
+        obj_id: usize,
+        dict_extra: &str,
+        raw_stream: &[u8],
+    ) {
+        self.offsets[obj_id] = self.pdf.len();
+        append_pdf_stream_object(&mut self.pdf, obj_id, dict_extra, raw_stream);
+    }
+
+    pub(crate) fn emit_image_entries(&mut self, entries: &[PdfImageEntry]) {
+        emit_pdf_image_objects(&mut self.pdf, &mut self.offsets, entries);
+    }
+
+    pub(crate) fn ensure_shared_q_stream(&mut self) -> usize {
+        if let Some(id) = self.shared_q_stream_id {
+            return id;
+        }
+        let id = self.alloc_obj_id();
+        self.emit_stream_object(id, "", b"q\n");
+        self.shared_q_stream_id = Some(id);
+        id
+    }
+
+    pub(crate) fn ensure_pdf_counter_capacity(&mut self, pdf_idx: usize) {
+        if pdf_idx >= self.copied_count_per_pdf.len() {
+            self.copied_count_per_pdf.resize(pdf_idx + 1, 0);
+        }
+    }
+
+    pub(crate) fn lookup_remapped(
+        &self,
+        pdf_idx: usize,
+        id: hayro::hayro_syntax::object::ObjectIdentifier,
+    ) -> Option<&usize> {
+        self.remapped_objs
+            .get(&(pdf_idx, id.obj_number, id.gen_number))
+    }
+
+    pub(crate) fn insert_remapped(
+        &mut self,
+        pdf_idx: usize,
+        id: hayro::hayro_syntax::object::ObjectIdentifier,
+        dest_id: usize,
+    ) {
+        let key = (pdf_idx, id.obj_number, id.gen_number);
+        if self.remapped_objs.insert(key, dest_id).is_none() {
+            self.remapped_log.push(key);
+        }
+    }
+
+    pub(crate) fn increment_copied_count(&mut self, pdf_idx: usize, max_objects: usize) -> bool {
+        self.ensure_pdf_counter_capacity(pdf_idx);
+        let slot = &mut self.copied_count_per_pdf[pdf_idx];
+        if *slot >= max_objects {
+            return false;
+        }
+        *slot += 1;
+        true
+    }
+
+    fn ensure_paper_template_obj(&mut self, key: PaperTemplateKey) -> (usize, String) {
+        if let Some((idx, &(_, obj_id))) = self
+            .template_obj_ids
+            .iter()
+            .enumerate()
+            .find(|(_, (k, _))| *k == key)
+        {
+            return (obj_id, format!("P{idx}"));
+        }
+        let idx = self.template_obj_ids.len();
+        let obj_id = self.alloc_obj_id();
+        self.offsets[obj_id] = self.pdf.len();
         let pt_w = f64::from(key.w) * 0.5;
         let pt_h = f64::from(key.h) * 0.5;
         let stream = build_pdf_paper_xobject_stream(key.w, key.h, key.template, key.color);
         let extra = format!(
             "/Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 {pt_w:.2} {pt_h:.2}] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >> >> >> "
         );
-        append_pdf_stream_object(&mut pdf, obj_id, &extra, &stream);
+        append_pdf_stream_object(&mut self.pdf, obj_id, &extra, &stream);
+        self.template_obj_ids.push((key, obj_id));
+        (obj_id, format!("P{idx}"))
     }
 
-    for (i, page) in pages.iter().enumerate() {
-        let page_obj_id = first_page_obj + i * 2;
-        let content_obj_id = page_obj_id + 1;
-        let t_idx = page_template_idx[i];
-        let paper_obj_id = first_template_obj + t_idx;
-        let paper_name = format!("P{t_idx}");
+    fn finish(mut self) -> Vec<u8> {
+        self.offsets[1] = self.pdf.len();
+        self.pdf
+            .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
 
-        let (stream, states) = build_pdf_page_stream(page, &paper_name, &page_images[i]);
-        let resources = format_pdf_resources(&states, &paper_name, paper_obj_id, &page_images[i]);
+        let mut kids = String::new();
+        for (i, &page_obj_id) in self.page_obj_ids.iter().enumerate() {
+            if i > 0 {
+                kids.push(' ');
+            }
+            let _ = write!(kids, "{page_obj_id} 0 R");
+        }
+        self.offsets[2] = self.pdf.len();
+        let pages_obj = format!(
+            "2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {} >>\nendobj\n",
+            self.page_obj_ids.len()
+        );
+        self.pdf.extend_from_slice(pages_obj.as_bytes());
+
+        let total_objs = self.offsets.len().saturating_sub(1);
+        let xref_offset = self.pdf.len();
+        let xref_head = format!("xref\n0 {}\n0000000000 65535 f \n", total_objs + 1);
+        self.pdf.extend_from_slice(xref_head.as_bytes());
+        for &off in self.offsets.iter().skip(1) {
+            let entry = format!("{off:010} 00000 n \n");
+            self.pdf.extend_from_slice(entry.as_bytes());
+        }
+        let trailer = format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            total_objs + 1
+        );
+        self.pdf.extend_from_slice(trailer.as_bytes());
+        self.pdf
+    }
+}
+
+/// Progress update yielded while running an incremental [`PdfExportSession`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PdfExportStep {
+    InProgress { done: usize, total: usize },
+    Finished(Vec<u8>),
+}
+
+/// Incremental, memory-bounded multi-page PDF exporter supporting pass-through vector PDFs
+/// and page-by-page streaming emission.
+pub struct PdfExportSession {
+    doc: Arc<Document>,
+    selected_pages: Vec<usize>,
+    next_page: usize,
+    parsed_pdfs: Vec<Option<Option<hayro::hayro_syntax::Pdf>>>,
+    writer: Option<PdfWriterState>,
+    finished_bytes: Option<Vec<u8>>,
+}
+
+impl PdfExportSession {
+    /// Starts an incremental PDF export session over all pages (`None`) or unique ordered `page_indices`.
+    #[must_use]
+    pub fn new(doc: Arc<Document>, page_indices: Option<Vec<usize>>) -> Self {
+        let total_doc_pages = doc.page_count().max(1);
+        let mut selected = Vec::new();
+        if let Some(raw) = page_indices {
+            let mut seen = std::collections::HashSet::with_capacity(raw.len().min(total_doc_pages));
+            for idx in raw {
+                if idx < total_doc_pages && seen.insert(idx) {
+                    selected.push(idx);
+                }
+            }
+        }
+        if selected.is_empty() {
+            selected = (0..total_doc_pages).collect();
+        }
+
+        let mut max_ver = (1u8, 4u8);
+        for pdf_src in &doc.pdf_documents {
+            let ver = crate::pdf_passthrough::detect_pdf_header_version(&pdf_src.bytes);
+            if ver > max_ver {
+                max_ver = ver;
+            }
+        }
+        max_ver = max_ver.min((2, 0));
+
+        let parsed_pdfs = std::iter::repeat_with(|| None)
+            .take(doc.pdf_documents.len())
+            .collect();
+        let writer = PdfWriterState::new(max_ver, selected.len());
+        Self {
+            doc,
+            selected_pages: selected,
+            next_page: 0,
+            parsed_pdfs,
+            writer: Some(writer),
+            finished_bytes: None,
+        }
+    }
+
+    #[must_use]
+    pub fn total_pages(&self) -> usize {
+        self.selected_pages.len()
+    }
+
+    #[must_use]
+    pub fn done_pages(&self) -> usize {
+        self.next_page.min(self.selected_pages.len())
+    }
+
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.finished_bytes.is_some()
+    }
+
+    /// Processes up to `max_pages.max(1)` pages and returns either progress or the completed PDF.
+    pub fn step_batch(&mut self, max_pages: usize) -> PdfExportStep {
+        if let Some(ref bytes) = self.finished_bytes {
+            return PdfExportStep::Finished(bytes.clone());
+        }
+        let budget = max_pages.max(1);
+        for _ in 0..budget {
+            match self.step_one() {
+                step @ PdfExportStep::Finished(_) => return step,
+                PdfExportStep::InProgress { .. } => {}
+            }
+        }
+        PdfExportStep::InProgress {
+            done: self.done_pages(),
+            total: self.total_pages(),
+        }
+    }
+
+    /// Processes the next selected page (or finalizes xref/trailer when all pages are done).
+    pub fn step_one(&mut self) -> PdfExportStep {
+        if let Some(ref bytes) = self.finished_bytes {
+            return PdfExportStep::Finished(bytes.clone());
+        }
+        let total = self.selected_pages.len();
+        if self.next_page < total {
+            let page_idx = self.selected_pages[self.next_page];
+            let doc_ref = Arc::clone(&self.doc);
+            let _ = doc_ref.with_resolved_page(page_idx, |page| {
+                self.emit_single_resolved_page(&doc_ref, page);
+            });
+            self.next_page += 1;
+        }
+        if self.next_page >= total {
+            let bytes = if let Some(writer) = self.writer.take() {
+                writer.finish()
+            } else {
+                Vec::new()
+            };
+            self.finished_bytes = Some(bytes.clone());
+            return PdfExportStep::Finished(bytes);
+        }
+        PdfExportStep::InProgress {
+            done: self.next_page,
+            total,
+        }
+    }
+
+    fn emit_single_resolved_page(&mut self, doc: &Document, page: &NotebookPage) {
+        let Some(writer) = self.writer.as_mut() else {
+            return;
+        };
+        if let Some(backdrop) = page.pdf_backdrop
+            && let Some(slot) = self.parsed_pdfs.get_mut(backdrop.pdf_index)
+        {
+            let parsed_opt = slot.get_or_insert_with(|| {
+                doc.pdf_documents
+                    .get(backdrop.pdf_index)
+                    .filter(|src| papercraft_doc::looks_like_pdf_bytes(&src.bytes))
+                    .and_then(|src| hayro::hayro_syntax::Pdf::new(Arc::clone(&src.bytes)).ok())
+            });
+            if let Some(parsed_pdf) = parsed_opt.as_ref()
+                && crate::pdf_passthrough::try_emit_pdf_backdrop_page(
+                    writer, parsed_pdf, page, backdrop, doc,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+
+        // Streaming 1-page fallback for custom image backdrops, native pages, or malformed PDFs.
+        let backdrop_entry = if page.pdf_backdrop.is_some() {
+            render_single_pdf_backdrop_fallback(doc, page, writer)
+        } else {
+            decode_single_custom_image_backdrop(doc, page, writer)
+        };
+        let has_backdrop = backdrop_entry.is_some();
+
+        let mut page_images = Vec::new();
+        if let Some(bg) = backdrop_entry {
+            page_images.push(bg);
+        }
+        let mut dummy_next = 0usize;
+        let mut content_images = prepare_pdf_page_images(page, &mut dummy_next);
+        for entry in &mut content_images {
+            entry.obj_id = writer.alloc_obj_id();
+            entry.smask_obj_id = entry.alpha_bytes.as_ref().map(|_| writer.alloc_obj_id());
+        }
+        page_images.extend(content_images);
+
+        let paper_ref = if has_backdrop {
+            None
+        } else {
+            let key = PaperTemplateKey {
+                w: page.width.clamp(64, 8192),
+                h: page.height.clamp(64, 8192),
+                template: page.paper_template,
+                color: page.paper_color,
+            };
+            let (paper_obj_id, paper_name) = writer.ensure_paper_template_obj(key);
+            Some((paper_name, paper_obj_id))
+        };
+
+        let paper_name_str = paper_ref.as_ref().map_or("", |(n, _)| n.as_str());
+        let (stream, states) = build_pdf_page_stream(page, paper_name_str, &page_images);
+        let paper_ref_borrowed = paper_ref.as_ref().map(|(n, id)| (n.as_str(), *id));
+        let resources = format_pdf_overlay_resources(&states, paper_ref_borrowed, &page_images);
+
+        let page_obj_id = writer.alloc_obj_id();
+        let content_obj_id = writer.alloc_obj_id();
         let pt_w = f64::from(page.width.clamp(64, 8192)) * 0.5;
         let pt_h = f64::from(page.height.clamp(64, 8192)) * 0.5;
 
-        offsets[page_obj_id] = pdf.len();
         let page_dict = format!(
-            "{page_obj_id} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {pt_w:.2} {pt_h:.2}] /Resources {resources} /Contents {content_obj_id} 0 R >>\nendobj\n"
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {pt_w:.2} {pt_h:.2}] /Resources {resources} /Contents {content_obj_id} 0 R >>"
         );
-        pdf.extend_from_slice(page_dict.as_bytes());
-
-        offsets[content_obj_id] = pdf.len();
-        append_pdf_stream_object(&mut pdf, content_obj_id, "", &stream);
+        writer.emit_raw_object(page_obj_id, page_dict.as_bytes());
+        writer.emit_stream_object(content_obj_id, "", &stream);
+        writer.emit_image_entries(&page_images);
+        writer.page_obj_ids.push(page_obj_id);
+        drop(page_images);
     }
+}
 
-    for entries in &page_images {
-        emit_pdf_image_objects(&mut pdf, &mut offsets, entries);
+/// Exports every page in `doc` as a self-contained pure-Rust multi-page PDF byte vector,
+/// preserving vector PDF backdrops via pass-through and emitting strokes cleanly.
+pub fn export_notebook_pdf(doc: &Document) -> Vec<u8> {
+    let mut snapshot = doc.clone();
+    snapshot.sync_active_to_pages();
+    run_export_session_to_end(PdfExportSession::new(Arc::new(snapshot), None))
+}
+
+/// Exports only the requested 0-based `page_indices` from `doc` as a multi-page PDF byte vector.
+/// Out-of-bounds or duplicate indices are ignored; empty selections fall back to all pages.
+pub fn export_notebook_pdf_pages(doc: &Document, page_indices: &[usize]) -> Vec<u8> {
+    let mut snapshot = doc.clone();
+    snapshot.sync_active_to_pages();
+    let indices = (!page_indices.is_empty()).then(|| page_indices.to_vec());
+    run_export_session_to_end(PdfExportSession::new(Arc::new(snapshot), indices))
+}
+
+fn run_export_session_to_end(mut session: PdfExportSession) -> Vec<u8> {
+    loop {
+        match session.step_batch(16) {
+            PdfExportStep::InProgress { .. } => {}
+            PdfExportStep::Finished(bytes) => return bytes,
+        }
     }
-
-    let xref_offset = pdf.len();
-    let xref_head = format!("xref\n0 {}\n0000000000 65535 f \n", total_objs + 1);
-    pdf.extend_from_slice(xref_head.as_bytes());
-    for &off in offsets.iter().skip(1) {
-        let entry = format!("{off:010} 00000 n \n");
-        pdf.extend_from_slice(entry.as_bytes());
-    }
-    let trailer = format!(
-        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
-        total_objs + 1
-    );
-    pdf.extend_from_slice(trailer.as_bytes());
-
-    pdf
 }
 
 #[cfg(test)]
@@ -2659,8 +2884,22 @@ mod tests {
 
         let exported_pdf = export_notebook_pdf(&doc);
         let text = String::from_utf8_lossy(&exported_pdf);
-        assert!(text.contains("/Bg0"));
-        assert!(text.contains("/Type /XObject /Subtype /Image"));
+        assert!(
+            !text.contains("/Subtype /Image"),
+            "vector PDF backdrop should pass through without rasterizing to an image XObject"
+        );
+        let exported_arc = Arc::new(exported_pdf);
+        let parsed = hayro::hayro_syntax::Pdf::new(Arc::clone(&exported_arc))
+            .expect("exported vector PDF should parse cleanly");
+        assert_eq!(parsed.pages().len(), 2);
+        let rendered = crate::pdf::render_pdf_page_rgba(exported_arc, 0, 100, 100)
+            .expect("exported page 0 should render");
+        let idx = ((50 * rendered.width + 50) * 4) as usize;
+        assert!(
+            rendered.rgba[idx + 1] > 200 && rendered.rgba[idx] < 40 && rendered.rgba[idx + 2] < 40,
+            "expected green vector backdrop at center, got {:?}",
+            &rendered.rgba[idx..idx + 4]
+        );
     }
 
     #[test]
@@ -3023,5 +3262,274 @@ mod tests {
             pdf_hl < pdf_shape && pdf_shape < pdf_blue,
             "expected HL < Shape < Ink in PDF: hl={pdf_hl}, shape={pdf_shape}, ink={pdf_blue}"
         );
+    }
+
+    fn build_synthetic_pdf_from_objects(objects: &[&[u8]]) -> Vec<u8> {
+        let mut raw = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len() + 1);
+        offsets.push(0usize);
+        for obj in objects {
+            offsets.push(raw.len());
+            raw.extend_from_slice(obj);
+        }
+        let xref = raw.len();
+        let total = objects.len() + 1;
+        raw.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for &off in &offsets[1..] {
+            raw.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        raw.extend_from_slice(
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                .as_bytes(),
+        );
+        raw
+    }
+
+    fn stamp_top_left_red_annotation(doc: &mut Document, page_idx: usize) {
+        use papercraft_color::Color;
+        use papercraft_doc::{GeometricShape, PenKind, PenSettings, ShapeKind, StrokeSample};
+
+        doc.select_page(page_idx);
+        doc.shapes.push(Arc::new(GeometricShape {
+            kind: ShapeKind::Rectangle,
+            x1: 12.0,
+            y1: 12.0,
+            x2: 112.0,
+            y2: 112.0,
+            color: Color::from_rgba8(230, 20, 20, 255),
+            fill_color: Some(Color::from_rgba8(230, 20, 20, 255)),
+            width: 2.0,
+            ..GeometricShape::default()
+        }));
+        let hl_id = doc.alloc_stroke_id();
+        let hl_pts = vec![
+            StrokeSample::from_xy_pressure(12.0, 60.0, 0.9),
+            StrokeSample::from_xy_pressure(112.0, 60.0, 0.9),
+        ];
+        doc.strokes.push(Arc::new(InkStroke::new(
+            hl_id,
+            PenSettings {
+                kind: PenKind::Highlighter,
+                color: Color::from_rgba8(255, 230, 0, 140),
+                ..PenSettings::fountain_pen()
+            },
+            hl_pts.clone(),
+            hl_pts,
+        )));
+        doc.sync_active_to_pages();
+    }
+
+    #[test]
+    fn pdf_passthrough_aligns_annotations_with_nonzero_cropbox_and_rotations() {
+        // Non-zero CropBox [40 60 240 360] (200x300 pt) inside MediaBox [0 0 300 420],
+        // across all 4 PDF /Rotate orientations (0, 90, 180, 270).
+        let objects: Vec<Vec<u8>> = vec![
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] /Count 4 >>\nendobj\n"
+                .to_vec(),
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 420] /CropBox [40 60 240 360] /Rotate 0 /Contents 7 0 R /Resources << >> >>\nendobj\n"
+                .to_vec(),
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 420] /CropBox [40 60 240 360] /Rotate 90 /Contents 7 0 R /Resources << >> >>\nendobj\n"
+                .to_vec(),
+            b"5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 420] /CropBox [40 60 240 360] /Rotate 180 /Contents 7 0 R /Resources << >> >>\nendobj\n"
+                .to_vec(),
+            b"6 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 420] /CropBox [40 60 240 360] /Rotate 270 /Contents 7 0 R /Resources << >> >>\nendobj\n"
+                .to_vec(),
+            b"7 0 obj\n<< /Length 28 >>\nstream\n1 1 1 rg 0 0 300 420 re f\nendstream\nendobj\n"
+                .to_vec(),
+        ];
+        let obj_slices: Vec<&[u8]> = objects.iter().map(Vec::as_slice).collect();
+        let raw_pdf = build_synthetic_pdf_from_objects(&obj_slices);
+
+        let pdf_arc = Arc::new(raw_pdf);
+        let summary = crate::pdf::inspect_pdf(Arc::clone(&pdf_arc), 10).unwrap();
+        assert_eq!(summary.pages.len(), 4);
+
+        let mut doc = Document::new(summary.pages[0].page_width, summary.pages[0].page_height);
+        doc.pdf_documents.push(papercraft_doc::EmbeddedPdf {
+            name: "crop_rot.pdf".to_string(),
+            bytes: pdf_arc,
+        });
+        doc.pdf_backdrop = Some(papercraft_doc::PdfPageBackdrop {
+            pdf_index: 0,
+            page_index: 0,
+        });
+        doc.sync_active_to_pages();
+        for (idx, metrics) in summary.pages.iter().enumerate().skip(1) {
+            doc.add_page(None, None);
+            let p = &mut doc.pages[idx];
+            p.width = metrics.page_width;
+            p.height = metrics.page_height;
+            p.pdf_backdrop = Some(papercraft_doc::PdfPageBackdrop {
+                pdf_index: 0,
+                page_index: idx,
+            });
+        }
+
+        // Also combine PaperCraft `backdrop_rotation` on pages 1..4 by rotating after creation.
+        for rot_idx in 1..4 {
+            assert!(doc.rotate_page_quarter_turns(rot_idx, rot_idx as i32));
+        }
+
+        for page_idx in 0..4 {
+            stamp_top_left_red_annotation(&mut doc, page_idx);
+        }
+
+        let exported = Arc::new(export_notebook_pdf(&doc));
+        let pdf_text = String::from_utf8_lossy(&exported);
+        assert!(
+            !pdf_text.contains("/Subtype /Image"),
+            "annotated pass-through PDF must not rasterize base PDF"
+        );
+        let parsed = hayro::hayro_syntax::Pdf::new(Arc::clone(&exported))
+            .expect("exported CropBox+Rotate PDF should parse cleanly");
+        assert_eq!(parsed.pages().len(), 4);
+
+        for page_idx in 0..4 {
+            let rendered =
+                crate::pdf::render_pdf_page_rgba(Arc::clone(&exported), page_idx, 400, 400)
+                    .expect("exported rotated CropBox page should render");
+            let rw = rendered.width;
+            let rh = rendered.height;
+            // Top-left quadrant center inside the [12..112] rectangle must be predominantly red.
+            let sample_x = (rw / 12).clamp(2, rw - 1);
+            let sample_y = (rh / 12).clamp(2, rh - 1);
+            let tl_idx = ((sample_y * rw + sample_x) * 4) as usize;
+            let br_x = (rw * 3 / 4).min(rw - 1);
+            let br_y = (rh * 3 / 4).min(rh - 1);
+            let br_idx = ((br_y * rw + br_x) * 4) as usize;
+            assert!(
+                rendered.rgba[tl_idx] > 180
+                    && rendered.rgba[tl_idx + 1] < 80
+                    && rendered.rgba[tl_idx + 2] < 80,
+                "page {page_idx} top-left annotation misaligned: {:?}",
+                &rendered.rgba[tl_idx..tl_idx + 4]
+            );
+            assert!(
+                rendered.rgba[br_idx] > 230
+                    && rendered.rgba[br_idx + 1] > 230
+                    && rendered.rgba[br_idx + 2] > 230,
+                "page {page_idx} bottom-right should stay clean paper: {:?}",
+                &rendered.rgba[br_idx..br_idx + 4]
+            );
+        }
+    }
+
+    #[test]
+    fn pdf_passthrough_handles_contents_array_deduplicates_and_strips_annots() {
+        // Object graph:
+        // 1 Catalog, 2 Pages, 3 Page0 (indirect /Contents array + /Annots + /Group + shared Form /Fm0),
+        // 4 Page1 (shares /Fm0 + extra exclusive marker if page 1 omitted),
+        // 5 Indirect Contents array [6 0 R 7 0 R], 6 StreamA, 7 StreamB, 8 Shared Form XObject,
+        // 9 Exclusive Page1 stream with unique token `UNIQUE_PAGE_ONE_STREAM`.
+        let objects: Vec<&[u8]> = vec![
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [10 0 R] /Contents 5 0 R /Resources << /XObject << /Fm0 8 0 R >> >> >>\nendobj\n",
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 9 0 R /Resources << /XObject << /Fm0 8 0 R >> >> >>\nendobj\n",
+            b"5 0 obj\n[6 0 R 7 0 R]\nendobj\n",
+            b"6 0 obj\n<< /Length 28 >>\nstream\n0 0 1 rg 0 0 200 200 re f\nendstream\nendobj\n",
+            b"7 0 obj\n<< /Length 28 >>\nstream\n0 1 0 rg 50 50 100 100 re f\nendstream\nendobj\n",
+            b"8 0 obj\n<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 10 10] /Length 13 >>\nstream\n1 0 0 rg 0 0 10 10 re f\nendstream\nendobj\n",
+            b"9 0 obj\n<< /Length 49 >>\nstream\n% UNIQUE_PAGE_ONE_STREAM\n1 1 0 rg 0 0 50 50 re f\nendstream\nendobj\n",
+            b"10 0 obj\n<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest [4 0 R /Fit] >>\nendobj\n",
+        ];
+        let raw_pdf = build_synthetic_pdf_from_objects(&objects);
+
+        let mut doc = Document::new(400, 400);
+        doc.pdf_documents.push(papercraft_doc::EmbeddedPdf {
+            name: "multi.pdf".to_string(),
+            bytes: Arc::new(raw_pdf),
+        });
+        doc.pdf_backdrop = Some(papercraft_doc::PdfPageBackdrop {
+            pdf_index: 0,
+            page_index: 0,
+        });
+        doc.sync_active_to_pages();
+        doc.add_page(None, None);
+        doc.pages[1].pdf_backdrop = Some(papercraft_doc::PdfPageBackdrop {
+            pdf_index: 0,
+            page_index: 1,
+        });
+        stamp_top_left_red_annotation(&mut doc, 0);
+
+        // 1. Export only page 0 -> strips `/Annots`, skips page 1's stream, parses and renders cleanly.
+        let subset = Arc::new(export_notebook_pdf_pages(&doc, &[0]));
+        let subset_text = String::from_utf8_lossy(&subset);
+        assert!(!subset_text.contains("/Annots"));
+        assert!(!subset_text.contains("/Encrypt"));
+        assert!(!subset_text.contains("UNIQUE_PAGE_ONE_STREAM"));
+        assert!(!subset_text.contains("/Subtype /Image"));
+        let parsed_subset = hayro::hayro_syntax::Pdf::new(Arc::clone(&subset))
+            .expect("subset PDF with indirect /Contents array should parse");
+        assert_eq!(parsed_subset.pages().len(), 1);
+        let rendered = crate::pdf::render_pdf_page_rgba(subset, 0, 200, 200).unwrap();
+        let center_idx = ((100 * rendered.width + 100) * 4) as usize;
+        assert!(
+            rendered.rgba[center_idx + 1] > 180,
+            "second stream of indirect /Contents array should paint green center"
+        );
+
+        // 2. Export both pages -> shared Form XObject (`8 0 obj`) should be copied once (1 `/Subtype /Form` excluding PCOv overlap check).
+        let both = export_notebook_pdf(&doc);
+        let both_text = String::from_utf8_lossy(&both);
+        assert!(!both_text.contains("/Annots"));
+        assert_eq!(
+            both_text.matches("/BBox [0 0 10 10]").count(),
+            1,
+            "shared XObject resource must be deduplicated across pages"
+        );
+    }
+
+    #[test]
+    fn pdf_export_session_incremental_handles_mixed_pages_and_corrupt_fallback() {
+        let valid_pdf = build_synthetic_pdf_from_objects(&[
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources << >> >>\nendobj\n",
+            b"4 0 obj\n<< /Length 28 >>\nstream\n0 1 0 rg 0 0 200 200 re f\nendstream\nendobj\n",
+        ]);
+
+        let mut doc = Document::new(400, 400);
+        doc.pdf_documents.push(papercraft_doc::EmbeddedPdf {
+            name: "valid.pdf".to_string(),
+            bytes: Arc::new(valid_pdf),
+        });
+        doc.pdf_documents.push(papercraft_doc::EmbeddedPdf {
+            name: "corrupt.pdf".to_string(),
+            bytes: Arc::new(b"%PDF-1.4\ncorrupted-xref-fallback".to_vec()),
+        });
+        doc.pdf_backdrop = Some(papercraft_doc::PdfPageBackdrop {
+            pdf_index: 0,
+            page_index: 0,
+        });
+        doc.sync_active_to_pages();
+        // Page 1: corrupted PDF backdrop (must transparently fall back without panic/failure)
+        doc.add_page(None, None);
+        doc.pages[1].pdf_backdrop = Some(papercraft_doc::PdfPageBackdrop {
+            pdf_index: 1,
+            page_index: 0,
+        });
+        // Page 2: native paper page
+        doc.add_page(Some(PaperTemplate::Grid), None);
+
+        let mut snap = doc.clone();
+        snap.sync_active_to_pages();
+        let mut session = PdfExportSession::new(Arc::new(snap), None);
+        assert_eq!(session.total_pages(), 3);
+        assert!(!session.is_finished());
+
+        let step1 = session.step_one();
+        assert_eq!(step1, PdfExportStep::InProgress { done: 1, total: 3 });
+        let step2 = session.step_one();
+        assert_eq!(step2, PdfExportStep::InProgress { done: 2, total: 3 });
+        let step3 = session.step_one();
+        let PdfExportStep::Finished(bytes) = step3 else {
+            panic!("expected Finished on 3rd page step");
+        };
+        assert!(session.is_finished());
+        let parsed = hayro::hayro_syntax::Pdf::new(Arc::new(bytes))
+            .expect("mixed incremental export must parse cleanly");
+        assert_eq!(parsed.pages().len(), 3);
     }
 }

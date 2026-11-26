@@ -12,8 +12,12 @@
 
 pub mod export;
 pub mod pdf;
+mod pdf_passthrough;
 
-pub use export::{export_notebook_pdf, export_notebook_pdf_pages, render_document_svg};
+pub use export::{
+    PdfExportSession, PdfExportStep, export_notebook_pdf, export_notebook_pdf_pages,
+    render_document_svg,
+};
 pub use pdf::{
     PdfDocumentSummary, PdfError, PdfPageMetrics, PdfPageRenderer, RenderedPdfPage, inspect_pdf,
     pdf_pt_to_page_size, render_pdf_batch_exact_rgba, render_pdf_page_exact_rgba,

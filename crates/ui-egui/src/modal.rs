@@ -97,7 +97,7 @@ impl ActiveModal {
                 icon: Icon::Export,
                 title: "Export Notebook",
                 subtitle: "Choose a file format to save a copy.",
-                width: 420.0,
+                width: 460.0,
                 min_body_height: 0.0,
             },
             Self::NewNotebook => DialogSpec {
@@ -275,7 +275,19 @@ pub(crate) fn open(app: &mut PaperCraftApp, target: ActiveModal) {
             {
                 app.view.export_target_pages = Some(app.view.selected_page_indices.clone());
             }
+            app.view.export_page_scope = if app
+                .view
+                .export_target_pages
+                .as_ref()
+                .is_some_and(|v| !v.is_empty())
+            {
+                crate::ExportPageScope::SidebarSelection
+            } else {
+                crate::ExportPageScope::AllPages
+            };
+            app.view.export_page_range_draft.clear();
             app.view.export_feedback = None;
+            app.view.pdf_export_progress = None;
         }
         ActiveModal::NewNotebook => {
             app.view.new_notebook_step = 0;
@@ -427,7 +439,10 @@ pub(crate) fn close(app: &mut PaperCraftApp) {
     app.view.tag_edit_draft.clear();
     app.view.tag_edit_focus_pending = false;
     app.view.template_import_error = None;
+    app.cancel_active_pdf_export_silently();
     app.view.export_target_pages = None;
+    app.view.export_page_scope = crate::ExportPageScope::AllPages;
+    app.view.export_page_range_draft.clear();
     app.view.export_feedback = None;
 }
 
@@ -819,7 +834,8 @@ fn show_dialog(
         active,
         ActiveModal::FirstAccessNickname | ActiveModal::SelectLocalAccount
     ) && !(active == ActiveModal::ConvertLocalAccount
-        && app.view.account.convert_busy);
+        && app.view.account.convert_busy)
+        && !(active == ActiveModal::Export && app.is_pdf_export_active());
 
     let modal_resp = egui::Area::new(modal_id)
         .order(egui::Order::Foreground)
