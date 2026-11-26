@@ -942,15 +942,6 @@ fn clear_ruler_drag(app: &mut PaperCraftApp) {
     app.view.ruler_drag_anchor = None;
 }
 
-fn standard_ruler_dimensions(app: &PaperCraftApp) -> (f64, f64) {
-    let page_w = f64::from(app.session.doc.width).max(64.0);
-    let page_h = f64::from(app.session.doc.height).max(64.0);
-    let length = (page_w * 0.72).clamp(64.0, page_w);
-    let page_cap = (page_w.min(page_h) * 0.25).max(8.0);
-    let depth = crate::canvas::RULER_DEPTH.min(page_cap).max(8.0);
-    (length, depth)
-}
-
 fn toggle_ruler_tool(app: &mut PaperCraftApp) {
     let activating = !app.view.ruler_active;
     if activating {
@@ -960,11 +951,9 @@ fn toggle_ruler_tool(app: &mut PaperCraftApp) {
             0.0
         };
         let center = app.camera_center_page_point();
-        let (length, depth) = standard_ruler_dimensions(app);
         app.view.ruler_center = [center.x, center.y];
         app.view.ruler_angle = angle;
-        app.view.ruler_length = length;
-        app.view.ruler_depth = depth;
+        crate::canvas::sync_ruler_dimensions_for_camera(app);
         app.view.ruler_initialized = true;
     }
     app.view.ruler_active = activating;
@@ -4199,6 +4188,7 @@ fn push_ruler_angle_control(app: &PaperCraftApp, flow: &mut DockFlow<'_>) {
         );
         if response.changed() && angle_degrees.is_finite() {
             app.view.ruler_angle = angle_degrees.to_radians();
+            crate::canvas::sync_ruler_dimensions_for_camera(app);
             let center = crate::canvas::clamp_ruler_center(
                 app,
                 Point::new(app.view.ruler_center[0], app.view.ruler_center[1]),
@@ -8103,7 +8093,7 @@ mod tests {
     }
 
     #[test]
-    fn activating_ruler_centers_at_active_camera_and_keeps_standard_size_regardless_of_zoom() {
+    fn activating_ruler_centers_and_scales_proportionally_to_active_camera_zoom() {
         let mut app = PaperCraftApp::default();
         crate::open_notebook_in_editor(&mut app, 0);
         app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
@@ -8115,10 +8105,6 @@ mod tests {
             time += 0.08;
             let _ = step_editor_frame(&ctx, &mut app, viewport, time, 0.08, Vec::new());
         }
-
-        let expected_length = (f64::from(app.session.doc.width) * 0.72)
-            .clamp(64.0, f64::from(app.session.doc.width).max(64.0));
-        let expected_depth = crate::canvas::RULER_DEPTH;
 
         // 1. Zoom in and pan to the upper-left quadrant, well away from page center.
         app.view.fit_requested = false;
@@ -8143,15 +8129,16 @@ mod tests {
                 && (app.view.ruler_center[1] - page_cy).abs() > 100.0,
             "ruler should spawn at active camera center, not page center"
         );
+        let len_at_1_8 = app.view.ruler_length;
+        let screen_len_1 = len_at_1_8 * 1.8;
+        let screen_depth_1 = app.view.ruler_depth * 1.8;
         assert!(
-            (app.view.ruler_length - expected_length).abs() < 1e-6,
-            "ruler length must stay standard ({expected_length}) at zoom 1.8, got {}",
-            app.view.ruler_length
+            screen_len_1 <= f64::from(canvas_rect.width()) * 0.70 && screen_len_1 >= 180.0,
+            "expected zoomed ruler screen length to fit proportionally in viewport, got {screen_len_1}"
         );
         assert!(
-            (app.view.ruler_depth - expected_depth).abs() < 1e-6,
-            "ruler depth must stay standard ({expected_depth}) at zoom 1.8, got {}",
-            app.view.ruler_depth
+            (26.0..=61.0).contains(&screen_depth_1),
+            "expected zoomed ruler screen depth in ergonomic bounds, got {screen_depth_1}"
         );
 
         // 2. Deactivate, rotate ruler preference, pan/zoom to bottom-right quadrant, and re-activate.
@@ -8175,17 +8162,23 @@ mod tests {
             "subsequent activation should keep the user's ruler angle"
         );
         assert!(
-            (app.view.ruler_length - expected_length).abs() < 1e-6,
-            "vertical ruler length must stay standard ({expected_length}) at zoom 3.5, got {}",
+            app.view.ruler_length < len_at_1_8,
+            "expected ruler length in page units to scale down at zoom 3.5 (< {len_at_1_8}), got {}",
             app.view.ruler_length
         );
+        let screen_span_y = app.view.ruler_length * 3.5;
+        let screen_depth_2 = app.view.ruler_depth * 3.5;
         assert!(
-            (app.view.ruler_depth - expected_depth).abs() < 1e-6,
-            "vertical ruler depth must stay standard ({expected_depth}) at zoom 3.5, got {}",
-            app.view.ruler_depth
+            screen_span_y <= f64::from(canvas_rect.height()) * 0.70 && screen_span_y >= 180.0,
+            "vertical zoomed ruler screen span {screen_span_y} must fit canvas height {}",
+            canvas_rect.height()
+        );
+        assert!(
+            (26.0..=61.0).contains(&screen_depth_2),
+            "vertical ruler screen depth must stay ergonomic at zoom 3.5, got {screen_depth_2}"
         );
 
-        // 3. Active camera_glide uses the glide's target camera center & keeps standard size.
+        // 3. Active camera_glide uses the glide's target camera center & target zoom for sizing.
         toggle_ruler_tool(&mut app);
         let glide_target = papercraft_geom::Point::new(140.0, 180.0);
         let glide_zoom = 2.5_f32;
@@ -8205,8 +8198,13 @@ mod tests {
         toggle_ruler_tool(&mut app);
         assert!((app.view.ruler_center[0] - glide_target.x).abs() < 1.0);
         assert!((app.view.ruler_center[1] - glide_target.y).abs() < 1.0);
-        assert!((app.view.ruler_length - expected_length).abs() < 1e-6);
-        assert!((app.view.ruler_depth - expected_depth).abs() < 1e-6);
+        let glide_screen_span_y = app.view.ruler_length * f64::from(glide_zoom);
+        let glide_screen_depth = app.view.ruler_depth * f64::from(glide_zoom);
+        assert!(
+            glide_screen_span_y <= f64::from(canvas_rect.height()) * 0.70
+                && glide_screen_span_y >= 180.0
+        );
+        assert!((26.0..=61.0).contains(&glide_screen_depth));
     }
 
     #[test]

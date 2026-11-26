@@ -58,28 +58,28 @@ impl Tokens {
     pub fn light() -> Self {
         Self {
             is_dark: false,
-            toolbar_bg: Color32::from_rgb(0xEE, 0xF6, 0xFA),
-            panel_bg: Color32::from_rgb(0xF8, 0xFB, 0xFD),
-            canvas_bg: Color32::from_rgb(0xE3, 0xED, 0xF4),
-            border: Color32::from_rgb(0xCE, 0xE0, 0xEB),
-            text: Color32::from_rgb(0x13, 0x20, 0x2B),
-            text_muted: Color32::from_rgb(0x51, 0x67, 0x79),
-            accent: Color32::from_rgb(0x0C, 0x6F, 0xA6),
-            accent_hover: Color32::from_rgb(0x09, 0x59, 0x85),
-            accent_soft: Color32::from_rgb(0xDF, 0xF1, 0xFC),
+            toolbar_bg: Color32::from_rgb(0xF4, 0xF6, 0xF8),
+            panel_bg: Color32::from_rgb(0xFA, 0xFB, 0xFC),
+            canvas_bg: Color32::from_rgb(0xEC, 0xEF, 0xF3),
+            border: Color32::from_rgb(0xD9, 0xE0, 0xE7),
+            text: Color32::from_rgb(0x1B, 0x23, 0x2C),
+            text_muted: Color32::from_rgb(0x5B, 0x66, 0x73),
+            accent: Color32::from_rgb(0x35, 0x6B, 0x8F),
+            accent_hover: Color32::from_rgb(0x2A, 0x58, 0x77),
+            accent_soft: Color32::from_rgb(0xE8, 0xF1, 0xF6),
             on_accent: Color32::WHITE,
             field_bg: Color32::from_rgb(0xFF, 0xFF, 0xFF),
-            tab_strip_bg: Color32::from_rgb(0x0D, 0x43, 0x63),
+            tab_strip_bg: Color32::from_rgb(0x3B, 0x52, 0x63),
             tab_strip_fg: Color32::from_rgb(0xFF, 0xFF, 0xFF),
-            tab_strip_fg_muted: Color32::from_rgb(0xBF, 0xE2, 0xF6),
-            header_bg: Color32::from_rgb(0x13, 0x5A, 0x84),
-            header_border: Color32::from_rgb(0x26, 0x72, 0x9E),
+            tab_strip_fg_muted: Color32::from_rgb(0xCC, 0xD8, 0xE2),
+            header_bg: Color32::from_rgb(0x42, 0x5B, 0x6D),
+            header_border: Color32::from_rgb(0x53, 0x6E, 0x82),
             header_fg: Color32::from_rgb(0xFF, 0xFF, 0xFF),
-            header_fg_muted: Color32::from_rgb(0xCB, 0xE8, 0xF8),
-            header_track_bg: Color32::from_rgb(0x0E, 0x4A, 0x6E),
-            header_control_hover: Color32::from_rgb(0x1B, 0x6E, 0x9E),
+            header_fg_muted: Color32::from_rgb(0xD5, 0xE0, 0xE9),
+            header_track_bg: Color32::from_rgb(0x39, 0x50, 0x61),
+            header_control_hover: Color32::from_rgb(0x4C, 0x68, 0x7D),
             header_active_bg: Color32::from_rgb(0x82, 0xCA, 0xF2),
-            header_active_fg: Color32::from_rgb(0x09, 0x32, 0x4A),
+            header_active_fg: Color32::from_rgb(0x14, 0x2F, 0x42),
             danger_fg: Color32::from_rgb(0xB4, 0x28, 0x28),
             danger_border: Color32::from_rgb(0xE4, 0xBE, 0xBE),
             danger_bg: Color32::from_rgb(0xFD, 0xF5, 0xF5),
@@ -412,8 +412,13 @@ mod tests {
         assert_eq!(light.header_active_bg, brand_cyan);
         assert_eq!(dark.accent, brand_cyan);
 
-        // Two-tier Light header hierarchy: darkest cyan tab strip -> one step lighter active header.
+        // Two-tier Light header hierarchy: calm slate-blue tab strip -> gently lighter active header.
         assert!(relative_luminance(light.header_bg) > relative_luminance(light.tab_strip_bg));
+        let tier_contrast = contrast_ratio(light.header_bg, light.tab_strip_bg);
+        assert!(
+            (1.08..=1.22).contains(&tier_contrast),
+            "expected gentle two-tier header contrast in Light theme, got {tier_contrast:.3}"
+        );
         assert!(contrast_ratio(light.tab_strip_fg, light.tab_strip_bg) >= 7.0);
         assert!(contrast_ratio(light.tab_strip_fg_muted, light.tab_strip_bg) >= 4.5);
         assert!(contrast_ratio(light.header_fg, light.header_bg) >= 6.0);

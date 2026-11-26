@@ -1513,6 +1513,11 @@ fn handle_pan_and_zoom(app: &mut PaperCraftApp, ui: &mut egui::Ui, resp: &egui::
 
 const MIN_TOUCH_CONTACT_PRESSURE: f32 = 0.02;
 pub(crate) const RULER_DEPTH: f64 = 64.0;
+const RULER_TARGET_SCREEN_DEPTH: f64 = 60.0;
+const RULER_MIN_SCREEN_DEPTH: f64 = 26.0;
+const RULER_MAX_SCREEN_LENGTH: f64 = 900.0;
+const RULER_VIEWPORT_FILL: f64 = 0.68;
+const RULER_PAGE_FILL: f64 = 0.72;
 const RULER_EDGE_SNAP_SCREEN: f64 = 16.0;
 
 struct SampleCursor {
@@ -1570,6 +1575,117 @@ fn can_start_on_canvas(ui: &egui::Ui, resp: &egui::Response, pos: Pos2) -> bool 
             .ctx()
             .layer_id_at(pos)
             .is_none_or(|layer| layer == resp.layer_id)
+}
+
+pub(crate) fn ruler_dimensions_for_view(
+    app: &PaperCraftApp,
+    zoom: f32,
+    canvas_rect: Option<Rect>,
+    angle: f64,
+) -> (f64, f64) {
+    let page_w = f64::from(app.session.doc.width).max(64.0);
+    let page_h = f64::from(app.session.doc.height).max(64.0);
+    let safe_zoom = if zoom.is_finite() && zoom > 0.05 {
+        f64::from(zoom)
+    } else {
+        1.0
+    };
+    let safe_angle = if angle.is_finite() { angle } else { 0.0 };
+    let cos_a = safe_angle.cos().abs();
+    let sin_a = safe_angle.sin().abs();
+    let span_limit = |w: f64, h: f64| -> f64 {
+        let lx = if cos_a > 1e-4 {
+            w / cos_a
+        } else {
+            f64::INFINITY
+        };
+        let ly = if sin_a > 1e-4 {
+            h / sin_a
+        } else {
+            f64::INFINITY
+        };
+        lx.min(ly)
+    };
+
+    let page_span = span_limit(page_w * RULER_PAGE_FILL, page_h * RULER_PAGE_FILL);
+    let view_span = canvas_rect
+        .filter(|rect| rect.is_finite() && rect.width() > 32.0 && rect.height() > 32.0)
+        .map_or(f64::INFINITY, |rect| {
+            let eff_w =
+                (f64::from(rect.width()) * RULER_VIEWPORT_FILL).min(RULER_MAX_SCREEN_LENGTH);
+            let eff_h =
+                (f64::from(rect.height()) * RULER_VIEWPORT_FILL).min(RULER_MAX_SCREEN_LENGTH);
+            span_limit(eff_w / safe_zoom, eff_h / safe_zoom)
+        });
+
+    let max_page_len = page_w.max(page_h);
+    let raw_length = page_span.min(view_span);
+    let min_length = (64.0 / safe_zoom).min(page_span).clamp(8.0, max_page_len);
+    let length = if raw_length.is_finite() {
+        raw_length.clamp(min_length, max_page_len)
+    } else {
+        (page_w * RULER_PAGE_FILL).clamp(64.0, max_page_len)
+    };
+
+    let page_cap = (page_w.min(page_h) * 0.25).max(8.0);
+    let aspect_cap = (length / 6.5).max(8.0);
+    let view_depth_cap = canvas_rect
+        .filter(|rect| rect.is_finite() && rect.height() > 32.0)
+        .map_or(f64::INFINITY, |rect| {
+            (f64::from(rect.height()) * 0.16) / safe_zoom
+        });
+    let target_depth = RULER_TARGET_SCREEN_DEPTH / safe_zoom;
+    let min_depth = (RULER_MIN_SCREEN_DEPTH / safe_zoom)
+        .min(page_cap)
+        .min(length * 0.35)
+        .max(6.0);
+    let max_depth = target_depth
+        .min(aspect_cap)
+        .min(page_cap)
+        .min(view_depth_cap);
+    let depth = max_depth.max(min_depth).min(page_cap).max(6.0);
+    (length, depth)
+}
+
+pub(crate) fn sync_ruler_dimensions_for_camera(app: &mut PaperCraftApp) {
+    let angle = if app.view.ruler_angle.is_finite() {
+        app.view.ruler_angle
+    } else {
+        0.0
+    };
+    let (zoom, canvas_rect) = if let Some((rect, zoom, _)) = app.active_camera_viewport() {
+        (zoom, Some(rect))
+    } else if let Some(rect) = app
+        .view
+        .last_canvas_rect
+        .filter(|rect| rect.is_finite() && rect.width() > 32.0 && rect.height() > 32.0)
+    {
+        let zoom = if app.view.fit_requested {
+            compute_fit_view(app, rect).0
+        } else {
+            app.view.zoom
+        };
+        (zoom, Some(rect))
+    } else {
+        (app.view.zoom, None)
+    };
+    let (length, depth) = ruler_dimensions_for_view(app, zoom, canvas_rect, angle);
+    app.view.ruler_length = length;
+    app.view.ruler_depth = depth;
+}
+
+fn sync_ruler_dimensions_for_live_canvas(app: &mut PaperCraftApp, avail: Rect) {
+    if !app.view.ruler_active || app.view.ruler_stroke_edge.is_some() || has_active_live(app) {
+        return;
+    }
+    let angle = if app.view.ruler_angle.is_finite() {
+        app.view.ruler_angle
+    } else {
+        0.0
+    };
+    let (length, depth) = ruler_dimensions_for_view(app, app.view.zoom, Some(avail), angle);
+    app.view.ruler_length = length;
+    app.view.ruler_depth = depth;
 }
 
 fn ruler_geometry(app: &PaperCraftApp) -> (Point, Point, Point, f64, f64) {
@@ -2967,6 +3083,7 @@ fn update_ruler_drag(app: &mut PaperCraftApp, page_pos: Point) {
                     angle_delta += std::f64::consts::TAU;
                 }
                 app.view.ruler_angle = app.view.ruler_drag_origin_angle + angle_delta;
+                sync_ruler_dimensions_for_camera(app);
                 let center = clamp_ruler_center(app, center);
                 app.view.ruler_center = [center.x, center.y];
             }
@@ -8544,14 +8661,85 @@ fn paint_shape_preview(
     );
 }
 
+enum RulerSnapVisual {
+    Hover {
+        edge: f64,
+        along: f64,
+    },
+    Drawing {
+        edge: f64,
+        start_along: f64,
+        end_along: f64,
+        distance: f64,
+    },
+}
+
+fn ruler_tick_intervals(zoom: f32) -> (f64, f64, f64, usize, usize) {
+    // `(major, medium, fine_minor, coarse_minor)` in real page points (`pt`).
+    const TABLE: &[(f64, f64, f64, f64)] = &[
+        (5.0, 1.0, 0.5, 1.0),
+        (10.0, 5.0, 1.0, 2.0),
+        (20.0, 10.0, 2.0, 5.0),
+        (50.0, 10.0, 5.0, 10.0),
+        (100.0, 50.0, 10.0, 20.0),
+        (200.0, 100.0, 20.0, 50.0),
+        (500.0, 100.0, 50.0, 100.0),
+        (1000.0, 500.0, 100.0, 200.0),
+        (2000.0, 1000.0, 200.0, 500.0),
+    ];
+    let z = f64::from(zoom.max(0.05));
+    let min_major_page = 58.0 / z;
+    let &(major, medium, fine_minor, coarse_minor) = TABLE
+        .iter()
+        .find(|&&(maj, _, _, _)| maj >= min_major_page)
+        .unwrap_or(&TABLE[TABLE.len() - 1]);
+    let minor = if fine_minor * z >= 5.5 {
+        fine_minor
+    } else if coarse_minor * z >= 5.5 {
+        coarse_minor
+    } else {
+        medium
+    };
+    let major_mod = (major / minor).round().max(1.0) as usize;
+    let medium_mod = if (medium / minor - (medium / minor).round()).abs() < 1e-4 {
+        (medium / minor).round().max(1.0) as usize
+    } else {
+        major_mod
+    };
+    (major, medium, minor, major_mod, medium_mod)
+}
+
+fn format_ruler_measure(value: f64) -> String {
+    if value < 10.0 && (value - value.round()).abs() >= 0.05 {
+        format!("{value:.1}")
+    } else {
+        format!("{:.0}", value.round())
+    }
+}
+
 fn ruler_snap_preview(
     app: &PaperCraftApp,
     ui: &egui::Ui,
     resp: &egui::Response,
     xf: Affine2,
-) -> Option<(f64, f64)> {
+) -> Option<RulerSnapVisual> {
     if !app.view.ruler_active || !matches!(app.session.active_tool, ToolKind::Pen(_)) {
         return None;
+    }
+    if let Some(edge) = app.view.ruler_stroke_edge
+        && let Some(live) = app.session.live_stroke.as_ref()
+        && let (Some(first), Some(last)) = (live.raw_points.first(), live.raw_points.last())
+    {
+        let start_pt = first.point();
+        let end_pt = last.point();
+        let (start_along, _) = ruler_local_position(app, start_pt);
+        let (end_along, _) = ruler_local_position(app, end_pt);
+        return Some(RulerSnapVisual::Drawing {
+            edge,
+            start_along,
+            end_along,
+            distance: start_pt.distance(end_pt),
+        });
     }
     let screen_pos = ui.input(|input| input.pointer.hover_pos())?;
     if !can_start_on_canvas(ui, resp, screen_pos) {
@@ -8560,7 +8748,247 @@ fn ruler_snap_preview(
     let page_pos = xf.to_page(Point::new(f64::from(screen_pos.x), f64::from(screen_pos.y)));
     let edge = ruler_edge_for_point(app, page_pos)?;
     let (along, _) = ruler_local_position(app, page_pos);
-    Some((edge, along))
+    Some(RulerSnapVisual::Hover { edge, along })
+}
+
+fn paint_ruler_callout(
+    p: &egui::Painter,
+    anchor: Pos2,
+    direction: Point,
+    normal: Point,
+    edge: f64,
+    label: String,
+    t: &Tokens,
+) {
+    let galley = p.layout_no_wrap(label, FontId::proportional(10.0), t.text);
+    let direction_screen = Vec2::new(direction.x as f32, direction.y as f32);
+    let normal_screen = Vec2::new(normal.x as f32, normal.y as f32);
+    let label_center = anchor + direction_screen * 12.0 + normal_screen * (edge as f32 * 16.0);
+    let mut label_rect = Rect::from_center_size(label_center, galley.size() + Vec2::splat(10.0));
+    let clip = p.clip_rect();
+    if clip.is_finite() && clip.width() > label_rect.width() + 8.0 {
+        let dx = if label_rect.left() < clip.left() + 4.0 {
+            clip.left() + 4.0 - label_rect.left()
+        } else if label_rect.right() > clip.right() - 4.0 {
+            clip.right() - 4.0 - label_rect.right()
+        } else {
+            0.0
+        };
+        let dy = if label_rect.top() < clip.top() + 4.0 {
+            clip.top() + 4.0 - label_rect.top()
+        } else if label_rect.bottom() > clip.bottom() - 4.0 {
+            clip.bottom() - 4.0 - label_rect.bottom()
+        } else {
+            0.0
+        };
+        label_rect = label_rect.translate(Vec2::new(dx, dy));
+    }
+    p.rect_filled(label_rect, CornerRadius::same(5), t.panel_bg);
+    p.rect_stroke(
+        label_rect,
+        CornerRadius::same(5),
+        Stroke::new(1.0, t.accent),
+        StrokeKind::Inside,
+    );
+    p.galley(label_rect.min + Vec2::splat(5.0), galley, t.text);
+}
+
+struct RulerPaintFrame {
+    center: Point,
+    direction: Point,
+    normal: Point,
+    half_length: f64,
+    half_width: f64,
+    xf: Affine2,
+    zoom: f32,
+    reading_dir: f64,
+    display_angle_rad: f32,
+}
+
+impl RulerPaintFrame {
+    fn corner_pos2(&self, along: f64, across: f64) -> Pos2 {
+        let pt = self.xf.to_screen(Point::new(
+            self.center.x + self.direction.x * along + self.normal.x * across,
+            self.center.y + self.direction.y * along + self.normal.y * across,
+        ));
+        pos2(pt.x as f32, pt.y as f32)
+    }
+
+    fn paint_rotated(
+        &self,
+        p: &egui::Painter,
+        target_center: Pos2,
+        galley: std::sync::Arc<egui::Galley>,
+        color: Color32,
+    ) {
+        let rot = egui::emath::Rot2::from_angle(self.display_angle_rad);
+        let local_center = Vec2::new(galley.size().x * 0.5, galley.size().y * 0.5);
+        let origin = target_center - rot * local_center;
+        p.add(make_unrounded_text_shape(
+            origin,
+            galley,
+            color,
+            self.display_angle_rad,
+            p.pixels_per_point(),
+        ));
+    }
+}
+
+fn paint_ruler_graduations(
+    frame: &RulerPaintFrame,
+    p: &egui::Painter,
+    t: &Tokens,
+    badge_half_w_px: f32,
+) {
+    let total_length = frame.half_length * 2.0;
+    let zoom_f64 = f64::from(frame.zoom);
+    let length_px = total_length as f32 * frame.zoom;
+    let half_width_px = frame.half_width as f32 * frame.zoom;
+    let depth_px = half_width_px * 2.0;
+
+    let (_, _, minor_step, major_mod, medium_mod) = ruler_tick_intervals(frame.zoom);
+    let tick_count = (total_length / minor_step).floor().clamp(0.0, 2048.0) as usize;
+    let tick_color = t.text.gamma_multiply(0.76);
+    let minor_tick_color = t.text.gamma_multiply(0.48);
+    let label_color = t.text.gamma_multiply(0.86);
+    let show_tick_numbers = depth_px >= 42.0 && length_px >= 120.0;
+    let label_edge_sign = frame.reading_dir;
+
+    for idx in 0..=tick_count {
+        let dist = idx as f64 * minor_step;
+        if dist > total_length + 1e-4 {
+            break;
+        }
+        let along = (-frame.half_length + dist) * frame.reading_dir;
+        let is_major = idx % major_mod == 0;
+        let is_medium = !is_major && idx % medium_mod == 0;
+
+        if dist > 1e-4 && dist < total_length - 1e-4 {
+            let (primary_px, secondary_px, width, color) = if is_major {
+                (9.0, 7.0, 1.2, tick_color)
+            } else if is_medium {
+                (6.0, 4.8, 0.95, tick_color)
+            } else {
+                (3.5, 2.8, 0.75, minor_tick_color)
+            };
+            let primary_len = (primary_px / zoom_f64).min(frame.half_width * 0.38);
+            let secondary_len = (secondary_px / zoom_f64).min(frame.half_width * 0.32);
+            let stroke = Stroke::new(width, color);
+
+            p.line_segment(
+                [
+                    frame.corner_pos2(along, frame.half_width * label_edge_sign),
+                    frame.corner_pos2(along, (frame.half_width - primary_len) * label_edge_sign),
+                ],
+                stroke,
+            );
+            p.line_segment(
+                [
+                    frame.corner_pos2(along, -frame.half_width * label_edge_sign),
+                    frame.corner_pos2(along, -(frame.half_width - secondary_len) * label_edge_sign),
+                ],
+                stroke,
+            );
+        }
+
+        if !is_major || !show_tick_numbers {
+            continue;
+        }
+        let num_galley = p.layout_no_wrap(
+            format_ruler_measure(dist),
+            FontId::monospace(8.5),
+            label_color,
+        );
+        let num_half_w = f64::from(num_galley.size().x) * 0.5;
+        let rem_px = (total_length - dist) * zoom_f64;
+        let adj_dist = if idx == 0 {
+            (num_half_w + 5.0) / zoom_f64
+        } else if rem_px < num_half_w + 5.0 || dist * zoom_f64 < num_half_w + 14.0 {
+            continue;
+        } else {
+            dist
+        };
+        let adj_along = (-frame.half_length + adj_dist) * frame.reading_dir;
+        if (adj_along * zoom_f64).abs() < f64::from(badge_half_w_px) + num_half_w + 8.0 {
+            continue;
+        }
+        let label_across = (f64::from(half_width_px - 15.0) / zoom_f64) * label_edge_sign;
+        frame.paint_rotated(
+            p,
+            frame.corner_pos2(adj_along, label_across),
+            num_galley,
+            label_color,
+        );
+    }
+}
+
+fn paint_ruler_snap_visual(
+    frame: &RulerPaintFrame,
+    p: &egui::Painter,
+    t: &Tokens,
+    snap: RulerSnapVisual,
+) {
+    let total_length = frame.half_length * 2.0;
+    match snap {
+        RulerSnapVisual::Hover { edge, along } => {
+            let edge_start = frame.corner_pos2(-frame.half_length, frame.half_width * edge);
+            let edge_end = frame.corner_pos2(frame.half_length, frame.half_width * edge);
+            p.line_segment(
+                [edge_start, edge_end],
+                Stroke::new(9.0, t.accent.gamma_multiply(0.28)),
+            );
+            p.line_segment([edge_start, edge_end], Stroke::new(3.0, t.accent));
+            let clamped_along = along.clamp(-frame.half_length, frame.half_length);
+            let marker = frame.corner_pos2(clamped_along, frame.half_width * edge);
+            p.circle_filled(marker, 6.0, t.accent);
+            p.circle_stroke(marker, 6.0, Stroke::new(2.0, t.toolbar_bg));
+            let mark_pt =
+                (clamped_along * frame.reading_dir + frame.half_length).clamp(0.0, total_length);
+            paint_ruler_callout(
+                p,
+                marker,
+                frame.direction,
+                frame.normal,
+                edge,
+                format!("STRAIGHT LINE · {} pt", format_ruler_measure(mark_pt)),
+                t,
+            );
+        }
+        RulerSnapVisual::Drawing {
+            edge,
+            start_along,
+            end_along,
+            distance,
+        } => {
+            let edge_start = frame.corner_pos2(-frame.half_length, frame.half_width * edge);
+            let edge_end = frame.corner_pos2(frame.half_length, frame.half_width * edge);
+            p.line_segment(
+                [edge_start, edge_end],
+                Stroke::new(8.0, t.accent.gamma_multiply(0.24)),
+            );
+            let seg_start = frame.corner_pos2(
+                start_along.clamp(-frame.half_length, frame.half_length),
+                frame.half_width * edge,
+            );
+            let seg_end = frame.corner_pos2(
+                end_along.clamp(-frame.half_length, frame.half_length),
+                frame.half_width * edge,
+            );
+            p.line_segment([seg_start, seg_end], Stroke::new(3.0, t.accent));
+            p.circle_filled(seg_start, 4.5, t.accent);
+            p.circle_filled(seg_end, 5.5, t.accent);
+            p.circle_stroke(seg_end, 5.5, Stroke::new(2.0, t.toolbar_bg));
+            paint_ruler_callout(
+                p,
+                seg_end,
+                frame.direction,
+                frame.normal,
+                edge,
+                format!("{} pt", format_ruler_measure(distance)),
+                t,
+            );
+        }
+    }
 }
 
 fn paint_ruler(
@@ -8568,25 +8996,52 @@ fn paint_ruler(
     p: &egui::Painter,
     xf: Affine2,
     t: &Tokens,
-    snap_preview: Option<(f64, f64)>,
+    snap_preview: Option<RulerSnapVisual>,
 ) {
     if !app.view.ruler_active {
         return;
     }
     let (center, direction, normal, half_length, half_width) = ruler_geometry(app);
-    let corner = |along: f64, across: f64| {
-        xf.to_screen(Point::new(
-            center.x + direction.x * along + normal.x * across,
-            center.y + direction.y * along + normal.y * across,
-        ))
+    let total_length = half_length * 2.0;
+    let zoom = app.view.zoom.max(0.05);
+    let length_px = total_length as f32 * zoom;
+    let half_width_px = half_width as f32 * zoom;
+    let depth_px = half_width_px * 2.0;
+
+    let angle = if app.view.ruler_angle.is_finite() {
+        app.view.ruler_angle
+    } else {
+        0.0
     };
+    let flip_reading = direction.x < -1e-4 || (direction.x.abs() <= 1e-4 && direction.y < 0.0);
+    let reading_dir = if flip_reading { -1.0 } else { 1.0 };
+    let display_angle_rad = {
+        let raw = if flip_reading {
+            angle + std::f64::consts::PI
+        } else {
+            angle
+        };
+        ((raw + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI)
+            as f32
+    };
+    let frame = RulerPaintFrame {
+        center,
+        direction,
+        normal,
+        half_length,
+        half_width,
+        xf,
+        zoom,
+        reading_dir,
+        display_angle_rad,
+    };
+
     let corners = [
-        corner(-half_length, -half_width),
-        corner(half_length, -half_width),
-        corner(half_length, half_width),
-        corner(-half_length, half_width),
-    ]
-    .map(|point| pos2(point.x as f32, point.y as f32));
+        frame.corner_pos2(-half_length, -half_width),
+        frame.corner_pos2(half_length, -half_width),
+        frame.corner_pos2(half_length, half_width),
+        frame.corner_pos2(-half_length, half_width),
+    ];
     let fill = if t.is_dark {
         Color32::from_rgba_unmultiplied(42, 52, 68, 210)
     } else {
@@ -8597,108 +9052,43 @@ fn paint_ruler(
         fill,
         Stroke::new(1.5, t.accent),
     ));
-
-    let upper_left = corner(-half_length, -half_width);
-    let upper_right = corner(half_length, -half_width);
-    let lower_right = corner(half_length, half_width);
-    let lower_left = corner(-half_length, half_width);
-    for (a, b) in [
-        (upper_left, upper_right),
-        (upper_right, lower_right),
-        (lower_right, lower_left),
-        (lower_left, upper_left),
-    ] {
+    for idx in 0..4 {
         p.line_segment(
-            [pos2(a.x as f32, a.y as f32), pos2(b.x as f32, b.y as f32)],
+            [corners[idx], corners[(idx + 1) % 4]],
             Stroke::new(1.2, t.accent),
         );
     }
 
-    let depth = half_width * 2.0;
-    let tick_step = if depth >= 96.0 {
-        25.0
-    } else if depth >= 48.0 {
-        10.0
-    } else if depth >= 24.0 {
-        5.0
-    } else if depth >= 12.0 {
-        2.5
+    let angle_degrees = (angle.to_degrees() + 180.0).rem_euclid(360.0) - 180.0;
+    let angle_degrees = if angle_degrees.abs() < 0.5 {
+        0.0
     } else {
-        2.0
+        angle_degrees
     };
-    let tick_count = (half_length * 2.0 / tick_step).floor().clamp(0.0, 2048.0) as usize;
-    let tick_color = t.text.gamma_multiply(0.72);
-    for idx in 0..=tick_count {
-        let along = -half_length + idx as f64 * tick_step;
-        let major = idx % 5 == 0;
-        let tick_length = if major {
-            half_width * 0.375
+    let center_badge_info = (depth_px >= 18.0).then(|| {
+        let label_size = (10.5_f32 * (zoom / 0.7).sqrt()).clamp(8.5, 13.0);
+        let text = if length_px >= 165.0 {
+            format!("{angle_degrees:+.0}° · {:.0} pt", total_length.round())
         } else {
-            half_width * 0.1875
+            format!("{angle_degrees:+.0}°")
         };
-        let start = corner(along, half_width);
-        let end = corner(along, half_width - tick_length);
-        p.line_segment(
-            [
-                pos2(start.x as f32, start.y as f32),
-                pos2(end.x as f32, end.y as f32),
-            ],
-            Stroke::new(if major { 1.1 } else { 0.75 }, tick_color),
-        );
+        let galley = p.layout_no_wrap(text, FontId::monospace(label_size), t.text);
+        let size = galley.size() + Vec2::new(10.0, 4.0);
+        (galley, size, label_size)
+    });
+    let badge_half_w_px = center_badge_info
+        .as_ref()
+        .map_or(0.0, |(_, size, _)| size.x * 0.5);
+
+    paint_ruler_graduations(&frame, p, t, badge_half_w_px);
+    if let Some(snap) = snap_preview {
+        paint_ruler_snap_visual(&frame, p, t, snap);
     }
 
-    if let Some((edge, along)) = snap_preview {
-        let edge_start = corner(-half_length, half_width * edge);
-        let edge_end = corner(half_length, half_width * edge);
-        p.line_segment(
-            [
-                pos2(edge_start.x as f32, edge_start.y as f32),
-                pos2(edge_end.x as f32, edge_end.y as f32),
-            ],
-            Stroke::new(9.0, t.accent.gamma_multiply(0.28)),
-        );
-        p.line_segment(
-            [
-                pos2(edge_start.x as f32, edge_start.y as f32),
-                pos2(edge_end.x as f32, edge_end.y as f32),
-            ],
-            Stroke::new(3.0, t.accent),
-        );
-        let marker = corner(along.clamp(-half_length, half_length), half_width * edge);
-        let marker = pos2(marker.x as f32, marker.y as f32);
-        p.circle_filled(marker, 6.0, t.accent);
-        p.circle_stroke(marker, 6.0, Stroke::new(2.0, t.toolbar_bg));
-
-        let label = "STRAIGHT LINE";
-        let galley = p.layout_no_wrap(label.to_string(), FontId::proportional(10.0), t.text);
-        let direction_screen = Vec2::new(direction.x as f32, direction.y as f32);
-        let normal_screen = Vec2::new(normal.x as f32, normal.y as f32);
-        let label_center = marker + direction_screen * 12.0 + normal_screen * (edge as f32 * 14.0);
-        let label_rect = Rect::from_center_size(label_center, galley.size() + Vec2::splat(10.0));
-        p.rect_filled(label_rect, CornerRadius::same(5), t.panel_bg);
-        p.rect_stroke(
-            label_rect,
-            CornerRadius::same(5),
-            Stroke::new(1.0, t.accent),
-            StrokeKind::Inside,
-        );
-        p.galley(label_rect.min + Vec2::splat(5.0), galley, t.text);
-    }
-
-    let zoom = app.view.zoom.max(0.05);
-    if (half_width * 2.0) as f32 * zoom >= 18.0 {
-        let label_size = (11.0_f32 * (zoom / 0.6).sqrt()).clamp(8.0, 14.0);
+    if let Some((angle_galley, badge_size, label_size)) = center_badge_info {
         let center_screen = xf.to_screen(center);
         let center_screen = pos2(center_screen.x as f32, center_screen.y as f32);
-        let angle_degrees = if app.view.ruler_angle.is_finite() {
-            (app.view.ruler_angle.to_degrees() + 180.0).rem_euclid(360.0) - 180.0
-        } else {
-            0.0
-        };
-        let angle_label = format!("{angle_degrees:+.0}°");
-        let angle_galley = p.layout_no_wrap(angle_label, FontId::monospace(label_size), t.text);
-        let angle_badge =
-            Rect::from_center_size(center_screen, angle_galley.size() + Vec2::new(10.0, 4.0));
+        let angle_badge = Rect::from_center_size(center_screen, badge_size);
         p.rect_filled(angle_badge, CornerRadius::same(4), t.panel_bg);
         p.rect_stroke(
             angle_badge,
@@ -8707,22 +9097,27 @@ fn paint_ruler(
             StrokeKind::Inside,
         );
         p.galley(angle_badge.min + Vec2::new(5.0, 2.0), angle_galley, t.text);
-        let direction_screen = Vec2::new(direction.x as f32, direction.y as f32);
-        p.text(
-            center_screen + direction_screen * (half_length as f32 * 0.72 * zoom),
-            egui::Align2::CENTER_CENTER,
-            "MOVE",
-            FontId::proportional(label_size.min(9.0)),
-            t.text_muted,
-        );
+        if length_px >= 240.0 && depth_px >= 42.0 {
+            let move_across = -(f64::from(half_width_px - 13.5) / f64::from(zoom)) * reading_dir;
+            let move_galley = p.layout_no_wrap(
+                "MOVE".to_string(),
+                FontId::proportional(label_size.min(9.0)),
+                t.text_muted,
+            );
+            frame.paint_rotated(
+                p,
+                frame.corner_pos2(half_length * 0.72 * reading_dir, move_across),
+                move_galley,
+                t.text_muted,
+            );
+        }
     }
 
-    let handle_page = ruler_rotation_handle(app);
-    let handle_screen = xf.to_screen(handle_page);
+    let handle_screen = xf.to_screen(ruler_rotation_handle(app));
     let handle = pos2(handle_screen.x as f32, handle_screen.y as f32);
-    let edge_center = corner(0.0, -half_width);
+    let edge_center = frame.corner_pos2(0.0, -half_width);
     p.line_segment(
-        [pos2(edge_center.x as f32, edge_center.y as f32), handle],
+        [edge_center, handle],
         Stroke::new(1.0, t.accent.gamma_multiply(0.8)),
     );
     p.circle_filled(handle, 8.0, t.accent);
@@ -9228,8 +9623,10 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
                 app.view.active_modal.is_none() && !app.view.motion.screen.is_exiting();
             if input_active {
                 handle_pan_and_zoom(app, ui, &resp);
+                sync_ruler_dimensions_for_live_canvas(app, avail);
                 handle_drawing_input(app, ui, &resp);
             } else {
+                sync_ruler_dimensions_for_live_canvas(app, avail);
                 clear_finger_pan(app);
                 if has_active_live(app) {
                     finish_active_stroke(app);
@@ -14734,6 +15131,231 @@ mod tests {
                 pt.y
             );
         }
+    }
+
+    #[test]
+    fn ruler_scales_dynamically_with_live_zoom_and_keeps_proportional_screen_space() {
+        let ctx = egui::Context::default();
+        let mut app = setup_editor_app(&ctx);
+        app.view.fit_requested = false;
+        app.view.zoom = 0.45;
+        app.session.zoom = 0.45;
+        app.view.ruler_active = true;
+        app.view.ruler_initialized = true;
+        app.view.ruler_center = [600.0, 800.0];
+        app.view.ruler_angle = 0.0;
+        sync_ruler_dimensions_for_camera(&mut app);
+
+        run_editor_frame(&ctx, &mut app, 0.016, Vec::new());
+        let len_fit = app.view.ruler_length;
+        let depth_fit = app.view.ruler_depth;
+        let canvas_w = f64::from(app.view.last_canvas_rect.expect("canvas rect").width());
+        assert!((len_fit - 864.0).abs() < 1.0);
+        assert!(depth_fit * 0.45 >= 26.0 && depth_fit * 0.45 <= 60.5);
+
+        // Zoom in via Ctrl+MouseWheel while ruler stays open -> page-space length & depth scale down.
+        let zoom_anchor = pos2(640.0, 400.0);
+        run_editor_frame(
+            &ctx,
+            &mut app,
+            0.032,
+            vec![
+                egui::Event::PointerMoved(zoom_anchor),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, 320.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                    modifiers: egui::Modifiers::CTRL,
+                },
+            ],
+        );
+        let zoom_mid = f64::from(app.view.zoom);
+        assert!(zoom_mid > 0.6);
+        let len_mid = app.view.ruler_length;
+        let depth_mid = app.view.ruler_depth;
+
+        // Jump to 3.0x zoom (with a fresh time step after smooth wheel decay) and verify full dynamic scaling.
+        run_editor_frame(&ctx, &mut app, 0.30, Vec::new());
+        app.view.zoom = 3.0;
+        app.session.zoom = 3.0;
+        run_editor_frame(&ctx, &mut app, 0.32, Vec::new());
+        let z_3x = f64::from(app.view.zoom);
+        let len_3x = app.view.ruler_length;
+        let depth_3x = app.view.ruler_depth;
+        assert!(
+            len_3x < len_mid && len_mid <= len_fit,
+            "expected ruler length to shrink in page units as zoom increases: fit={len_fit}, mid={len_mid}, 3x={len_3x}"
+        );
+        assert!(
+            depth_3x < depth_mid && depth_mid < depth_fit,
+            "expected ruler depth to shrink in page units as zoom increases: fit={depth_fit}, mid={depth_mid}, 3x={depth_3x}"
+        );
+        let screen_len_3x = len_3x * z_3x;
+        let screen_depth_3x = depth_3x * z_3x;
+        assert!(
+            screen_len_3x <= canvas_w * 0.70 + 1.0 && screen_len_3x >= 200.0,
+            "expected 3x zoomed ruler screen length proportional to canvas ({canvas_w}), got {screen_len_3x}"
+        );
+        assert!(
+            (screen_depth_3x - 60.0).abs() < 1e-3,
+            "expected 3x zoomed ruler screen depth 60.0 (zoom={z_3x}), got {screen_depth_3x}"
+        );
+
+        // Zooming back out restores larger page-space dimensions smoothly.
+        app.view.zoom = 0.5;
+        app.session.zoom = 0.5;
+        run_editor_frame(&ctx, &mut app, 0.34, Vec::new());
+        assert!(app.view.ruler_length > len_3x);
+        assert!(app.view.ruler_depth > depth_3x);
+    }
+
+    #[test]
+    fn ruler_tick_intervals_adapt_cleanly_to_zoom_and_preserve_real_scale() {
+        let mut prev_major = f64::INFINITY;
+        for zoom in [0.15_f32, 0.42, 1.0, 2.0, 3.5, 6.0] {
+            let (major, _medium, minor, major_mod, medium_mod) = ruler_tick_intervals(zoom);
+            let z = f64::from(zoom);
+            assert!(
+                major <= prev_major,
+                "major tick step should refine monotonically with zoom: zoom={zoom}, major={major}, prev={prev_major}"
+            );
+            prev_major = major;
+            assert!(
+                major * z >= 58.0,
+                "major ticks too crowded on screen at zoom={zoom}: {} px",
+                major * z
+            );
+            assert!(
+                minor * z >= 5.5,
+                "minor ticks too crowded on screen at zoom={zoom}: {} px",
+                minor * z
+            );
+            assert!(major_mod >= 2 && medium_mod >= 1);
+            assert!(((major / minor) - major_mod as f64).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn zoomed_ruler_edge_snap_and_live_length_measurement_are_accurate() {
+        let ctx = egui::Context::default();
+        let mut app = setup_editor_app(&ctx);
+        app.view.fit_requested = false;
+        app.view.zoom = 2.5;
+        app.session.zoom = 2.5;
+        let center = Point::new(500.0, 600.0);
+        app.view.pan = [640.0 - center.x * 2.5, 400.0 - center.y * 2.5];
+        app.view.ruler_active = true;
+        app.view.ruler_initialized = true;
+        app.view.ruler_center = [center.x, center.y];
+        app.view.ruler_angle = 0.0;
+        run_editor_frame(&ctx, &mut app, 0.016, Vec::new());
+
+        let expected_upper_y = center.y - app.view.ruler_depth * 0.5;
+        let xf = page_affine(&app);
+        let p0 = xf.to_screen(Point::new(450.0, expected_upper_y));
+        let p1 = xf.to_screen(Point::new(550.0, expected_upper_y));
+
+        run_editor_frame(
+            &ctx,
+            &mut app,
+            0.032,
+            vec![
+                egui::Event::PointerMoved(pos2(p0.x as f32, p0.y as f32)),
+                egui::Event::PointerButton {
+                    pos: pos2(p0.x as f32, p0.y as f32),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(pos2(p1.x as f32, p1.y as f32)),
+            ],
+        );
+        assert!(app.view.ruler_stroke_edge.is_some());
+        let live = app
+            .session
+            .live_stroke
+            .as_ref()
+            .expect("live stroke active");
+        let first = live.raw_points.first().unwrap().point();
+        let last = live.raw_points.last().unwrap().point();
+        assert!((first.distance(last) - 100.0).abs() < 1e-2);
+
+        run_editor_frame(
+            &ctx,
+            &mut app,
+            0.048,
+            vec![egui::Event::PointerButton {
+                pos: pos2(p1.x as f32, p1.y as f32),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.session.doc.strokes.len(), 1);
+        let committed = &app.session.doc.strokes[0];
+        let c_start = committed.raw_points.first().unwrap().point();
+        let c_end = committed.raw_points.last().unwrap().point();
+        assert!((c_start.distance(c_end) - 100.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn ruler_renders_real_scale_labels_and_total_span_across_zooms_and_angles() {
+        fn collect_rendered_text(
+            ctx: &egui::Context,
+            app: &mut PaperCraftApp,
+            time: f64,
+        ) -> Vec<String> {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+                time: Some(time),
+                predicted_dt: 0.016,
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| app.show_ui(ui));
+            let mut texts = Vec::new();
+            for clipped in &out.shapes {
+                if let Shape::Text(ts) = &clipped.shape {
+                    texts.push(ts.galley.text().to_string());
+                }
+            }
+            out.drop_without_applying_deltas();
+            texts
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = setup_editor_app(&ctx);
+        app.view.fit_requested = false;
+        app.view.zoom = 1.0;
+        app.session.zoom = 1.0;
+        app.view.pan = [40.0, 24.0];
+        app.view.ruler_active = true;
+        app.view.ruler_initialized = true;
+        app.view.ruler_center = [600.0, 400.0];
+        app.view.ruler_angle = 0.0;
+
+        let texts_1x = collect_rendered_text(&ctx, &mut app, 0.016);
+        let expected_span_1x = format!("+0° · {:.0} pt", app.view.ruler_length.round());
+        assert!(
+            texts_1x.iter().any(|s| s == &expected_span_1x),
+            "expected ruler badge {expected_span_1x:?} in {texts_1x:?}"
+        );
+        assert!(texts_1x.iter().any(|s| s == "0"));
+        assert!(texts_1x.iter().any(|s| s == "100"));
+
+        // Zooming in to 3.0x shrinks the span badge and reveals finer 20 pt subdivisions.
+        app.view.zoom = 3.0;
+        app.session.zoom = 3.0;
+        app.view.pan = [640.0 - 600.0 * 3.0, 400.0 - 400.0 * 3.0];
+        app.view.ruler_angle = std::f64::consts::PI;
+        let texts_3x = collect_rendered_text(&ctx, &mut app, 0.032);
+        let expected_span_3x = format!("-180° · {:.0} pt", app.view.ruler_length.round());
+        assert!(
+            texts_3x.iter().any(|s| s == &expected_span_3x),
+            "expected zoomed rotated ruler badge {expected_span_3x:?} in {texts_3x:?}"
+        );
+        assert!(texts_3x.iter().any(|s| s == "20"));
+        assert!(texts_3x.iter().any(|s| s == "40"));
     }
 
     #[test]

@@ -51,7 +51,9 @@ use papercraft_engine::Session;
 use papercraft_paint::RibbonMesh;
 use serde_json::json;
 
-/// Public source repository URL displayed in Home and Profile links.
+/// Official PaperCraft website URL displayed in the Home sidebar footer.
+pub(crate) const WEBSITE_URL: &str = "https://papercraft.ink/";
+/// Public source repository URL displayed in Profile download links.
 pub(crate) const GITHUB_REPO_URL: &str = "https://github.com/Alyx-Labs/papercraft";
 
 /// Top-level workspace screen mode.
@@ -1711,11 +1713,12 @@ impl PaperCraftApp {
                 return;
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                if self.view.active_modal == Some(modal::ActiveModal::FirstAccessNickname) {
-                    return;
-                }
-                if self.view.active_modal == Some(modal::ActiveModal::WelcomeBanner) {
-                    welcome_modal::dismiss(self);
+                if matches!(
+                    self.view.active_modal,
+                    Some(
+                        modal::ActiveModal::FirstAccessNickname | modal::ActiveModal::WelcomeBanner
+                    )
+                ) {
                     return;
                 }
                 if self.view.tag_edit_index.is_some() {

@@ -115,7 +115,7 @@ pub(crate) fn show(
         ActiveModal::WelcomeBanner.id_tag(),
     ));
 
-    let backdrop_resp = egui::Area::new(backdrop_id)
+    let _backdrop_resp = egui::Area::new(backdrop_id)
         .order(egui::Order::Middle)
         .fixed_pos(viewport.min)
         .fade_in(false)
@@ -177,13 +177,8 @@ pub(crate) fn show(
         });
 
     let modal_rect = modal_resp.response.rect;
-    let pointer_in_modal = backdrop_resp
-        .interact_pointer_pos()
-        .is_some_and(|pos| modal_rect.contains(pos));
-    if interactive && backdrop_resp.clicked() && !pointer_in_modal {
-        should_dismiss = true;
-    }
-
+    // Outside clicks are absorbed by the backdrop and must not dismiss the welcome banner;
+    // only an explicit modal button click closes it.
     if interactive && should_dismiss {
         dismiss(app);
     }
@@ -255,7 +250,7 @@ fn draw_top_header(ui: &mut egui::Ui, width: f32, viewport_h: f32) -> (bool, Rec
                 paint_icon(ui.painter(), btn_rect.shrink(6.0), Icon::Close, TOP_TITLE);
                 let resp = resp
                     .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text("Close (Esc)");
+                    .on_hover_text("Close");
                 if resp.clicked() {
                     close_clicked = true;
                 }
@@ -630,5 +625,135 @@ mod tests {
         crate::modal::open(&mut app, ActiveModal::WelcomeBanner);
         dismiss(&mut app);
         assert_eq!(app.view.active_modal, None);
+    }
+
+    #[test]
+    fn welcome_banner_ignores_outside_clicks_and_escape_until_button_clicked() {
+        let dir = std::env::temp_dir().join(format!(
+            "papercraft_welcome_button_only_{}_{}",
+            std::process::id(),
+            papercraft_sync_protocol::now_unix_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        struct Guard(std::path::PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(dir.clone());
+
+        let session = Session::open_desktop_library(dir);
+        let mut app = PaperCraftApp::new(session, crate::PlatformHooks::default());
+        assert_eq!(app.view.active_modal, Some(ActiveModal::WelcomeBanner));
+
+        let ctx = egui::Context::default();
+        let viewport = Vec2::new(1280.0, 800.0);
+        let mut time = 0.0_f64;
+        let mut cta_center = pos2(0.0, 0.0);
+        for _ in 0..8 {
+            time += 0.08;
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), viewport)),
+                time: Some(time),
+                predicted_dt: 0.08,
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| app.show_ui(ui));
+            fn find_cta(shape: &egui::Shape, cta: &mut Rect) {
+                match shape {
+                    egui::Shape::Rect(r) if (r.rect.height() - 44.0).abs() < 0.5 => {
+                        *cta = r.rect;
+                    }
+                    egui::Shape::Vec(items) => {
+                        for s in items {
+                            find_cta(s, cta);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut cta = Rect::NOTHING;
+            for cs in &out.shapes {
+                find_cta(&cs.shape, &mut cta);
+            }
+            if cta.is_positive() {
+                cta_center = cta.center();
+            }
+            out.drop_without_applying_deltas();
+        }
+        assert!(cta_center.x > 0.0);
+
+        // 1. Clicking outside the modal on the backdrop keeps WelcomeBanner open.
+        let outside = pos2(16.0, 16.0);
+        for pressed in [true, false] {
+            time += 0.04;
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), viewport)),
+                time: Some(time),
+                predicted_dt: 0.04,
+                events: vec![
+                    egui::Event::PointerMoved(outside),
+                    egui::Event::PointerButton {
+                        pos: outside,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| app.show_ui(ui));
+            out.drop_without_applying_deltas();
+        }
+        assert_eq!(app.view.active_modal, Some(ActiveModal::WelcomeBanner));
+        assert!(app.session.should_show_welcome_banner());
+
+        // 2. Pressing Escape keeps WelcomeBanner open.
+        time += 0.04;
+        let esc_raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), viewport)),
+            time: Some(time),
+            predicted_dt: 0.04,
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let esc_out = ctx.run_ui(esc_raw, |ui| app.show_ui(ui));
+        esc_out.drop_without_applying_deltas();
+        assert_eq!(app.view.active_modal, Some(ActiveModal::WelcomeBanner));
+        assert!(app.session.should_show_welcome_banner());
+
+        // 3. Clicking the CTA button dismisses WelcomeBanner cleanly.
+        for pressed in [true, false] {
+            time += 0.04;
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), viewport)),
+                time: Some(time),
+                predicted_dt: 0.04,
+                events: vec![
+                    egui::Event::PointerMoved(cta_center),
+                    egui::Event::PointerButton {
+                        pos: cta_center,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| app.show_ui(ui));
+            out.drop_without_applying_deltas();
+        }
+        assert!(!app.session.should_show_welcome_banner());
+        assert_eq!(
+            app.view.active_modal,
+            Some(ActiveModal::FirstAccessNickname)
+        );
     }
 }

@@ -1504,7 +1504,7 @@ fn draw_library_nav_with_notice(
             }
         }
         if draw_sidebar_footer(ui, t) {
-            crate::open_external_url(app, ui.ctx(), crate::GITHUB_REPO_URL);
+            crate::open_external_url(app, ui.ctx(), crate::WEBSITE_URL);
         }
     }
 }
@@ -1648,7 +1648,7 @@ fn draw_sidebar_footer(ui: &mut egui::Ui, t: &Tokens) -> bool {
     let icon_dim = 12.5_f32;
     let icon_gap = 5.0_f32;
     let label_galley = ui.painter().layout_no_wrap(
-        "GitHub".to_string(),
+        "papercraft.ink".to_string(),
         FontId::proportional(11.0),
         t.text_muted,
     );
@@ -1659,14 +1659,11 @@ fn draw_sidebar_footer(ui: &mut egui::Ui, t: &Tokens) -> bool {
     let link_resp = ui
         .interact(
             link_rect,
-            ui.make_persistent_id("papercraft_home_sidebar_github_link"),
+            ui.make_persistent_id("papercraft_home_sidebar_website_link"),
             Sense::click(),
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(format!(
-            "Open GitHub repository\n{}",
-            crate::GITHUB_REPO_URL
-        ));
+        .on_hover_text(format!("Open PaperCraft website\n{}", crate::WEBSITE_URL));
 
     if ui.is_rect_visible(rect) {
         let hover_t =
@@ -1684,7 +1681,7 @@ fn draw_sidebar_footer(ui: &mut egui::Ui, t: &Tokens) -> bool {
             pos2(link_rect.left() + icon_dim * 0.5, row_rect.center().y),
             Vec2::splat(icon_dim),
         );
-        paint_icon(p, icon_rect, Icon::GitHub, fg);
+        paint_icon(p, icon_rect, Icon::Globe, fg);
         let text_x = icon_rect.right() + icon_gap;
         let text_y = row_rect.center().y - label_galley.size().y * 0.5;
         let label_w = label_galley.size().x;
@@ -2669,7 +2666,7 @@ mod tests {
     }
 
     #[test]
-    fn home_sidebar_footer_shows_github_link_and_version_only_in_sidebar_mode() {
+    fn home_sidebar_footer_shows_website_link_and_version_only_in_sidebar_mode() {
         let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let opened_hook = std::sync::Arc::clone(&opened);
         let hooks = crate::PlatformHooks {
@@ -2685,7 +2682,7 @@ mod tests {
         assert_eq!(expected_version, "v0.5.1");
 
         let mut sidebar_rect = Rect::NOTHING;
-        let mut github_rect = None;
+        let mut website_rect = None;
         let mut version_rect = None;
         for _ in 0..2 {
             let raw = egui::RawInput {
@@ -2700,33 +2697,33 @@ mod tests {
             });
             fn find_texts(
                 shape: &egui::Shape,
-                github_rect: &mut Option<Rect>,
+                website_rect: &mut Option<Rect>,
                 version_rect: &mut Option<Rect>,
                 expected_version: &str,
             ) {
                 match shape {
                     egui::Shape::Text(text) => {
                         let s = text.galley.text();
-                        if s == "GitHub" {
-                            *github_rect = Some(text.visual_bounding_rect());
+                        if s == "papercraft.ink" {
+                            *website_rect = Some(text.visual_bounding_rect());
                         } else if s == expected_version {
                             *version_rect = Some(text.visual_bounding_rect());
                         }
                     }
                     egui::Shape::Vec(items) => {
                         for item in items {
-                            find_texts(item, github_rect, version_rect, expected_version);
+                            find_texts(item, website_rect, version_rect, expected_version);
                         }
                     }
                     _ => {}
                 }
             }
-            github_rect = None;
+            website_rect = None;
             version_rect = None;
             for clipped in &out.shapes {
                 find_texts(
                     &clipped.shape,
-                    &mut github_rect,
+                    &mut website_rect,
                     &mut version_rect,
                     &expected_version,
                 );
@@ -2734,15 +2731,15 @@ mod tests {
             out.drop_without_applying_deltas();
         }
 
-        let gh_r = github_rect.expect("expected GitHub link in Home sidebar footer");
+        let site_r = website_rect.expect("expected website link in Home sidebar footer");
         let ver_r = version_rect.expect("expected version label in Home sidebar footer");
-        assert!(sidebar_rect.contains(gh_r.center()));
+        assert!(sidebar_rect.contains(site_r.center()));
         assert!(sidebar_rect.contains(ver_r.center()));
-        assert!(gh_r.right() < ver_r.left());
-        assert!((gh_r.center().y - ver_r.center().y).abs() <= 2.0);
-        assert!(sidebar_rect.bottom() - gh_r.bottom() <= 24.0);
+        assert!(site_r.right() < ver_r.left());
+        assert!((site_r.center().y - ver_r.center().y).abs() <= 2.0);
+        assert!(sidebar_rect.bottom() - site_r.bottom() <= 24.0);
 
-        let click_pos = gh_r.center();
+        let click_pos = site_r.center();
         for (pressed, time) in [(true, 0.05), (false, 0.10)] {
             let raw = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, viewport)),
@@ -2766,7 +2763,7 @@ mod tests {
         }
         assert_eq!(
             *opened.lock().unwrap(),
-            vec![crate::GITHUB_REPO_URL.to_string()]
+            vec![crate::WEBSITE_URL.to_string()]
         );
 
         // Popup mode (narrow Browse menu) and Editor screen must not show the Home sidebar footer.
@@ -2783,26 +2780,26 @@ mod tests {
                 draw_library_nav(&mut app, ui, &t, NavMode::Popup);
             },
         );
-        let mut popup_gh = None;
+        let mut popup_site = None;
         let mut popup_ver = None;
         fn find_popup(
             shape: &egui::Shape,
-            gh: &mut Option<Rect>,
+            site: &mut Option<Rect>,
             ver: &mut Option<Rect>,
             expected_version: &str,
         ) {
             match shape {
                 egui::Shape::Text(text) => {
                     let s = text.galley.text();
-                    if s == "GitHub" {
-                        *gh = Some(text.visual_bounding_rect());
+                    if s == "papercraft.ink" {
+                        *site = Some(text.visual_bounding_rect());
                     } else if s == expected_version {
                         *ver = Some(text.visual_bounding_rect());
                     }
                 }
                 egui::Shape::Vec(items) => {
                     for item in items {
-                        find_popup(item, gh, ver, expected_version);
+                        find_popup(item, site, ver, expected_version);
                     }
                 }
                 _ => {}
@@ -2811,18 +2808,21 @@ mod tests {
         for clipped in &popup_out.shapes {
             find_popup(
                 &clipped.shape,
-                &mut popup_gh,
+                &mut popup_site,
                 &mut popup_ver,
                 &expected_version,
             );
         }
         popup_out.drop_without_applying_deltas();
-        assert!(popup_gh.is_none(), "Browse popup must omit GitHub footer");
+        assert!(
+            popup_site.is_none(),
+            "Browse popup must omit website footer"
+        );
         assert!(popup_ver.is_none(), "Browse popup must omit version footer");
 
         crate::open_notebook_in_editor(&mut app, 0);
         app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
-        let mut editor_gh = None;
+        let mut editor_site = None;
         let mut editor_ver = None;
         for _ in 0..2 {
             let editor_out = ctx.run_ui(
@@ -2834,19 +2834,22 @@ mod tests {
                     app.show_ui(ui);
                 },
             );
-            editor_gh = None;
+            editor_site = None;
             editor_ver = None;
             for clipped in &editor_out.shapes {
                 find_popup(
                     &clipped.shape,
-                    &mut editor_gh,
+                    &mut editor_site,
                     &mut editor_ver,
                     &expected_version,
                 );
             }
             editor_out.drop_without_applying_deltas();
         }
-        assert!(editor_gh.is_none(), "Editor must omit Home GitHub footer");
+        assert!(
+            editor_site.is_none(),
+            "Editor must omit Home website footer"
+        );
         assert!(editor_ver.is_none(), "Editor must omit Home version footer");
     }
 
@@ -2897,7 +2900,7 @@ mod tests {
             shapes.iter().find_map(|c| visit(&c.shape, needle))
         };
 
-        // 1. Available notice renders in Sidebar below New Folder and above GitHub footer, and opens modal on click.
+        // 1. Available notice renders in Sidebar below New Folder and above website footer, and opens modal on click.
         let avail_spec =
             sidebar_update_notice_spec(&UpdateStatus::Available(Box::new(update.clone())))
                 .expect("Available status should build sidebar notice");
@@ -2928,10 +2931,10 @@ mod tests {
         let folders_r = find_rect(&shapes, "New Folder").expect("New Folder visible");
         let notice_title_r = find_rect(&shapes, "Update available").expect("Update notice title");
         let notice_badge_r = find_rect(&shapes, "v0.3.0").expect("Update notice badge");
-        let gh_r = find_rect(&shapes, "GitHub").expect("GitHub footer visible");
+        let site_r = find_rect(&shapes, "papercraft.ink").expect("Website footer visible");
         assert!(folders_r.bottom() < notice_title_r.top());
         assert!(notice_title_r.right() < notice_badge_r.left());
-        assert!(notice_title_r.bottom() < gh_r.top());
+        assert!(notice_title_r.bottom() < site_r.top());
 
         let click_pos = notice_title_r.center();
         for (pressed, time) in [(true, 0.05), (false, 0.10)] {
