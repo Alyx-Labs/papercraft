@@ -18,7 +18,7 @@ use crate::icons::{Icon, SwitchLayout, SwitchOption, paint_icon, segmented_switc
 use crate::modal::{danger_action_button, primary_action_button, secondary_action_button};
 use crate::sync_worker::{
     SyncWorkerCommand, complete_forget_server_account, complete_sign_out,
-    switch_to_cached_cloud_account_clean, switch_to_local_account_clean, trigger_manual_sync,
+    switch_to_local_account_clean, trigger_manual_sync,
 };
 use crate::theme::Tokens;
 
@@ -125,6 +125,7 @@ pub struct AccountDraftState {
     pub quick_login_password: String,
     pub quick_login_show_password: bool,
     pub quick_login_error: Option<String>,
+    pub quick_login_focus_pending: bool,
     pub reauth_password: String,
     pub reauth_show_password: bool,
     pub reauth_error: Option<String>,
@@ -132,6 +133,7 @@ pub struct AccountDraftState {
     pub disconnect_notice: Option<String>,
     pub select_local_new_name: String,
     pub select_local_error: Option<String>,
+    pub selector_other_server_open: bool,
     pub convert_source_profile_id: String,
     pub convert_source_nickname: String,
     pub convert_source_notebook_count: usize,
@@ -191,6 +193,7 @@ impl Default for AccountDraftState {
             quick_login_password: String::new(),
             quick_login_show_password: false,
             quick_login_error: None,
+            quick_login_focus_pending: false,
             reauth_password: String::new(),
             reauth_show_password: false,
             reauth_error: None,
@@ -198,6 +201,7 @@ impl Default for AccountDraftState {
             disconnect_notice: None,
             select_local_new_name: String::new(),
             select_local_error: None,
+            selector_other_server_open: false,
             convert_source_profile_id: String::new(),
             convert_source_nickname: String::new(),
             convert_source_notebook_count: 0,
@@ -362,11 +366,12 @@ impl AccountDraftState {
         self.delete_profile_paste_blocked = false;
     }
 
-    fn clear_quick_login_draft(&mut self) {
+    pub(crate) fn clear_quick_login_draft(&mut self) {
         self.quick_login_key = None;
         self.quick_login_password.clear();
         self.quick_login_show_password = false;
         self.quick_login_error = None;
+        self.quick_login_focus_pending = false;
     }
 
     pub fn clear_reauth_draft(&mut self) {
@@ -414,6 +419,7 @@ impl AccountDraftState {
         self.clear_convert_draft();
         self.clear_pending_delete_profile();
         self.clear_pending_forget_server();
+        self.selector_other_server_open = false;
         self.profile_save_busy = false;
         self.change_password_busy = false;
         self.current_password_draft.clear();
@@ -582,6 +588,7 @@ impl AccountDraftState {
         self.clear_convert_draft();
         self.clear_pending_delete_profile();
         self.clear_pending_forget_server();
+        self.selector_other_server_open = false;
         self.password_reset = PasswordResetFlowState::default();
         self.signup_username.clear();
         self.edit_display_name.clear();
@@ -595,7 +602,7 @@ impl AccountDraftState {
         self.new_password_draft.clear();
         self.confirm_new_password_draft.clear();
         self.error_message = None;
-        self.status_message = Some("Exited server session. Switched to local mode.".to_string());
+        self.status_message = Some("Signed out. Choose an account to continue.".to_string());
     }
 }
 
@@ -606,6 +613,7 @@ pub(crate) fn sync_draft_from_session(app: &mut PaperCraftApp) {
         .sync_identity_from_session(app.session.active_account_session());
     app.view.account.error_message = None;
     app.view.account.status_message = None;
+    app.view.account.selector_other_server_open = false;
     app.view.account.clear_quick_login_draft();
     app.view.account.clear_reauth_draft();
     app.view.account.clear_pending_delete_profile();
@@ -804,159 +812,475 @@ pub(crate) fn render_select_local_account_body(
     ui: &mut egui::Ui,
     t: &Tokens,
 ) -> bool {
-    let mut should_close = false;
-    ui.spacing_mut().item_spacing.y = 0.0;
-
-    if let Some(ref notice) = app.view.account.disconnect_notice {
-        draw_status_banner(ui, BannerTone::Error, notice, t);
-        ui.add_space(10.0);
+    if std::mem::take(&mut app.view.account.profile_probe_pending) {
+        probe_all_known_servers(app, ui.ctx());
     }
 
-    let profiles = app.session.saved_local_profiles().to_vec();
-    draw_section_card(ui, t, |ui| {
-        ui.horizontal(|ui| {
-            let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-            paint_icon(ui.painter(), ir, Icon::Inbox, t.accent);
-            ui.label(
-                egui::RichText::new("Saved Local Accounts")
-                    .size(13.0)
-                    .strong()
-                    .color(t.text),
-            );
-        });
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new("Stored exclusively on this device. Access any account immediately without internet.")
-                .size(11.0)
-                .color(t.text_muted),
-        );
-        ui.add_space(8.0);
+    let mut should_close = false;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let subflow_id: u8 = if app.view.account.selector_other_server_open {
+        1
+    } else {
+        0
+    };
 
-        if profiles.is_empty() {
-            ui.label(
-                egui::RichText::new("No local accounts exist on this device yet.")
-                    .size(11.5)
-                    .color(t.text_muted),
-            );
-        } else {
-            let mut open_id: Option<String> = None;
-            for prof in &profiles {
-                let nb_count = app
-                    .session
-                    .local_profile_notebook_count(&prof.local_profile_id);
-                let count_label = format_notebook_count(nb_count);
-                draw_account_block_frame(ui, false, None, t, |ui| {
+    crate::modal::apply_subflow_motion(
+        app,
+        ui,
+        crate::modal::ActiveModal::SelectLocalAccount,
+        subflow_id,
+        isize::from(subflow_id),
+        |app, ui| {
+            if app.view.account.selector_other_server_open {
+                let mut test_on_enter = false;
+                draw_section_card(ui, t, |ui| {
+                    test_on_enter = render_server_probe_section(app, ui, t, true);
+                });
+                ui.add_space(9.0);
+                let mut submit_on_enter = false;
+                draw_section_card(ui, t, |ui| {
+                    submit_on_enter = render_auth_card_contents(app, ui, t, true);
+                });
+                render_auth_banners(app, ui, t);
+                if test_on_enter && !app.view.account.is_testing() {
+                    trigger_test_connection(app, ui.ctx());
+                }
+                if submit_on_enter {
+                    handle_auth_submit_on_enter(app, ui.ctx());
+                }
+                return;
+            }
+
+            if let Some(ref notice) = app.view.account.disconnect_notice {
+                draw_status_banner(ui, BannerTone::Error, notice, t);
+                ui.add_space(10.0);
+            }
+
+            let profiles = app.session.saved_local_profiles().to_vec();
+            let remembered = app.session.remembered_server_accounts().to_vec();
+
+            if !remembered.is_empty() {
+                let any_checking = app
+                    .view
+                    .account
+                    .server_probes
+                    .values()
+                    .any(|p| matches!(p, ServerProbeState::Checking { .. }));
+                draw_section_card(ui, t, |ui| {
                     ui.horizontal(|ui| {
-                        let (ir, _) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::hover());
-                        paint_icon(ui.painter(), ir, Icon::Account, t.accent);
-                        draw_truncated_block_title(
-                            ui,
-                            &prof.nickname,
-                            (ui.available_width() - 120.0).max(80.0),
-                            t,
+                        let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                        paint_icon(ui.painter(), ir, Icon::Server, t.accent);
+                        ui.label(
+                            egui::RichText::new("Server Accounts")
+                                .size(13.0)
+                                .strong()
+                                .color(t.text),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if primary_action_button(ui, "Open", true, t).clicked() {
-                                open_id = Some(prof.local_profile_id.clone());
+                            let check_lbl = if any_checking { "..." } else { "Check" };
+                            if fixed_secondary_button(ui, check_lbl, 62.0, !any_checking, t)
+                                .on_hover_text(
+                                    "Check whether your configured sync servers are online",
+                                )
+                                .clicked()
+                            {
+                                probe_all_known_servers(app, ui.ctx());
                             }
                         });
                     });
+                    ui.add_space(2.0);
                     ui.label(
-                        egui::RichText::new(format!("{count_label} · Offline on this device"))
-                            .size(11.0)
-                            .color(t.text_muted),
+                        egui::RichText::new(
+                            "Select a linked server account and enter your password to sign in.",
+                        )
+                        .size(11.0)
+                        .color(t.text_muted),
+                    );
+                    ui.add_space(8.0);
+                    for entry in &remembered {
+                        render_selector_server_account_block(app, ui, entry, t);
+                        ui.add_space(6.0);
+                    }
+                });
+                ui.add_space(10.0);
+            }
+
+            draw_section_card(ui, t, |ui| {
+                ui.horizontal(|ui| {
+                    let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                    paint_icon(ui.painter(), ir, Icon::Inbox, t.accent);
+                    ui.label(
+                        egui::RichText::new("Saved Local Accounts")
+                            .size(13.0)
+                            .strong()
+                            .color(t.text),
                     );
                 });
-                ui.add_space(6.0);
-            }
-            if let Some(pid) = open_id {
-                if let Err(err) = switch_to_local_account_clean(app, ui.ctx(), &pid) {
-                    app.view.account.select_local_error = Some(err);
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Stored exclusively on this device. Access any account immediately without internet.",
+                    )
+                    .size(11.0)
+                    .color(t.text_muted),
+                );
+                ui.add_space(8.0);
+
+                if profiles.is_empty() {
+                    let empty_msg = if remembered.is_empty() {
+                        "No saved accounts exist on this device yet."
+                    } else {
+                        "No local-only accounts on this device. You can create one below."
+                    };
+                    ui.label(
+                        egui::RichText::new(empty_msg)
+                            .size(11.5)
+                            .color(t.text_muted),
+                    );
                 } else {
-                    should_close = true;
+                    let mut open_id: Option<String> = None;
+                    for prof in &profiles {
+                        let nb_count = app
+                            .session
+                            .local_profile_notebook_count(&prof.local_profile_id);
+                        let count_label = format_notebook_count(nb_count);
+                        draw_account_block_frame(
+                            ui,
+                            ("select_local_prof", &prof.local_profile_id),
+                            false,
+                            false,
+                            t,
+                            |ui| {
+                                ui.horizontal(|ui| {
+                                    let (ir, _) =
+                                        ui.allocate_exact_size(Vec2::splat(15.0), Sense::hover());
+                                    paint_icon(ui.painter(), ir, Icon::Account, t.accent);
+                                    draw_truncated_block_title(
+                                        ui,
+                                        &prof.nickname,
+                                        (ui.available_width() - 120.0).max(80.0),
+                                        t,
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if primary_action_button(ui, "Open", true, t).clicked()
+                                            {
+                                                open_id = Some(prof.local_profile_id.clone());
+                                            }
+                                        },
+                                    );
+                                });
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{count_label} · Offline on this device"
+                                    ))
+                                    .size(11.0)
+                                    .color(t.text_muted),
+                                );
+                            },
+                        );
+                        ui.add_space(6.0);
+                    }
+                    if let Some(pid) = open_id {
+                        if let Err(err) = switch_to_local_account_clean(app, ui.ctx(), &pid) {
+                            app.view.account.select_local_error = Some(err);
+                        } else {
+                            should_close = true;
+                        }
+                    }
                 }
-            }
-        }
-    });
+            });
 
-    ui.add_space(10.0);
+            ui.add_space(10.0);
 
-    draw_section_card(ui, t, |ui| {
-        draw_field_label_row(
-            ui,
-            "Or Create a New Local Account",
-            FieldHint::Muted("Start a clean workspace on this device"),
-            t,
-        );
-        ui.add_space(6.0);
-        let btn_w = 112.0_f32;
-        let gap = 8.0_f32;
-        let input_w = (ui.available_width() - btn_w - gap).max(120.0);
-        let mut create_submitted = false;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            let resp = draw_text_input(
-                ui,
-                InputFieldSpec {
-                    id_salt: "select_local_new_nickname_input",
-                    width: input_w,
-                    hint: "New nickname...",
-                    border_color: None,
-                    trailing: InputTrailing::None,
-                },
-                &mut app.view.account.select_local_new_name,
-                t,
-            );
-            if resp.changed {
-                app.view.account.select_local_error = None;
-            }
-            if resp.enter_pressed {
-                create_submitted = true;
-            }
-            let has_name = !app.view.account.select_local_new_name.trim().is_empty();
-            if fixed_secondary_button(ui, "Create & Open", btn_w, has_name, t).clicked()
-                || (create_submitted && has_name)
-            {
-                let nick = app.view.account.select_local_new_name.trim().to_string();
-                match app.session.execute(
-                    "profile.create",
-                    &json!({ "nickname": nick, "switch_now": true }),
-                ) {
-                    Ok(_) => {
-                        app.view.account.select_local_new_name.clear();
+            draw_section_card(ui, t, |ui| {
+                draw_field_label_row(
+                    ui,
+                    "Or Create a New Local Account",
+                    FieldHint::Muted("Start a clean workspace on this device"),
+                    t,
+                );
+                ui.add_space(6.0);
+                let btn_w = 112.0_f32;
+                let gap = 8.0_f32;
+                let input_w = (ui.available_width() - btn_w - gap).max(120.0);
+                let mut create_submitted = false;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    let resp = draw_text_input(
+                        ui,
+                        InputFieldSpec {
+                            id_salt: "select_local_new_nickname_input",
+                            width: input_w,
+                            hint: "New nickname...",
+                            border_color: None,
+                            trailing: InputTrailing::None,
+                        },
+                        &mut app.view.account.select_local_new_name,
+                        t,
+                    );
+                    if resp.changed {
                         app.view.account.select_local_error = None;
-                        app.view.account.disconnect_notice = None;
-                        crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
-                        crate::sync_view_to_active_notebook(app);
-                        should_close = true;
                     }
-                    Err(err) => {
-                        app.view.account.select_local_error = Some(err.to_string());
+                    if resp.enter_pressed {
+                        create_submitted = true;
                     }
-                }
-            }
-        });
-    });
+                    let has_name = !app.view.account.select_local_new_name.trim().is_empty();
+                    if fixed_secondary_button(ui, "Create & Open", btn_w, has_name, t).clicked()
+                        || (create_submitted && has_name)
+                    {
+                        let nick = app.view.account.select_local_new_name.trim().to_string();
+                        match app.session.execute(
+                            "profile.create",
+                            &json!({ "nickname": nick, "switch_now": true }),
+                        ) {
+                            Ok(_) => {
+                                app.view.account.select_local_new_name.clear();
+                                app.view.account.select_local_error = None;
+                                app.view.account.disconnect_notice = None;
+                                crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                                crate::sync_view_to_active_notebook(app);
+                                should_close = true;
+                            }
+                            Err(err) => {
+                                app.view.account.select_local_error = Some(err.to_string());
+                            }
+                        }
+                    }
+                });
+            });
 
-    if let Some(ref err) = app.view.account.select_local_error {
-        ui.add_space(8.0);
-        draw_status_banner(ui, BannerTone::Error, err, t);
-    }
+            if let Some(ref err) = app.view.account.select_local_error {
+                ui.add_space(8.0);
+                draw_status_banner(ui, BannerTone::Error, err, t);
+            } else if app.view.account.quick_login_error.is_none() {
+                render_auth_banners(app, ui, t);
+            }
+        },
+    );
 
     should_close
 }
 
+fn render_selector_server_account_block(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    entry: &RememberedServerAccount,
+    t: &Tokens,
+) {
+    let norm_url = norm_probe_url_key(&entry.server_url);
+    let probe = app.view.account.probe_for(&entry.server_url);
+    let server_offline = matches!(probe, ServerProbeState::Failed { .. });
+    let is_cached = app
+        .session
+        .has_cached_server_account(&entry.server_url, &entry.user_id);
+    let entry_key = (norm_url, entry.user_id.clone());
+    let quick_open =
+        !server_offline && app.view.account.quick_login_key.as_ref() == Some(&entry_key);
+    let primary = entry.primary_label();
+    let subtitle_id = entry
+        .login_email()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("@{}", entry.username));
+
+    draw_account_block_frame(
+        ui,
+        ("selector_srv_block", &entry.server_url, &entry.user_id),
+        quick_open,
+        false,
+        t,
+        |ui| {
+            ui.horizontal(|ui| {
+                let (ir, _) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::hover());
+                paint_icon(
+                    ui.painter(),
+                    ir,
+                    Icon::Server,
+                    if server_offline {
+                        t.text_muted
+                    } else {
+                        t.accent
+                    },
+                );
+                draw_truncated_block_title(
+                    ui,
+                    &primary,
+                    (ui.available_width() - 210.0).max(56.0),
+                    t,
+                );
+                draw_probe_status_pill(ui, &probe, t);
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let can_open_login = !server_offline && !app.view.account.auth_busy;
+                    let tip = if server_offline {
+                        "Server is offline — signing in requires an online connection to verify your password"
+                    } else {
+                        "Enter your password to sign in to this account"
+                    };
+                    if fixed_secondary_button(ui, "Sign In", 68.0, can_open_login, t)
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        if quick_open {
+                            app.view.account.clear_quick_login_draft();
+                        } else {
+                            app.view.account.quick_login_key = Some(entry_key.clone());
+                            app.view.account.quick_login_password.clear();
+                            app.view.account.quick_login_error = None;
+                            app.view.account.quick_login_focus_pending = true;
+                            app.view.account.server_url = entry.server_url.clone();
+                        }
+                    }
+                });
+            });
+
+            ui.label(
+                egui::RichText::new(format!("{subtitle_id} · {}", entry.server_url))
+                    .size(11.0)
+                    .color(t.text_muted),
+            );
+            if server_offline {
+                ui.label(
+                    egui::RichText::new(
+                        "Server offline — signing in requires an online connection to verify your password.",
+                    )
+                    .size(10.5)
+                    .color(t.warning_fg),
+                );
+            }
+
+            let drawer_id = ui.make_persistent_id((
+                "selector_quick_login_collapse",
+                &entry.server_url,
+                &entry.user_id,
+            ));
+            crate::motion::animated_collapse_with_duration(
+                ui,
+                drawer_id,
+                quick_open,
+                92.0,
+                crate::motion::MICRO_DURATION_S,
+                |ui| {
+                    render_quick_login_drawer(app, ui, entry, is_cached, "selector_quick_pw", t);
+                },
+            );
+        },
+    );
+}
+
+fn render_quick_login_drawer(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    entry: &RememberedServerAccount,
+    is_cached: bool,
+    pw_prefix: &str,
+    t: &Tokens,
+) {
+    let probe = app.view.account.probe_for(&entry.server_url);
+    let server_offline = matches!(probe, ServerProbeState::Failed { .. });
+    let entry_key = (norm_probe_url_key(&entry.server_url), entry.user_id.clone());
+    let quick_open =
+        !server_offline && app.view.account.quick_login_key.as_ref() == Some(&entry_key);
+
+    ui.add_space(6.0);
+    let hint_text = if is_cached {
+        "Enter your password to verify your identity and switch into this server account."
+    } else {
+        "Enter your password to sign in and download this server account."
+    };
+    ui.label(
+        egui::RichText::new(hint_text)
+            .size(11.0)
+            .color(t.text_muted),
+    );
+    ui.add_space(4.0);
+
+    let busy = app.view.account.auth_busy;
+    let mut submit_quick = false;
+    let pw_id_salt = format!("{pw_prefix}_{}", entry.user_id);
+    let pw_edit_id = ui.make_persistent_id(&pw_id_salt);
+    if ui.is_enabled()
+        && quick_open
+        && std::mem::take(&mut app.view.account.quick_login_focus_pending)
+    {
+        ui.memory_mut(|m| m.request_focus(pw_edit_id));
+    }
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let btn_w = 88.0_f32;
+        let cancel_w = 64.0_f32;
+        let input_w = (ui.available_width() - btn_w - cancel_w - 12.0).max(110.0);
+        let pw_resp = draw_password_input(
+            ui,
+            &pw_id_salt,
+            input_w,
+            &mut app.view.account.quick_login_password,
+            &mut app.view.account.quick_login_show_password,
+            t,
+        );
+        if pw_resp.changed {
+            app.view.account.quick_login_error = None;
+        }
+        if ui.is_enabled() && pw_resp.enter_pressed && !busy {
+            submit_quick = true;
+        }
+        let can_connect = !busy && !app.view.account.quick_login_password.is_empty();
+        let cta = if busy {
+            "Signing In..."
+        } else if is_cached {
+            "Verify"
+        } else {
+            "Sign In"
+        };
+        if primary_action_button(ui, cta, can_connect, t).clicked() && ui.is_enabled() {
+            submit_quick = true;
+        }
+        if fixed_secondary_button(ui, "Cancel", cancel_w, !busy, t).clicked() && ui.is_enabled() {
+            app.view.account.clear_quick_login_draft();
+        }
+    });
+    if let Some(ref err) = app.view.account.quick_login_error {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(err).size(11.0).color(t.danger_fg));
+    }
+    if ui.is_enabled() && submit_quick && !busy {
+        submit_quick_server_login(app, ui.ctx(), entry);
+    }
+}
+
 pub(crate) fn render_select_local_account_footer(
-    _app: &mut PaperCraftApp,
+    app: &mut PaperCraftApp,
     ui: &mut egui::Ui,
     t: &Tokens,
 ) -> bool {
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Select an existing local account or create one to continue.")
-                .size(11.0)
-                .color(t.text_muted),
-        );
+        if app.view.account.selector_other_server_open {
+            let busy = app.view.account.auth_busy || app.view.account.password_reset.busy;
+            if secondary_action_button(ui, "Back to Accounts", !busy, t).clicked() {
+                app.view.account.selector_other_server_open = false;
+                app.view.account.exit_password_reset_flow();
+                app.view.account.error_message = None;
+                app.view.account.status_message = None;
+            }
+        } else {
+            ui.label(
+                egui::RichText::new("Select an account above to continue.")
+                    .size(11.0)
+                    .color(t.text_muted),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if secondary_action_button(ui, "Sign In with Another Email", true, t).clicked() {
+                    app.view.account.selector_other_server_open = true;
+                    app.view.account.tab = AuthTab::SignIn;
+                    app.view.account.exit_password_reset_flow();
+                    app.view.account.clear_quick_login_draft();
+                    app.view.account.error_message = None;
+                    app.view.account.status_message = None;
+                }
+            });
+        }
     });
     false
 }
@@ -1269,8 +1593,29 @@ pub(crate) fn render_auth_card_contents(
     t: &Tokens,
     show_inline_submit: bool,
 ) -> bool {
+    let auth_flow_key: u8 = if app.view.account.password_reset.active {
+        2
+    } else if app.view.account.tab == AuthTab::CreateAccount {
+        1
+    } else {
+        0
+    };
+    let dt = ui.ctx().input(|i| i.stable_dt);
+    if app
+        .view
+        .motion
+        .auth_flow
+        .advance(auth_flow_key, isize::from(auth_flow_key), dt)
+    {
+        ui.ctx().request_repaint();
+    }
+    let flow_opacity = app.view.motion.auth_flow.opacity();
+    let flow_offset_x = app.view.motion.auth_flow.offset_x();
+
     if app.view.account.password_reset.active {
-        return render_password_reset_flow_card(app, ui, t, show_inline_submit);
+        return crate::motion::show_flow_content(ui, flow_opacity, flow_offset_x, |ui| {
+            render_password_reset_flow_card(app, ui, t, show_inline_submit)
+        });
     }
 
     let mut submit_on_enter = false;
@@ -1278,45 +1623,33 @@ pub(crate) fn render_auth_card_contents(
     ui.add_space(9.0);
 
     let tab = app.view.account.tab;
-    let subflow_id = match tab {
-        AuthTab::SignIn => 0,
-        AuthTab::CreateAccount => 1,
-    };
-    crate::modal::apply_subflow_motion(
-        app,
-        ui,
-        crate::modal::ActiveModal::AccountSync,
-        subflow_id,
-        isize::from(subflow_id),
-        |app, ui| {
-            render_auth_tab_explanation(app, ui, t);
+    crate::motion::show_flow_content(ui, flow_opacity, flow_offset_x, |ui| {
+        render_auth_tab_explanation(app, ui, t);
+        ui.add_space(8.0);
+
+        if is_active_server_known_offline(app) {
+            draw_status_banner(
+                ui,
+                BannerTone::Warning,
+                "Server is offline — first sign-in or registration requires an online connection because no local backup of this account exists on this device.",
+                t,
+            );
             ui.add_space(8.0);
+        } else if matches!(tab, AuthTab::CreateAccount) && app.view.account.is_registration_closed()
+        {
+            draw_status_banner(
+                ui,
+                BannerTone::Warning,
+                "Registration is closed on this server. Switch to Sign In to use an existing account.",
+                t,
+            );
+            ui.add_space(8.0);
+        }
 
-            if is_active_server_known_offline(app) {
-                draw_status_banner(
-                    ui,
-                    BannerTone::Warning,
-                    "Server is offline — first sign-in or registration requires an online connection because no local backup of this account exists on this device.",
-                    t,
-                );
-                ui.add_space(8.0);
-            } else if matches!(tab, AuthTab::CreateAccount)
-                && app.view.account.is_registration_closed()
-            {
-                draw_status_banner(
-                    ui,
-                    BannerTone::Warning,
-                    "Registration is closed on this server. Switch to Sign In to use an existing account.",
-                    t,
-                );
-                ui.add_space(8.0);
-            }
-
-            if render_account_credentials_fields(app, ui, t) {
-                submit_on_enter = true;
-            }
-        },
-    );
+        if render_account_credentials_fields(app, ui, t) {
+            submit_on_enter = true;
+        }
+    });
 
     if tab == AuthTab::SignIn {
         ui.add_space(6.0);
@@ -1411,19 +1744,14 @@ fn render_password_reset_flow_card(
     );
 
     ui.add_space(8.0);
-    draw_field_label_row(
-        ui,
-        "Email or Username",
-        FieldHint::Muted("Account being recovered"),
-        t,
-    );
+    draw_field_label_row(ui, "Email", FieldHint::Muted("Account being recovered"), t);
     ui.add_space(3.0);
     if draw_text_input(
         ui,
         InputFieldSpec {
             id_salt: "acct_reset_identifier",
             width: ui.available_width(),
-            hint: "you@example.com or alex_notes",
+            hint: "you@example.com",
             border_color: None,
             trailing: InputTrailing::None,
         },
@@ -1589,12 +1917,20 @@ fn render_signed_out_local_workspace_card(app: &mut PaperCraftApp, ui: &mut egui
         .color(t.text_muted),
     );
 
-    if app.view.account.profiles_panel_open {
-        ui.add_space(8.0);
-        draw_hairline(ui, t);
-        ui.add_space(8.0);
-        render_local_profiles_manager(app, ui, t);
-    }
+    let collapse_id = ui.make_persistent_id("signed_out_local_profiles_collapse");
+    crate::motion::animated_collapse_with_duration(
+        ui,
+        collapse_id,
+        app.view.account.profiles_panel_open,
+        148.0,
+        crate::motion::MICRO_DURATION_S,
+        |ui| {
+            ui.add_space(8.0);
+            draw_hairline(ui, t);
+            ui.add_space(8.0);
+            render_local_profiles_manager(app, ui, t);
+        },
+    );
 }
 
 fn render_auth_tab_explanation(app: &PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
@@ -1665,31 +2001,24 @@ fn render_account_credentials_fields(
 ) -> bool {
     let mut submit_on_enter = false;
     let tab = app.view.account.tab;
-    let is_email_only = matches!(tab, AuthTab::CreateAccount);
+    let is_create = matches!(tab, AuthTab::CreateAccount);
 
-    let (id_label, id_hint, id_placeholder) = if is_email_only {
-        let hint = if app.view.account.email_or_username.trim().is_empty() {
+    let id_hint = if app.view.account.email_or_username.trim().is_empty() {
+        if is_create {
             FieldHint::Muted("Unique account email")
-        } else if normalize_email(&app.view.account.email_or_username).is_ok() {
-            FieldHint::Success("Valid email")
         } else {
-            FieldHint::Warning("Enter a valid email address".to_string())
-        };
-        ("Email", hint, "you@example.com")
+            FieldHint::Muted("Account email address")
+        }
+    } else if normalize_email(&app.view.account.email_or_username).is_ok() {
+        FieldHint::Success("Valid email")
     } else {
-        (
-            "Email or Username",
-            FieldHint::Muted("Account identifier"),
-            "you@example.com or alex_notes",
-        )
+        FieldHint::Warning("Enter a valid email address".to_string())
     };
 
-    draw_field_label_row(ui, id_label, id_hint, t);
+    draw_field_label_row(ui, "Email", id_hint, t);
     ui.add_space(3.0);
 
-    let user_trailing = if tab == AuthTab::CreateAccount
-        && normalize_email(&app.view.account.email_or_username).is_ok()
-    {
+    let user_trailing = if normalize_email(&app.view.account.email_or_username).is_ok() {
         InputTrailing::GreenCheck("Valid email format")
     } else {
         InputTrailing::None
@@ -1699,7 +2028,7 @@ fn render_account_credentials_fields(
         InputFieldSpec {
             id_salt: "acct_email_or_username",
             width: ui.available_width(),
-            hint: id_placeholder,
+            hint: "you@example.com",
             border_color: None,
             trailing: user_trailing,
         },
@@ -1710,7 +2039,7 @@ fn render_account_credentials_fields(
         submit_on_enter = true;
     }
 
-    if is_email_only {
+    if is_create {
         ui.add_space(7.0);
         let avail_w = ui.available_width();
         if avail_w >= 360.0 {
@@ -2235,58 +2564,66 @@ fn render_account_email_row(
         });
     });
 
-    if !app.view.account.change_email_open {
-        return;
-    }
-
-    ui.add_space(8.0);
-    draw_field_label_row(ui, "New Email", FieldHint::Muted("Must be unique"), t);
-    ui.add_space(3.0);
-    let mut submit_email = false;
-    let email_resp = draw_text_input(
+    crate::motion::animated_collapse_with_duration(
         ui,
-        InputFieldSpec {
-            id_salt: "acct_change_email_new",
-            width: ui.available_width(),
-            hint: "new@example.com",
-            border_color: None,
-            trailing: InputTrailing::None,
+        ui.make_persistent_id("acct_change_email_drawer"),
+        app.view.account.change_email_open,
+        156.0,
+        crate::motion::MICRO_DURATION_S,
+        |ui| {
+            ui.add_space(8.0);
+            draw_field_label_row(ui, "New Email", FieldHint::Muted("Must be unique"), t);
+            ui.add_space(3.0);
+            let mut submit_email = false;
+            let email_resp = draw_text_input(
+                ui,
+                InputFieldSpec {
+                    id_salt: "acct_change_email_new",
+                    width: ui.available_width(),
+                    hint: "new@example.com",
+                    border_color: None,
+                    trailing: InputTrailing::None,
+                },
+                &mut app.view.account.new_email_draft,
+                t,
+            );
+            if email_resp.enter_pressed {
+                submit_email = true;
+            }
+
+            ui.add_space(6.0);
+            draw_field_label_row(
+                ui,
+                "Current Password",
+                FieldHint::Muted("Verify identity"),
+                t,
+            );
+            ui.add_space(3.0);
+            let pw_resp = draw_password_input(
+                ui,
+                "acct_change_email_pw",
+                ui.available_width(),
+                &mut app.view.account.change_email_password,
+                &mut app.view.account.show_change_email_password,
+                t,
+            );
+            if pw_resp.enter_pressed {
+                submit_email = true;
+            }
+
+            ui.add_space(7.0);
+            let busy = app.view.account.change_email_busy;
+            ui.horizontal(|ui| {
+                let save_lbl = if busy { "Saving..." } else { "Save Email" };
+                if (fixed_secondary_button(ui, save_lbl, 96.0, !busy, t).clicked()
+                    || (ui.is_enabled() && submit_email))
+                    && !busy
+                {
+                    submit_change_email(app, ui.ctx());
+                }
+            });
         },
-        &mut app.view.account.new_email_draft,
-        t,
     );
-    if email_resp.enter_pressed {
-        submit_email = true;
-    }
-
-    ui.add_space(6.0);
-    draw_field_label_row(
-        ui,
-        "Current Password",
-        FieldHint::Muted("Verify identity"),
-        t,
-    );
-    ui.add_space(3.0);
-    let pw_resp = draw_password_input(
-        ui,
-        "acct_change_email_pw",
-        ui.available_width(),
-        &mut app.view.account.change_email_password,
-        &mut app.view.account.show_change_email_password,
-        t,
-    );
-    if pw_resp.enter_pressed {
-        submit_email = true;
-    }
-
-    ui.add_space(7.0);
-    let busy = app.view.account.change_email_busy;
-    ui.horizontal(|ui| {
-        let save_lbl = if busy { "Saving..." } else { "Save Email" };
-        if fixed_secondary_button(ui, save_lbl, 96.0, !busy, t).clicked() || submit_email {
-            submit_change_email(app, ui.ctx());
-        }
-    });
 }
 
 pub(crate) fn render_profile_identity_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
@@ -2307,7 +2644,7 @@ pub(crate) fn render_profile_identity_card(app: &mut PaperCraftApp, ui: &mut egu
     ui.add(
         egui::Label::new(
             egui::RichText::new(
-                "Update how your name appears across devices and change your unique @username handle used for signing in.",
+                "Update how your name and @username handle appear across synced devices.",
             )
             .size(11.0)
             .color(t.text_muted),
@@ -2627,14 +2964,45 @@ fn draw_truncated_block_title(ui: &mut egui::Ui, title: &str, max_w: f32, t: &To
 
 fn draw_account_block_frame(
     ui: &mut egui::Ui,
+    id_salt: impl egui::AsIdSalt,
     active: bool,
-    border_override: Option<Color32>,
+    danger: bool,
     t: &Tokens,
     body: impl FnOnce(&mut egui::Ui),
 ) {
-    let fill = if active { t.accent_soft } else { t.toolbar_bg };
-    let stroke_color = border_override.unwrap_or(if active { t.accent } else { t.border });
-    egui::Frame::new()
+    let block_id = ui.make_persistent_id(id_salt);
+    let base_fill = if danger {
+        t.danger_bg
+    } else if active {
+        t.accent_soft
+    } else {
+        t.toolbar_bg
+    };
+    let hover_fill = if danger {
+        t.danger_bg
+    } else if active {
+        t.accent_soft
+    } else {
+        t.field_bg
+    };
+    let base_stroke = if danger {
+        t.danger_border
+    } else if active {
+        t.accent
+    } else {
+        t.border
+    };
+    let hover_stroke = if danger { t.danger_border } else { t.accent };
+
+    let prev_hovered = ui.ctx().data(|d| {
+        d.get_temp::<bool>(block_id.with("hovered"))
+            .unwrap_or(false)
+    });
+    let hover_t = crate::motion::hover_factor(ui.ctx(), block_id.with("hov"), prev_hovered);
+    let fill = crate::motion::lerp_color(base_fill, hover_fill, hover_t * 0.65);
+    let stroke_color = crate::motion::lerp_color(base_stroke, hover_stroke, hover_t * 0.45);
+
+    let resp = egui::Frame::new()
         .fill(fill)
         .stroke(Stroke::new(1.0, stroke_color))
         .corner_radius(CornerRadius::same(8))
@@ -2644,6 +3012,12 @@ fn draw_account_block_frame(
             ui.spacing_mut().item_spacing.y = 4.0;
             body(ui);
         });
+    let now_hovered = ui.rect_contains_pointer(resp.response.rect);
+    if now_hovered != prev_hovered {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(block_id.with("hovered"), now_hovered));
+        ui.ctx().request_repaint();
+    }
 }
 
 /// Builds the exact manual confirmation phrase (`I agree <local_profile>`) for local deletion.
@@ -2812,7 +3186,7 @@ pub(crate) fn render_accounts_switcher_section(
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 if fixed_secondary_button(ui, "Sign In / Add", 98.0, true, t)
-                    .on_hover_text("Sign in with email/username or create a new cloud account")
+                    .on_hover_text("Sign in with your email or create a new cloud account")
                     .clicked()
                 {
                     app.view.account.profile_section = ProfileSection::ServerLogin;
@@ -2936,8 +3310,9 @@ fn render_active_cloud_account_block(
 
     draw_account_block_frame(
         ui,
+        ("active_cloud_block", &acct.server_url, &acct.user.user_id),
         true,
-        is_confirming_forget.then_some(t.danger_border),
+        is_confirming_forget,
         t,
         |ui| {
             ui.horizontal(|ui| {
@@ -2985,28 +3360,48 @@ fn render_active_cloud_account_block(
                     .size(11.0)
                     .color(t.text_muted),
             );
-            if is_confirming_forget {
-                ui.add_space(4.0);
-                render_forget_server_account_confirmation(
-                    app,
-                    ui,
+            crate::motion::animated_collapse_with_duration(
+                ui,
+                ui.make_persistent_id((
+                    "active_forget_confirm",
                     &acct.server_url,
                     &acct.user.user_id,
-                    &disp,
-                    cloud_pending,
-                    t,
-                );
-            } else if app.session.is_session_expired() {
-                ui.add_space(6.0);
-                render_expired_session_reauth_box(
-                    app,
-                    ui,
-                    &acct,
-                    cloud_pending,
-                    "profile_reauth_pw",
-                    t,
-                );
-            }
+                )),
+                is_confirming_forget,
+                152.0,
+                crate::motion::MICRO_DURATION_S,
+                |ui| {
+                    ui.add_space(4.0);
+                    render_forget_server_account_confirmation(
+                        app,
+                        ui,
+                        &acct.server_url,
+                        &acct.user.user_id,
+                        &disp,
+                        cloud_pending,
+                        t,
+                    );
+                },
+            );
+            let show_reauth = !is_confirming_forget && app.session.is_session_expired();
+            crate::motion::animated_collapse_with_duration(
+                ui,
+                ui.make_persistent_id(("active_reauth_box", &acct.server_url, &acct.user.user_id)),
+                show_reauth,
+                140.0,
+                crate::motion::MICRO_DURATION_S,
+                |ui| {
+                    ui.add_space(6.0);
+                    render_expired_session_reauth_box(
+                        app,
+                        ui,
+                        &acct,
+                        cloud_pending,
+                        "profile_reauth_pw",
+                        t,
+                    );
+                },
+            );
         },
     );
 }
@@ -3083,13 +3478,13 @@ fn render_expired_session_reauth_box(
                 if pw_resp.changed {
                     app.view.account.reauth_error = None;
                 }
-                if pw_resp.enter_pressed && !busy && !server_offline {
+                if ui.is_enabled() && pw_resp.enter_pressed && !busy && !server_offline {
                     submit_now = true;
                 }
                 let can_submit =
                     !busy && !server_offline && !app.view.account.reauth_password.is_empty();
                 let cta = if busy { "Signing In..." } else { "Sign In & Sync" };
-                if primary_action_button(ui, cta, can_submit, t).clicked() {
+                if primary_action_button(ui, cta, can_submit, t).clicked() && ui.is_enabled() {
                     submit_now = true;
                 }
             });
@@ -3097,7 +3492,7 @@ fn render_expired_session_reauth_box(
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(err).size(11.0).color(t.danger_fg));
             }
-            if submit_now && !busy {
+            if ui.is_enabled() && submit_now && !busy {
                 submit_active_session_reauth(app, ui.ctx(), acct);
             }
         });
@@ -3113,19 +3508,18 @@ fn submit_active_session_reauth(
         app.view.account.reauth_error = Some("Enter your password to resume sync.".to_string());
         return;
     }
-    let identifier = acct
+    let Some(identifier) = acct
         .user
         .email
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| acct.user.username.clone());
-    if identifier.is_empty() {
+    else {
         app.view.account.reauth_error =
-            Some("Account session is missing an email or username.".to_string());
+            Some("Account session is missing a sign-in email address.".to_string());
         return;
-    }
+    };
     let norm_url = norm_probe_url_key(&acct.server_url);
     app.view.account.server_url = norm_url.clone();
     let _ = app.session.set_server_url_preference(&norm_url);
@@ -3258,7 +3652,7 @@ fn render_remembered_server_account_block(
 ) {
     let norm_url = norm_probe_url_key(&entry.server_url);
     let probe = app.view.account.probe_for(&entry.server_url);
-    let server_online = probe.is_connected();
+    let server_offline = matches!(probe, ServerProbeState::Failed { .. });
     let is_cached = app
         .session
         .has_cached_server_account(&entry.server_url, &entry.user_id);
@@ -3266,13 +3660,12 @@ fn render_remembered_server_account_block(
         .session
         .server_account_pending_changes_count(&entry.server_url, &entry.user_id);
     let entry_key = (norm_url.clone(), entry.user_id.clone());
-    let quick_open = !is_cached && app.view.account.quick_login_key.as_ref() == Some(&entry_key);
+    let quick_open =
+        !server_offline && app.view.account.quick_login_key.as_ref() == Some(&entry_key);
     let confirming_forget = app.view.account.pending_forget_server_key.as_ref() == Some(&entry_key);
     let primary = entry.primary_label();
     let subtitle_id = entry
-        .email
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
+        .login_email()
         .map(|e| {
             if entry.username.is_empty() {
                 e.to_string()
@@ -3284,8 +3677,9 @@ fn render_remembered_server_account_block(
 
     draw_account_block_frame(
         ui,
-        quick_open && server_online,
-        confirming_forget.then_some(t.danger_border),
+        ("rem_srv_block", &entry.server_url, &entry.user_id),
+        quick_open,
+        confirming_forget,
         t,
         |ui| {
             ui.horizontal(|ui| {
@@ -3294,10 +3688,10 @@ fn render_remembered_server_account_block(
                     ui.painter(),
                     ir,
                     Icon::Server,
-                    if server_online || is_cached {
-                        t.accent
-                    } else {
+                    if server_offline {
                         t.text_muted
+                    } else {
+                        t.accent
                     },
                 );
                 draw_truncated_block_title(
@@ -3306,20 +3700,7 @@ fn render_remembered_server_account_block(
                     (ui.available_width() - 310.0).max(56.0),
                     t,
                 );
-                if is_cached && !server_online {
-                    draw_pill_badge(
-                        ui,
-                        PillStyle {
-                            fill: t.panel_bg,
-                            border: t.warning_fg,
-                            fg: t.warning_fg,
-                            icon: PillIcon::Dot,
-                        },
-                        "Offline mode",
-                    );
-                } else {
-                    draw_probe_status_pill(ui, &probe, t);
-                }
+                draw_probe_status_pill(ui, &probe, t);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -3335,53 +3716,29 @@ fn render_remembered_server_account_block(
                         app.view.account.clear_pending_delete_profile();
                     }
 
-                    if is_cached {
-                        let cta = if server_online {
-                            "Switch"
-                        } else {
-                            "Open Offline"
-                        };
-                        let btn_w = if server_online { 66.0 } else { 96.0 };
-                        let tip = if server_online {
-                            "Switch into this cached Offline-First server account and sync"
-                        } else {
-                            "Open your saved offline local copy now; edits will sync when reconnected"
-                        };
-                        if fixed_secondary_button(ui, cta, btn_w, !confirming_forget, t)
-                            .on_hover_text(tip)
-                            .clicked()
-                        {
-                            crate::canvas::commit_pending_text(app);
-                            if let Err(err) = switch_to_cached_cloud_account_clean(
-                                app,
-                                ui.ctx(),
-                                &entry.server_url,
-                                &entry.user_id,
-                            ) {
-                                app.view.account.error_message = Some(err);
-                            } else {
-                                app.view.account.error_message = None;
-                            }
-                        }
+                    let cta = if is_cached { "Switch" } else { "Sign In" };
+                    let tip = if server_offline {
+                        "Server is offline — password verification requires an online connection to sign in or switch to this server account"
+                    } else if is_cached {
+                        "Enter your password to verify your identity and switch to this server account"
                     } else {
-                        let sign_in_tip = if server_online {
-                            "Enter password to sign in and download this server account"
+                        "Enter password to sign in and download this server account"
+                    };
+                    let can_open_login =
+                        !server_offline && !confirming_forget && !app.view.account.auth_busy;
+                    if fixed_secondary_button(ui, cta, 68.0, can_open_login, t)
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        app.view.account.clear_pending_forget_server();
+                        if quick_open {
+                            app.view.account.clear_quick_login_draft();
                         } else {
-                            "Server is offline — no local cache exists for this account on this device"
-                        };
-                        let can_open_login = server_online && !app.view.account.auth_busy;
-                        let btn = fixed_secondary_button(ui, "Sign In", 68.0, can_open_login, t)
-                            .on_hover_text(sign_in_tip);
-                        if btn.clicked() {
-                            app.view.account.clear_pending_forget_server();
-                            if quick_open {
-                                app.view.account.clear_quick_login_draft();
-                            } else {
-                                app.view.account.quick_login_key = Some(entry_key.clone());
-                                app.view.account.quick_login_password.clear();
-                                app.view.account.quick_login_error = None;
-                                app.view.account.server_url = entry.server_url.clone();
-                            }
+                            app.view.account.quick_login_key = Some(entry_key.clone());
+                            app.view.account.quick_login_password.clear();
+                            app.view.account.quick_login_error = None;
+                            app.view.account.quick_login_focus_pending = true;
+                            app.view.account.server_url = entry.server_url.clone();
                         }
                     }
                 });
@@ -3401,79 +3758,45 @@ fn render_remembered_server_account_block(
                 .color(t.text_muted),
             );
 
-            if is_cached && !server_online {
-                ui.label(
-                    egui::RichText::new("Offline mode — will sync on reconnect")
-                        .size(10.5)
-                        .color(t.warning_fg),
-                );
-            } else if !is_cached && !server_online {
+            if server_offline {
                 ui.label(
                     egui::RichText::new(
-                        "Server offline — sign in is blocked until online because no local cache exists on this device.",
+                        "Server offline — password verification requires an online connection before switching or signing in.",
                     )
                     .size(10.5)
                     .color(t.warning_fg),
                 );
             }
 
-            if confirming_forget {
-                ui.add_space(4.0);
-                render_forget_server_account_confirmation(
-                    app,
-                    ui,
-                    &entry.server_url,
-                    &entry.user_id,
-                    &primary,
-                    pending,
-                    t,
-                );
-            } else if quick_open && server_online {
-                ui.add_space(6.0);
-                let busy = app.view.account.auth_busy;
-                let mut submit_quick = false;
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    let btn_w = 82.0_f32;
-                    let cancel_w = 64.0_f32;
-                    let input_w = (ui.available_width() - btn_w - cancel_w - 12.0).max(110.0);
-                    let pw_resp = draw_password_input(
+            crate::motion::animated_collapse_with_duration(
+                ui,
+                ui.make_persistent_id(("rem_forget_confirm", &entry.server_url, &entry.user_id)),
+                confirming_forget,
+                152.0,
+                crate::motion::MICRO_DURATION_S,
+                |ui| {
+                    ui.add_space(4.0);
+                    render_forget_server_account_confirmation(
+                        app,
                         ui,
-                        &format!("quick_login_pw_{}", entry.user_id),
-                        input_w,
-                        &mut app.view.account.quick_login_password,
-                        &mut app.view.account.quick_login_show_password,
+                        &entry.server_url,
+                        &entry.user_id,
+                        &primary,
+                        pending,
                         t,
                     );
-                    if pw_resp.changed {
-                        app.view.account.quick_login_error = None;
-                    }
-                    if pw_resp.enter_pressed && !busy {
-                        submit_quick = true;
-                    }
-                    let can_connect = !busy && !app.view.account.quick_login_password.is_empty();
-                    if primary_action_button(
-                        ui,
-                        if busy { "Connecting..." } else { "Connect" },
-                        can_connect,
-                        t,
-                    )
-                    .clicked()
-                    {
-                        submit_quick = true;
-                    }
-                    if fixed_secondary_button(ui, "Cancel", cancel_w, !busy, t).clicked() {
-                        app.view.account.clear_quick_login_draft();
-                    }
-                });
-                if let Some(ref err) = app.view.account.quick_login_error {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(err).size(11.0).color(t.danger_fg));
-                }
-                if submit_quick && !busy {
-                    submit_quick_server_login(app, ui.ctx(), entry);
-                }
-            }
+                },
+            );
+            crate::motion::animated_collapse_with_duration(
+                ui,
+                ui.make_persistent_id(("rem_quick_login", &entry.server_url, &entry.user_id)),
+                quick_open && !confirming_forget,
+                92.0,
+                crate::motion::MICRO_DURATION_S,
+                |ui| {
+                    render_quick_login_drawer(app, ui, entry, is_cached, "quick_login_pw", t);
+                },
+            );
         },
     );
 }
@@ -3488,12 +3811,13 @@ fn submit_quick_server_login(
         app.view.account.quick_login_error = Some("Enter your password.".to_string());
         return;
     }
-    let identifier = entry.login_identifier().to_string();
-    if identifier.is_empty() {
-        app.view.account.quick_login_error =
-            Some("Account shortcut is missing an email or username.".to_string());
+    let Some(identifier) = entry.login_email().map(str::to_string) else {
+        app.view.account.quick_login_error = Some(
+            "Account shortcut is missing a sign-in email address. Use Sign In with Another Email instead."
+                .to_string(),
+        );
         return;
-    }
+    };
     let norm_url = norm_probe_url_key(&entry.server_url);
     app.view.account.server_url = norm_url.clone();
     let _ = app.session.set_server_url_preference(&norm_url);
@@ -3697,18 +4021,20 @@ fn render_local_profile_delete_confirmation(
             manual.edit_id
         });
 
-    if std::mem::take(&mut app.view.account.pending_delete_profile_scroll_pending) {
+    if ui.is_enabled()
+        && std::mem::take(&mut app.view.account.pending_delete_profile_scroll_pending)
+    {
         ui.scroll_to_rect(confirm_resp.response.rect, Some(egui::Align::Center));
         ui.memory_mut(|m| m.request_focus(confirm_resp.inner));
     }
 
-    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if ui.is_enabled() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         cancel_delete = true;
     }
 
-    if confirm_delete && matched {
+    if ui.is_enabled() && confirm_delete && matched {
         execute_local_profile_delete(app, ui, profile);
-    } else if cancel_delete {
+    } else if ui.is_enabled() && cancel_delete {
         app.view.account.clear_pending_delete_profile();
     }
 }
@@ -3735,8 +4061,9 @@ fn render_local_profile_block(
 
     draw_account_block_frame(
         ui,
+        ("local_prof_block", &profile.local_profile_id),
         is_active,
-        is_confirming_delete.then_some(t.danger_border),
+        is_confirming_delete,
         t,
         |ui| {
             if is_renaming {
@@ -3882,10 +4209,19 @@ fn render_local_profile_block(
                         .color(t.text_muted),
                 );
             });
-            if is_confirming_delete {
-                ui.add_space(4.0);
-                render_local_profile_delete_confirmation(app, ui, profile, is_active, nb_count, t);
-            }
+            crate::motion::animated_collapse_with_duration(
+                ui,
+                ui.make_persistent_id(("acct_local_delete_confirm", &profile.local_profile_id)),
+                is_confirming_delete,
+                224.0,
+                crate::motion::MICRO_DURATION_S,
+                |ui| {
+                    ui.add_space(4.0);
+                    render_local_profile_delete_confirmation(
+                        app, ui, profile, is_active, nb_count, t,
+                    );
+                },
+            );
         },
     );
 }
@@ -4238,16 +4574,12 @@ fn submit_complete_password_reset(app: &mut PaperCraftApp, ctx: &egui::Context) 
         .identifier
         .trim()
         .to_string();
-    let valid_id = if identifier.contains('@') {
-        normalize_email(&identifier).map(|(e, _)| e)
-    } else {
-        normalize_username(&identifier).map(|(u, _)| u)
-    };
-    let clean_id = match valid_id {
-        Ok(id) => id,
-        Err(err) => {
+    let (clean_id, _) = match normalize_email(&identifier) {
+        Ok(pair) => pair,
+        Err(_) => {
             app.view.account.status_message = None;
-            app.view.account.error_message = Some(err.to_string());
+            app.view.account.error_message =
+                Some("Enter a valid email address to recover your account.".to_string());
             return;
         }
     };
@@ -4393,23 +4725,16 @@ fn build_sign_in_command(
     device_name: String,
 ) -> Result<SyncWorkerCommand, String> {
     let trimmed = identifier_raw.trim();
-    if trimmed.contains('@') {
-        let (email, _) = normalize_email(trimmed).map_err(|e| e.to_string())?;
-        Ok(SyncWorkerCommand::Login {
-            server_url: server_url.to_string(),
-            identifier: email,
-            password,
-            device_name,
-        })
-    } else {
-        let (username, _) = normalize_username(trimmed).map_err(|e| e.to_string())?;
-        Ok(SyncWorkerCommand::Login {
-            server_url: server_url.to_string(),
-            identifier: username,
-            password,
-            device_name,
-        })
+    if !trimmed.contains('@') {
+        return Err("Sign in with your email address (usernames are not accepted).".to_string());
     }
+    let (_, email) = normalize_email(trimmed).map_err(|e| e.to_string())?;
+    Ok(SyncWorkerCommand::Login {
+        server_url: server_url.to_string(),
+        identifier: email,
+        password,
+        device_name,
+    })
 }
 
 fn submit_change_email(app: &mut PaperCraftApp, ctx: &egui::Context) {
@@ -4491,19 +4816,19 @@ fn draw_input_shell(
     t: &Tokens,
 ) -> (Rect, egui::Id) {
     let input_width = width.max(0.0).min(ui.available_width().max(0.0));
-    let (box_rect, box_resp) =
+    let (box_rect, _) =
         ui.allocate_exact_size(Vec2::new(input_width, INPUT_HEIGHT), Sense::hover());
     let edit_id = ui.make_persistent_id(id_salt);
     let has_focus = ui.ctx().memory(|m| m.has_focus(edit_id));
-    let stroke = if has_focus {
-        Stroke::new(1.5, t.accent)
-    } else if box_resp.hovered() {
-        Stroke::new(1.0, t.text_muted.gamma_multiply(0.55))
-    } else if let Some(custom) = border_override {
-        Stroke::new(1.2, custom)
-    } else {
-        Stroke::new(1.0, t.border)
-    };
+    let is_hovered = !has_focus && ui.is_enabled() && ui.rect_contains_pointer(box_rect);
+    let focus_t = crate::motion::hover_factor(ui.ctx(), edit_id.with("focus_t"), has_focus);
+    let hover_t = crate::motion::hover_factor(ui.ctx(), edit_id.with("hover_t"), is_hovered);
+    let rest_border = border_override.unwrap_or(t.border);
+    let hover_border = border_override.unwrap_or_else(|| t.text_muted.gamma_multiply(0.55));
+    let active_border = crate::motion::lerp_color(rest_border, hover_border, hover_t);
+    let border_color = crate::motion::lerp_color(active_border, t.accent, focus_t);
+    let rest_width = if border_override.is_some() { 1.2 } else { 1.0 };
+    let stroke_width = crate::motion::lerp_f32(rest_width, 1.5, focus_t);
     let p = ui.painter();
     p.rect_filled(
         box_rect,
@@ -4513,7 +4838,7 @@ fn draw_input_shell(
     p.rect_stroke(
         box_rect,
         CornerRadius::same(CONTROL_RADIUS as u8),
-        stroke,
+        Stroke::new(stroke_width, border_color),
         StrokeKind::Inside,
     );
     (box_rect, edit_id)
@@ -4765,12 +5090,51 @@ pub(crate) fn fixed_secondary_button(
     t: &Tokens,
 ) -> egui::Response {
     let text_color = if enabled { t.text } else { t.text_muted };
-    let btn = egui::Button::new(egui::RichText::new(label).size(12.0).color(text_color))
-        .fill(t.toolbar_bg)
-        .stroke(Stroke::new(1.0, t.border))
-        .corner_radius(CONTROL_RADIUS)
-        .min_size(Vec2::new(width, INPUT_HEIGHT));
-    let resp = ui.add_enabled(enabled, btn);
+    let galley = ui.painter().layout_no_wrap(
+        label.to_string(),
+        egui::FontId::proportional(12.0),
+        text_color,
+    );
+    let size = Vec2::new(width.max(galley.size().x + 16.0), INPUT_HEIGHT);
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    let hov_t = crate::motion::hover_factor(
+        ui.ctx(),
+        resp.id.with("hov"),
+        enabled && ui.is_enabled() && resp.hovered(),
+    );
+    let fill = if enabled {
+        crate::motion::lerp_color(t.toolbar_bg, t.field_bg, hov_t)
+    } else {
+        t.toolbar_bg
+    };
+    let border = if enabled {
+        crate::motion::lerp_color(t.border, t.accent.gamma_multiply(0.75), hov_t * 0.65)
+    } else {
+        t.border
+    };
+    let fg = if enabled {
+        crate::motion::lerp_color(t.text, t.accent, hov_t * 0.25)
+    } else {
+        t.text_muted
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(CONTROL_RADIUS as u8), fill);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(CONTROL_RADIUS as u8),
+        Stroke::new(1.0, border),
+        StrokeKind::Inside,
+    );
+    let text_pos = egui::pos2(
+        rect.center().x - galley.size().x * 0.5,
+        rect.center().y - galley.size().y * 0.5,
+    );
+    painter.galley(text_pos, galley, fg);
     if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {
@@ -4809,10 +5173,26 @@ fn draw_metric_cell(ui: &mut egui::Ui, label: &str, value: &str, t: &Tokens) {
     });
 }
 
-pub(crate) fn render_auth_banners(app: &PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+pub(crate) fn render_auth_banners(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    let active_key = if let Some(ref err) = app.view.account.error_message {
+        format!("err:{err}")
+    } else if let Some(ref msg) = app.view.account.status_message {
+        format!("msg:{msg}")
+    } else {
+        String::new()
+    };
+    let dt = ui.input(|i| i.unstable_dt).min(0.1);
+    if app.view.motion.account_banner.advance(active_key, dt) {
+        ui.ctx().request_repaint();
+    }
+    let banner_opacity = app.view.motion.account_banner.opacity();
+
     if let Some(ref err) = app.view.account.error_message {
         ui.add_space(8.0);
-        draw_status_banner(ui, BannerTone::Error, err, t);
+        ui.scope(|ui| {
+            ui.multiply_opacity(banner_opacity);
+            draw_status_banner(ui, BannerTone::Error, err, t);
+        });
     } else if let Some(ref msg) = app.view.account.status_message {
         ui.add_space(8.0);
         let tone = if msg.starts_with("Server URL updated")
@@ -4827,7 +5207,10 @@ pub(crate) fn render_auth_banners(app: &PaperCraftApp, ui: &mut egui::Ui, t: &To
         } else {
             BannerTone::Info
         };
-        draw_status_banner(ui, tone, msg, t);
+        ui.scope(|ui| {
+            ui.multiply_opacity(banner_opacity);
+            draw_status_banner(ui, tone, msg, t);
+        });
     }
 }
 
@@ -5331,7 +5714,9 @@ mod tests {
             "missing shortcut:\n{text}"
         );
         assert!(
-            text.contains("Server offline — sign in is blocked"),
+            text.contains(
+                "Server offline — password verification requires an online connection before switching or signing in."
+            ),
             "missing offline block notice:\n{text}"
         );
         assert!(text.contains("Forget Account"));
@@ -5340,11 +5725,11 @@ mod tests {
         click_profile_button(&ctx, &mut app, &shapes, "Forget Account", 0.30);
         // First click opens inline confirmation rather than deleting immediately.
         assert_eq!(app.session.remembered_server_accounts().len(), 1);
-        let (_, confirm_shapes) = render_profile_frames(&ctx, &mut app, 0.36, 2);
-        click_profile_button(&ctx, &mut app, &confirm_shapes, "Confirm Forget", 0.40);
+        let (_, confirm_shapes) = render_profile_frames(&ctx, &mut app, 0.36, 10);
+        click_profile_button(&ctx, &mut app, &confirm_shapes, "Confirm Forget", 1.20);
         assert!(app.session.remembered_server_accounts().is_empty());
 
-        // Cached server accounts remain accessible offline (`Open Offline`) AND warn on unsynced edits when forgetting.
+        // Cached server accounts block passwordless access when offline and require password when online.
         let cached_acct = test_account("u-cached", "cached@example.com");
         let cached_pull = SyncPullResponse {
             server_cursor: 1,
@@ -5372,37 +5757,35 @@ mod tests {
         app.view
             .account
             .mark_server_offline(DEFAULT_SERVER_URL, "offline");
-        let (cached_text, cached_shapes) = render_profile_frames(&ctx, &mut app, 0.50, 3);
+        let (cached_text, cached_shapes) = render_profile_frames(&ctx, &mut app, 1.30, 10);
         assert!(
-            cached_text.contains("Offline mode — will sync on reconnect"),
-            "missing offline-first cached badge:\n{cached_text}"
+            cached_text.contains("1 pending sync"),
+            "missing pending offline count:\n{cached_text}"
         );
         assert!(
-            cached_text.contains("Open Offline"),
-            "missing Open Offline button:\n{cached_text}"
+            cached_text.contains(
+                "Server offline — password verification requires an online connection before switching or signing in."
+            ),
+            "missing offline password-required notice for cached server account:\n{cached_text}"
         );
+        assert!(
+            !cached_text.contains("Open Offline"),
+            "must not allow passwordless Open Offline bypass:\n{cached_text}"
+        );
+        click_profile_button(&ctx, &mut app, &cached_shapes, "Switch", 2.15);
+        assert!(!app.session.is_viewing_cloud());
+        assert!(app.view.account.quick_login_key.is_none());
 
         // Clicking Forget Account on the cached account shows the pending local change warning.
-        click_profile_button(&ctx, &mut app, &cached_shapes, "Forget Account", 0.56);
-        let (warn_text, _) = render_profile_frames(&ctx, &mut app, 0.60, 1);
+        click_profile_button(&ctx, &mut app, &cached_shapes, "Forget Account", 2.25);
+        let (warn_text, _) = render_profile_frames(&ctx, &mut app, 2.35, 10);
         assert!(
             warn_text.contains("not synced to the server yet"),
             "missing pending changes warning on Forget Account:\n{warn_text}"
         );
-        // Cancel forget, then click Open Offline to reopen the cached cloud workspace offline.
         app.view.account.clear_pending_forget_server();
-        let (_, offline_shapes) = render_profile_frames(&ctx, &mut app, 0.62, 2);
-        click_profile_button(&ctx, &mut app, &offline_shapes, "Open Offline", 0.66);
-        assert!(app.session.is_viewing_cloud());
-        assert!(
-            app.session
-                .notebooks
-                .iter()
-                .any(|n| n.title == "Pending Cloud Note")
-        );
-        app.session.switch_to_local_profile(&pid).unwrap();
 
-        // When server comes back online, clicking Sync on a local card opens ConvertLocalAccount modal.
+        // When server comes back online, clicking Switch on the cached server account opens the password verification drawer instead of switching without password.
         app.view.account.apply_health_ok(
             DEFAULT_SERVER_URL.to_string(),
             ServerInfoResponse {
@@ -5416,13 +5799,223 @@ mod tests {
                 local_discovery: LocalDiscoverySummary::default(),
             },
         );
-        let (_, online_shapes) = render_profile_frames(&ctx, &mut app, 0.70, 3);
-        click_profile_button(&ctx, &mut app, &online_shapes, "Sync", 0.90);
+        let (_, online_shapes) = render_profile_frames(&ctx, &mut app, 3.25, 10);
+        click_profile_button(&ctx, &mut app, &online_shapes, "Switch", 4.10);
+        assert!(
+            !app.session.is_viewing_cloud(),
+            "switching to a server-linked account must require password verification"
+        );
+        assert!(
+            app.view.account.quick_login_key.is_some(),
+            "clicking Switch on a server-linked account must open password prompt"
+        );
+        let (pw_text, _) = render_profile_frames(&ctx, &mut app, 4.20, 10);
+        assert!(
+            pw_text.contains("Verify"),
+            "missing Verify button in quick-login drawer:\n{pw_text}"
+        );
+        assert!(
+            pw_text.contains("Enter your password to verify your identity"),
+            "missing password verification hint:\n{pw_text}"
+        );
+        app.view.account.clear_quick_login_draft();
+
+        // Clicking Sync on a local card still opens ConvertLocalAccount modal.
+        let (_, clean_shapes) = render_profile_frames(&ctx, &mut app, 5.10, 10);
+        click_profile_button(&ctx, &mut app, &clean_shapes, "Sync", 5.95);
         assert_eq!(
             app.view.active_modal,
             Some(modal::ActiveModal::ConvertLocalAccount)
         );
         assert_eq!(app.view.account.convert_source_nickname, "Personal");
+    }
+
+    #[test]
+    fn select_local_account_modal_shows_server_accounts_password_drawer_and_other_email_subflow() {
+        fn run_modal_frames(
+            ctx: &egui::Context,
+            app: &mut PaperCraftApp,
+            start_time: f64,
+            frames: usize,
+        ) -> (String, Vec<ClippedShape>) {
+            let mut text = String::new();
+            let mut shapes = Vec::new();
+            for step in 0..frames {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 800.0),
+                    )),
+                    time: Some(start_time + f64::from(step as u32) * 0.05),
+                    predicted_dt: 0.05,
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(raw, |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    modal::show(app, ui);
+                });
+                text = collect_text(&out.shapes);
+                shapes = out.shapes.clone();
+                out.drop_without_applying_deltas();
+            }
+            (text, shapes)
+        }
+
+        let ctx = egui::Context::default();
+        let session = papercraft_engine::Session::open_web_cache(None);
+        let mut app = PaperCraftApp::new(session, crate::PlatformHooks::default());
+        app.view.active_modal = None;
+        app.session
+            .execute(
+                "profile.completeFirstAccess",
+                &serde_json::json!({ "nickname": "Work" }),
+            )
+            .unwrap();
+        let acct = test_account("u-selector", "selector@example.com");
+        let pull = SyncPullResponse {
+            server_cursor: 0,
+            user: acct.user.clone(),
+            notebooks: Vec::new(),
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        app.session.enter_online_server_session(acct, pull);
+        crate::sync_worker::complete_sign_out(&mut app, &ctx);
+        assert_eq!(
+            app.view.active_modal,
+            Some(modal::ActiveModal::SelectLocalAccount)
+        );
+        app.view.account.apply_health_ok(
+            DEFAULT_SERVER_URL.to_string(),
+            ServerInfoResponse {
+                status: "ok".to_string(),
+                service: "papercraft-server".to_string(),
+                version: "0.1.0".to_string(),
+                protocol_version: 1,
+                registration_open: true,
+                storage_engine: "redb".to_string(),
+                max_notebook_bytes: 1_048_576,
+                local_discovery: LocalDiscoverySummary::default(),
+            },
+        );
+
+        let (text, shapes) = run_modal_frames(&ctx, &mut app, 0.0, 8);
+        assert!(text.contains("Choose an Account"), "\n{text}");
+        assert!(text.contains("Server Accounts"), "\n{text}");
+        assert!(text.contains("selector@example.com"), "\n{text}");
+        assert!(text.contains("Saved Local Accounts"), "\n{text}");
+        assert!(text.contains("Work"), "\n{text}");
+        assert!(text.contains("Sign In with Another Email"), "\n{text}");
+
+        // Clicking Sign In on the server card opens the password drawer instead of bypassing auth.
+        let sign_in_pos = find_profile_button_center(&shapes, "Sign In");
+        for (pressed, t) in [(true, 0.45), (false, 0.47)] {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 800.0),
+                    )),
+                    time: Some(t),
+                    events: vec![
+                        egui::Event::PointerMoved(sign_in_pos),
+                        egui::Event::PointerButton {
+                            pos: sign_in_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    modal::show(&mut app, ui);
+                },
+            );
+            out.drop_without_applying_deltas();
+        }
+        assert!(app.view.account.quick_login_key.is_some());
+        assert!(!app.session.is_viewing_cloud());
+        let (pw_text, pw_shapes) = run_modal_frames(&ctx, &mut app, 0.55, 8);
+        assert!(
+            pw_text.contains("Enter your password"),
+            "missing inline password prompt:\n{pw_text}"
+        );
+        assert!(
+            pw_text.contains("Cancel"),
+            "missing drawer Cancel button:\n{pw_text}"
+        );
+
+        // Clicking Sign In with Another Email transitions into the email-only login form.
+        let other_pos = find_profile_button_center(&pw_shapes, "Sign In with Another Email");
+        for (pressed, t) in [(true, 1.00), (false, 1.02)] {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 800.0),
+                    )),
+                    time: Some(t),
+                    events: vec![
+                        egui::Event::PointerMoved(other_pos),
+                        egui::Event::PointerButton {
+                            pos: other_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    modal::show(&mut app, ui);
+                },
+            );
+            out.drop_without_applying_deltas();
+        }
+        assert!(app.view.account.selector_other_server_open);
+        let (other_text, _) = run_modal_frames(&ctx, &mut app, 1.10, 8);
+        assert!(other_text.contains("Back to Accounts"), "\n{other_text}");
+        assert!(other_text.contains("Email"), "\n{other_text}");
+        assert!(
+            !other_text.contains("Username or Email"),
+            "must only allow email login:\n{other_text}"
+        );
+    }
+
+    #[test]
+    fn sign_in_rejects_username_only_and_accepts_email_only() {
+        use crate::sync_worker::SyncWorkerCommand;
+
+        let Err(err) = super::build_sign_in_command(
+            "http://127.0.0.1:8787",
+            "alex_nick",
+            "SecretPass1!".to_string(),
+            "Laptop".to_string(),
+        ) else {
+            panic!("username-only login must be rejected");
+        };
+        assert!(
+            err.to_ascii_lowercase().contains("email"),
+            "expected email-only validation error, got: {err}"
+        );
+
+        let Ok(cmd) = super::build_sign_in_command(
+            "http://127.0.0.1:8787",
+            "  Alex@Example.COM ",
+            "SecretPass1!".to_string(),
+            "Laptop".to_string(),
+        ) else {
+            panic!("valid email must produce login command");
+        };
+        match cmd {
+            SyncWorkerCommand::Login { identifier, .. } => {
+                assert_eq!(identifier, "alex@example.com");
+            }
+            _ => panic!("unexpected command variant"),
+        }
     }
 
     #[test]

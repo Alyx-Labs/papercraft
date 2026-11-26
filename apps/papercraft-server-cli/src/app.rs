@@ -278,7 +278,7 @@ impl From<DbError> for ApiError {
             DbError::InvalidCredentials => Self::new(
                 StatusCode::UNAUTHORIZED,
                 "invalid_credentials",
-                "Invalid email/username or password.",
+                "Invalid email or password.",
             ),
             DbError::IncorrectCurrentPassword => Self::new(
                 StatusCode::BAD_REQUEST,

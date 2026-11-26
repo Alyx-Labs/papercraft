@@ -81,6 +81,14 @@ impl RememberedServerAccount {
         }
         &self.username
     }
+
+    /// Returns the account's normalized non-empty email for email-only authentication.
+    pub fn login_email(&self) -> Option<&str> {
+        self.email
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 /// Explicit per-entity live status surfaced in UI badges.

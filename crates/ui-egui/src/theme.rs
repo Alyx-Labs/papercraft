@@ -139,6 +139,7 @@ pub fn apply_visuals(ctx: &egui::Context, theme: UiTheme) {
         || active_style.visuals.dark_mode != t.is_dark
         || active_style.visuals.panel_fill != t.panel_bg
         || active_style.visuals.extreme_bg_color != t.field_bg
+        || active_style.interaction.selectable_labels
         || (active_style.animation_time - crate::motion::STANDARD_DURATION_S).abs() > 1e-4;
     if !needs_apply {
         return;
@@ -192,7 +193,10 @@ pub fn apply_visuals(ctx: &egui::Context, theme: UiTheme) {
     visuals.widgets.open.corner_radius = control_radius;
 
     ctx.set_visuals(visuals);
-    ctx.all_styles_mut(crate::motion::apply_motion_style);
+    ctx.all_styles_mut(|style| {
+        crate::motion::apply_motion_style(style);
+        style.interaction.selectable_labels = false;
+    });
 }
 
 /// Renders a `ComboBox` matching PaperCraft's standard 28px control height,
@@ -498,5 +502,44 @@ mod tests {
         assert_eq!(ctx.theme(), egui::Theme::Light);
         assert!(!ctx.style_of(ctx.theme()).visuals.dark_mode);
         assert!(modal_light.contains("Export Notebook"));
+    }
+
+    #[test]
+    fn apply_visuals_disables_ui_label_text_selection_in_light_and_dark() {
+        let ctx = egui::Context::default();
+        assert!(
+            ctx.style_of(egui::Theme::Light)
+                .interaction
+                .selectable_labels
+        );
+        assert!(
+            ctx.style_of(egui::Theme::Dark)
+                .interaction
+                .selectable_labels
+        );
+
+        apply_visuals(&ctx, UiTheme::Light);
+        assert!(
+            !ctx.style_of(egui::Theme::Light)
+                .interaction
+                .selectable_labels
+        );
+        assert!(
+            !ctx.style_of(egui::Theme::Dark)
+                .interaction
+                .selectable_labels
+        );
+
+        apply_visuals(&ctx, UiTheme::Dark);
+        assert!(
+            !ctx.style_of(egui::Theme::Light)
+                .interaction
+                .selectable_labels
+        );
+        assert!(
+            !ctx.style_of(egui::Theme::Dark)
+                .interaction
+                .selectable_labels
+        );
     }
 }

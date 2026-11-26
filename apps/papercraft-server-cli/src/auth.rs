@@ -125,15 +125,14 @@ pub async fn login(
 
     let db = state.db.clone();
     let ttls = state.token_ttls();
-    let identifier = req
+    let email = req
         .email
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&req.username)
+        .unwrap_or("")
         .to_string();
     let auth = tokio::task::spawn_blocking(move || {
-        db.login_user(&identifier, &req.password, req.device_name.as_deref(), ttls)
+        db.login_user(&email, &req.password, req.device_name.as_deref(), ttls)
     })
     .await
     .map_err(|e| ApiError::internal(format!("login task failed: {e}")))?
@@ -228,16 +227,15 @@ pub async fn complete_password_reset(
 
     let db = state.db.clone();
     let ttls = state.token_ttls();
-    let identifier = req
+    let email = req
         .email
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&req.username)
+        .unwrap_or("")
         .to_string();
     let auth = tokio::task::spawn_blocking(move || {
         db.complete_password_reset(
-            &identifier,
+            &email,
             &req.recovery_code,
             &req.new_password,
             req.device_name.as_deref(),

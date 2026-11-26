@@ -1150,14 +1150,19 @@ pub(crate) const BRAND_DISPLAY_BOLD_TTF: &[u8] =
 
 impl PaperCraftApp {
     pub fn new(session: Session, mut hooks: PlatformHooks) -> Self {
-        let account = account_modal::AccountDraftState {
+        let mut account = account_modal::AccountDraftState {
             server_url: session.server_url().to_string(),
             ..Default::default()
         };
         let initial_modal = if session.should_show_welcome_banner() {
             Some(modal::ActiveModal::WelcomeBanner)
         } else if session.needs_initial_nickname() {
-            Some(modal::ActiveModal::FirstAccessNickname)
+            if session.has_any_saved_accounts() {
+                account.profile_probe_pending = true;
+                Some(modal::ActiveModal::SelectLocalAccount)
+            } else {
+                Some(modal::ActiveModal::FirstAccessNickname)
+            }
         } else {
             None
         };
@@ -4201,6 +4206,24 @@ pub(crate) fn open_profile_screen(app: &mut PaperCraftApp) {
     app.view.account.quick_login_key = None;
     app.view.account.quick_login_password.clear();
     app.view.account.quick_login_error = None;
+    app.view.account.quick_login_focus_pending = false;
+    app.view
+        .motion
+        .profile_section
+        .sync((app.session.is_signed_in(), 0), 0);
+    let auth_key = if app.view.account.password_reset.active {
+        2
+    } else if app.view.account.tab == account_modal::AuthTab::CreateAccount {
+        1
+    } else {
+        0
+    };
+    app.view
+        .motion
+        .auth_flow
+        .sync(auth_key, isize::from(auth_key));
+    app.view.motion.profile_identity.reset();
+    app.view.motion.account_banner.reset();
     app.view.screen = AppScreen::Profile;
 }
 

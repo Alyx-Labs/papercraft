@@ -142,10 +142,15 @@ pub(crate) fn dismiss(app: &mut PaperCraftApp) {
         .session
         .execute("profile.dismissWelcomeBanner", &serde_json::json!({}));
     if app.session.needs_initial_nickname() {
-        app.view.first_access_nickname.clear();
-        app.view.first_access_error = None;
-        app.view.first_access_focus_pending = true;
-        crate::modal::open(app, ActiveModal::FirstAccessNickname);
+        if app.session.has_any_saved_accounts() {
+            app.view.account.profile_probe_pending = true;
+            crate::modal::open(app, ActiveModal::SelectLocalAccount);
+        } else {
+            app.view.first_access_nickname.clear();
+            app.view.first_access_error = None;
+            app.view.first_access_focus_pending = true;
+            crate::modal::open(app, ActiveModal::FirstAccessNickname);
+        }
     } else {
         crate::modal::close(app);
     }

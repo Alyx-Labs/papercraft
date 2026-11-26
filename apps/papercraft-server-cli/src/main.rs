@@ -1528,18 +1528,8 @@ mod tests {
         assert_eq!(updated.username, "nina_new");
         assert_eq!(updated.display_name, "Nina Updated");
 
-        // Old username no longer logs in; new username does.
-        let old_login = agent
-            .post(&format!("{}/api/v1/auth/login", srv.base_url))
-            .send_json(LoginRequest {
-                email: None,
-                username: "nina_old".to_string(),
-                password: "initial-strong-pw".to_string(),
-                device_name: None,
-            })
-            .unwrap();
-        assert_eq!(old_login.status().as_u16(), 401);
-        let new_login = agent
+        // Login requires the account email address; username-only login is rejected.
+        let username_only_login = agent
             .post(&format!("{}/api/v1/auth/login", srv.base_url))
             .send_json(LoginRequest {
                 email: None,
@@ -1548,7 +1538,27 @@ mod tests {
                 device_name: None,
             })
             .unwrap();
-        assert_eq!(new_login.status().as_u16(), 200);
+        assert_eq!(username_only_login.status().as_u16(), 400);
+        let old_username_login = agent
+            .post(&format!("{}/api/v1/auth/login", srv.base_url))
+            .send_json(LoginRequest {
+                email: None,
+                username: "nina_old".to_string(),
+                password: "initial-strong-pw".to_string(),
+                device_name: None,
+            })
+            .unwrap();
+        assert_eq!(old_username_login.status().as_u16(), 400);
+        let email_login = agent
+            .post(&format!("{}/api/v1/auth/login", srv.base_url))
+            .send_json(LoginRequest {
+                email: Some("nina@example.com".to_string()),
+                username: String::new(),
+                password: "initial-strong-pw".to_string(),
+                device_name: None,
+            })
+            .unwrap();
+        assert_eq!(email_login.status().as_u16(), 200);
 
         // Voluntary password change rejects wrong current password with 400 and succeeds with valid.
         let bad_pw_resp = agent
@@ -1659,8 +1669,8 @@ mod tests {
         let mut wrong_login = agent
             .post(&format!("{}/api/v1/auth/login", srv2.base_url))
             .send_json(LoginRequest {
-                email: None,
-                username: "nina_new".to_string(),
+                email: Some("nina@example.com".to_string()),
+                username: String::new(),
                 password: "changed-strong-pw".to_string(),
                 device_name: None,
             })
@@ -1673,8 +1683,8 @@ mod tests {
         let mut code_login = agent
             .post(&format!("{}/api/v1/auth/login", srv2.base_url))
             .send_json(LoginRequest {
-                email: None,
-                username: "nina_new".to_string(),
+                email: Some("nina@example.com".to_string()),
+                username: String::new(),
                 password: reset.temporary_password.clone(),
                 device_name: None,
             })
@@ -1690,8 +1700,8 @@ mod tests {
                 srv2.base_url
             ))
             .send_json(CompletePasswordResetRequest {
-                email: None,
-                username: "nina_new".to_string(),
+                email: Some("nina@example.com".to_string()),
+                username: String::new(),
                 recovery_code: "WRONG-CODE-0000".to_string(),
                 new_password: "final-strong-password".to_string(),
                 device_name: Some("Desk".to_string()),
@@ -1706,8 +1716,8 @@ mod tests {
                 srv2.base_url
             ))
             .send_json(CompletePasswordResetRequest {
-                email: None,
-                username: "nina_new".to_string(),
+                email: Some("nina@example.com".to_string()),
+                username: String::new(),
                 recovery_code: reset.temporary_password.clone(),
                 new_password: reset.temporary_password.clone(),
                 device_name: Some("Desk".to_string()),
@@ -1734,12 +1744,23 @@ mod tests {
         assert!(!completed_auth.user.must_change_password);
         assert_eq!(completed_auth.user.username, "nina_new");
 
-        // Regular login with the newly chosen password now succeeds cleanly.
-        let final_login = agent
+        // Regular login with the newly chosen password requires email and rejects username-only login.
+        let username_login = agent
             .post(&format!("{}/api/v1/auth/login", srv2.base_url))
             .send_json(LoginRequest {
                 email: None,
                 username: "nina_new".to_string(),
+                password: "final-strong-password".to_string(),
+                device_name: Some("Laptop".to_string()),
+            })
+            .unwrap();
+        assert_eq!(username_login.status().as_u16(), 400);
+
+        let final_login = agent
+            .post(&format!("{}/api/v1/auth/login", srv2.base_url))
+            .send_json(LoginRequest {
+                email: Some("nina@example.com".to_string()),
+                username: String::new(),
                 password: "final-strong-password".to_string(),
                 device_name: Some("Laptop".to_string()),
             })
@@ -1865,8 +1886,8 @@ mod tests {
         let mut trashed_login = agent
             .post(&format!("{}/api/v1/auth/login", srv2.base_url))
             .send_json(LoginRequest {
-                email: None,
-                username: "trash_nina".to_string(),
+                email: Some("trash_nina@example.com".to_string()),
+                username: String::new(),
                 password: "strong-password-1".to_string(),
                 device_name: Some("Laptop".to_string()),
             })
@@ -1910,8 +1931,8 @@ mod tests {
         let mut restored_login = agent
             .post(&format!("{}/api/v1/auth/login", srv3.base_url))
             .send_json(LoginRequest {
-                email: None,
-                username: "trash_nina".to_string(),
+                email: Some("trash_nina@example.com".to_string()),
+                username: String::new(),
                 password: "strong-password-1".to_string(),
                 device_name: Some("Laptop".to_string()),
             })

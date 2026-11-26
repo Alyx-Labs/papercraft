@@ -186,10 +186,10 @@ impl ActiveModal {
             },
             Self::SelectLocalAccount => DialogSpec {
                 icon: Icon::Account,
-                title: "Select a Local Account",
-                subtitle: "Choose a saved local account on this device or create a new local session.",
-                width: 500.0,
-                min_body_height: 220.0,
+                title: "Choose an Account",
+                subtitle: "Select a saved account to sign in, or create a new local workspace.",
+                width: 520.0,
+                min_body_height: 240.0,
             },
             Self::ConvertLocalAccount => DialogSpec {
                 icon: Icon::Sync,
@@ -354,8 +354,16 @@ pub(crate) fn open(app: &mut PaperCraftApp, target: ActiveModal) {
             app.view.first_access_focus_pending = true;
         }
         ActiveModal::SelectLocalAccount => {
+            app.view.account.server_url = app.session.server_url().to_string();
             app.view.account.select_local_new_name.clear();
             app.view.account.select_local_error = None;
+            app.view.account.clear_quick_login_draft();
+            app.view.account.selector_other_server_open = false;
+            app.view.account.error_message = None;
+            app.view.account.status_message = None;
+            app.view.account.profile_probe_pending = true;
+            app.view.motion.auth_flow.sync(0, 0);
+            app.view.motion.account_banner.reset();
         }
         ActiveModal::ConvertLocalAccount => {
             app.view.account.convert_error = None;
@@ -365,6 +373,18 @@ pub(crate) fn open(app: &mut PaperCraftApp, target: ActiveModal) {
         ActiveModal::AccountSync => {
             crate::account_modal::sync_draft_from_session(app);
             app.view.account.profile_probe_pending = true;
+            let auth_key = if app.view.account.password_reset.active {
+                2
+            } else if app.view.account.tab == crate::account_modal::AuthTab::CreateAccount {
+                1
+            } else {
+                0
+            };
+            app.view
+                .motion
+                .auth_flow
+                .sync(auth_key, isize::from(auth_key));
+            app.view.motion.account_banner.reset();
         }
         ActiveModal::TransferPages => {
             if app.view.transfer_pages_list.is_empty()

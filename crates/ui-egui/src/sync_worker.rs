@@ -192,40 +192,29 @@ pub fn build_register_request(
     })
 }
 
-/// Builds a login payload accepting either an email address or a username.
+/// Builds an email-only login payload from an email address and password.
 pub fn build_login_request(
-    identifier: &str,
+    email_raw: &str,
     password: String,
     device_name: &str,
 ) -> Result<LoginRequest, String> {
-    let trimmed = identifier.trim();
-    if trimmed.contains('@') {
-        let (email, _) = normalize_email(trimmed).map_err(|e| e.to_string())?;
-        Ok(LoginRequest {
-            email: Some(email),
-            username: String::new(),
-            password,
-            device_name: Some(device_name.to_string()),
-        })
-    } else {
-        let (username, _) = normalize_username(trimmed).map_err(|e| e.to_string())?;
-        Ok(LoginRequest {
-            email: None,
-            username,
-            password,
-            device_name: Some(device_name.to_string()),
-        })
-    }
+    let (_, email) = normalize_email(email_raw)
+        .map_err(|_| "Enter a valid email address to sign in.".to_string())?;
+    Ok(LoginRequest {
+        email: Some(email),
+        username: String::new(),
+        password,
+        device_name: Some(device_name.to_string()),
+    })
 }
 
-/// Builds a validated `CompletePasswordResetRequest` payload.
+/// Builds a validated `CompletePasswordResetRequest` payload (email-only).
 pub fn build_complete_password_reset_request(
     identifier: &str,
     recovery_code: &str,
     new_password: String,
     device_name: &str,
 ) -> Result<CompletePasswordResetRequest, String> {
-    let trimmed = identifier.trim();
     let code = recovery_code.trim();
     if code.is_empty() {
         return Err("Enter the temporary recovery code generated on the server.".to_string());
@@ -234,16 +223,11 @@ pub fn build_complete_password_reset_request(
     if new_password == code {
         return Err("New password must be different from the temporary recovery code.".to_string());
     }
-    let (email, username) = if trimmed.contains('@') {
-        let (email, _) = normalize_email(trimmed).map_err(|e| e.to_string())?;
-        (Some(email), String::new())
-    } else {
-        let (username, _) = normalize_username(trimmed).map_err(|e| e.to_string())?;
-        (None, username)
-    };
+    let (_, email) = normalize_email(identifier)
+        .map_err(|_| "Enter a valid email address to recover your account.".to_string())?;
     Ok(CompletePasswordResetRequest {
-        email,
-        username,
+        email: Some(email),
+        username: String::new(),
         recovery_code: code.to_string(),
         new_password,
         device_name: Some(device_name.to_string()),
@@ -496,41 +480,6 @@ pub(crate) fn switch_to_local_account_clean(
     Ok(())
 }
 
-/// Switches into a previously cached Offline-First server account without needing internet
-/// or re-entering a password, queueing a background sync attempt on the next frame.
-pub(crate) fn switch_to_cached_cloud_account_clean(
-    app: &mut PaperCraftApp,
-    ctx: &egui::Context,
-    server_url: &str,
-    user_id: &str,
-) -> Result<(), String> {
-    app.session
-        .execute(
-            "profile.switch",
-            &serde_json::json!({
-                "target": "cloud",
-                "server_url": server_url,
-                "user_id": user_id
-            }),
-        )
-        .map_err(|err| err.to_string())?;
-    app.sync_worker.pending_outcome = None;
-    app.sync_worker.next_retry_delay_ms = 8_000.0;
-    app.sync_worker.startup_sync_queued = false;
-    app.sync_worker.last_attempt_ui_ms = ctx.input(|i| i.time * 1000.0);
-    app.view.open_tabs.clear();
-    app.view.inspector_open = false;
-    app.mesh_cache.clear();
-    app.view.account.disconnect_notice = None;
-    app.view.account.clear_transient_auth_status();
-    crate::account_modal::sync_draft_from_session(app);
-    app.view.profile_return_screen = crate::AppScreen::Home;
-    crate::theme::apply_visuals(ctx, app.session.prefs.theme);
-    crate::sync_view_to_active_notebook(app);
-    ctx.request_repaint();
-    Ok(())
-}
-
 /// Forgets a remembered server account from this device, deleting only its local cache
 /// while keeping server data intact, and returning gracefully to local state if it was active.
 pub(crate) fn complete_forget_server_account(
@@ -565,16 +514,24 @@ pub(crate) fn complete_forget_server_account(
         app.mesh_cache.clear();
         app.view.account.disconnect_notice = None;
         app.view.account.reset_after_sign_out(server_url);
+        app.view.screen = crate::AppScreen::Home;
         app.view.profile_return_screen = crate::AppScreen::Home;
         crate::theme::apply_visuals(ctx, app.session.prefs.theme);
         crate::sync_view_to_active_notebook(app);
-        if !app.session.has_saved_local_accounts() {
-            app.view.screen = crate::AppScreen::Home;
+        if app.session.has_any_saved_accounts() {
+            crate::modal::open(app, crate::modal::ActiveModal::SelectLocalAccount);
+            crate::account_modal::probe_all_known_servers(app, ctx);
+        } else {
             app.view.first_access_nickname.clear();
             app.view.first_access_error = None;
             app.view.first_access_focus_pending = true;
             crate::modal::open(app, crate::modal::ActiveModal::FirstAccessNickname);
         }
+    } else if app.session.needs_initial_nickname() && !app.session.has_any_saved_accounts() {
+        app.view.first_access_nickname.clear();
+        app.view.first_access_error = None;
+        app.view.first_access_focus_pending = true;
+        crate::modal::open(app, crate::modal::ActiveModal::FirstAccessNickname);
     }
     app.view.account.error_message = None;
     app.view.account.status_message = Some(format!(
@@ -678,6 +635,7 @@ pub(crate) fn complete_authenticated_switch(
     app.view.account.sync_identity_from_session(Some(&auth));
     app.view.account.disconnect_notice = None;
     app.view.profile_return_screen = crate::AppScreen::Home;
+    crate::canvas::commit_pending_text(app);
     app.session.enter_online_server_session(auth, initial_pull);
     if let Some(msg) = app.session.take_last_conflict_notice() {
         app.view.account.status_message = Some(msg);
@@ -730,8 +688,10 @@ pub(crate) fn complete_sign_out(app: &mut PaperCraftApp, ctx: &egui::Context) {
     app.view.account.reset_after_sign_out(&prev_url);
     crate::theme::apply_visuals(ctx, app.session.prefs.theme);
     crate::sync_view_to_active_notebook(app);
-    if has_locals {
+    let has_any_saved = has_locals || !app.session.remembered_server_accounts().is_empty();
+    if has_any_saved {
         crate::modal::open(app, crate::modal::ActiveModal::SelectLocalAccount);
+        crate::account_modal::probe_all_known_servers(app, ctx);
     } else {
         app.view.first_access_nickname.clear();
         app.view.first_access_error = None;
@@ -842,6 +802,9 @@ pub(crate) fn apply_worker_event(
             app.view
                 .account
                 .enter_password_reset_flow(identifier, prefill_code, message);
+            if app.view.active_modal == Some(crate::modal::ActiveModal::SelectLocalAccount) {
+                app.view.account.selector_other_server_open = true;
+            }
         }
         SyncWorkerEvent::ProfileUpdated { updated_session } => {
             let next_username = updated_session.user.username.clone();
@@ -1970,5 +1933,99 @@ mod tests {
 
     fn json_nick(nick: &str) -> serde_json::Value {
         serde_json::json!({ "nickname": nick })
+    }
+
+    #[test]
+    fn build_login_request_requires_email_and_rejects_username_only() {
+        let err =
+            build_login_request("alex_nick", "SecretPass1!".to_string(), "TestPC").unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("email"), "{err}");
+
+        let req = build_login_request("  Alex@Example.COM ", "SecretPass1!".to_string(), "TestPC")
+            .expect("normalized email login request");
+        assert_eq!(req.email.as_deref(), Some("alex@example.com"));
+        assert!(req.username.is_empty());
+    }
+
+    #[test]
+    fn build_complete_password_reset_request_requires_email() {
+        let err = build_complete_password_reset_request(
+            "alex_nick",
+            "REC-123",
+            "NewSecretPass1!".to_string(),
+            "TestPC",
+        )
+        .unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("email"), "{err}");
+
+        let req = build_complete_password_reset_request(
+            "Alyx@Example.COM",
+            "REC-123",
+            "NewSecretPass1!".to_string(),
+            "TestPC",
+        )
+        .expect("valid email reset request");
+        assert_eq!(req.email.as_deref(), Some("alyx@example.com"));
+        assert!(req.username.is_empty());
+    }
+
+    #[test]
+    fn sign_out_opens_account_selector_when_remembered_server_account_exists_and_first_access_when_none()
+     {
+        let ctx = egui::Context::default();
+        let session = papercraft_engine::Session::open_web_cache(None);
+        let mut app = PaperCraftApp::new(session, crate::PlatformHooks::default());
+        assert!(app.session.needs_initial_nickname());
+        assert!(!app.session.has_any_saved_accounts());
+
+        let auth = ActiveAccountSession {
+            server_url: "http://127.0.0.1:8787".to_string(),
+            user: papercraft_sync_protocol::UserProfile {
+                user_id: "u-only-srv".to_string(),
+                email: Some("only@example.com".to_string()),
+                username: "onlyuser".to_string(),
+                display_name: "Only User".to_string(),
+                created_at_ms: 1000,
+                must_change_password: false,
+            },
+            access_token: "acc".to_string(),
+            refresh_token: "ref".to_string(),
+            access_expires_at_ms: 99_999,
+            refresh_expires_at_ms: 99_999,
+            device_name: "TestPC".to_string(),
+            last_auth_ms: 1000,
+        };
+        let empty_pull = SyncPullResponse {
+            server_cursor: 0,
+            user: auth.user.clone(),
+            notebooks: Vec::new(),
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        app.session.enter_online_server_session(auth, empty_pull);
+
+        // Zero local profiles, 1 remembered server account -> Sign Out opens Choose an Account selector.
+        complete_sign_out(&mut app, &ctx);
+        assert!(app.session.needs_initial_nickname());
+        assert!(app.session.has_any_saved_accounts());
+        assert_eq!(
+            app.view.active_modal,
+            Some(crate::modal::ActiveModal::SelectLocalAccount)
+        );
+
+        // Forgetting that last server account drops saved accounts to 0 -> opens FirstAccessNickname.
+        complete_forget_server_account(
+            &mut app,
+            &ctx,
+            "http://127.0.0.1:8787",
+            "u-only-srv",
+            "Only User",
+        )
+        .expect("forget remembered server account");
+        assert!(!app.session.has_any_saved_accounts());
+        assert_eq!(
+            app.view.active_modal,
+            Some(crate::modal::ActiveModal::FirstAccessNickname)
+        );
     }
 }

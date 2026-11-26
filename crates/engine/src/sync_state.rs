@@ -509,6 +509,11 @@ impl Session {
         self.sync.global.has_saved_local_accounts()
     }
 
+    /// Returns `true` when at least one saved local profile or remembered server account exists.
+    pub fn has_any_saved_accounts(&self) -> bool {
+        self.has_saved_local_accounts() || !self.remembered_server_accounts().is_empty()
+    }
+
     pub fn active_local_profile(&self) -> Option<&LocalProfile> {
         self.sync.global.active_local_profile()
     }

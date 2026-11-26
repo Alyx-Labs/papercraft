@@ -120,6 +120,7 @@ pub fn apply_visuals(ctx: &egui::Context, theme: UiTheme) {
         || active_style.visuals.dark_mode != t.is_dark
         || active_style.visuals.panel_fill != t.panel_bg
         || active_style.visuals.extreme_bg_color != t.field_bg
+        || active_style.interaction.selectable_labels
         || (active_style.animation_time - STANDARD_DURATION_S).abs() > 1e-4;
     if !needs_apply {
         return;
@@ -174,6 +175,7 @@ pub fn apply_visuals(ctx: &egui::Context, theme: UiTheme) {
     ctx.set_visuals(visuals);
     ctx.all_styles_mut(|style| {
         style.animation_time = STANDARD_DURATION_S;
+        style.interaction.selectable_labels = false;
     });
 }
 

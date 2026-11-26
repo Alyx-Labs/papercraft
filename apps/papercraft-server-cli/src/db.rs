@@ -59,7 +59,7 @@ pub enum DbError {
     UsernameInTrash(String),
     #[error("trashed account `{0}` has expired and was permanently deleted")]
     TrashedUserExpired(String),
-    #[error("invalid username or password")]
+    #[error("invalid email or password")]
     InvalidCredentials,
     #[error("current password is incorrect")]
     IncorrectCurrentPassword,
@@ -591,6 +591,9 @@ impl ServerDb {
         device_name_raw: Option<&str>,
         ttls: TokenTtls,
     ) -> Result<AuthResponse, DbError> {
+        let (_, email_lower) = normalize_email(identifier_raw).map_err(|_| {
+            DbError::Validation("Please enter a valid email address to sign in.".to_string())
+        })?;
         if password.is_empty() || password.len() > papercraft_sync_protocol::MAX_PASSWORD_LEN {
             return Err(DbError::InvalidCredentials);
         }
@@ -600,7 +603,7 @@ impl ServerDb {
         let (active_user, trashed_match) = {
             let rx = self.db.begin_read().map_err(map_tx_err)?;
             let users = rx.open_table(USERS_TABLE).map_err(map_table_err)?;
-            if let Some(user_id) = lookup_user_id_by_identifier(&rx, identifier_raw)? {
+            if let Some(user_id) = lookup_user_id_by_email(&rx, &email_lower)? {
                 let row = users
                     .get(user_id.as_str())
                     .map_err(map_storage_err)?
@@ -608,7 +611,7 @@ impl ServerDb {
                     .transpose()?;
                 (row, None)
             } else {
-                let trashed = lookup_trashed_user_by_identifier(&rx, identifier_raw)?;
+                let trashed = lookup_trashed_user_by_email(&rx, &email_lower)?;
                 (None, trashed)
             }
         };
@@ -668,6 +671,11 @@ impl ServerDb {
         device_name_raw: Option<&str>,
         ttls: TokenTtls,
     ) -> Result<AuthResponse, DbError> {
+        let (_, email_lower) = normalize_email(identifier_raw).map_err(|_| {
+            DbError::Validation(
+                "Please enter a valid email address to recover your account.".to_string(),
+            )
+        })?;
         validate_password(new_password)?;
         let code = recovery_code.trim();
         if code.is_empty() || code.len() > papercraft_sync_protocol::MAX_PASSWORD_LEN {
@@ -681,7 +689,7 @@ impl ServerDb {
         let (active_user, trashed_match) = {
             let rx = self.db.begin_read().map_err(map_tx_err)?;
             let users = rx.open_table(USERS_TABLE).map_err(map_table_err)?;
-            if let Some(user_id) = lookup_user_id_by_identifier(&rx, identifier_raw)? {
+            if let Some(user_id) = lookup_user_id_by_email(&rx, &email_lower)? {
                 let row = users
                     .get(user_id.as_str())
                     .map_err(map_storage_err)?
@@ -689,7 +697,7 @@ impl ServerDb {
                     .transpose()?;
                 (row, None)
             } else {
-                let trashed = lookup_trashed_user_by_identifier(&rx, identifier_raw)?;
+                let trashed = lookup_trashed_user_by_email(&rx, &email_lower)?;
                 (None, trashed)
             }
         };
@@ -2326,19 +2334,30 @@ fn trashed_row_matches_id_or_identifier(row: &TrashedUserRow, raw: &str) -> bool
     row.user.user_id == trimmed || trashed_row_matches_identifier(row, trimmed)
 }
 
-fn lookup_trashed_user_by_identifier(
+fn lookup_trashed_user_by_email(
     rx: &redb::ReadTransaction,
-    identifier_raw: &str,
+    email_lower: &str,
 ) -> Result<Option<TrashedUserRow>, DbError> {
     let trashed = rx.open_table(TRASHED_USERS_TABLE).map_err(map_table_err)?;
     for item in trashed.iter().map_err(map_storage_err)? {
         let (_, v) = item.map_err(map_storage_err)?;
         let row: TrashedUserRow = from_json(v.value())?;
-        if trashed_row_matches_identifier(&row, identifier_raw) {
+        if row.user.email_lower.as_deref() == Some(email_lower) {
             return Ok(Some(row));
         }
     }
     Ok(None)
+}
+
+fn lookup_user_id_by_email(
+    rx: &redb::ReadTransaction,
+    email_lower: &str,
+) -> Result<Option<String>, DbError> {
+    let by_email = rx.open_table(USERS_BY_EMAIL_TABLE).map_err(map_table_err)?;
+    Ok(by_email
+        .get(email_lower)
+        .map_err(map_storage_err)?
+        .map(|g| g.value().to_string()))
 }
 
 fn lookup_trashed_user_by_id_or_identifier(

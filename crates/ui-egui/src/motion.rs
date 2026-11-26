@@ -446,7 +446,22 @@ pub fn animated_collapse(
     fallback_h: f32,
     add_contents: impl FnOnce(&mut Ui),
 ) {
-    let reveal = panel_reveal_factor(ui.ctx(), id, open);
+    animated_collapse_with_duration(ui, id, open, fallback_h, STANDARD_DURATION_S, add_contents);
+}
+
+/// Smoothly expands or collapses inline secondary UI over `duration_s` using an animated height
+/// slot, opacity crossfade, and child clipping.
+pub fn animated_collapse_with_duration(
+    ui: &mut Ui,
+    id: Id,
+    open: bool,
+    fallback_h: f32,
+    duration_s: f32,
+    add_contents: impl FnOnce(&mut Ui),
+) {
+    let reveal = ui
+        .ctx()
+        .animate_bool_with_time_and_easing(id, open, duration_s, ease_out_cubic);
     if !open && reveal <= 0.001 {
         return;
     }
@@ -504,6 +519,42 @@ pub fn animated_collapse(
     }
 }
 
+/// Renders `add_contents` inside a smoothly cross-fading and horizontally gliding container
+/// without introducing wrapper layout overhead once settled.
+pub fn show_flow_content<R>(
+    ui: &mut Ui,
+    opacity: f32,
+    offset_x: f32,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    let opacity = clamp01(opacity);
+    let offset_x = if offset_x.is_finite() { offset_x } else { 0.0 };
+    if opacity >= 0.999 && offset_x.abs() <= 0.05 {
+        return add_contents(ui);
+    }
+
+    let clip = ui.clip_rect();
+    let avail_w = ui.available_width().max(1.0);
+    let avail_h = ui.available_height().max(400.0);
+    let origin = ui.cursor().min;
+    let shifted_max = egui::Rect::from_min_size(
+        origin + egui::vec2(offset_x, 0.0),
+        egui::vec2(avail_w, avail_h),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(shifted_max)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    child.set_clip_rect(clip);
+    child.set_width(avail_w);
+    child.multiply_opacity(opacity);
+    let out = add_contents(&mut child);
+    let measured_h = child.min_rect().height().max(0.0);
+    let _ = ui.allocate_exact_size(egui::vec2(avail_w, measured_h), egui::Sense::hover());
+    out
+}
+
 #[inline]
 fn reveal_opacity(progress: f32) -> f32 {
     lerp_f32(0.15, 1.0, ease_out_cubic(progress))
@@ -530,6 +581,12 @@ impl<K> Default for RevealFade<K> {
 }
 
 impl<K: PartialEq> RevealFade<K> {
+    /// Clears tracked key state so the next observed key renders immediately without fading.
+    pub fn reset(&mut self) {
+        self.last_key = None;
+        self.progress = 1.0;
+    }
+
     /// Synchronizes the tracked key immediately without starting a fade.
     pub fn sync(&mut self, key: K) {
         self.last_key = Some(key);
@@ -694,6 +751,10 @@ pub struct MotionState {
     pub modal_backdrop: BackdropTransition,
     pub modal_flow: FlowTransition<(u64, u8, usize)>,
     pub modal_subflow: FlowTransition<(u64, u8, u8)>,
+    pub profile_section: FlowTransition<(bool, u8)>,
+    pub auth_flow: FlowTransition<u8>,
+    pub profile_identity: RevealFade<String>,
+    pub account_banner: RevealFade<String>,
     pub settings_tab: TabFadeTransition,
     pub page_fade: PageFadeTransition,
     pub home_scope: RevealFade<String>,

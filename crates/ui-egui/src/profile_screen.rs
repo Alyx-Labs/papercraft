@@ -1,6 +1,6 @@
 //! Dedicated full-window Profile, Account Switching, Security & Server screen.
 
-use egui::{CornerRadius, Margin, Sense, Stroke, Vec2};
+use egui::{Color32, CornerRadius, Margin, Sense, Stroke, Vec2};
 use papercraft_sync::{SyncConnectionState, SyncStatusSummary};
 
 use crate::PaperCraftApp;
@@ -351,7 +351,7 @@ fn draw_sidebar_rail(
     summary: &SyncStatusSummary,
     t: &Tokens,
 ) {
-    draw_identity_summary_card(ui, summary, t);
+    draw_identity_summary_card(app, ui, summary, t);
     ui.add_space(10.0);
 
     egui::Frame::new()
@@ -420,7 +420,33 @@ fn draw_sidebar_rail(
         });
 }
 
-fn draw_identity_summary_card(ui: &mut egui::Ui, summary: &SyncStatusSummary, t: &Tokens) {
+fn draw_identity_summary_card(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    summary: &SyncStatusSummary,
+    t: &Tokens,
+) {
+    let identity_key = if summary.signed_in {
+        format!(
+            "cloud:{}:{}:{}:{}",
+            summary.server_url,
+            summary.username.as_deref().unwrap_or(""),
+            summary.display_name.as_deref().unwrap_or(""),
+            summary.email.as_deref().unwrap_or("")
+        )
+    } else {
+        format!(
+            "local:{}:{}",
+            summary.active_local_profile_id.as_deref().unwrap_or(""),
+            summary.active_local_profile_name.as_deref().unwrap_or("")
+        )
+    };
+    let dt = ui.ctx().input(|i| i.stable_dt);
+    if app.view.motion.profile_identity.advance(identity_key, dt) {
+        ui.ctx().request_repaint();
+    }
+    let identity_opacity = app.view.motion.profile_identity.opacity();
+
     egui::Frame::new()
         .fill(t.toolbar_bg)
         .stroke(Stroke::new(1.0, t.border))
@@ -429,6 +455,7 @@ fn draw_identity_summary_card(ui: &mut egui::Ui, summary: &SyncStatusSummary, t:
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 6.0;
+            ui.multiply_opacity(identity_opacity);
 
             let (primary, secondary, monogram) = if summary.signed_in {
                 let disp = summary
@@ -517,17 +544,25 @@ fn draw_rail_nav_button(
     selected: bool,
     t: &Tokens,
 ) -> bool {
-    let fill = if selected {
-        t.accent_soft
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    let border = if selected {
-        Stroke::new(1.0, t.accent)
+    let id = ui.make_persistent_id(("profile_rail_nav", title));
+    let hov_state_id = id.with("hov_state");
+    let prev_hovered = ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(hov_state_id).unwrap_or(false));
+    let hover_t = crate::motion::hover_factor(ui.ctx(), id.with("hov"), prev_hovered && !selected);
+    let select_t = crate::motion::hover_factor(ui.ctx(), id.with("sel"), selected);
+
+    let base_fill = crate::motion::lerp_color(Color32::TRANSPARENT, t.panel_bg, hover_t);
+    let fill = crate::motion::lerp_color(base_fill, t.accent_soft, select_t);
+    let base_border = crate::motion::lerp_color(Color32::TRANSPARENT, t.border, hover_t);
+    let border_color = crate::motion::lerp_color(base_border, t.accent, select_t);
+    let border = if select_t > 0.01 || hover_t > 0.01 {
+        Stroke::new(1.0, border_color)
     } else {
         Stroke::NONE
     };
-    let title_color = if selected { t.accent } else { t.text };
+    let title_color = crate::motion::lerp_color(t.text, t.accent, select_t);
+    let icon_color = crate::motion::lerp_color(t.text_muted, t.accent, select_t.max(hover_t * 0.4));
 
     let resp = egui::Frame::new()
         .fill(fill)
@@ -539,12 +574,7 @@ fn draw_rail_nav_button(
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                paint_icon(
-                    ui.painter(),
-                    ir,
-                    icon,
-                    if selected { t.accent } else { t.text_muted },
-                );
+                paint_icon(ui.painter(), ir, icon, icon_color);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
                     ui.add(
@@ -569,6 +599,24 @@ fn draw_rail_nav_button(
         .response
         .interact(Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    if select_t > 0.02 && ui.is_rect_visible(resp.rect) {
+        let half_h = (resp.rect.height() - 16.0).max(4.0) * 0.5 * select_t;
+        let center_y = resp.rect.center().y;
+        let bar_rect = egui::Rect::from_min_max(
+            egui::pos2(resp.rect.left() + 3.0, center_y - half_h),
+            egui::pos2(resp.rect.left() + 5.5, center_y + half_h),
+        );
+        ui.painter().rect_filled(
+            bar_rect,
+            CornerRadius::same(2),
+            t.accent.gamma_multiply(select_t),
+        );
+    }
+
+    let hovered_now = resp.hovered();
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(hov_state_id, hovered_now));
     resp.clicked()
 }
 
@@ -581,71 +629,92 @@ fn draw_active_section_content(
 ) {
     ui.spacing_mut().item_spacing.y = 0.0;
 
-    if summary.signed_in {
-        match app.view.account.profile_section {
-            ProfileSection::Accounts => {
-                render_accounts_switcher_section(app, ui, summary, cloud_pending, t);
-            }
-            ProfileSection::ServerLogin => {
-                draw_section_card(ui, t, |ui| {
-                    render_signed_in_account_card(app, ui, summary, cloud_pending, t);
-                });
-                ui.add_space(10.0);
-                let mut test_on_enter = false;
-                draw_section_card(ui, t, |ui| {
-                    test_on_enter = render_signed_in_server_card(app, ui, summary, t);
-                });
-                if test_on_enter && !app.view.account.is_testing() {
-                    trigger_test_connection(app, ui.ctx());
-                }
-                ui.add_space(10.0);
-                draw_self_hosted_download_disclaimer(app, ui, t);
-            }
-            ProfileSection::Profile => {
-                draw_section_card(ui, t, |ui| {
-                    render_profile_identity_card(app, ui, t);
-                });
-                ui.add_space(10.0);
-                draw_section_card(ui, t, |ui| {
-                    render_account_email_card(app, ui, summary, t);
-                });
-            }
-            ProfileSection::Security => {
-                draw_section_card(ui, t, |ui| {
-                    render_change_password_card(app, ui, t);
-                });
-                ui.add_space(10.0);
-                draw_section_card(ui, t, |ui| {
-                    render_session_sign_out_card(app, ui, summary, t);
-                });
-            }
-        }
-    } else {
-        match app.view.account.profile_section {
-            ProfileSection::Accounts => {
-                render_accounts_switcher_section(app, ui, summary, cloud_pending, t);
-            }
-            _ => {
-                let mut test_on_enter = false;
-                draw_section_card(ui, t, |ui| {
-                    test_on_enter = render_server_probe_section(app, ui, t, true);
-                });
-                ui.add_space(10.0);
-                let mut submit_on_enter = false;
-                draw_section_card(ui, t, |ui| {
-                    submit_on_enter = render_auth_card_contents(app, ui, t, true);
-                });
-                ui.add_space(10.0);
-                draw_self_hosted_download_disclaimer(app, ui, t);
-                if test_on_enter && !app.view.account.is_testing() {
-                    trigger_test_connection(app, ui.ctx());
-                }
-                if submit_on_enter {
-                    handle_auth_submit_on_enter(app, ui.ctx());
-                }
-            }
-        }
+    let section_order: isize = match app.view.account.profile_section {
+        ProfileSection::Accounts => 0,
+        ProfileSection::ServerLogin => 1,
+        ProfileSection::Profile => 2,
+        ProfileSection::Security => 3,
+    };
+    let section_key = (summary.signed_in, section_order as u8);
+    let dt = ui.ctx().input(|i| i.stable_dt);
+    if app
+        .view
+        .motion
+        .profile_section
+        .advance(section_key, section_order, dt)
+    {
+        ui.ctx().request_repaint();
     }
+    let flow_opacity = app.view.motion.profile_section.opacity();
+    let flow_offset_x = app.view.motion.profile_section.offset_x();
+
+    crate::motion::show_flow_content(ui, flow_opacity, flow_offset_x, |ui| {
+        if summary.signed_in {
+            match app.view.account.profile_section {
+                ProfileSection::Accounts => {
+                    render_accounts_switcher_section(app, ui, summary, cloud_pending, t);
+                }
+                ProfileSection::ServerLogin => {
+                    draw_section_card(ui, t, |ui| {
+                        render_signed_in_account_card(app, ui, summary, cloud_pending, t);
+                    });
+                    ui.add_space(10.0);
+                    let mut test_on_enter = false;
+                    draw_section_card(ui, t, |ui| {
+                        test_on_enter = render_signed_in_server_card(app, ui, summary, t);
+                    });
+                    if test_on_enter && !app.view.account.is_testing() {
+                        trigger_test_connection(app, ui.ctx());
+                    }
+                    ui.add_space(10.0);
+                    draw_self_hosted_download_disclaimer(app, ui, t);
+                }
+                ProfileSection::Profile => {
+                    draw_section_card(ui, t, |ui| {
+                        render_profile_identity_card(app, ui, t);
+                    });
+                    ui.add_space(10.0);
+                    draw_section_card(ui, t, |ui| {
+                        render_account_email_card(app, ui, summary, t);
+                    });
+                }
+                ProfileSection::Security => {
+                    draw_section_card(ui, t, |ui| {
+                        render_change_password_card(app, ui, t);
+                    });
+                    ui.add_space(10.0);
+                    draw_section_card(ui, t, |ui| {
+                        render_session_sign_out_card(app, ui, summary, t);
+                    });
+                }
+            }
+        } else {
+            match app.view.account.profile_section {
+                ProfileSection::Accounts => {
+                    render_accounts_switcher_section(app, ui, summary, cloud_pending, t);
+                }
+                _ => {
+                    let mut test_on_enter = false;
+                    draw_section_card(ui, t, |ui| {
+                        test_on_enter = render_server_probe_section(app, ui, t, true);
+                    });
+                    ui.add_space(10.0);
+                    let mut submit_on_enter = false;
+                    draw_section_card(ui, t, |ui| {
+                        submit_on_enter = render_auth_card_contents(app, ui, t, true);
+                    });
+                    ui.add_space(10.0);
+                    draw_self_hosted_download_disclaimer(app, ui, t);
+                    if test_on_enter && !app.view.account.is_testing() {
+                        trigger_test_connection(app, ui.ctx());
+                    }
+                    if submit_on_enter {
+                        handle_auth_submit_on_enter(app, ui.ctx());
+                    }
+                }
+            }
+        }
+    });
 
     if let Some(ref err) = summary.last_error
         && app.view.account.error_message.is_none()
@@ -1159,5 +1228,101 @@ mod tests {
             out.drop_without_applying_deltas();
         }
         assert!(app.view.inspector_open);
+    }
+
+    #[test]
+    fn profile_section_and_auth_tab_transitions_animate_smoothly() {
+        fn settle_profile(ctx: &egui::Context, app: &mut PaperCraftApp, time: &mut f64) {
+            for _ in 0..12 {
+                *time += 0.04;
+                let out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 800.0),
+                        )),
+                        time: Some(*time),
+                        predicted_dt: 0.04,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                        show(app, ui);
+                    },
+                );
+                out.drop_without_applying_deltas();
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = PaperCraftApp::default();
+        crate::open_profile_screen(&mut app);
+
+        let mut time = 0.0_f64;
+        settle_profile(&ctx, &mut app, &mut time);
+        assert!(
+            (app.view.motion.profile_section.opacity() - 1.0).abs() <= f32::EPSILON,
+            "expected settled initial profile section"
+        );
+
+        // Switching ProfileSection starts a directional FlowTransition that settles smoothly.
+        app.view.account.profile_section = crate::account_modal::ProfileSection::ServerLogin;
+        time += 0.02;
+        let out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(time),
+                predicted_dt: 0.02,
+                ..Default::default()
+            },
+            |ui| {
+                crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                show(&mut app, ui);
+            },
+        );
+        out.drop_without_applying_deltas();
+        assert!(
+            app.view.motion.profile_section.opacity() < 1.0,
+            "expected active profile_section transition opacity < 1.0, got {}",
+            app.view.motion.profile_section.opacity()
+        );
+        settle_profile(&ctx, &mut app, &mut time);
+        assert!(
+            (app.view.motion.profile_section.opacity() - 1.0).abs() <= f32::EPSILON,
+            "expected settled profile_section after animation"
+        );
+
+        // Switching AuthTab on ServerLogin starts auth_flow FlowTransition that settles smoothly.
+        app.view.account.tab = crate::account_modal::AuthTab::CreateAccount;
+        time += 0.02;
+        let out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(time),
+                predicted_dt: 0.02,
+                ..Default::default()
+            },
+            |ui| {
+                crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                show(&mut app, ui);
+            },
+        );
+        out.drop_without_applying_deltas();
+        assert!(
+            app.view.motion.auth_flow.opacity() < 1.0,
+            "expected active auth_flow transition opacity < 1.0, got {}",
+            app.view.motion.auth_flow.opacity()
+        );
+        settle_profile(&ctx, &mut app, &mut time);
+        assert!(
+            (app.view.motion.auth_flow.opacity() - 1.0).abs() <= f32::EPSILON,
+            "expected settled auth_flow after animation"
+        );
     }
 }
