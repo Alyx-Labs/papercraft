@@ -129,6 +129,7 @@ impl ServerControlApp {
         self.hidden_shield.prepare_show();
         self.controller.window_visible = true;
         self.controller.refresh_stats();
+        self.controller.refresh_users();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);

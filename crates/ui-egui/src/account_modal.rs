@@ -130,6 +130,10 @@ pub struct AccountDraftState {
     pub new_profile_name: String,
     pub renaming_profile_id: Option<String>,
     pub rename_profile_draft: String,
+    pub pending_delete_profile_id: Option<String>,
+    pub delete_profile_confirm_input: String,
+    pub pending_delete_profile_scroll_pending: bool,
+    pub delete_profile_paste_blocked: bool,
     pub pending_migration_profile_id: Option<String>,
     pub migration_confirm_input: String,
     pub migration_confirm_scroll_pending: bool,
@@ -175,6 +179,10 @@ impl Default for AccountDraftState {
             new_profile_name: String::new(),
             renaming_profile_id: None,
             rename_profile_draft: String::new(),
+            pending_delete_profile_id: None,
+            delete_profile_confirm_input: String::new(),
+            pending_delete_profile_scroll_pending: false,
+            delete_profile_paste_blocked: false,
             pending_migration_profile_id: None,
             migration_confirm_input: String::new(),
             migration_confirm_scroll_pending: false,
@@ -251,6 +259,14 @@ impl AccountDraftState {
         };
     }
 
+    /// Clears any pending local profile deletion confirmation draft and focus/clipboard flags.
+    pub fn clear_pending_delete_profile(&mut self) {
+        self.pending_delete_profile_id = None;
+        self.delete_profile_confirm_input.clear();
+        self.pending_delete_profile_scroll_pending = false;
+        self.delete_profile_paste_blocked = false;
+    }
+
     /// Applies successful login/registration feedback to the draft state.
     pub fn apply_auth_ok(&mut self, server_url: &str, label: &str) {
         self.auth_busy = false;
@@ -265,6 +281,7 @@ impl AccountDraftState {
         self.migration_confirm_input.clear();
         self.migration_confirm_scroll_pending = false;
         self.migration_paste_blocked = false;
+        self.clear_pending_delete_profile();
         self.profile_save_busy = false;
         self.change_password_busy = false;
         self.current_password_draft.clear();
@@ -398,6 +415,7 @@ impl AccountDraftState {
         self.migration_confirm_input.clear();
         self.migration_confirm_scroll_pending = false;
         self.migration_paste_blocked = false;
+        self.clear_pending_delete_profile();
         self.password_reset = PasswordResetFlowState::default();
         self.signup_username.clear();
         self.edit_display_name.clear();
@@ -431,6 +449,7 @@ pub(crate) fn sync_draft_from_session(app: &mut PaperCraftApp) {
     app.view.account.migration_confirm_input.clear();
     app.view.account.migration_confirm_scroll_pending = false;
     app.view.account.migration_paste_blocked = false;
+    app.view.account.clear_pending_delete_profile();
     app.view.account.profile_save_busy = false;
     app.view.account.change_email_open = false;
     app.view.account.change_email_password.clear();
@@ -2303,6 +2322,11 @@ pub(crate) fn migration_confirmation_phrase(local_nickname: &str) -> String {
     format!("I agree {}", local_nickname.trim())
 }
 
+/// Builds the exact manual confirmation phrase (`I agree <local_profile>`) for local deletion.
+pub(crate) fn local_profile_delete_confirmation_phrase(local_nickname: &str) -> String {
+    format!("I agree {}", local_nickname.trim())
+}
+
 fn normalize_confirmation_words(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -2310,6 +2334,91 @@ fn normalize_confirmation_words(raw: &str) -> String {
 fn migration_confirmation_matches(input: &str, expected: &str) -> bool {
     normalize_confirmation_words(input).to_lowercase()
         == normalize_confirmation_words(expected).to_lowercase()
+}
+
+struct ManualAgreeInputOutcome {
+    edit_id: egui::Id,
+    matched: bool,
+    enter_pressed: bool,
+}
+
+fn draw_manual_agree_confirmation_input(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    expected: &str,
+    input: &mut String,
+    paste_blocked: &mut bool,
+    t: &Tokens,
+) -> ManualAgreeInputOutcome {
+    ui.label(
+        egui::RichText::new("Example — type this manually:")
+            .size(10.5)
+            .color(t.text_muted),
+    );
+    ui.add_space(3.0);
+    egui::Frame::new()
+        .fill(t.toolbar_bg)
+        .stroke(Stroke::new(1.0, t.border))
+        .corner_radius(CornerRadius::same(5))
+        .inner_margin(Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(expected)
+                        .size(11.5)
+                        .strong()
+                        .monospace()
+                        .color(t.text),
+                )
+                .selectable(false)
+                .wrap(),
+            );
+        });
+    ui.add_space(6.0);
+    let matched = migration_confirmation_matches(input, expected);
+    let hint = if *paste_blocked && !matched {
+        FieldHint::Warning("Copy/paste is disabled — type it manually".to_string())
+    } else if input.trim().is_empty() {
+        FieldHint::Muted("Type manually (no copy/paste)")
+    } else if matched {
+        FieldHint::Success("Confirmation matched")
+    } else {
+        FieldHint::Warning(format!("Must match: {expected}"))
+    };
+    draw_field_label_row(ui, "Manual Confirmation", hint, t);
+    ui.add_space(3.0);
+    let input_resp = draw_manual_confirm_input(
+        ui,
+        InputFieldSpec {
+            id_salt,
+            width: ui.available_width(),
+            hint: "I agree ...",
+            border_color: Some(if matched {
+                t.success_border
+            } else {
+                t.danger_border
+            }),
+            trailing: if matched {
+                InputTrailing::GreenCheck("Confirmation matches")
+            } else {
+                InputTrailing::None
+            },
+        },
+        input,
+        t,
+    );
+    if input_resp.paste_blocked {
+        *paste_blocked = true;
+        ui.ctx().request_repaint();
+    } else if input_resp.outcome.changed {
+        *paste_blocked = false;
+    }
+    ManualAgreeInputOutcome {
+        edit_id: input_resp.edit_id,
+        matched,
+        enter_pressed: input_resp.outcome.enter_pressed,
+    }
 }
 
 fn render_migration_typed_confirmation(
@@ -2355,85 +2464,29 @@ fn render_migration_typed_confirmation(
                 .wrap(),
             );
             ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new("Example — type this manually:")
-                    .size(10.5)
-                    .color(t.text_muted),
-            );
-            ui.add_space(3.0);
-            egui::Frame::new()
-                .fill(t.toolbar_bg)
-                .stroke(Stroke::new(1.0, t.border))
-                .corner_radius(CornerRadius::same(5))
-                .inner_margin(Margin::symmetric(8, 6))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&expected)
-                                .size(11.5)
-                                .strong()
-                                .monospace()
-                                .color(t.text),
-                        )
-                        .selectable(false)
-                        .wrap(),
-                    );
-                });
-            ui.add_space(6.0);
-            let matched =
-                migration_confirmation_matches(&app.view.account.migration_confirm_input, &expected);
-            let hint = if app.view.account.migration_paste_blocked && !matched {
-                FieldHint::Warning("Copy/paste is disabled — type it manually".to_string())
-            } else if app.view.account.migration_confirm_input.trim().is_empty() {
-                FieldHint::Muted("Type manually (no copy/paste)")
-            } else if matched {
-                FieldHint::Success("Confirmation matched")
-            } else {
-                FieldHint::Warning(format!("Must match: {expected}"))
-            };
-            draw_field_label_row(ui, "Manual Confirmation", hint, t);
-            ui.add_space(3.0);
-            let input_resp = draw_manual_confirm_input(
+            let manual = draw_manual_agree_confirmation_input(
                 ui,
-                InputFieldSpec {
-                    id_salt: "acct_migration_confirm_input",
-                    width: ui.available_width(),
-                    hint: "I agree ...",
-                    border_color: Some(if matched {
-                        t.success_border
-                    } else {
-                        t.danger_border
-                    }),
-                    trailing: if matched {
-                        InputTrailing::GreenCheck("Confirmation matches")
-                    } else {
-                        InputTrailing::None
-                    },
-                },
+                "acct_migration_confirm_input",
+                &expected,
                 &mut app.view.account.migration_confirm_input,
+                &mut app.view.account.migration_paste_blocked,
                 t,
             );
-            if input_resp.paste_blocked {
-                app.view.account.migration_paste_blocked = true;
-                ui.ctx().request_repaint();
-            } else if input_resp.outcome.changed {
-                app.view.account.migration_paste_blocked = false;
-            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if secondary_action_button(ui, "Cancel", true, t).clicked() {
                     cancel = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if danger_action_button(ui, "Confirm Merge & Delete", matched, t).clicked()
-                        || (input_resp.outcome.enter_pressed && matched)
+                    if danger_action_button(ui, "Confirm Merge & Delete", manual.matched, t)
+                        .clicked()
+                        || (manual.enter_pressed && manual.matched)
                     {
                         confirmed = true;
                     }
                 });
             });
-            input_resp.edit_id
+            manual.edit_id
         });
 
     if std::mem::take(&mut app.view.account.migration_confirm_scroll_pending) {
@@ -2744,6 +2797,11 @@ pub(crate) fn render_local_profiles_manager(
         .unwrap_or_default();
     let viewing_cloud = app.session.is_viewing_cloud();
     let can_delete = profiles.len() > 1;
+    if let Some(ref pending_del) = app.view.account.pending_delete_profile_id
+        && (!can_delete || !profiles.iter().any(|p| p.local_profile_id == *pending_del))
+    {
+        app.view.account.clear_pending_delete_profile();
+    }
 
     for profile in profiles {
         let is_active = !viewing_cloud && profile.local_profile_id == active_local_id;
@@ -2793,6 +2851,127 @@ pub(crate) fn render_local_profiles_manager(
     });
 }
 
+fn execute_local_profile_delete(
+    app: &mut PaperCraftApp,
+    ui: &egui::Ui,
+    profile: &papercraft_sync::LocalProfile,
+) {
+    crate::canvas::commit_pending_text(app);
+    let deleted_name = profile.nickname.clone();
+    match app.session.execute(
+        "profile.delete",
+        &json!({ "profile_id": profile.local_profile_id }),
+    ) {
+        Ok(_) => {
+            app.view.account.clear_pending_delete_profile();
+            app.view.account.error_message = None;
+            app.view.account.status_message =
+                Some(format!("Deleted local profile '{deleted_name}'."));
+            app.view.profile_return_screen = crate::AppScreen::Home;
+            crate::sync_view_to_active_notebook(app);
+            crate::sync_worker::maybe_report_local_discovery(
+                app,
+                ui.ctx(),
+                ui.ctx().input(|i| i.time * 1000.0),
+            );
+        }
+        Err(err) => {
+            app.view.account.status_message = None;
+            app.view.account.error_message = Some(err.to_string());
+        }
+    }
+}
+
+fn render_local_profile_delete_confirmation(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    profile: &papercraft_sync::LocalProfile,
+    is_active: bool,
+    nb_count: usize,
+    t: &Tokens,
+) {
+    let expected = local_profile_delete_confirmation_phrase(&profile.nickname);
+    let count_label = format_notebook_count(nb_count);
+    let mut confirm_delete = false;
+    let mut cancel_delete = false;
+    let active_note = if is_active {
+        " PaperCraft will switch to another local profile."
+    } else {
+        ""
+    };
+
+    let mut matched = false;
+    let confirm_resp = egui::Frame::new()
+        .fill(t.field_bg)
+        .stroke(Stroke::new(1.0, t.danger_border))
+        .corner_radius(CornerRadius::same(7))
+        .inner_margin(Margin::symmetric(10, 9))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (ir, _) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::hover());
+                paint_icon(ui.painter(), ir, Icon::AlertCircle, t.danger_fg);
+                ui.label(
+                    egui::RichText::new("Delete Local Profile?")
+                        .size(12.0)
+                        .strong()
+                        .color(t.danger_fg),
+                );
+            });
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "Irreversible action: permanently deletes local profile '{}' ({count_label}) and all offline data on this device.{active_note} Copy and paste is disabled.",
+                        profile.nickname
+                    ))
+                    .size(11.0)
+                    .color(t.text_muted),
+                )
+                .wrap(),
+            );
+            ui.add_space(6.0);
+            let manual = draw_manual_agree_confirmation_input(
+                ui,
+                "acct_delete_profile_confirm_input",
+                &expected,
+                &mut app.view.account.delete_profile_confirm_input,
+                &mut app.view.account.delete_profile_paste_blocked,
+                t,
+            );
+            matched = manual.matched;
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if secondary_action_button(ui, "Cancel", true, t).clicked() {
+                    cancel_delete = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if danger_action_button(ui, "Delete Profile", matched, t).clicked()
+                        || (manual.enter_pressed && matched)
+                    {
+                        confirm_delete = true;
+                    }
+                });
+            });
+            manual.edit_id
+        });
+
+    if std::mem::take(&mut app.view.account.pending_delete_profile_scroll_pending) {
+        ui.scroll_to_rect(confirm_resp.response.rect, Some(egui::Align::Center));
+        ui.memory_mut(|m| m.request_focus(confirm_resp.inner));
+    }
+
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        cancel_delete = true;
+    }
+
+    if confirm_delete && matched {
+        execute_local_profile_delete(app, ui, profile);
+    } else if cancel_delete {
+        app.view.account.clear_pending_delete_profile();
+    }
+}
+
 fn render_local_profile_block(
     app: &mut PaperCraftApp,
     ui: &mut egui::Ui,
@@ -2803,110 +2982,132 @@ fn render_local_profile_block(
 ) {
     let is_renaming =
         app.view.account.renaming_profile_id.as_deref() == Some(&profile.local_profile_id);
+    let is_confirming_delete = !is_renaming
+        && can_delete
+        && app.view.account.pending_delete_profile_id.as_deref() == Some(&profile.local_profile_id);
     let nb_count = app
         .session
         .local_profile_notebook_count(&profile.local_profile_id);
     let count_label = format_notebook_count(nb_count);
 
-    draw_account_block_frame(ui, is_active, None, t, |ui| {
-        if is_renaming {
-            ui.horizontal(|ui| {
-                let save_w = 56.0_f32;
-                let gap = 6.0_f32;
-                let input_w = (ui.available_width() - save_w * 2.0 - gap * 2.0).max(100.0);
-                let resp = draw_text_input(
-                    ui,
-                    InputFieldSpec {
-                        id_salt: "acct_rename_profile_input",
-                        width: input_w,
-                        hint: "Profile nickname",
-                        border_color: None,
-                        trailing: InputTrailing::None,
-                    },
-                    &mut app.view.account.rename_profile_draft,
-                    t,
-                );
-                if fixed_secondary_button(ui, "Save", save_w, true, t).clicked()
-                    || resp.enter_pressed
-                {
-                    let name = app.view.account.rename_profile_draft.trim().to_string();
-                    if let Err(err) = app.session.execute(
-                        "profile.rename",
-                        &json!({ "profile_id": profile.local_profile_id, "nickname": name }),
-                    ) {
-                        app.view.account.error_message = Some(err.to_string());
-                    } else {
-                        app.view.account.renaming_profile_id = None;
-                        app.view.account.error_message = None;
-                    }
-                }
-                if fixed_secondary_button(ui, "Cancel", save_w, true, t).clicked() {
-                    app.view.account.renaming_profile_id = None;
-                }
-            });
-            return;
-        }
-
-        ui.horizontal(|ui| {
-            let right_w = if can_delete { 58.0 + 6.0 } else { 0.0 }
-                + 62.0
-                + 6.0
-                + if is_active { 74.0 } else { 62.0 };
-            let name_max_w = (ui.available_width() - right_w - 117.0).max(48.0);
-            let (ir, _) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::hover());
-            paint_icon(
-                ui.painter(),
-                ir,
-                Icon::Inbox,
-                if is_active { t.accent } else { t.text_muted },
-            );
-            draw_truncated_block_title(ui, &profile.nickname, name_max_w, t);
-            draw_pill_badge(
-                ui,
-                PillStyle {
-                    fill: t.panel_bg,
-                    border: t.border,
-                    fg: t.text_muted,
-                    icon: PillIcon::Dot,
-                },
-                "Local Only",
-            );
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                if can_delete && fixed_secondary_button(ui, "Delete", 58.0, true, t).clicked() {
-                    crate::canvas::commit_pending_text(app);
-                    if let Err(err) = app.session.execute(
-                        "profile.delete",
-                        &json!({ "profile_id": profile.local_profile_id }),
-                    ) {
-                        app.view.account.error_message = Some(err.to_string());
-                    } else {
-                        app.view.account.error_message = None;
-                        app.view.profile_return_screen = crate::AppScreen::Home;
-                        crate::sync_view_to_active_notebook(app);
-                    }
-                }
-                if fixed_secondary_button(ui, "Rename", 62.0, true, t).clicked() {
-                    app.view.account.renaming_profile_id = Some(profile.local_profile_id.clone());
-                    app.view.account.rename_profile_draft = profile.nickname.clone();
-                }
-                if is_active {
-                    draw_active_pill(ui, t);
-                } else if fixed_secondary_button(ui, "Switch", 62.0, true, t).clicked() {
-                    switch_workspace_profile(
-                        app,
-                        &json!({ "target": "local", "profile_id": profile.local_profile_id }),
+    draw_account_block_frame(
+        ui,
+        is_active,
+        is_confirming_delete.then_some(t.danger_border),
+        t,
+        |ui| {
+            if is_renaming {
+                ui.horizontal(|ui| {
+                    let save_w = 56.0_f32;
+                    let gap = 6.0_f32;
+                    let input_w = (ui.available_width() - save_w * 2.0 - gap * 2.0).max(100.0);
+                    let resp = draw_text_input(
+                        ui,
+                        InputFieldSpec {
+                            id_salt: "acct_rename_profile_input",
+                            width: input_w,
+                            hint: "Profile nickname",
+                            border_color: None,
+                            trailing: InputTrailing::None,
+                        },
+                        &mut app.view.account.rename_profile_draft,
+                        t,
                     );
-                }
+                    if fixed_secondary_button(ui, "Save", save_w, true, t).clicked()
+                        || resp.enter_pressed
+                    {
+                        let name = app.view.account.rename_profile_draft.trim().to_string();
+                        if let Err(err) = app.session.execute(
+                            "profile.rename",
+                            &json!({ "profile_id": profile.local_profile_id, "nickname": name }),
+                        ) {
+                            app.view.account.error_message = Some(err.to_string());
+                        } else {
+                            app.view.account.renaming_profile_id = None;
+                            app.view.account.error_message = None;
+                        }
+                    }
+                    if fixed_secondary_button(ui, "Cancel", save_w, true, t).clicked() {
+                        app.view.account.renaming_profile_id = None;
+                    }
+                });
+                return;
+            }
+
+            ui.horizontal(|ui| {
+                let right_w = if is_confirming_delete {
+                    if is_active { 74.0 } else { 0.0 }
+                } else {
+                    (if can_delete { 58.0 + 6.0 } else { 0.0 })
+                        + 62.0
+                        + 6.0
+                        + if is_active { 74.0 } else { 62.0 }
+                };
+                let name_max_w = (ui.available_width() - right_w - 117.0).max(48.0);
+                let (ir, _) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::hover());
+                paint_icon(
+                    ui.painter(),
+                    ir,
+                    Icon::Inbox,
+                    if is_active { t.accent } else { t.text_muted },
+                );
+                draw_truncated_block_title(ui, &profile.nickname, name_max_w, t);
+                draw_pill_badge(
+                    ui,
+                    PillStyle {
+                        fill: t.panel_bg,
+                        border: t.border,
+                        fg: t.text_muted,
+                        icon: PillIcon::Dot,
+                    },
+                    "Local Only",
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if !is_confirming_delete {
+                        if can_delete
+                            && fixed_secondary_button(ui, "Delete", 58.0, true, t).clicked()
+                        {
+                            app.view.account.pending_delete_profile_id =
+                                Some(profile.local_profile_id.clone());
+                            app.view.account.delete_profile_confirm_input.clear();
+                            app.view.account.pending_delete_profile_scroll_pending = true;
+                            app.view.account.delete_profile_paste_blocked = false;
+                            app.view.account.renaming_profile_id = None;
+                            app.view.account.error_message = None;
+                        }
+                        if fixed_secondary_button(ui, "Rename", 62.0, true, t).clicked() {
+                            app.view.account.renaming_profile_id =
+                                Some(profile.local_profile_id.clone());
+                            app.view.account.rename_profile_draft = profile.nickname.clone();
+                            app.view.account.clear_pending_delete_profile();
+                        }
+                    }
+                    if is_active {
+                        draw_active_pill(ui, t);
+                    } else if !is_confirming_delete
+                        && fixed_secondary_button(ui, "Switch", 62.0, true, t).clicked()
+                    {
+                        app.view.account.clear_pending_delete_profile();
+                        switch_workspace_profile(
+                            app,
+                            &json!({ "target": "local", "profile_id": profile.local_profile_id }),
+                        );
+                    }
+                });
             });
-        });
-        ui.label(
-            egui::RichText::new(format!("{count_label} · Offline on this device"))
-                .size(11.0)
-                .color(t.text_muted),
-        );
-    });
+            ui.label(
+                egui::RichText::new(format!("{count_label} · Offline on this device"))
+                    .size(11.0)
+                    .color(t.text_muted),
+            );
+            if is_confirming_delete {
+                ui.add_space(4.0);
+                render_local_profile_delete_confirmation(app, ui, profile, is_active, nb_count, t);
+            }
+        },
+    );
 }
 
 pub(crate) fn render_signed_in_server_card(
@@ -3837,6 +4038,7 @@ pub(crate) fn render_auth_banners(app: &PaperCraftApp, ui: &mut egui::Ui, t: &To
             || msg.starts_with("Profile updated")
             || msg.starts_with("Account password updated")
             || msg.starts_with("Moved ")
+            || msg.starts_with("Deleted local profile ")
             || msg.starts_with("Copied ")
         {
             BannerTone::Success
@@ -4046,7 +4248,10 @@ fn format_last_sync(last_ms: Option<i64>) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{AuthTab, ServerProbeState, migration_confirmation_phrase};
+    use super::{
+        AuthTab, ServerProbeState, local_profile_delete_confirmation_phrase,
+        migration_confirmation_phrase,
+    };
     use crate::PaperCraftApp;
     use crate::modal;
     use egui::{Shape, epaint::ClippedShape};
@@ -4758,5 +4963,244 @@ mod tests {
         assert!(text.contains("Merge into Cloud"), "missing Merge:\n{text}");
         assert!(text.contains("Cloud Sync"), "missing Cloud Sync:\n{text}");
         assert!(text.contains("Local Only"), "missing Local Only:\n{text}");
+    }
+
+    #[test]
+    fn local_profile_delete_requires_explicit_confirmation_before_removing_profile() {
+        fn find_all_text_centers(shapes: &[ClippedShape], target: &str) -> Vec<egui::Pos2> {
+            fn visit(shape: &Shape, target: &str, out: &mut Vec<egui::Pos2>) {
+                match shape {
+                    Shape::Text(text) if text.galley.text() == target => {
+                        out.push(text.visual_bounding_rect().center());
+                    }
+                    Shape::Vec(items) => {
+                        for item in items {
+                            visit(item, target, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for clipped in shapes {
+                let mut found = Vec::new();
+                visit(&clipped.shape, target, &mut found);
+                for pos in found {
+                    if clipped.clip_rect.contains(pos) {
+                        out.push(pos);
+                    }
+                }
+            }
+            out
+        }
+
+        fn run_profile_screen(
+            ctx: &egui::Context,
+            app: &mut PaperCraftApp,
+            events: Vec<egui::Event>,
+            t0: &mut f64,
+        ) -> (String, Vec<ClippedShape>) {
+            *t0 += 0.05;
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(*t0),
+                predicted_dt: 0.05,
+                events,
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                crate::profile_screen::show(app, ui);
+            });
+            let text = collect_text(&out.shapes);
+            let shapes = out.shapes.clone();
+            out.drop_without_applying_deltas();
+            (text, shapes)
+        }
+
+        fn click_pos(ctx: &egui::Context, app: &mut PaperCraftApp, pos: egui::Pos2, t0: &mut f64) {
+            for pressed in [true, false] {
+                let _ = run_profile_screen(
+                    ctx,
+                    app,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    t0,
+                );
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = PaperCraftApp::default();
+        app.session
+            .execute(
+                "profile.completeFirstAccess",
+                &serde_json::json!({ "nickname": "Primary" }),
+            )
+            .unwrap();
+        let created = app
+            .session
+            .execute(
+                "profile.create",
+                &serde_json::json!({ "nickname": "SideNotes", "switch_now": false }),
+            )
+            .unwrap();
+        let side_id = created["localProfileId"].as_str().unwrap().to_string();
+        assert_eq!(app.session.accessible_local_profiles().len(), 2);
+
+        crate::open_profile_screen(&mut app);
+        app.view.account.signed_out_section = super::SignedOutProfileSection::LocalWorkspaces;
+
+        fn find_delete_btn_near(shapes: &[ClippedShape], label: &str) -> egui::Pos2 {
+            let target_y = find_all_text_centers(shapes, label)
+                .into_iter()
+                .next()
+                .expect("target profile label")
+                .y;
+            find_all_text_centers(shapes, "Delete")
+                .into_iter()
+                .min_by(|a, b| {
+                    (a.y - target_y)
+                        .abs()
+                        .partial_cmp(&(b.y - target_y).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .expect("Delete button for target profile")
+        }
+
+        let mut t = 0.0_f64;
+        let mut shapes = Vec::new();
+        for _ in 0..4 {
+            shapes = run_profile_screen(&ctx, &mut app, Vec::new(), &mut t).1;
+        }
+
+        // 1. Clicking Delete opens typed `I agree <name>` confirmation and keeps both profiles intact.
+        click_pos(
+            &ctx,
+            &mut app,
+            find_delete_btn_near(&shapes, "SideNotes"),
+            &mut t,
+        );
+        assert_eq!(
+            app.view.account.pending_delete_profile_id.as_deref(),
+            Some(side_id.as_str())
+        );
+        assert_eq!(app.session.accessible_local_profiles().len(), 2);
+
+        let _ = run_profile_screen(&ctx, &mut app, Vec::new(), &mut t);
+        let (confirm_text, _) = run_profile_screen(&ctx, &mut app, Vec::new(), &mut t);
+        assert!(
+            confirm_text.contains("Delete Local Profile?"),
+            "\n{confirm_text}"
+        );
+        assert!(
+            confirm_text.contains("I agree SideNotes"),
+            "\n{confirm_text}"
+        );
+        assert!(confirm_text.contains("Delete Profile"), "\n{confirm_text}");
+
+        // 2. Paste attempts (Event::Paste and Ctrl+V) must be blocked with a clear hint.
+        let _ = run_profile_screen(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::Paste("I agree SideNotes".to_string()),
+                egui::Event::Key {
+                    key: egui::Key::V,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                },
+            ],
+            &mut t,
+        );
+        let (paste_text, _) = run_profile_screen(&ctx, &mut app, Vec::new(), &mut t);
+        assert!(app.view.account.delete_profile_confirm_input.is_empty());
+        assert!(app.view.account.delete_profile_paste_blocked);
+        assert!(
+            paste_text.contains("Copy/paste is disabled — type it manually"),
+            "missing paste-blocked warning:\n{paste_text}"
+        );
+
+        // 3. Wrong manual phrase keeps Delete Profile disabled and preserves SideNotes.
+        let _ = run_profile_screen(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Text("yes delete SideNotes".to_string())],
+            &mut t,
+        );
+        let (_, wrong_shapes) = run_profile_screen(&ctx, &mut app, Vec::new(), &mut t);
+        let disabled_btn = find_all_text_centers(&wrong_shapes, "Delete Profile")
+            .into_iter()
+            .next()
+            .expect("Delete Profile button");
+        click_pos(&ctx, &mut app, disabled_btn, &mut t);
+        assert_eq!(app.session.accessible_local_profiles().len(), 2);
+        assert_eq!(
+            app.view.account.pending_delete_profile_id.as_deref(),
+            Some(side_id.as_str())
+        );
+
+        // 4. Clicking Cancel clears confirmation input/flags and preserves SideNotes.
+        let (_, cancel_shapes) = run_profile_screen(&ctx, &mut app, Vec::new(), &mut t);
+        let cancel_btn = find_all_text_centers(&cancel_shapes, "Cancel")
+            .into_iter()
+            .next()
+            .expect("Cancel button");
+        click_pos(&ctx, &mut app, cancel_btn, &mut t);
+        assert!(app.view.account.pending_delete_profile_id.is_none());
+        assert!(app.view.account.delete_profile_confirm_input.is_empty());
+        assert!(!app.view.account.delete_profile_paste_blocked);
+        assert_eq!(app.session.accessible_local_profiles().len(), 2);
+
+        // 5. Re-opening confirmation, typing exact `I agree SideNotes`, and confirming deletes SideNotes.
+        let (_, shapes_reopen) = run_profile_screen(&ctx, &mut app, Vec::new(), &mut t);
+        click_pos(
+            &ctx,
+            &mut app,
+            find_delete_btn_near(&shapes_reopen, "SideNotes"),
+            &mut t,
+        );
+        let _ = run_profile_screen(&ctx, &mut app, Vec::new(), &mut t);
+        let _ = run_profile_screen(&ctx, &mut app, Vec::new(), &mut t);
+        let _ = run_profile_screen(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Text(local_profile_delete_confirmation_phrase(
+                "SideNotes",
+            ))],
+            &mut t,
+        );
+        let _ = run_profile_screen(&ctx, &mut app, Vec::new(), &mut t);
+        let (_, shapes_confirm2) = run_profile_screen(&ctx, &mut app, Vec::new(), &mut t);
+        assert_eq!(
+            app.view.account.delete_profile_confirm_input,
+            local_profile_delete_confirmation_phrase("SideNotes")
+        );
+        assert!(!app.view.account.delete_profile_paste_blocked);
+        let confirm_btn = find_all_text_centers(&shapes_confirm2, "Delete Profile")
+            .into_iter()
+            .next()
+            .expect("enabled Delete Profile button");
+        click_pos(&ctx, &mut app, confirm_btn, &mut t);
+
+        assert!(app.view.account.pending_delete_profile_id.is_none());
+        assert!(app.view.account.delete_profile_confirm_input.is_empty());
+        assert_eq!(app.session.accessible_local_profiles().len(), 1);
+        assert_eq!(
+            app.view.account.status_message.as_deref(),
+            Some("Deleted local profile 'SideNotes'.")
+        );
     }
 }

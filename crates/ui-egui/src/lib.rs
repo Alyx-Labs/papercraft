@@ -1735,6 +1735,10 @@ impl PaperCraftApp {
                     self.view.tag_edit_index = None;
                     self.view.tag_edit_draft.clear();
                     self.view.tag_edit_focus_pending = false;
+                } else if self.view.active_modal == Some(modal::ActiveModal::AccountSync)
+                    && self.view.account.pending_delete_profile_id.is_some()
+                {
+                    self.view.account.clear_pending_delete_profile();
                 } else {
                     modal::close(self);
                 }
@@ -2008,7 +2012,11 @@ impl PaperCraftApp {
                 tab_strip::close_active_tab(self);
             }
             KeyboardShortcutAction::CloseProfile => {
-                close_profile_screen(self);
+                if self.view.account.pending_delete_profile_id.is_some() {
+                    self.view.account.clear_pending_delete_profile();
+                } else {
+                    close_profile_screen(self);
+                }
             }
             KeyboardShortcutAction::ToggleKeyboardShortcuts => {
                 if self.view.active_modal == Some(modal::ActiveModal::KeyboardShortcuts) {
@@ -3431,6 +3439,7 @@ pub(crate) fn open_profile_screen(app: &mut PaperCraftApp) {
 
 pub(crate) fn close_profile_screen(app: &mut PaperCraftApp) {
     app.view.inspector_open = false;
+    app.view.account.clear_pending_delete_profile();
     let target = match app.view.profile_return_screen {
         AppScreen::Editor if app.session.active_notebook < app.session.notebooks.len() => {
             AppScreen::Editor

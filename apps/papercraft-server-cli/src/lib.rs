@@ -27,7 +27,12 @@ use crate::app::{
     discover_local_accounts_on_disk,
 };
 use crate::config::{ServerConfig, ensure_data_dir_and_meta};
-use crate::db::{DbStats, DeletedUserSummary, PasswordResetOutcome, ServerDb, UserSummary};
+use crate::db::{
+    DbStats, DeletedUserSummary, PasswordResetOutcome, RestoredUserSummary, ServerDb,
+    TrashedUserActionSummary, TrashedUserSummary, UserSummary,
+};
+
+const TRASH_CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
 
 pub type ServerStoppedCallback = Box<dyn FnOnce(Result<(), String>) + Send>;
 
@@ -138,6 +143,14 @@ impl ServerRuntime {
         db.list_users().map_err(|e| e.to_string())
     }
 
+    pub fn list_trashed_users(&self) -> Result<Vec<TrashedUserSummary>, String> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| "Server database handle is closed.".to_string())?;
+        db.list_trashed_users().map_err(|e| e.to_string())
+    }
+
     pub fn reset_user_password_temporary(
         &self,
         user_id: &str,
@@ -150,12 +163,38 @@ impl ServerRuntime {
             .map_err(|e| e.to_string())
     }
 
-    pub fn delete_user(&self, user_id: &str) -> Result<DeletedUserSummary, String> {
+    pub fn trash_user(&self, user_id: &str) -> Result<TrashedUserActionSummary, String> {
         let db = self
             .db
             .as_ref()
             .ok_or_else(|| "Server database handle is closed.".to_string())?;
-        db.delete_user(user_id).map_err(|e| e.to_string())
+        db.trash_user(user_id).map_err(|e| e.to_string())
+    }
+
+    pub fn restore_trashed_user(&self, user_id: &str) -> Result<RestoredUserSummary, String> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| "Server database handle is closed.".to_string())?;
+        db.restore_trashed_user(user_id).map_err(|e| e.to_string())
+    }
+
+    pub fn cleanup_expired_trashed_users(&self) -> Result<usize, String> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| "Server database handle is closed.".to_string())?;
+        db.cleanup_expired_trashed_users()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn delete_user_permanently(&self, user_id: &str) -> Result<DeletedUserSummary, String> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| "Server database handle is closed.".to_string())?;
+        db.delete_user_permanently(user_id)
+            .map_err(|e| e.to_string())
     }
 
     pub fn db_file_size_bytes(&self) -> u64 {
@@ -229,6 +268,25 @@ fn run_runtime_thread(
             }
         };
 
+        let cleanup_db = db.clone();
+        let cleanup_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(TRASH_CLEANUP_INTERVAL);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let db_ref = cleanup_db.clone();
+                if let Ok(Ok(purged)) =
+                    tokio::task::spawn_blocking(move || db_ref.cleanup_expired_trashed_users())
+                        .await
+                    && purged > 0
+                {
+                    log::info!(
+                        "Automatically purged {purged} expired account(s) from server Trash."
+                    );
+                }
+            }
+        });
+
         let state = AppState {
             db,
             config: Arc::new(config),
@@ -239,7 +297,7 @@ fn run_runtime_thread(
         let _ = ready_tx.send(Ok(bound_addr));
 
         let router = build_router(state);
-        axum::serve(
+        let serve_res = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
@@ -247,7 +305,12 @@ fn run_runtime_thread(
             let _ = shutdown_rx.await;
         })
         .await
-        .map_err(|e| format!("Server stopped with error: {e}"))
+        .map_err(|e| format!("Server stopped with error: {e}"));
+
+        // Abort and await cleanup task before leaving block_on so all ServerDb clones drop before stop() returns.
+        cleanup_task.abort();
+        let _ = cleanup_task.await;
+        serve_res
     });
 
     if let Some(cb) = on_stopped {
@@ -256,16 +319,50 @@ fn run_runtime_thread(
     result
 }
 
-/// Lists registered accounts in `data_dir` when no [`ServerRuntime`] holds the database open.
-pub fn list_users_in_dir(data_dir: &Path) -> Result<Vec<UserSummary>, String> {
+fn open_existing_db(data_dir: &Path) -> Result<Option<ServerDb>, String> {
     let db_path = crate::config::resolve_db_path(data_dir);
     if !db_path.is_file() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let db = ServerDb::open(&db_path).map_err(|e| format_db_open_error(&db_path, &e))?;
+    Ok(Some(db))
+}
+
+fn require_existing_db(data_dir: &Path) -> Result<ServerDb, String> {
+    open_existing_db(data_dir)?.ok_or_else(|| "Server database does not exist yet.".to_string())
+}
+
+/// Lists registered accounts in `data_dir` when no [`ServerRuntime`] holds the database open.
+pub fn list_users_in_dir(data_dir: &Path) -> Result<Vec<UserSummary>, String> {
+    let Some(db) = open_existing_db(data_dir)? else {
+        return Ok(Vec::new());
+    };
     let users = db.list_users().map_err(|e| e.to_string())?;
     drop(db);
     Ok(users)
+}
+
+/// Lists both active and trashed accounts in `data_dir` using a single database open.
+pub fn list_users_and_trash_in_dir(
+    data_dir: &Path,
+) -> Result<(Vec<UserSummary>, Vec<TrashedUserSummary>), String> {
+    let Some(db) = open_existing_db(data_dir)? else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let users = db.list_users().map_err(|e| e.to_string())?;
+    let trashed = db.list_trashed_users().map_err(|e| e.to_string())?;
+    drop(db);
+    Ok((users, trashed))
+}
+
+/// Lists accounts held in the 30-day server Trash when the server is stopped.
+pub fn list_trashed_users_in_dir(data_dir: &Path) -> Result<Vec<TrashedUserSummary>, String> {
+    let Some(db) = open_existing_db(data_dir)? else {
+        return Ok(Vec::new());
+    };
+    let trashed = db.list_trashed_users().map_err(|e| e.to_string())?;
+    drop(db);
+    Ok(trashed)
 }
 
 /// Generates a random temporary password/recovery code for `user_id` when the server is stopped.
@@ -273,11 +370,7 @@ pub fn reset_user_password_temporary_in_dir(
     data_dir: &Path,
     user_id: &str,
 ) -> Result<PasswordResetOutcome, String> {
-    let db_path = crate::config::resolve_db_path(data_dir);
-    if !db_path.is_file() {
-        return Err("Server database does not exist yet.".to_string());
-    }
-    let db = ServerDb::open(&db_path).map_err(|e| format_db_open_error(&db_path, &e))?;
+    let db = require_existing_db(data_dir)?;
     let outcome = db
         .reset_user_password_temporary(user_id)
         .map_err(|e| e.to_string())?;
@@ -285,14 +378,51 @@ pub fn reset_user_password_temporary_in_dir(
     Ok(outcome)
 }
 
+/// Moves `user_id` into the 30-day server Trash when the server is stopped.
+pub fn trash_user_in_dir(
+    data_dir: &Path,
+    user_id: &str,
+) -> Result<TrashedUserActionSummary, String> {
+    let db = require_existing_db(data_dir)?;
+    let summary = db.trash_user(user_id).map_err(|e| e.to_string())?;
+    drop(db);
+    Ok(summary)
+}
+
+/// Restores `user_id` from the 30-day server Trash when the server is stopped.
+pub fn restore_trashed_user_in_dir(
+    data_dir: &Path,
+    user_id: &str,
+) -> Result<RestoredUserSummary, String> {
+    let db = require_existing_db(data_dir)?;
+    let summary = db
+        .restore_trashed_user(user_id)
+        .map_err(|e| e.to_string())?;
+    drop(db);
+    Ok(summary)
+}
+
+/// Purges any expired trashed accounts in `data_dir` when the server is stopped.
+pub fn cleanup_expired_trashed_users_in_dir(data_dir: &Path) -> Result<usize, String> {
+    let Some(db) = open_existing_db(data_dir)? else {
+        return Ok(0);
+    };
+    let count = db
+        .cleanup_expired_trashed_users()
+        .map_err(|e| e.to_string())?;
+    drop(db);
+    Ok(count)
+}
+
 /// Permanently deletes `user_id` and all of its notebooks when the server is stopped.
-pub fn delete_user_in_dir(data_dir: &Path, user_id: &str) -> Result<DeletedUserSummary, String> {
-    let db_path = crate::config::resolve_db_path(data_dir);
-    if !db_path.is_file() {
-        return Err("Server database does not exist yet.".to_string());
-    }
-    let db = ServerDb::open(&db_path).map_err(|e| format_db_open_error(&db_path, &e))?;
-    let summary = db.delete_user(user_id).map_err(|e| e.to_string())?;
+pub fn delete_user_permanently_in_dir(
+    data_dir: &Path,
+    user_id: &str,
+) -> Result<DeletedUserSummary, String> {
+    let db = require_existing_db(data_dir)?;
+    let summary = db
+        .delete_user_permanently(user_id)
+        .map_err(|e| e.to_string())?;
     drop(db);
     Ok(summary)
 }

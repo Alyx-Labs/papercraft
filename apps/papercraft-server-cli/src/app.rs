@@ -11,8 +11,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use papercraft_sync::{inspect_local_accounts_in_library, sanitize_client_id};
 use papercraft_sync_protocol::{
-    ApiErrorBody, ERR_CODE_PASSWORD_CHANGE_REQUIRED, ERR_CODE_PASSWORD_RESET_REQUIRED,
-    LocalDiscoveryReport, LocalDiscoverySummary,
+    ApiErrorBody, ERR_CODE_ACCOUNT_IN_TRASH, ERR_CODE_EMAIL_IN_TRASH,
+    ERR_CODE_PASSWORD_CHANGE_REQUIRED, ERR_CODE_PASSWORD_RESET_REQUIRED,
+    ERR_CODE_USERNAME_IN_TRASH, LocalDiscoveryReport, LocalDiscoverySummary,
 };
 
 use crate::auth;
@@ -249,6 +250,30 @@ impl From<DbError> for ApiError {
                 StatusCode::CONFLICT,
                 "email_taken",
                 format!("An account with email `{email}` already exists."),
+            ),
+            DbError::AccountInTrash => Self::new(
+                StatusCode::FORBIDDEN,
+                ERR_CODE_ACCOUNT_IN_TRASH,
+                "This account is in the server Trash and scheduled for permanent deletion. Ask your server administrator to restore it.",
+            ),
+            DbError::EmailInTrash(email) => Self::new(
+                StatusCode::CONFLICT,
+                ERR_CODE_EMAIL_IN_TRASH,
+                format!(
+                    "An account with email `{email}` is in the server Trash. Restore it from Trash or wait for the 30-day retention period to expire."
+                ),
+            ),
+            DbError::UsernameInTrash(name) => Self::new(
+                StatusCode::CONFLICT,
+                ERR_CODE_USERNAME_IN_TRASH,
+                format!(
+                    "Username `{name}` belongs to an account in the server Trash. Restore it from Trash or wait for the 30-day retention period to expire."
+                ),
+            ),
+            DbError::TrashedUserExpired(name) => Self::new(
+                StatusCode::GONE,
+                "trashed_user_expired",
+                format!("Trashed account `{name}` has expired and was permanently deleted."),
             ),
             DbError::InvalidCredentials => Self::new(
                 StatusCode::UNAUTHORIZED,

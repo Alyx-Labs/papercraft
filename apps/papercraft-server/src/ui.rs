@@ -5,6 +5,7 @@ use papercraft_doc::UiTheme;
 
 use crate::controller::{
     ControlTab, NoticeBanner, NoticeTone, ServerController, ServerStatus, StatsSnapshot,
+    UsersViewMode, account_delete_confirmation_matches, account_delete_confirmation_phrase,
 };
 use crate::icons::{
     Icon, SwitchOption, icon_button, icon_button_width, paint_icon, segmented_switch,
@@ -15,7 +16,9 @@ use crate::settings::{
     MIN_MAX_NOTEBOOK_MB, MIN_REFRESH_TTL_DAYS, NetworkScope, format_bytes,
 };
 use crate::theme::Tokens;
-use papercraft_server_cli::db::{PasswordResetOutcome, UserSummary};
+use papercraft_server_cli::db::{
+    ACCOUNT_TRASH_RETENTION_DAYS, PasswordResetOutcome, TrashedUserSummary, UserSummary,
+};
 
 const CARD_RADIUS: f32 = 10.0;
 const CONTROL_RADIUS: f32 = 7.0;
@@ -370,15 +373,17 @@ fn render_stats_row(
     stats: StatsSnapshot,
     t: &Tokens,
 ) {
+    let accounts_value = if stats.trashed_user_count > 0 {
+        format!(
+            "{} ({} in Trash)",
+            stats.user_count, stats.trashed_user_count
+        )
+    } else {
+        stats.user_count.to_string()
+    };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 18.0;
-        draw_metric_cell(
-            ui,
-            Some(Icon::Account),
-            "Accounts",
-            &stats.user_count.to_string(),
-            t,
-        );
+        draw_metric_cell(ui, Some(Icon::Account), "Accounts", &accounts_value, t);
         draw_metric_cell(
             ui,
             Some(Icon::Notebook),
@@ -1196,13 +1201,52 @@ fn render_users_view(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Tokens)
 
     draw_card(ui, t, |ui| {
         render_users_header(ctrl, ui, t);
-        if !ctrl.users_snapshot.is_empty() {
+        ui.add_space(10.0);
+        render_users_view_switch(ctrl, ui, t);
+        let has_items = match ctrl.users_view_mode {
+            UsersViewMode::Active => !ctrl.users_snapshot.is_empty(),
+            UsersViewMode::Trash => !ctrl.trashed_users_snapshot.is_empty(),
+        };
+        if has_items {
             ui.add_space(10.0);
             render_user_search_bar(ctrl, ui, t);
         }
         ui.add_space(10.0);
-        render_users_list_body(ctrl, ui, t);
+        match ctrl.users_view_mode {
+            UsersViewMode::Active => render_users_list_body(ctrl, ui, t),
+            UsersViewMode::Trash => render_trashed_users_list_body(ctrl, ui, t),
+        }
     });
+}
+
+fn render_users_view_switch(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Tokens) {
+    let active_label = format!("Active ({})", ctrl.users_snapshot.len());
+    let trash_label = format!("Trash ({})", ctrl.trashed_users_snapshot.len());
+    let options = [
+        SwitchOption::new(
+            Some(Icon::Account),
+            &active_label,
+            "View active registered accounts stored on this server",
+        ),
+        SwitchOption::new(
+            Some(Icon::Trash),
+            &trash_label,
+            "View deleted accounts held in server Trash for 30 days",
+        ),
+    ];
+    let active_idx = match ctrl.users_view_mode {
+        UsersViewMode::Active => 0,
+        UsersViewMode::Trash => 1,
+    };
+    if let Some(clicked) = segmented_switch(ui, "bnc_srv_users_view_mode", &options, active_idx, t)
+    {
+        let next = if clicked == 0 {
+            UsersViewMode::Active
+        } else {
+            UsersViewMode::Trash
+        };
+        ctrl.set_users_view_mode(next);
+    }
 }
 
 fn render_password_reset_card(
@@ -1290,10 +1334,11 @@ fn render_password_reset_card(
 
 fn render_users_header(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Tokens) {
     let total = ctrl.users_snapshot.len();
+    let trashed_total = ctrl.trashed_users_snapshot.len();
     let count_text = if total == 1 {
-        "1 account".to_string()
+        "1 active".to_string()
     } else {
-        format!("{total} accounts")
+        format!("{total} active")
     };
 
     ui.horizontal(|ui| {
@@ -1307,10 +1352,20 @@ fn render_users_header(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Token
                 .color(t.text),
         );
         draw_compact_pill(ui, None, &count_text, t.toolbar_bg, t.border, t.text_muted);
+        if trashed_total > 0 {
+            draw_compact_pill(
+                ui,
+                Some(Icon::Trash),
+                &format!("{trashed_total} in Trash"),
+                t.danger_bg,
+                t.danger_border,
+                t.danger_fg,
+            );
+        }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if icon_button(ui, Icon::RotateCw, Some("Refresh"), false, true, t)
-                .on_hover_text("Reload registered accounts from the database")
+                .on_hover_text("Reload active and trashed accounts from the database")
                 .clicked()
             {
                 ctrl.refresh_users();
@@ -1322,30 +1377,36 @@ fn render_users_header(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Token
     });
 
     ui.add_space(3.0);
-    let data_path = ctrl.draft_settings.resolved_data_path();
-    let folder_name = data_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|s| !s.is_empty())
-        .map_or_else(|| data_path.display().to_string(), ToString::to_string);
-    let reg_note = if ctrl.draft_settings.allow_registration {
-        "New sign-ups open"
-    } else {
-        "New sign-ups closed"
+    let subtitle = match ctrl.users_view_mode {
+        UsersViewMode::Active => {
+            let data_path = ctrl.draft_settings.resolved_data_path();
+            let folder_name = data_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|s| !s.is_empty())
+                .map_or_else(|| data_path.display().to_string(), ToString::to_string);
+            let reg_note = if ctrl.draft_settings.allow_registration {
+                "New sign-ups open"
+            } else {
+                "New sign-ups closed"
+            };
+            format!("Accounts stored in `{folder_name}` (papercraft.redb) · {reg_note}.")
+        }
+        UsersViewMode::Trash => format!(
+            "Deleted accounts stay in server Trash for {ACCOUNT_TRASH_RETENTION_DAYS} days and are permanently deleted automatically when they expire. Restore an account anytime before then."
+        ),
     };
-    ui.label(
-        egui::RichText::new(format!(
-            "Accounts stored in `{folder_name}` (papercraft.redb) · {reg_note}."
-        ))
-        .size(11.0)
-        .color(t.text_muted),
-    );
+    ui.add(egui::Label::new(egui::RichText::new(subtitle).size(11.0).color(t.text_muted)).wrap());
 }
 
 fn render_user_search_bar(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Tokens) {
     let has_query = !ctrl.user_search.is_empty();
     let clear_w = if has_query { 28.0 + 6.0 } else { 0.0 };
     let frame_w = (ui.available_width() - clear_w).max(140.0);
+    let hint = match ctrl.users_view_mode {
+        UsersViewMode::Active => "Search active accounts by name, email, or @username...",
+        UsersViewMode::Trash => "Search trashed accounts by name, email, or @username...",
+    };
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
@@ -1366,11 +1427,7 @@ fn render_user_search_bar(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &To
                         [edit_w, INPUT_HEIGHT - 2.0],
                         egui::TextEdit::singleline(&mut ctrl.user_search)
                             .id_salt("bnc_srv_user_search")
-                            .hint_text(
-                                egui::RichText::new("Search by name or @username...")
-                                    .color(t.text_muted)
-                                    .size(12.0),
-                            )
+                            .hint_text(egui::RichText::new(hint).color(t.text_muted).size(12.0))
                             .frame(egui::Frame::NONE)
                             .font(egui::FontId::proportional(12.0))
                             .text_color(t.text),
@@ -1425,24 +1482,7 @@ fn render_users_list_body(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &To
         .collect();
 
     if matches.is_empty() {
-        egui::Frame::new()
-            .fill(t.toolbar_bg)
-            .stroke(Stroke::new(1.0, t.border))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(12, 16))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "No accounts match \"{}\".",
-                            ctrl.user_search.trim()
-                        ))
-                        .size(12.0)
-                        .color(t.text_muted),
-                    );
-                });
-            });
+        render_search_no_matches_box(&ctrl.user_search, "accounts", ui, t);
         return;
     }
 
@@ -1458,25 +1498,30 @@ fn render_users_list_body(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &To
     let mut action: Option<UserRowAction> = None;
     ui.spacing_mut().item_spacing.y = 7.0;
     for &idx in &matches {
-        let user = &ctrl.users_snapshot[idx];
+        let user = ctrl.users_snapshot[idx].clone();
         let copied = ctrl.was_recently_copied(&user.user_id);
         let confirm_reset = ctrl.pending_reset_user.as_deref() == Some(user.user_id.as_str());
         let confirm_delete = ctrl.pending_delete_user.as_deref() == Some(user.user_id.as_str());
-        match render_user_row(user, copied, confirm_reset, confirm_delete, ui, t) {
+        let mut confirm_draft = DeleteConfirmDraft {
+            input: &mut ctrl.delete_confirm_input,
+            paste_blocked: &mut ctrl.delete_confirm_paste_blocked,
+            focus_pending: &mut ctrl.delete_confirm_focus_pending,
+        };
+        match render_user_row(
+            &user,
+            copied,
+            confirm_reset,
+            confirm_delete,
+            &mut confirm_draft,
+            ui,
+            t,
+        ) {
             RowClick::None => {}
-            RowClick::CopyId => action = Some(UserRowAction::CopyId(user.user_id.clone())),
-            RowClick::RequestReset => {
-                action = Some(UserRowAction::RequestReset(user.user_id.clone()))
-            }
-            RowClick::ConfirmReset => {
-                action = Some(UserRowAction::ConfirmReset(user.user_id.clone()))
-            }
-            RowClick::RequestDelete => {
-                action = Some(UserRowAction::RequestDelete(user.user_id.clone()))
-            }
-            RowClick::ConfirmDelete => {
-                action = Some(UserRowAction::ConfirmDelete(user.user_id.clone()))
-            }
+            RowClick::CopyId => action = Some(UserRowAction::CopyId(user.user_id)),
+            RowClick::RequestReset => action = Some(UserRowAction::RequestReset(user.user_id)),
+            RowClick::ConfirmReset => action = Some(UserRowAction::ConfirmReset(user.user_id)),
+            RowClick::RequestDelete => action = Some(UserRowAction::RequestDelete(user.user_id)),
+            RowClick::ConfirmDelete => action = Some(UserRowAction::ConfirmDelete(user.user_id)),
             RowClick::Cancel => action = Some(UserRowAction::Cancel),
         }
     }
@@ -1499,14 +1544,113 @@ fn render_users_list_body(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &To
         "notebooks"
     };
     let summary = if matches.len() == total_users {
-        format!("{total_users} registered · {total_notebooks} {nb_label} total")
+        format!("{total_users} active · {total_notebooks} {nb_label} total")
     } else {
         format!(
-            "Showing {} of {total_users} accounts · {total_notebooks} {nb_label} total",
+            "Showing {} of {total_users} active accounts · {total_notebooks} {nb_label} total",
             matches.len()
         )
     };
     ui.label(egui::RichText::new(summary).size(11.0).color(t.text_muted));
+}
+
+fn render_trashed_users_list_body(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Tokens) {
+    if let Some(ref err) = ctrl.users_error {
+        draw_banner(
+            ui,
+            &NoticeBanner {
+                tone: NoticeTone::Error,
+                text: err.clone(),
+            },
+            false,
+            t,
+        );
+        return;
+    }
+
+    if ctrl.trashed_users_snapshot.is_empty() {
+        render_trash_empty_state(ui, t);
+        return;
+    }
+
+    let query = ctrl.user_search.trim().to_ascii_lowercase();
+    let matches: Vec<usize> = ctrl
+        .trashed_users_snapshot
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| {
+            query.is_empty()
+                || u.email
+                    .as_deref()
+                    .is_some_and(|e| e.to_ascii_lowercase().contains(&query))
+                || u.username.to_ascii_lowercase().contains(&query)
+                || u.display_name.to_ascii_lowercase().contains(&query)
+                || u.user_id.to_ascii_lowercase().contains(&query)
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+
+    if matches.is_empty() {
+        render_search_no_matches_box(&ctrl.user_search, "trashed accounts", ui, t);
+        return;
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let mut restore_target: Option<String> = None;
+    ui.spacing_mut().item_spacing.y = 7.0;
+    for &idx in &matches {
+        let user = &ctrl.trashed_users_snapshot[idx];
+        if render_trashed_user_row(user, now_ms, ui, t) {
+            restore_target = Some(user.user_id.clone());
+        }
+    }
+    if let Some(user_id) = restore_target {
+        ctrl.restore_trashed_user(&user_id);
+    }
+
+    ui.add_space(4.0);
+    let total_trashed = ctrl.trashed_users_snapshot.len();
+    let total_notebooks: usize = ctrl
+        .trashed_users_snapshot
+        .iter()
+        .map(|u| u.notebook_count)
+        .sum();
+    let nb_label = if total_notebooks == 1 {
+        "notebook"
+    } else {
+        "notebooks"
+    };
+    let summary = if matches.len() == total_trashed {
+        format!(
+            "{total_trashed} in Trash · {total_notebooks} {nb_label} kept ({ACCOUNT_TRASH_RETENTION_DAYS}-day retention)"
+        )
+    } else {
+        format!(
+            "Showing {} of {total_trashed} in Trash · {total_notebooks} {nb_label} kept",
+            matches.len()
+        )
+    };
+    ui.label(egui::RichText::new(summary).size(11.0).color(t.text_muted));
+}
+
+fn render_search_no_matches_box(query: &str, noun: &str, ui: &mut egui::Ui, t: &Tokens) {
+    egui::Frame::new()
+        .fill(t.toolbar_bg)
+        .stroke(Stroke::new(1.0, t.border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 16))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("No {noun} match \"{}\".", query.trim()))
+                        .size(12.0)
+                        .color(t.text_muted),
+                );
+            });
+        });
 }
 
 fn render_users_empty_state(registration_open: bool, ui: &mut egui::Ui, t: &Tokens) {
@@ -1548,6 +1692,57 @@ fn render_users_empty_state(registration_open: bool, ui: &mut egui::Ui, t: &Toke
         });
 }
 
+fn render_trash_empty_state(ui: &mut egui::Ui, t: &Tokens) {
+    egui::Frame::new()
+        .fill(t.toolbar_bg)
+        .stroke(Stroke::new(1.0, t.border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(16, 22))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical_centered(|ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                let (badge_rect, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
+                ui.painter().rect(
+                    badge_rect,
+                    CornerRadius::same(10),
+                    t.field_bg,
+                    Stroke::new(1.0, t.border),
+                    egui::StrokeKind::Inside,
+                );
+                paint_icon(
+                    ui.painter(),
+                    badge_rect.shrink(9.0),
+                    Icon::Trash,
+                    t.text_muted,
+                );
+
+                ui.label(
+                    egui::RichText::new("Server Trash is empty")
+                        .size(13.0)
+                        .strong()
+                        .color(t.text),
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!(
+                            "Deleted accounts stay in server Trash for {ACCOUNT_TRASH_RETENTION_DAYS} days so you can restore them before automatic permanent deletion."
+                        ))
+                        .size(11.5)
+                        .color(t.text_muted),
+                    )
+                    .wrap(),
+                );
+            });
+        });
+}
+
+struct DeleteConfirmDraft<'a> {
+    input: &'a mut String,
+    paste_blocked: &'a mut bool,
+    focus_pending: &'a mut bool,
+}
+
 enum RowClick {
     None,
     CopyId,
@@ -1558,11 +1753,31 @@ enum RowClick {
     Cancel,
 }
 
+fn measure_compact_pill_width(ui: &egui::Ui, has_icon: bool, label: &str) -> f32 {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_string(),
+        egui::FontId::proportional(11.0),
+        Color32::WHITE,
+    );
+    let icon_w = if has_icon { 12.0 + 4.0 } else { 0.0 };
+    16.0 + icon_w + galley.size().x + 2.0
+}
+
+fn measure_action_button_width(ui: &egui::Ui, label: &str) -> f32 {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_string(),
+        egui::FontId::proportional(12.2),
+        Color32::WHITE,
+    );
+    (24.0 + 14.0 + 6.0 + galley.size().x).max(76.0)
+}
+
 fn render_user_row(
     user: &UserSummary,
     copied: bool,
     confirm_reset: bool,
     confirm_delete: bool,
+    confirm_draft: &mut DeleteConfirmDraft<'_>,
     ui: &mut egui::Ui,
     t: &Tokens,
 ) -> RowClick {
@@ -1581,6 +1796,15 @@ fn render_user_row(
         .inner_margin(Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            let nb_text = if user.notebook_count == 1 {
+                "1 notebook".to_string()
+            } else {
+                format!("{} notebooks", user.notebook_count)
+            };
+            let nb_pill_w = measure_compact_pill_width(ui, true, &nb_text);
+            let right_w = nb_pill_w + 5.0 * 3.0 + 28.0 * 3.0;
+            let left_w = (ui.available_width() - 32.0 - 10.0 - right_w - 8.0).max(72.0);
+
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
 
@@ -1592,7 +1816,7 @@ fn render_user_row(
                     16.0,
                     Stroke::new(1.0, t.accent.gamma_multiply(0.35)),
                 );
-                let initial = user_monogram(user);
+                let initial = user_monogram(&user.display_name, &user.username);
                 ui.painter().text(
                     avatar_rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -1601,62 +1825,103 @@ fn render_user_row(
                     t.accent,
                 );
 
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
+                ui.allocate_ui_with_layout(
+                    Vec2::new(left_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(left_w);
+                        ui.set_max_width(left_w);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+
                         let primary_name = if user.display_name.trim().is_empty() {
                             format!("@{}", user.username)
                         } else {
                             user.display_name.clone()
                         };
-                        ui.label(
-                            egui::RichText::new(&primary_name)
-                                .size(12.5)
-                                .strong()
-                                .color(t.text),
-                        );
                         let at_handle = format!("@{}", user.username);
-                        if !primary_name.eq_ignore_ascii_case(&at_handle)
-                            && !primary_name.eq_ignore_ascii_case(&user.username)
-                        {
-                            ui.label(
-                                egui::RichText::new(&at_handle)
-                                    .size(11.5)
-                                    .monospace()
-                                    .color(t.text_muted),
-                            );
-                        }
-                        if user.must_change_password {
-                            draw_compact_pill(
-                                ui,
-                                None,
-                                "Reset pending",
-                                t.field_bg,
-                                t.warning_fg,
-                                t.warning_fg,
-                            );
-                        }
-                    });
+                        let show_handle = !primary_name.eq_ignore_ascii_case(&at_handle)
+                            && !primary_name.eq_ignore_ascii_case(&user.username);
+                        let reset_pill_w = if user.must_change_password {
+                            measure_compact_pill_width(ui, false, "Reset pending") + 6.0
+                        } else {
+                            0.0
+                        };
 
-                    let joined = format_utc_date(user.created_at_ms);
-                    let short_id = short_user_id(&user.user_id);
-                    let subline = match user.email.as_deref().filter(|s| !s.trim().is_empty()) {
-                        Some(email) => format!("{email} · Joined {joined} · ID {short_id}"),
-                        None => format!("Joined {joined} · ID {short_id}"),
-                    };
-                    ui.label(
-                        egui::RichText::new(subline)
-                            .size(11.0)
-                            .color(t.text_muted),
-                    )
-                    .on_hover_text(format!("User ID: {}", user.user_id));
-                });
+                        ui.horizontal(|ui| {
+                            ui.set_max_width(left_w);
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let name_budget = if show_handle {
+                                ((left_w - reset_pill_w) * 0.56).max(40.0)
+                            } else {
+                                (left_w - reset_pill_w).max(48.0)
+                            };
+                            ui.scope(|ui| {
+                                ui.set_max_width(name_budget);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&primary_name)
+                                            .size(12.5)
+                                            .strong()
+                                            .color(t.text),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(&primary_name);
+                            });
+                            if show_handle {
+                                let handle_budget = (left_w - reset_pill_w - name_budget - 6.0).max(32.0);
+                                ui.scope(|ui| {
+                                    ui.set_max_width(handle_budget);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&at_handle)
+                                                .size(11.5)
+                                                .monospace()
+                                                .color(t.text_muted),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(&at_handle);
+                                });
+                            }
+                            if user.must_change_password {
+                                draw_compact_pill(
+                                    ui,
+                                    None,
+                                    "Reset pending",
+                                    t.field_bg,
+                                    t.warning_fg,
+                                    t.warning_fg,
+                                );
+                            }
+                        });
+
+                        let joined = format_utc_date(user.created_at_ms);
+                        let short_id = short_user_id(&user.user_id);
+                        let subline = match user.email.as_deref().filter(|s| !s.trim().is_empty()) {
+                            Some(email) => format!("{email} · Joined {joined} · ID {short_id}"),
+                            None => format!("Joined {joined} · ID {short_id}"),
+                        };
+                        let hover_tip = match user.email.as_deref().filter(|s| !s.trim().is_empty()) {
+                            Some(email) => format!("{email}\nUser ID: {}", user.user_id),
+                            None => format!("User ID: {}", user.user_id),
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(subline)
+                                    .size(11.0)
+                                    .color(t.text_muted),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(hover_tip);
+                    },
+                );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 5.0;
                     if danger_icon_button(ui, Icon::Trash, confirm_delete, t)
-                        .on_hover_text("Delete this user account and all synced notebooks")
+                        .on_hover_text("Move this user account to 30-day server Trash")
                         .clicked()
                     {
                         row_click = if confirm_delete {
@@ -1687,11 +1952,6 @@ fn render_user_row(
                         row_click = RowClick::CopyId;
                     }
 
-                    let nb_text = if user.notebook_count == 1 {
-                        "1 notebook".to_string()
-                    } else {
-                        format!("{} notebooks", user.notebook_count)
-                    };
                     draw_compact_pill(
                         ui,
                         Some(Icon::Notebook),
@@ -1739,32 +1999,480 @@ fn render_user_row(
                     .as_deref()
                     .filter(|s| !s.trim().is_empty())
                     .map_or_else(|| format!("@{}", user.username), ToString::to_string);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(format!(
-                            "Permanently delete `{account_lbl}` and all {} synced notebook(s)? This cannot be undone.",
-                            user.notebook_count
-                        ))
-                        .size(11.0)
-                        .color(t.danger_fg),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        if danger_button(ui, Icon::Trash, "Delete Permanently", true, t).clicked() {
-                            row_click = RowClick::ConfirmDelete;
+                let expected = account_delete_confirmation_phrase(&user.username);
+                let matched = account_delete_confirmation_matches(confirm_draft.input, &expected);
+
+                egui::Frame::new()
+                    .fill(t.field_bg)
+                    .stroke(Stroke::new(1.0, t.danger_border))
+                    .corner_radius(CONTROL_RADIUS)
+                    .inner_margin(Margin::symmetric(10, 9))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 5.0;
+
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let (ir, _) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::hover());
+                            paint_icon(ui.painter(), ir, Icon::AlertCircle, t.danger_fg);
+                            ui.label(
+                                egui::RichText::new("Confirm Account Deletion")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(t.danger_fg),
+                            );
+                        });
+
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "Move `{account_lbl}` and its {} synced notebook(s) to server Trash? Active devices will be signed out immediately. The account stays recoverable for {ACCOUNT_TRASH_RETENTION_DAYS} days, then is permanently deleted automatically. Copy and paste is disabled.",
+                                    user.notebook_count
+                                ))
+                                .size(11.0)
+                                .color(t.text_muted),
+                            )
+                            .wrap(),
+                        );
+
+                        ui.label(
+                            egui::RichText::new("Type this confirmation manually:")
+                                .size(10.5)
+                                .color(t.text_muted),
+                        );
+
+                        egui::Frame::new()
+                            .fill(t.toolbar_bg)
+                            .stroke(Stroke::new(1.0, t.border))
+                            .corner_radius(CornerRadius::same(5))
+                            .inner_margin(Margin::symmetric(8, 6))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&expected)
+                                            .size(11.5)
+                                            .strong()
+                                            .monospace()
+                                            .color(t.text),
+                                    )
+                                    .selectable(false)
+                                    .wrap(),
+                                );
+                            });
+
+                        let (hint_text, hint_color) =
+                            if *confirm_draft.paste_blocked && !matched {
+                                (
+                                    "Copy/paste is disabled — type it manually".to_string(),
+                                    t.warning_fg,
+                                )
+                            } else if confirm_draft.input.trim().is_empty() {
+                                (
+                                    "Type manually (no copy/paste)".to_string(),
+                                    t.text_muted,
+                                )
+                            } else if matched {
+                                ("Confirmation matched".to_string(), t.success_fg)
+                            } else {
+                                (format!("Must match: {expected}"), t.warning_fg)
+                            };
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Manual Confirmation")
+                                    .size(11.5)
+                                    .strong()
+                                    .color(t.text),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new(hint_text).size(10.5).color(hint_color));
+                            });
+                        });
+
+                        let input_border = if matched {
+                            t.success_border
+                        } else {
+                            t.danger_border
+                        };
+                        let input_res = draw_manual_confirm_input(
+                            ui,
+                            "bnc_srv_delete_user_confirm",
+                            ui.available_width(),
+                            &expected,
+                            input_border,
+                            matched,
+                            confirm_draft.input,
+                            t,
+                        );
+                        if std::mem::take(&mut *confirm_draft.focus_pending) {
+                            ui.memory_mut(|m| m.request_focus(input_res.edit_id));
                         }
-                        if secondary_button(ui, "Cancel", true, t).clicked() {
+                        if input_res.paste_blocked {
+                            *confirm_draft.paste_blocked = true;
+                            ui.ctx().request_repaint();
+                        } else if input_res.changed {
+                            *confirm_draft.paste_blocked = false;
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                             row_click = RowClick::Cancel;
                         }
+
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            if secondary_button(ui, "Cancel", true, t).clicked() {
+                                row_click = RowClick::Cancel;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if danger_button(ui, Icon::Trash, "Move to Trash", matched, t)
+                                    .clicked()
+                                    || (input_res.enter_pressed && matched)
+                                {
+                                    row_click = RowClick::ConfirmDelete;
+                                }
+                            });
+                        });
                     });
-                });
             }
         });
     row_click
+}
+
+fn render_trashed_user_row(
+    user: &TrashedUserSummary,
+    now_ms: i64,
+    ui: &mut egui::Ui,
+    t: &Tokens,
+) -> bool {
+    let mut restore_clicked = false;
+    let (expiry_label, urgent) = format_trash_remaining(user.expires_at_ms, now_ms);
+    let nb_text = if user.notebook_count == 1 {
+        "1 notebook".to_string()
+    } else {
+        format!("{} notebooks", user.notebook_count)
+    };
+
+    egui::Frame::new()
+        .fill(t.toolbar_bg)
+        .stroke(Stroke::new(1.0, t.border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let nb_pill_w = measure_compact_pill_width(ui, true, &nb_text);
+            let restore_w = measure_action_button_width(ui, "Restore");
+            let right_w = nb_pill_w + 6.0 + restore_w;
+            let left_w = (ui.available_width() - 32.0 - 10.0 - right_w - 8.0).max(72.0);
+
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+
+                let (avatar_rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
+                ui.painter()
+                    .circle_filled(avatar_rect.center(), 16.0, t.danger_bg);
+                ui.painter().circle_stroke(
+                    avatar_rect.center(),
+                    16.0,
+                    Stroke::new(1.0, t.danger_border),
+                );
+                let initial = user_monogram(&user.display_name, &user.username);
+                ui.painter().text(
+                    avatar_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    initial,
+                    egui::FontId::proportional(13.0),
+                    t.danger_fg,
+                );
+
+                ui.allocate_ui_with_layout(
+                    Vec2::new(left_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(left_w);
+                        ui.set_max_width(left_w);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+
+                        let primary_name = if user.display_name.trim().is_empty() {
+                            format!("@{}", user.username)
+                        } else {
+                            user.display_name.clone()
+                        };
+                        let at_handle = format!("@{}", user.username);
+                        let show_handle = !primary_name.eq_ignore_ascii_case(&at_handle)
+                            && !primary_name.eq_ignore_ascii_case(&user.username);
+                        let expiry_pill_w = measure_compact_pill_width(ui, false, &expiry_label) + 6.0;
+
+                        ui.horizontal(|ui| {
+                            ui.set_max_width(left_w);
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let name_budget = if show_handle {
+                                ((left_w - expiry_pill_w) * 0.56).max(40.0)
+                            } else {
+                                (left_w - expiry_pill_w).max(48.0)
+                            };
+                            ui.scope(|ui| {
+                                ui.set_max_width(name_budget);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&primary_name)
+                                            .size(12.5)
+                                            .strong()
+                                            .color(t.text),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(&primary_name);
+                            });
+                            if show_handle {
+                                let handle_budget = (left_w - expiry_pill_w - name_budget - 6.0).max(32.0);
+                                ui.scope(|ui| {
+                                    ui.set_max_width(handle_budget);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&at_handle)
+                                                .size(11.5)
+                                                .monospace()
+                                                .color(t.text_muted),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(&at_handle);
+                                });
+                            }
+                            let (pill_fill, pill_border, pill_fg) = if urgent {
+                                (t.danger_bg, t.danger_border, t.danger_fg)
+                            } else {
+                                (t.field_bg, t.warning_fg, t.warning_fg)
+                            };
+                            draw_compact_pill(ui, None, &expiry_label, pill_fill, pill_border, pill_fg);
+                        });
+
+                        let deleted_date = format_utc_date(user.deleted_at_ms);
+                        let expires_date = format_utc_date(user.expires_at_ms);
+                        let short_id = short_user_id(&user.user_id);
+                        let subline = match user.email.as_deref().filter(|s| !s.trim().is_empty()) {
+                            Some(email) => format!(
+                                "{email} · Deleted {deleted_date} · Expires {expires_date} · ID {short_id}"
+                            ),
+                            None => {
+                                format!("Deleted {deleted_date} · Expires {expires_date} · ID {short_id}")
+                            }
+                        };
+                        let hover_tip = match user.email.as_deref().filter(|s| !s.trim().is_empty()) {
+                            Some(email) => format!("{email}\nUser ID: {}", user.user_id),
+                            None => format!("User ID: {}", user.user_id),
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(subline)
+                                    .size(11.0)
+                                    .color(t.text_muted),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(hover_tip);
+                    },
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if primary_button(ui, Icon::Reset, "Restore", true, t)
+                        .on_hover_text(
+                            "Restore this account and all synced notebooks from Trash",
+                        )
+                        .clicked()
+                    {
+                        restore_clicked = true;
+                    }
+                    draw_compact_pill(
+                        ui,
+                        Some(Icon::Notebook),
+                        &nb_text,
+                        t.field_bg,
+                        t.border,
+                        t.text,
+                    );
+                });
+            });
+        });
+
+    restore_clicked
+}
+
+fn format_trash_remaining(expires_at_ms: i64, now_ms: i64) -> (String, bool) {
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+    let remaining_ms = expires_at_ms.saturating_sub(now_ms).max(0);
+    let days_left = if remaining_ms == 0 {
+        0
+    } else {
+        remaining_ms.saturating_add(DAY_MS - 1) / DAY_MS
+    };
+    if days_left <= 0 {
+        ("Expires today".to_string(), true)
+    } else if days_left == 1 {
+        ("1 day left to restore".to_string(), true)
+    } else {
+        (format!("{days_left} days left to restore"), days_left <= 3)
+    }
+}
+
+struct ManualConfirmInputResult {
+    edit_id: egui::Id,
+    changed: bool,
+    enter_pressed: bool,
+    paste_blocked: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClipboardEventAction {
+    Keep,
+    Drop,
+    BlockPaste,
+}
+
+fn classify_clipboard_event(
+    event: &egui::Event,
+    has_focus: bool,
+    pointer_inside: bool,
+    box_rect: egui::Rect,
+    target_accesskit_id: egui::accesskit::NodeId,
+) -> ClipboardEventAction {
+    match event {
+        egui::Event::Paste(_) if has_focus || pointer_inside => ClipboardEventAction::BlockPaste,
+        egui::Event::MiddleClickPaste { pos, .. } if has_focus || box_rect.contains(*pos) => {
+            ClipboardEventAction::BlockPaste
+        }
+        egui::Event::Copy | egui::Event::Cut if has_focus => ClipboardEventAction::Drop,
+        egui::Event::AccessKitActionRequest(req)
+            if req.target_node == target_accesskit_id
+                && matches!(
+                    req.action,
+                    egui::accesskit::Action::ReplaceSelectedText
+                        | egui::accesskit::Action::SetValue
+                ) =>
+        {
+            ClipboardEventAction::BlockPaste
+        }
+        egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } if has_focus => {
+            let cmd = modifiers.command || modifiers.ctrl;
+            if (cmd && *key == egui::Key::V) || (modifiers.shift && *key == egui::Key::Insert) {
+                ClipboardEventAction::BlockPaste
+            } else if cmd && matches!(*key, egui::Key::C | egui::Key::X | egui::Key::Insert) {
+                ClipboardEventAction::Drop
+            } else {
+                ClipboardEventAction::Keep
+            }
+        }
+        _ => ClipboardEventAction::Keep,
+    }
+}
+
+fn suppress_clipboard_events(ui: &egui::Ui, edit_id: egui::Id, box_rect: egui::Rect) -> bool {
+    let has_focus = ui.ctx().memory(|m| m.has_focus(edit_id));
+    let pointer_inside = ui.rect_contains_pointer(box_rect);
+    if !has_focus && !pointer_inside {
+        return false;
+    }
+    let target_accesskit_id = edit_id.accesskit_id();
+    let mut paste_blocked = false;
+    ui.ctx().input_mut(|i| {
+        i.events.retain(|event| {
+            match classify_clipboard_event(
+                event,
+                has_focus,
+                pointer_inside,
+                box_rect,
+                target_accesskit_id,
+            ) {
+                ClipboardEventAction::Keep => true,
+                ClipboardEventAction::Drop => false,
+                ClipboardEventAction::BlockPaste => {
+                    paste_blocked = true;
+                    false
+                }
+            }
+        });
+    });
+    paste_blocked
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_manual_confirm_input(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    width: f32,
+    hint: &str,
+    border_color: Color32,
+    matched: bool,
+    value: &mut String,
+    t: &Tokens,
+) -> ManualConfirmInputResult {
+    let input_width = width.max(0.0).min(ui.available_width().max(0.0));
+    let (box_rect, box_resp) =
+        ui.allocate_exact_size(Vec2::new(input_width, INPUT_HEIGHT), Sense::hover());
+    let edit_id = ui.make_persistent_id(id_salt);
+    let has_focus = ui.ctx().memory(|m| m.has_focus(edit_id));
+    let stroke = if has_focus {
+        Stroke::new(1.5, t.accent)
+    } else if box_resp.hovered() {
+        Stroke::new(1.0, t.text_muted.gamma_multiply(0.55))
+    } else {
+        Stroke::new(1.2, border_color)
+    };
+    let p = ui.painter();
+    p.rect_filled(
+        box_rect,
+        CornerRadius::same(CONTROL_RADIUS as u8),
+        t.field_bg,
+    );
+    p.rect_stroke(
+        box_rect,
+        CornerRadius::same(CONTROL_RADIUS as u8),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+
+    let paste_blocked = suppress_clipboard_events(ui, edit_id, box_rect);
+    let inner_rect = box_rect.shrink2(Vec2::new(10.0, 2.0));
+    let trailing_w = if matched { 20.0 } else { 0.0 };
+    let text_w = (inner_rect.width() - trailing_w).max(40.0);
+
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.spacing_mut().item_spacing.x = 6.0;
+    child.set_width(inner_rect.width());
+
+    let resp = child.add_sized(
+        Vec2::new(text_w, inner_rect.height()),
+        egui::TextEdit::singleline(value)
+            .id(edit_id)
+            .desired_width(text_w)
+            .font(egui::FontId::proportional(12.2))
+            .margin(egui::Margin::ZERO)
+            .align(egui::Align2::LEFT_CENTER)
+            .frame(egui::Frame::NONE)
+            .text_color(t.text)
+            .hint_text(egui::RichText::new(hint).color(t.text_muted).size(12.0)),
+    );
+    let enter_pressed = resp.lost_focus() && child.input(|i| i.key_pressed(egui::Key::Enter));
+    if matched {
+        let (ir, _) = child.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+        paint_icon(child.painter(), ir, Icon::Check, t.success_fg);
+    }
+
+    ManualConfirmInputResult {
+        edit_id,
+        changed: resp.changed(),
+        enter_pressed,
+        paste_blocked,
+    }
 }
 
 fn danger_icon_button(ui: &mut egui::Ui, icon: Icon, selected: bool, t: &Tokens) -> egui::Response {
@@ -1829,10 +2537,10 @@ fn draw_compact_pill(
         });
 }
 
-fn user_monogram(user: &UserSummary) -> String {
-    user.display_name
+fn user_monogram(display_name: &str, username: &str) -> String {
+    display_name
         .chars()
-        .chain(user.username.chars())
+        .chain(username.chars())
         .find(|c| c.is_alphanumeric())
         .map_or_else(|| "U".to_string(), |c| c.to_uppercase().collect::<String>())
 }
@@ -2535,7 +3243,260 @@ mod tests {
         assert!(text_delete.contains("ABCD-EFGH-JKLM"));
         assert!(text_delete.contains("Copy Code"));
         assert!(text_delete.contains("Reset pending"));
-        assert!(text_delete.contains("Delete Permanently"));
+        assert!(text_delete.contains("Confirm Account Deletion"));
+        assert!(text_delete.contains("delete maria_notes"));
+        assert!(text_delete.contains("Move to Trash"));
+    }
+
+    #[test]
+    fn users_view_requires_manual_typed_confirmation_blocks_paste_and_restores_from_trash() {
+        use papercraft_server_cli::config::ensure_data_dir_and_meta;
+        use papercraft_server_cli::db::{ServerDb, TokenTtls};
+
+        fn find_text_center(
+            shapes: &[egui::epaint::ClippedShape],
+            target: &str,
+        ) -> Option<egui::Pos2> {
+            fn visit(shape: &Shape, target: &str, out: &mut Option<egui::Pos2>) {
+                if out.is_some() {
+                    return;
+                }
+                match shape {
+                    Shape::Text(t) if t.galley.text() == target => {
+                        *out = Some(t.visual_bounding_rect().center());
+                    }
+                    Shape::Vec(items) => {
+                        for item in items {
+                            visit(item, target, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for c in shapes {
+                let mut found = None;
+                visit(&c.shape, target, &mut found);
+                if let Some(pos) = found
+                    && c.clip_rect.contains(pos)
+                {
+                    return Some(pos);
+                }
+            }
+            None
+        }
+
+        let dir = temp_dir("users-trash-restore-ui");
+        let vault_dir = dir.0.join("vault");
+        let _ = ensure_data_dir_and_meta(&vault_dir).unwrap();
+        let alice_id = {
+            let db = ServerDb::open(&vault_dir.join("papercraft.redb")).unwrap();
+            let ttls = TokenTtls {
+                access_ttl_ms: 3_600_000,
+                refresh_ttl_ms: 86_400_000,
+            };
+            db.register_user_with_email(
+                Some("alice.very.long.email.address.for.clipping.check@example.com"),
+                "alice_notes",
+                "strong-password-1",
+                Some("Alice Wonderfully Long Name"),
+                Some("Desk"),
+                true,
+                ttls,
+            )
+            .unwrap()
+            .user
+            .user_id
+        };
+
+        let cfg_path = dir.0.join(CONFIG_FILE_NAME);
+        let settings = crate::settings::ServerControlSettings {
+            data_dir: vault_dir.to_string_lossy().into_owned(),
+            port: 18951,
+            auto_start_server: false,
+            theme: UiTheme::Dark,
+            ..Default::default()
+        };
+        settings.save_atomic(&cfg_path).unwrap();
+
+        let mut ctrl = ServerController::new(cfg_path, false);
+        ctrl.set_active_tab(ControlTab::Users);
+        assert_eq!(ctrl.users_snapshot.len(), 1);
+
+        let ctx = egui::Context::default();
+        apply_visuals(&ctx, ctrl.theme());
+        let dark_tokens = Tokens::for_theme(ctrl.theme());
+        let mut t = 1.0_f64;
+
+        let run_ui =
+            |ctrl: &mut ServerController, time: &mut f64, width: f32, events: Vec<egui::Event>| {
+                *time += 0.05;
+                let out = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 960.0))),
+                        time: Some(*time),
+                        predicted_dt: 0.05,
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let _ = render_window_with_update_status(
+                            ctrl,
+                            ui,
+                            &dark_tokens,
+                            &papercraft_updater::UpdateStatus::Idle,
+                        );
+                    },
+                );
+                let text = collect_text(&out.shapes);
+                let shapes = out.shapes.clone();
+                out.drop_without_applying_deltas();
+                (text, shapes)
+            };
+
+        // 1. Narrow 460px width renders row and Active/Trash switch cleanly without clipping.
+        let (narrow_text, _) = run_ui(&mut ctrl, &mut t, 460.0, Vec::new());
+        assert!(narrow_text.contains("Active (1)"));
+        assert!(narrow_text.contains("Trash (0)"));
+
+        // 2. Request delete -> focus goes to manual input -> Paste / Ctrl+V is blocked.
+        ctrl.request_delete_user(&alice_id);
+        let _ = run_ui(&mut ctrl, &mut t, 560.0, Vec::new());
+        let _ = run_ui(
+            &mut ctrl,
+            &mut t,
+            560.0,
+            vec![
+                egui::Event::Paste("delete alice_notes".to_string()),
+                egui::Event::Key {
+                    key: egui::Key::V,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                },
+            ],
+        );
+        let (paste_text, paste_shapes) = run_ui(&mut ctrl, &mut t, 560.0, Vec::new());
+        assert!(ctrl.delete_confirm_input.is_empty());
+        assert!(ctrl.delete_confirm_paste_blocked);
+        assert!(paste_text.contains("Copy/paste is disabled — type it manually"));
+
+        // Clicking Move to Trash while empty does not trash the account.
+        let move_btn = find_text_center(&paste_shapes, "Move to Trash").unwrap();
+        for pressed in [true, false] {
+            let _ = run_ui(
+                &mut ctrl,
+                &mut t,
+                560.0,
+                vec![
+                    egui::Event::PointerMoved(move_btn),
+                    egui::Event::PointerButton {
+                        pos: move_btn,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(ctrl.users_snapshot.len(), 1);
+        assert!(ctrl.trashed_users_snapshot.is_empty());
+
+        // 3. Click the manual confirmation input and type `delete alice_notes` to enable Move to Trash.
+        let manual_lbl = find_text_center(&paste_shapes, "Manual Confirmation").unwrap();
+        let input_pos = egui::pos2(manual_lbl.x + 12.0, manual_lbl.y + 24.0);
+        for pressed in [true, false] {
+            let _ = run_ui(
+                &mut ctrl,
+                &mut t,
+                560.0,
+                vec![
+                    egui::Event::PointerMoved(input_pos),
+                    egui::Event::PointerButton {
+                        pos: input_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        let _ = run_ui(
+            &mut ctrl,
+            &mut t,
+            560.0,
+            vec![egui::Event::Text("delete alice_notes".to_string())],
+        );
+        let (matched_text, matched_shapes) = run_ui(&mut ctrl, &mut t, 560.0, Vec::new());
+        assert!(matched_text.contains("Confirmation matched"));
+        let enabled_move_btn = find_text_center(&matched_shapes, "Move to Trash").unwrap();
+        for pressed in [true, false] {
+            let _ = run_ui(
+                &mut ctrl,
+                &mut t,
+                560.0,
+                vec![
+                    egui::Event::PointerMoved(enabled_move_btn),
+                    egui::Event::PointerButton {
+                        pos: enabled_move_btn,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(ctrl.users_snapshot.is_empty());
+        assert_eq!(ctrl.trashed_users_snapshot.len(), 1);
+
+        // 4. Switch renders even when Active is empty; clicking Trash (1) shows 30-day retention & Restore.
+        let (empty_active_text, empty_active_shapes) = run_ui(&mut ctrl, &mut t, 560.0, Vec::new());
+        assert!(empty_active_text.contains("Active (0)"));
+        assert!(empty_active_text.contains("Trash (1)"));
+        let trash_tab = find_text_center(&empty_active_shapes, "Trash (1)").unwrap();
+        for pressed in [true, false] {
+            let _ = run_ui(
+                &mut ctrl,
+                &mut t,
+                560.0,
+                vec![
+                    egui::Event::PointerMoved(trash_tab),
+                    egui::Event::PointerButton {
+                        pos: trash_tab,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(ctrl.users_view_mode, UsersViewMode::Trash);
+
+        let (trash_text, trash_shapes) = run_ui(&mut ctrl, &mut t, 560.0, Vec::new());
+        assert!(trash_text.contains("30 days left to restore"));
+        assert!(trash_text.contains("Restore"));
+
+        // 5. Clicking Restore brings Alice back to Active.
+        let restore_btn = find_text_center(&trash_shapes, "Restore").unwrap();
+        for pressed in [true, false] {
+            let _ = run_ui(
+                &mut ctrl,
+                &mut t,
+                560.0,
+                vec![
+                    egui::Event::PointerMoved(restore_btn),
+                    egui::Event::PointerButton {
+                        pos: restore_btn,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(ctrl.users_snapshot.len(), 1);
+        assert!(ctrl.trashed_users_snapshot.is_empty());
+        assert_eq!(ctrl.users_view_mode, UsersViewMode::Active);
     }
 
     #[test]

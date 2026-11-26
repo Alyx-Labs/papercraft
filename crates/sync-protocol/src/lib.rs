@@ -33,6 +33,9 @@ pub const MAX_PUSH_BATCH_SIZE: usize = 64;
 
 pub const ERR_CODE_PASSWORD_RESET_REQUIRED: &str = "password_reset_required";
 pub const ERR_CODE_PASSWORD_CHANGE_REQUIRED: &str = "password_change_required";
+pub const ERR_CODE_ACCOUNT_IN_TRASH: &str = "account_in_trash";
+pub const ERR_CODE_EMAIL_IN_TRASH: &str = "email_in_trash";
+pub const ERR_CODE_USERNAME_IN_TRASH: &str = "username_in_trash";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProtocolError {

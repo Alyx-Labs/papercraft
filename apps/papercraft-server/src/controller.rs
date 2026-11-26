@@ -6,7 +6,7 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use papercraft_doc::UiTheme;
-use papercraft_server_cli::db::{PasswordResetOutcome, UserSummary};
+use papercraft_server_cli::db::{PasswordResetOutcome, TrashedUserSummary, UserSummary};
 use papercraft_server_cli::{LocalDiscoverySummary, ServerRuntime};
 use papercraft_updater::{AppId, UpdateStatus, UpdateWorker};
 
@@ -24,6 +24,28 @@ pub enum ControlTab {
     Users,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UsersViewMode {
+    #[default]
+    Active,
+    Trash,
+}
+
+/// Builds the exact manual confirmation phrase (`delete <username>`).
+pub fn account_delete_confirmation_phrase(username: &str) -> String {
+    format!("delete {}", username.trim())
+}
+
+fn normalize_confirmation_words(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Returns `true` when `input` matches `expected` ignoring extra spaces and case.
+pub fn account_delete_confirmation_matches(input: &str, expected: &str) -> bool {
+    normalize_confirmation_words(input).to_lowercase()
+        == normalize_confirmation_words(expected).to_lowercase()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerStatus {
     Running,
@@ -34,6 +56,7 @@ pub enum ServerStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatsSnapshot {
     pub user_count: usize,
+    pub trashed_user_count: usize,
     pub active_notebook_count: usize,
     pub active_session_count: usize,
     pub db_size_bytes: u64,
@@ -67,10 +90,15 @@ pub struct ServerController {
     pub stats_snapshot: Option<StatsSnapshot>,
     pub local_discovery: LocalDiscoverySummary,
     pub users_snapshot: Vec<UserSummary>,
+    pub trashed_users_snapshot: Vec<TrashedUserSummary>,
     pub users_error: Option<String>,
     pub active_tab: ControlTab,
+    pub users_view_mode: UsersViewMode,
     pub user_search: String,
     pub pending_delete_user: Option<String>,
+    pub delete_confirm_input: String,
+    pub delete_confirm_paste_blocked: bool,
+    pub delete_confirm_focus_pending: bool,
     pub pending_reset_user: Option<String>,
     pub last_password_reset: Option<PasswordResetOutcome>,
     last_stats_refresh: Option<Instant>,
@@ -127,10 +155,15 @@ impl ServerController {
             stats_snapshot: None,
             local_discovery: LocalDiscoverySummary::default(),
             users_snapshot: Vec::new(),
+            trashed_users_snapshot: Vec::new(),
             users_error: None,
             active_tab: ControlTab::Server,
+            users_view_mode: UsersViewMode::Active,
             user_search: String::new(),
             pending_delete_user: None,
+            delete_confirm_input: String::new(),
+            delete_confirm_paste_blocked: false,
+            delete_confirm_focus_pending: false,
             pending_reset_user: None,
             last_password_reset: None,
             last_stats_refresh: None,
@@ -451,6 +484,7 @@ impl ServerController {
         if let Ok(stats) = rt.stats() {
             self.stats_snapshot = Some(StatsSnapshot {
                 user_count: stats.user_count,
+                trashed_user_count: stats.trashed_user_count,
                 active_notebook_count: stats.active_notebook_count,
                 active_session_count: stats.active_session_count,
                 db_size_bytes: rt.db_file_size_bytes(),
@@ -462,17 +496,23 @@ impl ServerController {
 
     pub fn refresh_users(&mut self) {
         let res = match self.runtime.as_ref() {
-            Some(rt) => rt.list_users(),
-            None => {
-                papercraft_server_cli::list_users_in_dir(&self.draft_settings.resolved_data_path())
-            }
+            Some(rt) => match (rt.list_users(), rt.list_trashed_users()) {
+                (Ok(users), Ok(trashed)) => Ok((users, trashed)),
+                (Err(err), _) | (_, Err(err)) => Err(err),
+            },
+            None => papercraft_server_cli::list_users_and_trash_in_dir(
+                &self.draft_settings.resolved_data_path(),
+            ),
         };
         match res {
-            Ok(users) => {
+            Ok((users, trashed)) => {
                 if let Some(ref target) = self.pending_delete_user
                     && !users.iter().any(|u| u.user_id == *target)
                 {
                     self.pending_delete_user = None;
+                    self.delete_confirm_input.clear();
+                    self.delete_confirm_paste_blocked = false;
+                    self.delete_confirm_focus_pending = false;
                 }
                 if let Some(ref target) = self.pending_reset_user
                     && !users.iter().any(|u| u.user_id == *target)
@@ -480,30 +520,52 @@ impl ServerController {
                     self.pending_reset_user = None;
                 }
                 self.users_snapshot = users;
+                self.trashed_users_snapshot = trashed;
                 self.users_error = None;
             }
             Err(err) => {
                 self.users_snapshot.clear();
+                self.trashed_users_snapshot.clear();
                 self.users_error = Some(err);
                 self.pending_delete_user = None;
                 self.pending_reset_user = None;
+                self.delete_confirm_input.clear();
+                self.delete_confirm_paste_blocked = false;
+                self.delete_confirm_focus_pending = false;
             }
+        }
+    }
+
+    pub fn set_users_view_mode(&mut self, mode: UsersViewMode) {
+        if self.users_view_mode != mode {
+            self.users_view_mode = mode;
+            self.cancel_user_action();
+            self.refresh_users();
         }
     }
 
     pub fn request_delete_user(&mut self, user_id: &str) {
         self.pending_delete_user = Some(user_id.to_string());
         self.pending_reset_user = None;
+        self.delete_confirm_input.clear();
+        self.delete_confirm_paste_blocked = false;
+        self.delete_confirm_focus_pending = true;
     }
 
     pub fn request_reset_password(&mut self, user_id: &str) {
         self.pending_reset_user = Some(user_id.to_string());
         self.pending_delete_user = None;
+        self.delete_confirm_input.clear();
+        self.delete_confirm_paste_blocked = false;
+        self.delete_confirm_focus_pending = false;
     }
 
     pub fn cancel_user_action(&mut self) {
         self.pending_delete_user = None;
         self.pending_reset_user = None;
+        self.delete_confirm_input.clear();
+        self.delete_confirm_paste_blocked = false;
+        self.delete_confirm_focus_pending = false;
     }
 
     pub fn dismiss_password_reset(&mut self) {
@@ -511,15 +573,33 @@ impl ServerController {
     }
 
     pub fn confirm_delete_user(&mut self, user_id: &str) {
+        let Some(target) = self.users_snapshot.iter().find(|u| u.user_id == user_id) else {
+            self.notice_banner = Some(NoticeBanner {
+                tone: NoticeTone::Error,
+                text: "User account could not be found. Refresh and try again.".to_string(),
+            });
+            self.cancel_user_action();
+            return;
+        };
+        let expected = account_delete_confirmation_phrase(&target.username);
+        if !account_delete_confirmation_matches(&self.delete_confirm_input, &expected) {
+            self.notice_banner = Some(NoticeBanner {
+                tone: NoticeTone::Error,
+                text: format!(
+                    "Type `{expected}` manually to confirm moving this account to Trash."
+                ),
+            });
+            return;
+        }
+
         let res = match self.runtime.as_ref() {
-            Some(rt) => rt.delete_user(user_id),
-            None => papercraft_server_cli::delete_user_in_dir(
+            Some(rt) => rt.trash_user(user_id),
+            None => papercraft_server_cli::trash_user_in_dir(
                 &self.draft_settings.resolved_data_path(),
                 user_id,
             ),
         };
-        self.pending_delete_user = None;
-        self.pending_reset_user = None;
+        self.cancel_user_action();
         if self
             .last_password_reset
             .as_ref()
@@ -528,13 +608,14 @@ impl ServerController {
             self.last_password_reset = None;
         }
         match res {
-            Ok(deleted) => {
+            Ok(trashed) => {
                 self.notice_banner = Some(NoticeBanner {
                     tone: NoticeTone::Success,
                     text: format!(
-                        "Deleted account `{}` ({} synced notebook(s) removed).",
-                        deleted.account_label(),
-                        deleted.deleted_notebooks
+                        "Moved `{}` to server Trash ({} synced notebook(s) kept for {} days). Restore anytime from Trash before it expires.",
+                        trashed.account_label(),
+                        trashed.notebook_count,
+                        papercraft_server_cli::db::ACCOUNT_TRASH_RETENTION_DAYS
                     ),
                 });
                 self.refresh_users();
@@ -551,6 +632,43 @@ impl ServerController {
         }
     }
 
+    pub fn restore_trashed_user(&mut self, user_id: &str) {
+        let res = match self.runtime.as_ref() {
+            Some(rt) => rt.restore_trashed_user(user_id),
+            None => papercraft_server_cli::restore_trashed_user_in_dir(
+                &self.draft_settings.resolved_data_path(),
+                user_id,
+            ),
+        };
+        self.cancel_user_action();
+        match res {
+            Ok(restored) => {
+                self.notice_banner = Some(NoticeBanner {
+                    tone: NoticeTone::Success,
+                    text: format!(
+                        "Restored `{}` with {} synced notebook(s). They can sign in again now.",
+                        restored.account_label(),
+                        restored.restored_notebooks
+                    ),
+                });
+                self.refresh_users();
+                if self.is_running() {
+                    self.refresh_stats();
+                }
+                if self.trashed_users_snapshot.is_empty() {
+                    self.users_view_mode = UsersViewMode::Active;
+                }
+            }
+            Err(err) => {
+                self.notice_banner = Some(NoticeBanner {
+                    tone: NoticeTone::Error,
+                    text: err,
+                });
+                self.refresh_users();
+            }
+        }
+    }
+
     pub fn confirm_reset_password(&mut self, user_id: &str) {
         let res = match self.runtime.as_ref() {
             Some(rt) => rt.reset_user_password_temporary(user_id),
@@ -559,8 +677,7 @@ impl ServerController {
                 user_id,
             ),
         };
-        self.pending_reset_user = None;
-        self.pending_delete_user = None;
+        self.cancel_user_action();
         match res {
             Ok(outcome) => {
                 let label = outcome.account_label();
@@ -892,12 +1009,14 @@ mod tests {
         assert_eq!(ctrl.users_snapshot.len(), 1);
     }
 
-    #[test]
-    fn controller_resets_password_and_deletes_user_offline_and_online() {
+    fn setup_two_user_controller(
+        label: &str,
+        port: u16,
+    ) -> (TempDirGuard, ServerController, String, String) {
         use papercraft_server_cli::config::ensure_data_dir_and_meta;
         use papercraft_server_cli::db::{ServerDb, TokenTtls};
 
-        let dir = temp_dir("users_actions");
+        let dir = temp_dir(label);
         let vault_dir = dir.0.join("vault");
         let _ = ensure_data_dir_and_meta(&vault_dir).unwrap();
         let (alice_id, bob_id) = {
@@ -932,14 +1051,29 @@ mod tests {
         let cfg_path = dir.0.join(CONFIG_FILE_NAME);
         let settings = ServerControlSettings {
             data_dir: vault_dir.to_string_lossy().into_owned(),
-            port: 18946,
+            port,
             auto_start_server: false,
             ..ServerControlSettings::default()
         };
         settings.save_atomic(&cfg_path).unwrap();
 
-        let mut ctrl = ServerController::new(cfg_path, false);
+        let ctrl = ServerController::new(cfg_path, false);
         assert_eq!(ctrl.users_snapshot.len(), 2);
+        (dir, ctrl, alice_id, bob_id)
+    }
+
+    fn start_controller_with_fallback_port(ctrl: &mut ServerController, fallback_port: u16) {
+        ctrl.start_server();
+        if !ctrl.is_running() {
+            ctrl.draft_settings.port = fallback_port;
+            ctrl.start_server();
+        }
+        assert!(ctrl.is_running());
+    }
+
+    #[test]
+    fn controller_resets_password_and_deletes_user_offline_and_online() {
+        let (_dir, mut ctrl, alice_id, bob_id) = setup_two_user_controller("users_actions", 18946);
 
         // Reset Alice while stopped
         ctrl.request_reset_password(&alice_id);
@@ -957,17 +1091,68 @@ mod tests {
                 .must_change_password
         );
 
-        // Delete Bob while running
-        ctrl.start_server();
-        if !ctrl.is_running() {
-            ctrl.draft_settings.port = 28946;
-            ctrl.start_server();
-        }
-        assert!(ctrl.is_running());
+        // Move Bob to 30-day Trash while server is running
+        start_controller_with_fallback_port(&mut ctrl, 28946);
         ctrl.request_delete_user(&bob_id);
+        ctrl.delete_confirm_input = "delete bob".to_string();
         ctrl.confirm_delete_user(&bob_id);
+        assert!(ctrl.pending_delete_user.is_none());
         assert_eq!(ctrl.users_snapshot.len(), 1);
         assert_eq!(ctrl.users_snapshot[0].user_id, alice_id);
+        assert_eq!(ctrl.trashed_users_snapshot.len(), 1);
+        assert_eq!(ctrl.trashed_users_snapshot[0].user_id, bob_id);
+        ctrl.stop_server();
+    }
+
+    #[test]
+    fn controller_requires_manual_confirmation_for_trash_and_restores_user() {
+        let (_dir, mut ctrl, _alice_id, bob_id) =
+            setup_two_user_controller("trash_confirm_restore", 18947);
+        start_controller_with_fallback_port(&mut ctrl, 28947);
+
+        ctrl.request_delete_user(&bob_id);
+        assert_eq!(ctrl.pending_delete_user.as_deref(), Some(bob_id.as_str()));
+        assert!(ctrl.delete_confirm_focus_pending);
+
+        // Empty or wrong confirmation is rejected without moving Bob to Trash.
+        ctrl.confirm_delete_user(&bob_id);
+        assert_eq!(ctrl.users_snapshot.len(), 2);
+        assert!(ctrl.trashed_users_snapshot.is_empty());
+        assert_eq!(
+            ctrl.notice_banner.as_ref().map(|b| b.tone),
+            Some(NoticeTone::Error)
+        );
+
+        ctrl.delete_confirm_input = "delete alice".to_string();
+        ctrl.confirm_delete_user(&bob_id);
+        assert_eq!(ctrl.users_snapshot.len(), 2);
+        assert!(ctrl.trashed_users_snapshot.is_empty());
+
+        // Background refresh while typing must preserve the in-progress confirmation draft.
+        ctrl.delete_confirm_input = "delete bo".to_string();
+        ctrl.refresh_users();
+        assert_eq!(ctrl.pending_delete_user.as_deref(), Some(bob_id.as_str()));
+        assert_eq!(ctrl.delete_confirm_input, "delete bo");
+
+        // Exact manual phrase moves Bob to server Trash instead of erasing immediately.
+        ctrl.delete_confirm_input = "delete bob".to_string();
+        ctrl.confirm_delete_user(&bob_id);
+        assert!(ctrl.pending_delete_user.is_none());
+        assert!(ctrl.delete_confirm_input.is_empty());
+        assert_eq!(ctrl.users_snapshot.len(), 1);
+        assert_eq!(ctrl.trashed_users_snapshot.len(), 1);
+        assert_eq!(ctrl.trashed_users_snapshot[0].user_id, bob_id);
+
+        // Restore Bob from Trash back into active users.
+        ctrl.set_users_view_mode(UsersViewMode::Trash);
+        ctrl.restore_trashed_user(&bob_id);
+        assert_eq!(ctrl.users_snapshot.len(), 2);
+        assert!(ctrl.trashed_users_snapshot.is_empty());
+        assert_eq!(ctrl.users_view_mode, UsersViewMode::Active);
+        assert_eq!(
+            ctrl.notice_banner.as_ref().map(|b| b.tone),
+            Some(NoticeTone::Success)
+        );
         ctrl.stop_server();
     }
 

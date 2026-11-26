@@ -27,6 +27,7 @@ use uuid::Uuid;
 const USERS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("users");
 const USERS_BY_NAME_TABLE: TableDefinition<&str, &str> = TableDefinition::new("users_by_name");
 const USERS_BY_EMAIL_TABLE: TableDefinition<&str, &str> = TableDefinition::new("users_by_email");
+const TRASHED_USERS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("trashed_users");
 const ACCESS_TOKENS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("access_tokens");
 const REFRESH_TOKENS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("refresh_tokens");
 const NOTEBOOKS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("notebooks");
@@ -36,6 +37,8 @@ const FOLDERS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("folders
 const USER_PREFS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("user_prefs");
 const USER_CURSORS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("user_cursors");
 
+pub const ACCOUNT_TRASH_RETENTION_DAYS: i64 = 30;
+pub const ACCOUNT_TRASH_RETENTION_MS: i64 = ACCOUNT_TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const MAX_TOKENS_PER_USER_PRUNE: usize = 64;
 
 #[derive(Debug, Error)]
@@ -48,6 +51,14 @@ pub enum DbError {
     UsernameTaken(String),
     #[error("email `{0}` is already registered")]
     EmailTaken(String),
+    #[error("account is in server trash and scheduled for permanent deletion")]
+    AccountInTrash,
+    #[error("email `{0}` belongs to an account in server trash")]
+    EmailInTrash(String),
+    #[error("username `{0}` belongs to an account in server trash")]
+    UsernameInTrash(String),
+    #[error("trashed account `{0}` has expired and was permanently deleted")]
+    TrashedUserExpired(String),
     #[error("invalid username or password")]
     InvalidCredentials,
     #[error("current password is incorrect")]
@@ -177,9 +188,29 @@ struct StoredPrefsRow {
     prefs: UserStudioConfig,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TrashedUserRow {
+    user: UserRow,
+    deleted_at_ms: i64,
+    expires_at_ms: i64,
+}
+
+fn is_trashed_user_expired(row: &TrashedUserRow, now_ms: i64) -> bool {
+    now_ms >= row.expires_at_ms
+        || now_ms.saturating_sub(row.deleted_at_ms) >= ACCOUNT_TRASH_RETENTION_MS
+}
+
+fn format_account_label(email: Option<&str>, username: &str) -> String {
+    match email {
+        Some(email) if !email.trim().is_empty() => email.to_string(),
+        _ => format!("@{username}"),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DbStats {
     pub user_count: usize,
+    pub trashed_user_count: usize,
     pub active_notebook_count: usize,
     pub deleted_tombstone_count: usize,
     pub active_session_count: usize,
@@ -196,6 +227,59 @@ pub struct UserSummary {
     pub must_change_password: bool,
 }
 
+/// Summary of a user account currently held in the 30-day server Trash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrashedUserSummary {
+    pub user_id: String,
+    pub email: Option<String>,
+    pub username: String,
+    pub display_name: String,
+    pub notebook_count: usize,
+    pub created_at_ms: i64,
+    pub deleted_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+impl TrashedUserSummary {
+    pub fn account_label(&self) -> String {
+        format_account_label(self.email.as_deref(), &self.username)
+    }
+}
+
+/// Summary returned after moving an account into the 30-day server Trash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrashedUserActionSummary {
+    pub user_id: String,
+    pub username: String,
+    pub email: Option<String>,
+    pub display_name: String,
+    pub notebook_count: usize,
+    pub deleted_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+impl TrashedUserActionSummary {
+    pub fn account_label(&self) -> String {
+        format_account_label(self.email.as_deref(), &self.username)
+    }
+}
+
+/// Summary returned after restoring a trashed user account back to active status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoredUserSummary {
+    pub user_id: String,
+    pub username: String,
+    pub email: Option<String>,
+    pub display_name: String,
+    pub restored_notebooks: usize,
+}
+
+impl RestoredUserSummary {
+    pub fn account_label(&self) -> String {
+        format_account_label(self.email.as_deref(), &self.username)
+    }
+}
+
 /// Outcome returned when generating a one-time random temporary password for an account.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PasswordResetOutcome {
@@ -208,10 +292,7 @@ pub struct PasswordResetOutcome {
 
 impl PasswordResetOutcome {
     pub fn account_label(&self) -> String {
-        match self.email.as_deref() {
-            Some(email) if !email.trim().is_empty() => email.to_string(),
-            _ => format!("@{}", self.username),
-        }
+        format_account_label(self.email.as_deref(), &self.username)
     }
 }
 
@@ -227,10 +308,7 @@ pub struct DeletedUserSummary {
 
 impl DeletedUserSummary {
     pub fn account_label(&self) -> String {
-        match self.email.as_deref() {
-            Some(email) if !email.trim().is_empty() => email.to_string(),
-            _ => format!("@{}", self.username),
-        }
+        format_account_label(self.email.as_deref(), &self.username)
     }
 }
 
@@ -251,6 +329,7 @@ impl ServerDb {
             let _ = tx.open_table(USERS_TABLE).map_err(map_table_err)?;
             let _ = tx.open_table(USERS_BY_NAME_TABLE).map_err(map_table_err)?;
             let _ = tx.open_table(USERS_BY_EMAIL_TABLE).map_err(map_table_err)?;
+            let _ = tx.open_table(TRASHED_USERS_TABLE).map_err(map_table_err)?;
             let _ = tx.open_table(ACCESS_TOKENS_TABLE).map_err(map_table_err)?;
             let _ = tx.open_table(REFRESH_TOKENS_TABLE).map_err(map_table_err)?;
             let _ = tx.open_table(NOTEBOOKS_TABLE).map_err(map_table_err)?;
@@ -260,7 +339,9 @@ impl ServerDb {
             let _ = tx.open_table(USER_CURSORS_TABLE).map_err(map_table_err)?;
         }
         tx.commit().map_err(map_commit_err)?;
-        Ok(Self { db: Arc::new(db) })
+        let server_db = Self { db: Arc::new(db) };
+        let _ = server_db.cleanup_expired_trashed_users_at(now_unix_ms());
+        Ok(server_db)
     }
 
     pub fn register_user(
@@ -322,6 +403,7 @@ impl ServerDb {
         let password_hash = hash_password(password)?;
 
         let now = now_unix_ms();
+        self.cleanup_expired_trashed_users_at(now)?;
         let user_id = Uuid::new_v4().to_string();
 
         let tx = self.db.begin_write().map_err(map_tx_err)?;
@@ -335,9 +417,27 @@ impl ServerDb {
             {
                 return Err(DbError::EmailTaken(email_disp.clone()));
             }
+            let trashed_table = tx.open_table(TRASHED_USERS_TABLE).map_err(map_table_err)?;
+            let mut trashed_usernames = HashSet::new();
+            for item in trashed_table.iter().map_err(map_storage_err)? {
+                let (_, v) = item.map_err(map_storage_err)?;
+                let trashed: TrashedUserRow = from_json(v.value())?;
+                if is_trashed_user_expired(&trashed, now) {
+                    continue;
+                }
+                if let Some((ref email_disp, ref email_lower)) = email_pair
+                    && trashed.user.email_lower.as_deref() == Some(email_lower.as_str())
+                {
+                    return Err(DbError::EmailInTrash(email_disp.clone()));
+                }
+                trashed_usernames.insert(trashed.user.username_lower);
+            }
+            drop(trashed_table);
+
             let mut by_name = tx.open_table(USERS_BY_NAME_TABLE).map_err(map_table_err)?;
             let (username, username_lower) = allocate_unique_username(
                 &by_name,
+                &trashed_usernames,
                 &base_username,
                 &user_id,
                 require_unique_username,
@@ -395,12 +495,26 @@ impl ServerDb {
         registration_open: bool,
     ) -> Result<CheckEmailResponse, DbError> {
         let (_, email_lower) = normalize_email(email_raw)?;
+        let now = now_unix_ms();
         let rx = self.db.begin_read().map_err(map_tx_err)?;
         let by_email = rx.open_table(USERS_BY_EMAIL_TABLE).map_err(map_table_err)?;
-        let exists = by_email
+        let mut exists = by_email
             .get(email_lower.as_str())
             .map_err(map_storage_err)?
             .is_some();
+        if !exists {
+            let trashed = rx.open_table(TRASHED_USERS_TABLE).map_err(map_table_err)?;
+            for item in trashed.iter().map_err(map_storage_err)? {
+                let (_, v) = item.map_err(map_storage_err)?;
+                let row: TrashedUserRow = from_json(v.value())?;
+                if !is_trashed_user_expired(&row, now)
+                    && row.user.email_lower.as_deref() == Some(email_lower.as_str())
+                {
+                    exists = true;
+                    break;
+                }
+            }
+        }
         Ok(CheckEmailResponse {
             exists,
             registration_open,
@@ -415,10 +529,12 @@ impl ServerDb {
     ) -> Result<UserProfile, DbError> {
         let (new_email, new_lower) = normalize_email(new_email_raw)?;
         let now = now_unix_ms();
+        self.cleanup_expired_trashed_users_at(now)?;
         let tx = self.db.begin_write().map_err(map_tx_err)?;
         let profile = {
             let mut users = tx.open_table(USERS_TABLE).map_err(map_table_err)?;
             let mut by_email = tx.open_table(USERS_BY_EMAIL_TABLE).map_err(map_table_err)?;
+            let trashed_table = tx.open_table(TRASHED_USERS_TABLE).map_err(map_table_err)?;
             let Some(user_guard) = users.get(user_id).map_err(map_storage_err)? else {
                 return Err(DbError::Unauthorized);
             };
@@ -437,6 +553,16 @@ impl ServerDb {
             {
                 return Err(DbError::EmailTaken(new_email));
             }
+            for item in trashed_table.iter().map_err(map_storage_err)? {
+                let (_, v) = item.map_err(map_storage_err)?;
+                let trashed: TrashedUserRow = from_json(v.value())?;
+                if !is_trashed_user_expired(&trashed, now)
+                    && trashed.user.email_lower.as_deref() == Some(new_lower.as_str())
+                {
+                    return Err(DbError::EmailInTrash(new_email));
+                }
+            }
+            drop(trashed_table);
             if let Some(old_lower) = row.email_lower.take() {
                 let _ = by_email
                     .remove(old_lower.as_str())
@@ -469,16 +595,36 @@ impl ServerDb {
             return Err(DbError::InvalidCredentials);
         }
         let device_name = sanitize_device_name(device_name_raw.unwrap_or(""));
+        let now = now_unix_ms();
 
-        let user_row = {
+        let (active_user, trashed_match) = {
             let rx = self.db.begin_read().map_err(map_tx_err)?;
             let users = rx.open_table(USERS_TABLE).map_err(map_table_err)?;
-            let user_id = lookup_user_id_by_identifier(&rx, identifier_raw)?
-                .ok_or(DbError::InvalidCredentials)?;
-            let Some(row_guard) = users.get(user_id.as_str()).map_err(map_storage_err)? else {
+            if let Some(user_id) = lookup_user_id_by_identifier(&rx, identifier_raw)? {
+                let row = users
+                    .get(user_id.as_str())
+                    .map_err(map_storage_err)?
+                    .map(|g| from_json::<UserRow>(g.value()))
+                    .transpose()?;
+                (row, None)
+            } else {
+                let trashed = lookup_trashed_user_by_identifier(&rx, identifier_raw)?;
+                (None, trashed)
+            }
+        };
+
+        let user_row = match active_user {
+            Some(row) => row,
+            None => {
+                if let Some(trashed) = trashed_match {
+                    if is_trashed_user_expired(&trashed, now) {
+                        let _ = self.cleanup_expired_trashed_users_at(now);
+                    } else if password_matches_user(&trashed.user, password) {
+                        return Err(DbError::AccountInTrash);
+                    }
+                }
                 return Err(DbError::InvalidCredentials);
-            };
-            from_json::<UserRow>(row_guard.value())?
+            }
         };
 
         if user_row.must_change_password {
@@ -496,7 +642,6 @@ impl ServerDb {
 
         verify_password(password, &user_row.password_hash)?;
 
-        let now = now_unix_ms();
         let tx = self.db.begin_write().map_err(map_tx_err)?;
         let auth = {
             let mut access = tx.open_table(ACCESS_TOKENS_TABLE).map_err(map_table_err)?;
@@ -531,16 +676,38 @@ impl ServerDb {
             ));
         }
         let device_name = sanitize_device_name(device_name_raw.unwrap_or(""));
+        let now = now_unix_ms();
 
-        let user_row = {
+        let (active_user, trashed_match) = {
             let rx = self.db.begin_read().map_err(map_tx_err)?;
             let users = rx.open_table(USERS_TABLE).map_err(map_table_err)?;
-            let user_id = lookup_user_id_by_identifier(&rx, identifier_raw)?
-                .ok_or(DbError::InvalidCredentials)?;
-            let Some(row_guard) = users.get(user_id.as_str()).map_err(map_storage_err)? else {
+            if let Some(user_id) = lookup_user_id_by_identifier(&rx, identifier_raw)? {
+                let row = users
+                    .get(user_id.as_str())
+                    .map_err(map_storage_err)?
+                    .map(|g| from_json::<UserRow>(g.value()))
+                    .transpose()?;
+                (row, None)
+            } else {
+                let trashed = lookup_trashed_user_by_identifier(&rx, identifier_raw)?;
+                (None, trashed)
+            }
+        };
+
+        let user_row = match active_user {
+            Some(row) => row,
+            None => {
+                if let Some(trashed) = trashed_match {
+                    if is_trashed_user_expired(&trashed, now) {
+                        let _ = self.cleanup_expired_trashed_users_at(now);
+                    } else if trashed.user.must_change_password
+                        && verify_password(code, &trashed.user.password_hash).is_ok()
+                    {
+                        return Err(DbError::AccountInTrash);
+                    }
+                }
                 return Err(DbError::InvalidCredentials);
-            };
-            from_json::<UserRow>(row_guard.value())?
+            }
         };
 
         if !user_row.must_change_password {
@@ -616,11 +783,13 @@ impl ServerDb {
             None => None,
         };
         let now = now_unix_ms();
+        self.cleanup_expired_trashed_users_at(now)?;
 
         let tx = self.db.begin_write().map_err(map_tx_err)?;
         let profile = {
             let mut users = tx.open_table(USERS_TABLE).map_err(map_table_err)?;
             let mut by_name = tx.open_table(USERS_BY_NAME_TABLE).map_err(map_table_err)?;
+            let trashed_table = tx.open_table(TRASHED_USERS_TABLE).map_err(map_table_err)?;
             let Some(user_guard) = users.get(user_id).map_err(map_storage_err)? else {
                 return Err(DbError::Unauthorized);
             };
@@ -636,6 +805,15 @@ impl ServerDb {
                     {
                         return Err(DbError::UsernameTaken(clean_u));
                     }
+                    for item in trashed_table.iter().map_err(map_storage_err)? {
+                        let (_, v) = item.map_err(map_storage_err)?;
+                        let trashed: TrashedUserRow = from_json(v.value())?;
+                        if !is_trashed_user_expired(&trashed, now)
+                            && trashed.user.username_lower == new_lower
+                        {
+                            return Err(DbError::UsernameInTrash(clean_u));
+                        }
+                    }
                     let _ = by_name
                         .remove(row.username_lower.as_str())
                         .map_err(map_storage_err)?;
@@ -646,6 +824,7 @@ impl ServerDb {
                 row.username = clean_u;
                 row.username_lower = new_lower;
             }
+            drop(trashed_table);
 
             if let Some(raw_display) = new_display_name_raw {
                 row.display_name = sanitize_display_name(raw_display, &row.username);
@@ -1130,17 +1309,29 @@ impl ServerDb {
 
     pub fn stats(&self) -> Result<DbStats, DbError> {
         let now = now_unix_ms();
+        let _ = self.cleanup_expired_trashed_users_at(now);
         let rx = self.db.begin_read().map_err(map_tx_err)?;
         let users = rx.open_table(USERS_TABLE).map_err(map_table_err)?;
+        let trashed = rx.open_table(TRASHED_USERS_TABLE).map_err(map_table_err)?;
         let notebooks = rx.open_table(NOTEBOOKS_TABLE).map_err(map_table_err)?;
         let refresh = rx.open_table(REFRESH_TOKENS_TABLE).map_err(map_table_err)?;
 
         let user_count = users.iter().map_err(map_storage_err)?.count();
+        let mut trashed_ids = HashSet::new();
+        for entry in trashed.iter().map_err(map_storage_err)? {
+            let (k, _) = entry.map_err(map_storage_err)?;
+            trashed_ids.insert(k.value().to_string());
+        }
+        let trashed_user_count = trashed_ids.len();
+
         let mut active_notebook_count = 0usize;
         let mut deleted_tombstone_count = 0usize;
         for entry in notebooks.iter().map_err(map_storage_err)? {
             let (_, v) = entry.map_err(map_storage_err)?;
             let row: StoredNotebookRow = from_json(v.value())?;
+            if trashed_ids.contains(&row.user_id) {
+                continue;
+            }
             if row.deleted {
                 deleted_tombstone_count = deleted_tombstone_count.saturating_add(1);
             } else {
@@ -1158,6 +1349,7 @@ impl ServerDb {
 
         Ok(DbStats {
             user_count,
+            trashed_user_count,
             active_notebook_count,
             deleted_tombstone_count,
             active_session_count,
@@ -1168,15 +1360,7 @@ impl ServerDb {
         let rx = self.db.begin_read().map_err(map_tx_err)?;
         let users = rx.open_table(USERS_TABLE).map_err(map_table_err)?;
         let notebooks = rx.open_table(NOTEBOOKS_TABLE).map_err(map_table_err)?;
-
-        let mut counts = std::collections::HashMap::<String, usize>::new();
-        for entry in notebooks.iter().map_err(map_storage_err)? {
-            let (_, v) = entry.map_err(map_storage_err)?;
-            let row: StoredNotebookRow = from_json(v.value())?;
-            if !row.deleted {
-                *counts.entry(row.user_id).or_insert(0) += 1;
-            }
-        }
+        let counts = count_active_notebooks_by_user(&notebooks)?;
 
         let mut out = Vec::new();
         for entry in users.iter().map_err(map_storage_err)? {
@@ -1194,6 +1378,39 @@ impl ServerDb {
             });
         }
         out.sort_by_key(|a| a.created_at_ms);
+        Ok(out)
+    }
+
+    /// Lists accounts currently held in the 30-day server Trash after purging any expired ones.
+    pub fn list_trashed_users(&self) -> Result<Vec<TrashedUserSummary>, DbError> {
+        let now = now_unix_ms();
+        self.cleanup_expired_trashed_users_at(now)?;
+        let rx = self.db.begin_read().map_err(map_tx_err)?;
+        let trashed = rx.open_table(TRASHED_USERS_TABLE).map_err(map_table_err)?;
+        let notebooks = rx.open_table(NOTEBOOKS_TABLE).map_err(map_table_err)?;
+        let counts = count_active_notebooks_by_user(&notebooks)?;
+
+        let mut out = Vec::new();
+        for entry in trashed.iter().map_err(map_storage_err)? {
+            let (_, v) = entry.map_err(map_storage_err)?;
+            let row: TrashedUserRow = from_json(v.value())?;
+            let notebook_count = counts.get(&row.user.user_id).copied().unwrap_or(0);
+            out.push(TrashedUserSummary {
+                user_id: row.user.user_id,
+                email: row.user.email,
+                username: row.user.username,
+                display_name: row.user.display_name,
+                notebook_count,
+                created_at_ms: row.user.created_at_ms,
+                deleted_at_ms: row.deleted_at_ms,
+                expires_at_ms: row.expires_at_ms,
+            });
+        }
+        out.sort_by(|a, b| {
+            b.deleted_at_ms
+                .cmp(&a.deleted_at_ms)
+                .then_with(|| a.user_id.cmp(&b.user_id))
+        });
         Ok(out)
     }
 
@@ -1295,20 +1512,34 @@ impl ServerDb {
         Ok(outcome)
     }
 
-    /// Permanently deletes a user account and all of its notebooks, folders, preferences, and tokens.
-    pub fn delete_user(&self, user_id_or_identifier: &str) -> Result<DeletedUserSummary, DbError> {
-        let user_id = {
+    /// Permanently purges any trashed user accounts whose 30-day retention period has expired.
+    pub fn cleanup_expired_trashed_users(&self) -> Result<usize, DbError> {
+        self.cleanup_expired_trashed_users_at(now_unix_ms())
+    }
+
+    /// Permanently purges trashed user accounts expired as of `now_ms`.
+    pub fn cleanup_expired_trashed_users_at(&self, now_ms: i64) -> Result<usize, DbError> {
+        let has_expired = {
             let rx = self.db.begin_read().map_err(map_tx_err)?;
-            lookup_user_id_by_id_or_identifier(&rx, user_id_or_identifier)?
-                .ok_or_else(|| DbError::UserNotFound(user_id_or_identifier.trim().to_string()))?
+            let trashed = rx.open_table(TRASHED_USERS_TABLE).map_err(map_table_err)?;
+            let mut found = false;
+            for item in trashed.iter().map_err(map_storage_err)? {
+                let (_, v) = item.map_err(map_storage_err)?;
+                let row: TrashedUserRow = from_json(v.value())?;
+                if is_trashed_user_expired(&row, now_ms) {
+                    found = true;
+                    break;
+                }
+            }
+            found
         };
-        let prefix = user_notebook_prefix(&user_id);
+        if !has_expired {
+            return Ok(0);
+        }
 
         let tx = self.db.begin_write().map_err(map_tx_err)?;
-        let summary = {
-            let mut users = tx.open_table(USERS_TABLE).map_err(map_table_err)?;
-            let mut by_name = tx.open_table(USERS_BY_NAME_TABLE).map_err(map_table_err)?;
-            let mut by_email = tx.open_table(USERS_BY_EMAIL_TABLE).map_err(map_table_err)?;
+        let purged_count = {
+            let mut trashed = tx.open_table(TRASHED_USERS_TABLE).map_err(map_table_err)?;
             let mut access = tx.open_table(ACCESS_TOKENS_TABLE).map_err(map_table_err)?;
             let mut refresh = tx.open_table(REFRESH_TOKENS_TABLE).map_err(map_table_err)?;
             let mut notebooks = tx.open_table(NOTEBOOKS_TABLE).map_err(map_table_err)?;
@@ -1316,6 +1547,58 @@ impl ServerDb {
             let mut folders = tx.open_table(FOLDERS_TABLE).map_err(map_table_err)?;
             let mut prefs = tx.open_table(USER_PREFS_TABLE).map_err(map_table_err)?;
             let mut cursors = tx.open_table(USER_CURSORS_TABLE).map_err(map_table_err)?;
+
+            let mut expired_ids = Vec::new();
+            for item in trashed.iter().map_err(map_storage_err)? {
+                let (k, v) = item.map_err(map_storage_err)?;
+                let row: TrashedUserRow = from_json(v.value())?;
+                if is_trashed_user_expired(&row, now_ms) {
+                    expired_ids.push(k.value().to_string());
+                }
+            }
+            let count = expired_ids.len();
+            for uid in expired_ids {
+                let _ = trashed.remove(uid.as_str()).map_err(map_storage_err)?;
+                let _ = purge_user_data_in_tx(
+                    &uid,
+                    &mut access,
+                    &mut refresh,
+                    &mut notebooks,
+                    &mut blobs,
+                    &mut folders,
+                    &mut prefs,
+                    &mut cursors,
+                )?;
+            }
+            count
+        };
+        tx.commit().map_err(map_commit_err)?;
+        Ok(purged_count)
+    }
+
+    /// Moves an active user account into the 30-day server Trash, revoking sessions while keeping synced data recoverable.
+    pub fn trash_user(
+        &self,
+        user_id_or_identifier: &str,
+    ) -> Result<TrashedUserActionSummary, DbError> {
+        let now = now_unix_ms();
+        self.cleanup_expired_trashed_users_at(now)?;
+        let user_id = {
+            let rx = self.db.begin_read().map_err(map_tx_err)?;
+            lookup_user_id_by_id_or_identifier(&rx, user_id_or_identifier)?
+                .ok_or_else(|| DbError::UserNotFound(user_id_or_identifier.trim().to_string()))?
+        };
+        let expires_at_ms = now.saturating_add(ACCOUNT_TRASH_RETENTION_MS);
+
+        let tx = self.db.begin_write().map_err(map_tx_err)?;
+        let summary = {
+            let mut users = tx.open_table(USERS_TABLE).map_err(map_table_err)?;
+            let mut by_name = tx.open_table(USERS_BY_NAME_TABLE).map_err(map_table_err)?;
+            let mut by_email = tx.open_table(USERS_BY_EMAIL_TABLE).map_err(map_table_err)?;
+            let mut trashed = tx.open_table(TRASHED_USERS_TABLE).map_err(map_table_err)?;
+            let mut access = tx.open_table(ACCESS_TOKENS_TABLE).map_err(map_table_err)?;
+            let mut refresh = tx.open_table(REFRESH_TOKENS_TABLE).map_err(map_table_err)?;
+            let notebooks = tx.open_table(NOTEBOOKS_TABLE).map_err(map_table_err)?;
 
             let removed_user = users.remove(user_id.as_str()).map_err(map_storage_err)?;
             let Some(user_guard) = removed_user else {
@@ -1336,47 +1619,199 @@ impl ServerDb {
             }
 
             revoke_all_user_tokens(&mut access, &mut refresh, &user_id)?;
+            let notebook_count = count_user_active_notebooks(&notebooks, &user_id)?;
 
-            let mut notebook_keys = Vec::new();
-            let mut deleted_notebooks = 0usize;
-            for item in notebooks.iter().map_err(map_storage_err)? {
+            let trashed_row = TrashedUserRow {
+                user: user_row.clone(),
+                deleted_at_ms: now,
+                expires_at_ms,
+            };
+            let encoded = to_json(&trashed_row)?;
+            trashed
+                .insert(user_id.as_str(), encoded.as_str())
+                .map_err(map_storage_err)?;
+
+            TrashedUserActionSummary {
+                user_id: user_row.user_id,
+                username: user_row.username,
+                email: user_row.email,
+                display_name: user_row.display_name,
+                notebook_count,
+                deleted_at_ms: now,
+                expires_at_ms,
+            }
+        };
+        tx.commit().map_err(map_commit_err)?;
+        Ok(summary)
+    }
+
+    /// Restores a non-expired user account from the 30-day server Trash back to active status.
+    pub fn restore_trashed_user(
+        &self,
+        user_id_or_identifier: &str,
+    ) -> Result<RestoredUserSummary, DbError> {
+        let now = now_unix_ms();
+        let matched_expired = {
+            let rx = self.db.begin_read().map_err(map_tx_err)?;
+            lookup_trashed_user_by_id_or_identifier(&rx, user_id_or_identifier)?
+                .is_some_and(|row| is_trashed_user_expired(&row, now))
+        };
+        self.cleanup_expired_trashed_users_at(now)?;
+        if matched_expired {
+            return Err(DbError::TrashedUserExpired(
+                user_id_or_identifier.trim().to_string(),
+            ));
+        }
+
+        let tx = self.db.begin_write().map_err(map_tx_err)?;
+        let summary = {
+            let mut trashed = tx.open_table(TRASHED_USERS_TABLE).map_err(map_table_err)?;
+            let mut users = tx.open_table(USERS_TABLE).map_err(map_table_err)?;
+            let mut by_name = tx.open_table(USERS_BY_NAME_TABLE).map_err(map_table_err)?;
+            let mut by_email = tx.open_table(USERS_BY_EMAIL_TABLE).map_err(map_table_err)?;
+            let notebooks = tx.open_table(NOTEBOOKS_TABLE).map_err(map_table_err)?;
+
+            let mut target_key: Option<String> = None;
+            for item in trashed.iter().map_err(map_storage_err)? {
                 let (k, v) = item.map_err(map_storage_err)?;
-                if k.value().starts_with(&prefix) {
-                    notebook_keys.push(k.value().to_string());
-                    let row: StoredNotebookRow = from_json(v.value())?;
-                    if !row.deleted {
-                        deleted_notebooks = deleted_notebooks.saturating_add(1);
-                    }
+                let row: TrashedUserRow = from_json(v.value())?;
+                if trashed_row_matches_id_or_identifier(&row, user_id_or_identifier) {
+                    target_key = Some(k.value().to_string());
+                    break;
                 }
             }
-            for k in notebook_keys {
-                let _ = notebooks.remove(k.as_str()).map_err(map_storage_err)?;
+            let Some(key) = target_key else {
+                return Err(DbError::UserNotFound(
+                    user_id_or_identifier.trim().to_string(),
+                ));
+            };
+            let Some(trashed_guard) = trashed.get(key.as_str()).map_err(map_storage_err)? else {
+                return Err(DbError::UserNotFound(
+                    user_id_or_identifier.trim().to_string(),
+                ));
+            };
+            let mut trashed_row: TrashedUserRow = from_json(trashed_guard.value())?;
+            drop(trashed_guard);
+
+            if by_name
+                .get(trashed_row.user.username_lower.as_str())
+                .map_err(map_storage_err)?
+                .is_some()
+            {
+                return Err(DbError::UsernameTaken(trashed_row.user.username));
+            }
+            if let Some(ref email_lower) = trashed_row.user.email_lower
+                && by_email
+                    .get(email_lower.as_str())
+                    .map_err(map_storage_err)?
+                    .is_some()
+            {
+                return Err(DbError::EmailTaken(
+                    trashed_row.user.email.clone().unwrap_or_default(),
+                ));
             }
 
-            let mut blob_keys = Vec::new();
-            for item in blobs.iter().map_err(map_storage_err)? {
-                let (k, _) = item.map_err(map_storage_err)?;
-                if k.value().starts_with(&prefix) {
-                    blob_keys.push(k.value().to_string());
+            let _ = trashed.remove(key.as_str()).map_err(map_storage_err)?;
+            trashed_row.user.updated_at_ms = now;
+            let user_row = trashed_row.user;
+            let encoded = to_json(&user_row)?;
+            users
+                .insert(user_row.user_id.as_str(), encoded.as_str())
+                .map_err(map_storage_err)?;
+            by_name
+                .insert(user_row.username_lower.as_str(), user_row.user_id.as_str())
+                .map_err(map_storage_err)?;
+            if let Some(ref email_lower) = user_row.email_lower {
+                by_email
+                    .insert(email_lower.as_str(), user_row.user_id.as_str())
+                    .map_err(map_storage_err)?;
+            }
+
+            let restored_notebooks = count_user_active_notebooks(&notebooks, &user_row.user_id)?;
+            RestoredUserSummary {
+                user_id: user_row.user_id,
+                username: user_row.username,
+                email: user_row.email,
+                display_name: user_row.display_name,
+                restored_notebooks,
+            }
+        };
+        tx.commit().map_err(map_commit_err)?;
+        Ok(summary)
+    }
+
+    /// Permanently deletes a user account (active or trashed) and all of its notebooks, folders, preferences, and tokens.
+    pub fn delete_user_permanently(
+        &self,
+        user_id_or_identifier: &str,
+    ) -> Result<DeletedUserSummary, DbError> {
+        let now = now_unix_ms();
+        let _ = self.cleanup_expired_trashed_users_at(now);
+        let user_id = {
+            let rx = self.db.begin_read().map_err(map_tx_err)?;
+            if let Some(id) = lookup_user_id_by_id_or_identifier(&rx, user_id_or_identifier)? {
+                id
+            } else if let Some(trashed) =
+                lookup_trashed_user_by_id_or_identifier(&rx, user_id_or_identifier)?
+            {
+                trashed.user.user_id
+            } else {
+                return Err(DbError::UserNotFound(
+                    user_id_or_identifier.trim().to_string(),
+                ));
+            }
+        };
+
+        let tx = self.db.begin_write().map_err(map_tx_err)?;
+        let summary = {
+            let mut users = tx.open_table(USERS_TABLE).map_err(map_table_err)?;
+            let mut by_name = tx.open_table(USERS_BY_NAME_TABLE).map_err(map_table_err)?;
+            let mut by_email = tx.open_table(USERS_BY_EMAIL_TABLE).map_err(map_table_err)?;
+            let mut trashed = tx.open_table(TRASHED_USERS_TABLE).map_err(map_table_err)?;
+            let mut access = tx.open_table(ACCESS_TOKENS_TABLE).map_err(map_table_err)?;
+            let mut refresh = tx.open_table(REFRESH_TOKENS_TABLE).map_err(map_table_err)?;
+            let mut notebooks = tx.open_table(NOTEBOOKS_TABLE).map_err(map_table_err)?;
+            let mut blobs = tx.open_table(NOTEBOOK_BLOBS_TABLE).map_err(map_table_err)?;
+            let mut folders = tx.open_table(FOLDERS_TABLE).map_err(map_table_err)?;
+            let mut prefs = tx.open_table(USER_PREFS_TABLE).map_err(map_table_err)?;
+            let mut cursors = tx.open_table(USER_CURSORS_TABLE).map_err(map_table_err)?;
+
+            let user_row: UserRow = if let Some(user_guard) =
+                users.remove(user_id.as_str()).map_err(map_storage_err)?
+            {
+                let row: UserRow = from_json(user_guard.value())?;
+                drop(user_guard);
+                let _ = by_name
+                    .remove(row.username_lower.as_str())
+                    .map_err(map_storage_err)?;
+                if let Some(ref email_lower) = row.email_lower {
+                    let _ = by_email
+                        .remove(email_lower.as_str())
+                        .map_err(map_storage_err)?;
                 }
-            }
-            for k in blob_keys {
-                let _ = blobs.remove(k.as_str()).map_err(map_storage_err)?;
-            }
+                row
+            } else if let Some(trashed_guard) =
+                trashed.remove(user_id.as_str()).map_err(map_storage_err)?
+            {
+                let row: TrashedUserRow = from_json(trashed_guard.value())?;
+                drop(trashed_guard);
+                row.user
+            } else {
+                return Err(DbError::UserNotFound(
+                    user_id_or_identifier.trim().to_string(),
+                ));
+            };
 
-            let mut folder_keys = Vec::new();
-            for item in folders.iter().map_err(map_storage_err)? {
-                let (k, _) = item.map_err(map_storage_err)?;
-                if k.value().starts_with(&prefix) {
-                    folder_keys.push(k.value().to_string());
-                }
-            }
-            for k in folder_keys {
-                let _ = folders.remove(k.as_str()).map_err(map_storage_err)?;
-            }
-
-            let _ = prefs.remove(user_id.as_str()).map_err(map_storage_err)?;
-            let _ = cursors.remove(user_id.as_str()).map_err(map_storage_err)?;
+            let deleted_notebooks = purge_user_data_in_tx(
+                &user_id,
+                &mut access,
+                &mut refresh,
+                &mut notebooks,
+                &mut blobs,
+                &mut folders,
+                &mut prefs,
+                &mut cursors,
+            )?;
 
             DeletedUserSummary {
                 user_id: user_row.user_id,
@@ -1717,19 +2152,24 @@ fn stored_row_to_remote(
 
 fn allocate_unique_username(
     by_name: &redb::Table<&str, &str>,
+    trashed_usernames: &HashSet<String>,
     base_username: &str,
     user_id: &str,
     strict_unique: bool,
 ) -> Result<(String, String), DbError> {
     let base_lower = base_username.to_ascii_lowercase();
-    if by_name
+    let active_taken = by_name
         .get(base_lower.as_str())
         .map_err(map_storage_err)?
-        .is_none()
-    {
+        .is_some();
+    let trashed_taken = trashed_usernames.contains(base_lower.as_str());
+    if !active_taken && !trashed_taken {
         return Ok((base_username.to_string(), base_lower));
     }
     if strict_unique {
+        if trashed_taken && !active_taken {
+            return Err(DbError::UsernameInTrash(base_username.to_string()));
+        }
         return Err(DbError::UsernameTaken(base_username.to_string()));
     }
     let short: String = user_id
@@ -1745,6 +2185,7 @@ fn allocate_unique_username(
             .get(cand_lower.as_str())
             .map_err(map_storage_err)?
             .is_none()
+            && !trashed_usernames.contains(cand_lower.as_str())
         {
             return Ok((cand, cand_lower));
         }
@@ -1753,6 +2194,173 @@ fn allocate_unique_username(
     let cand = format!("{stem}_{short}");
     let cand_lower = cand.to_ascii_lowercase();
     Ok((cand, cand_lower))
+}
+
+fn password_matches_user(user: &UserRow, password: &str) -> bool {
+    if verify_password(password, &user.password_hash).is_ok() {
+        return true;
+    }
+    if user.must_change_password {
+        let trimmed = password.trim();
+        return !trimmed.is_empty()
+            && trimmed != password
+            && verify_password(trimmed, &user.password_hash).is_ok();
+    }
+    false
+}
+
+fn count_active_notebooks_by_user(
+    notebooks: &impl ReadableTable<&'static str, &'static str>,
+) -> Result<std::collections::HashMap<String, usize>, DbError> {
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for entry in notebooks.iter().map_err(map_storage_err)? {
+        let (_, v) = entry.map_err(map_storage_err)?;
+        let row: StoredNotebookRow = from_json(v.value())?;
+        if !row.deleted {
+            *counts.entry(row.user_id).or_insert(0) += 1;
+        }
+    }
+    Ok(counts)
+}
+
+fn count_user_active_notebooks(
+    notebooks: &impl ReadableTable<&'static str, &'static str>,
+    user_id: &str,
+) -> Result<usize, DbError> {
+    let prefix = user_notebook_prefix(user_id);
+    let mut count = 0usize;
+    for entry in notebooks.iter().map_err(map_storage_err)? {
+        let (k, v) = entry.map_err(map_storage_err)?;
+        if !k.value().starts_with(&prefix) {
+            continue;
+        }
+        let row: StoredNotebookRow = from_json(v.value())?;
+        if !row.deleted {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn purge_user_data_in_tx(
+    user_id: &str,
+    access: &mut redb::Table<&str, &str>,
+    refresh: &mut redb::Table<&str, &str>,
+    notebooks: &mut redb::Table<&str, &str>,
+    blobs: &mut redb::Table<&str, &[u8]>,
+    folders: &mut redb::Table<&str, &str>,
+    prefs: &mut redb::Table<&str, &str>,
+    cursors: &mut redb::Table<&str, u64>,
+) -> Result<usize, DbError> {
+    let prefix = user_notebook_prefix(user_id);
+    revoke_all_user_tokens(access, refresh, user_id)?;
+
+    let mut notebook_keys = Vec::new();
+    let mut deleted_notebooks = 0usize;
+    for item in notebooks.iter().map_err(map_storage_err)? {
+        let (k, v) = item.map_err(map_storage_err)?;
+        if k.value().starts_with(&prefix) {
+            notebook_keys.push(k.value().to_string());
+            if from_json::<StoredNotebookRow>(v.value())
+                .ok()
+                .is_some_and(|row| !row.deleted)
+            {
+                deleted_notebooks = deleted_notebooks.saturating_add(1);
+            }
+        }
+    }
+    for k in notebook_keys {
+        let _ = notebooks.remove(k.as_str()).map_err(map_storage_err)?;
+    }
+
+    let mut blob_keys = Vec::new();
+    for item in blobs.iter().map_err(map_storage_err)? {
+        let (k, _) = item.map_err(map_storage_err)?;
+        if k.value().starts_with(&prefix) {
+            blob_keys.push(k.value().to_string());
+        }
+    }
+    for k in blob_keys {
+        let _ = blobs.remove(k.as_str()).map_err(map_storage_err)?;
+    }
+
+    let mut folder_keys = Vec::new();
+    for item in folders.iter().map_err(map_storage_err)? {
+        let (k, _) = item.map_err(map_storage_err)?;
+        if k.value().starts_with(&prefix) {
+            folder_keys.push(k.value().to_string());
+        }
+    }
+    for k in folder_keys {
+        let _ = folders.remove(k.as_str()).map_err(map_storage_err)?;
+    }
+
+    let _ = prefs.remove(user_id).map_err(map_storage_err)?;
+    let _ = cursors.remove(user_id).map_err(map_storage_err)?;
+    Ok(deleted_notebooks)
+}
+
+fn trashed_row_matches_identifier(row: &TrashedUserRow, identifier_raw: &str) -> bool {
+    let trimmed = identifier_raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains('@') {
+        let Ok((_, email_lower)) = normalize_email(trimmed) else {
+            return false;
+        };
+        return row.user.email_lower.as_deref() == Some(email_lower.as_str());
+    }
+    let Ok((_, username_lower)) = normalize_username(trimmed) else {
+        return false;
+    };
+    row.user.username_lower == username_lower
+}
+
+fn trashed_row_matches_id_or_identifier(row: &TrashedUserRow, raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    row.user.user_id == trimmed || trashed_row_matches_identifier(row, trimmed)
+}
+
+fn lookup_trashed_user_by_identifier(
+    rx: &redb::ReadTransaction,
+    identifier_raw: &str,
+) -> Result<Option<TrashedUserRow>, DbError> {
+    let trashed = rx.open_table(TRASHED_USERS_TABLE).map_err(map_table_err)?;
+    for item in trashed.iter().map_err(map_storage_err)? {
+        let (_, v) = item.map_err(map_storage_err)?;
+        let row: TrashedUserRow = from_json(v.value())?;
+        if trashed_row_matches_identifier(&row, identifier_raw) {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
+fn lookup_trashed_user_by_id_or_identifier(
+    rx: &redb::ReadTransaction,
+    raw: &str,
+) -> Result<Option<TrashedUserRow>, DbError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let trashed = rx.open_table(TRASHED_USERS_TABLE).map_err(map_table_err)?;
+    if let Some(guard) = trashed.get(trimmed).map_err(map_storage_err)? {
+        return Ok(Some(from_json(guard.value())?));
+    }
+    for item in trashed.iter().map_err(map_storage_err)? {
+        let (_, v) = item.map_err(map_storage_err)?;
+        let row: TrashedUserRow = from_json(v.value())?;
+        if trashed_row_matches_id_or_identifier(&row, trimmed) {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
 }
 
 fn lookup_user_id_by_id_or_identifier(

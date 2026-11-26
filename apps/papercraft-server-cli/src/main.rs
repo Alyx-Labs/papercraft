@@ -78,6 +78,9 @@ enum Commands {
         /// Server data directory path.
         #[arg(long, env = "PAPERCRAFT_DATA_DIR", default_value = DEFAULT_DATA_DIR)]
         data_dir: PathBuf,
+        /// Show accounts currently held in the 30-day server Trash instead of active accounts.
+        #[arg(long, default_value_t = false)]
+        trash: bool,
     },
     /// Reset a user's password (random one-time recovery code if --password is omitted).
     ResetPassword {
@@ -94,7 +97,7 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         temporary: bool,
     },
-    /// Permanently delete a user account and all of its synced notebooks.
+    /// Move a user account to the 30-day server Trash (or permanently delete with --permanent).
     DeleteUser {
         /// Server data directory path.
         #[arg(long, env = "PAPERCRAFT_DATA_DIR", default_value = DEFAULT_DATA_DIR)]
@@ -102,6 +105,24 @@ enum Commands {
         /// Target account username, email, or user ID.
         #[arg(long)]
         user: String,
+        /// Permanently delete immediately instead of keeping in 30-day Trash.
+        #[arg(long, default_value_t = false)]
+        permanent: bool,
+    },
+    /// Restore a user account from the 30-day server Trash back to active status.
+    RestoreUser {
+        /// Server data directory path.
+        #[arg(long, env = "PAPERCRAFT_DATA_DIR", default_value = DEFAULT_DATA_DIR)]
+        data_dir: PathBuf,
+        /// Target account username, email, or user ID.
+        #[arg(long)]
+        user: String,
+    },
+    /// Permanently remove expired accounts from the 30-day server Trash.
+    CleanupTrash {
+        /// Server data directory path.
+        #[arg(long, env = "PAPERCRAFT_DATA_DIR", default_value = DEFAULT_DATA_DIR)]
+        data_dir: PathBuf,
     },
 }
 
@@ -141,6 +162,25 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
     rt.block_on(async move {
         let discovery = Arc::new(LocalDiscoveryRegistry::for_config(&config));
         let local_counts = discovery.summary();
+        let cleanup_db = db.clone();
+        let cleanup_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(3600));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let db_ref = cleanup_db.clone();
+                if let Ok(Ok(purged)) =
+                    tokio::task::spawn_blocking(move || db_ref.cleanup_expired_trashed_users())
+                        .await
+                    && purged > 0
+                {
+                    log::info!(
+                        "Automatically purged {purged} expired account(s) from server Trash."
+                    );
+                }
+            }
+        });
+
         let state = AppState {
             db,
             config: Arc::new(config.clone()),
@@ -166,8 +206,8 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
             }
         );
         println!(
-            "  Stored Data  : {} users, {} active notebooks",
-            stats.user_count, stats.active_notebook_count
+            "  Stored Data  : {} users ({} in trash), {} active notebooks",
+            stats.user_count, stats.trashed_user_count, stats.active_notebook_count
         );
         println!(
             "  Local Discovery (counts only): {} unsynced local accounts, {} notebooks in local accounts",
@@ -176,13 +216,17 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
         println!("Press Ctrl+C to stop gracefully.");
 
         let router = build_router(state);
-        axum::serve(
+        let serve_res = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .map_err(|e| format!("server stopped with error: {e}"))
+        .map_err(|e| format!("server stopped with error: {e}"));
+
+        cleanup_task.abort();
+        let _ = cleanup_task.await;
+        serve_res
     })
 }
 
@@ -207,6 +251,7 @@ fn run_status(data_dir: PathBuf) -> Result<(), String> {
     );
     println!("  Server ID         : {}", meta.server_id);
     println!("  Users             : {}", stats.user_count);
+    println!("  Trashed Accounts  : {}", stats.trashed_user_count);
     println!("  Active Notebooks  : {}", stats.active_notebook_count);
     println!("  Deleted Tombstones: {}", stats.deleted_tombstone_count);
     println!("  Active Sessions   : {}", stats.active_session_count);
@@ -221,10 +266,36 @@ fn run_status(data_dir: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn run_users(data_dir: PathBuf) -> Result<(), String> {
+fn run_users(data_dir: PathBuf, trash: bool) -> Result<(), String> {
     let _ = ensure_data_dir_and_meta(&data_dir)?;
     let db_path = crate::config::resolve_db_path(&data_dir);
     let db = ServerDb::open(&db_path).map_err(|e| e.to_string())?;
+    if trash {
+        let trashed = db.list_trashed_users().map_err(|e| e.to_string())?;
+        if trashed.is_empty() {
+            println!("No trashed accounts in `{}`.", data_dir.display());
+            return Ok(());
+        }
+        let now_ms = papercraft_sync_protocol::now_unix_ms();
+        let day_ms = 24 * 60 * 60 * 1000_i64;
+        println!(
+            "{:<38} {:<28} {:<20} {:<10} DAYS LEFT",
+            "USER ID", "ACCOUNT", "DISPLAY NAME", "NOTEBOOKS"
+        );
+        for u in trashed {
+            let days_left = (u.expires_at_ms.saturating_sub(now_ms).max(0) + day_ms - 1) / day_ms;
+            println!(
+                "{:<38} {:<28} {:<20} {:<10} {}",
+                u.user_id,
+                u.account_label(),
+                u.display_name,
+                u.notebook_count,
+                days_left
+            );
+        }
+        return Ok(());
+    }
+
     let users = db.list_users().map_err(|e| e.to_string())?;
     if users.is_empty() {
         println!("No registered accounts in `{}`.", data_dir.display());
@@ -282,17 +353,55 @@ fn run_reset_password(
     Ok(())
 }
 
-fn run_delete_user(data_dir: PathBuf, user: String) -> Result<(), String> {
+fn run_delete_user(data_dir: PathBuf, user: String, permanent: bool) -> Result<(), String> {
     let _ = ensure_data_dir_and_meta(&data_dir)?;
     let db_path = crate::config::resolve_db_path(&data_dir);
     let db = ServerDb::open(&db_path).map_err(|e| e.to_string())?;
-    let deleted = db.delete_user(&user).map_err(|e| e.to_string())?;
+    if permanent {
+        let deleted = db
+            .delete_user_permanently(&user)
+            .map_err(|e| e.to_string())?;
+        println!(
+            "Permanently deleted user `{}` (id={}, {} synced notebook(s) removed).",
+            deleted.account_label(),
+            deleted.user_id,
+            deleted.deleted_notebooks
+        );
+    } else {
+        let trashed = db.trash_user(&user).map_err(|e| e.to_string())?;
+        println!(
+            "Moved user `{}` (id={}, {} synced notebook(s)) to server Trash for {} days.",
+            trashed.account_label(),
+            trashed.user_id,
+            trashed.notebook_count,
+            db::ACCOUNT_TRASH_RETENTION_DAYS
+        );
+    }
+    Ok(())
+}
+
+fn run_restore_user(data_dir: PathBuf, user: String) -> Result<(), String> {
+    let _ = ensure_data_dir_and_meta(&data_dir)?;
+    let db_path = crate::config::resolve_db_path(&data_dir);
+    let db = ServerDb::open(&db_path).map_err(|e| e.to_string())?;
+    let restored = db.restore_trashed_user(&user).map_err(|e| e.to_string())?;
     println!(
-        "Deleted user `{}` (id={}, {} synced notebook(s) removed).",
-        deleted.account_label(),
-        deleted.user_id,
-        deleted.deleted_notebooks
+        "Restored user `{}` (id={}, {} synced notebook(s) kept).",
+        restored.account_label(),
+        restored.user_id,
+        restored.restored_notebooks
     );
+    Ok(())
+}
+
+fn run_cleanup_trash(data_dir: PathBuf) -> Result<(), String> {
+    let _ = ensure_data_dir_and_meta(&data_dir)?;
+    let db_path = crate::config::resolve_db_path(&data_dir);
+    let db = ServerDb::open(&db_path).map_err(|e| e.to_string())?;
+    let purged = db
+        .cleanup_expired_trashed_users()
+        .map_err(|e| e.to_string())?;
+    println!("Permanently removed {purged} expired account(s) from server Trash.");
     Ok(())
 }
 
@@ -303,14 +412,20 @@ fn main() -> ExitCode {
         None => run_serve(cli.serve),
         Some(Commands::Serve(args)) => run_serve(args),
         Some(Commands::Status { data_dir }) => run_status(data_dir),
-        Some(Commands::Users { data_dir }) => run_users(data_dir),
+        Some(Commands::Users { data_dir, trash }) => run_users(data_dir, trash),
         Some(Commands::ResetPassword {
             data_dir,
             username,
             password,
             temporary,
         }) => run_reset_password(data_dir, username, password, temporary),
-        Some(Commands::DeleteUser { data_dir, user }) => run_delete_user(data_dir, user),
+        Some(Commands::DeleteUser {
+            data_dir,
+            user,
+            permanent,
+        }) => run_delete_user(data_dir, user, permanent),
+        Some(Commands::RestoreUser { data_dir, user }) => run_restore_user(data_dir, user),
+        Some(Commands::CleanupTrash { data_dir }) => run_cleanup_trash(data_dir),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -1586,16 +1701,14 @@ mod tests {
         assert_eq!(final_login.status().as_u16(), 200);
         drop(srv2);
 
-        // 5. Delete user removes user, notebooks, and indices so username/email are free again.
+        // 5. Permanent deletion cleans user, notebooks, and indices immediately, freeing the identifiers.
         let db2 = ServerDb::open(&dir.0.join("notecraft.redb")).unwrap();
-        let del_summary = db2.delete_user(&reg.user.user_id).unwrap();
+        let del_summary = db2.delete_user_permanently(&reg.user.user_id).unwrap();
+        assert_eq!(del_summary.user_id, reg.user.user_id);
         assert_eq!(del_summary.deleted_notebooks, 1);
         assert_eq!(db2.stats().unwrap().user_count, 0);
         assert_eq!(db2.stats().unwrap().active_notebook_count, 0);
-        let ttls = TokenTtls {
-            access_ttl_ms: 3_600_000,
-            refresh_ttl_ms: 86_400_000,
-        };
+
         let re_reg = db2
             .register_user_with_email(
                 Some("nina@example.com"),
@@ -1604,7 +1717,222 @@ mod tests {
                 Some("Nina Again"),
                 Some("Desk"),
                 true,
-                ttls,
+                TokenTtls {
+                    access_ttl_ms: 3_600_000,
+                    refresh_ttl_ms: 86_400_000,
+                },
+            )
+            .unwrap();
+        assert_ne!(re_reg.user.user_id, reg.user.user_id);
+    }
+
+    fn test_http_agent() -> ureq::Agent {
+        ureq::Agent::new_with_config(
+            ureq::config::Config::builder()
+                .http_status_as_error(false)
+                .build(),
+        )
+    }
+
+    fn register_and_push_single_notebook(
+        base_url: &str,
+        agent: &ureq::Agent,
+        email: &str,
+        username: &str,
+        notebook_id: &str,
+    ) -> papercraft_sync_protocol::AuthResponse {
+        use papercraft_sync_protocol::{AuthResponse, RegisterRequest};
+
+        let mut reg_resp = agent
+            .post(&format!("{base_url}/api/v1/auth/register"))
+            .send_json(RegisterRequest {
+                email: Some(email.to_string()),
+                username: username.to_string(),
+                password: "strong-password-1".to_string(),
+                display_name: Some("Nina".to_string()),
+                device_name: Some("Desk".to_string()),
+            })
+            .unwrap();
+        assert_eq!(reg_resp.status().as_u16(), 201);
+        let reg: AuthResponse = reg_resp.body_mut().read_json().unwrap();
+        let doc = Document {
+            id: notebook_id.to_string(),
+            title: "Trash Test Notes".to_string(),
+            ..Default::default()
+        };
+        let push_resp = agent
+            .post(&format!("{base_url}/api/v1/sync/push"))
+            .header("Authorization", &format!("Bearer {}", reg.access_token))
+            .send_json(SyncPushRequest {
+                client_cursor: 0,
+                device_name: "Desk".to_string(),
+                changes: vec![LocalNotebookChange {
+                    notebook_id: notebook_id.to_string(),
+                    base_version: 0,
+                    deleted: false,
+                    updated_at_ms: now_unix_ms(),
+                    deleted_at_ms: None,
+                    content_hash: canonical_document_hash(&doc),
+                    body_hash: canonical_document_body_hash(&doc),
+                    meta_hash: canonical_document_meta_hash(&doc),
+                    meta_updated_at_ms: now_unix_ms(),
+                    document: Some(doc),
+                }],
+                folders: Vec::new(),
+                studio_prefs: None,
+                force_overwrite: false,
+            })
+            .unwrap();
+        assert_eq!(push_resp.status().as_u16(), 200);
+        reg
+    }
+
+    #[test]
+    fn http_e2e_server_account_trash_and_restore() {
+        use papercraft_sync_protocol::{ApiErrorBody, LoginRequest, RegisterRequest};
+
+        let dir = temp_dir("trash_and_restore");
+        let agent = test_http_agent();
+        let srv1 = spawn_server_on(&dir.0);
+        let reg = register_and_push_single_notebook(
+            &srv1.base_url,
+            &agent,
+            "trash_nina@example.com",
+            "trash_nina",
+            "nb-trash-1",
+        );
+        drop(srv1);
+
+        // Moving user to Trash hides them from active lists while keeping notebooks recoverable.
+        let db1 = ServerDb::open(&dir.0.join("notecraft.redb")).unwrap();
+        let trash_summary = db1.trash_user(&reg.user.user_id).unwrap();
+        assert_eq!(trash_summary.notebook_count, 1);
+        assert_eq!(db1.stats().unwrap().user_count, 0);
+        assert_eq!(db1.stats().unwrap().trashed_user_count, 1);
+        assert_eq!(db1.stats().unwrap().active_notebook_count, 0);
+        assert!(db1.list_users().unwrap().is_empty());
+        assert_eq!(db1.list_trashed_users().unwrap().len(), 1);
+        drop(db1);
+
+        // Trashed account cannot sign in and reserves its email/username until purged.
+        let srv2 = spawn_server_on(&dir.0);
+        let mut trashed_login = agent
+            .post(&format!("{}/api/v1/auth/login", srv2.base_url))
+            .send_json(LoginRequest {
+                email: None,
+                username: "trash_nina".to_string(),
+                password: "strong-password-1".to_string(),
+                device_name: Some("Laptop".to_string()),
+            })
+            .unwrap();
+        assert_eq!(trashed_login.status().as_u16(), 403);
+        let trashed_body: ApiErrorBody = trashed_login.body_mut().read_json().unwrap();
+        assert_eq!(
+            trashed_body.code,
+            papercraft_sync_protocol::ERR_CODE_ACCOUNT_IN_TRASH
+        );
+
+        let mut conflict_reg = agent
+            .post(&format!("{}/api/v1/auth/register", srv2.base_url))
+            .send_json(RegisterRequest {
+                email: Some("trash_nina@example.com".to_string()),
+                username: "other_name".to_string(),
+                password: "brand-new-password-1".to_string(),
+                display_name: None,
+                device_name: None,
+            })
+            .unwrap();
+        assert_eq!(conflict_reg.status().as_u16(), 409);
+        let conflict_body: ApiErrorBody = conflict_reg.body_mut().read_json().unwrap();
+        assert_eq!(
+            conflict_body.code,
+            papercraft_sync_protocol::ERR_CODE_EMAIL_IN_TRASH
+        );
+        drop(srv2);
+
+        // Restoring from Trash brings back login access and synced notebooks cleanly.
+        let db2 = ServerDb::open(&dir.0.join("notecraft.redb")).unwrap();
+        let restored = db2.restore_trashed_user(&reg.user.user_id).unwrap();
+        assert_eq!(restored.restored_notebooks, 1);
+        assert_eq!(db2.stats().unwrap().user_count, 1);
+        assert_eq!(db2.stats().unwrap().trashed_user_count, 0);
+        assert_eq!(db2.stats().unwrap().active_notebook_count, 1);
+        assert!(db2.list_trashed_users().unwrap().is_empty());
+        drop(db2);
+
+        let srv3 = spawn_server_on(&dir.0);
+        let mut restored_login = agent
+            .post(&format!("{}/api/v1/auth/login", srv3.base_url))
+            .send_json(LoginRequest {
+                email: None,
+                username: "trash_nina".to_string(),
+                password: "strong-password-1".to_string(),
+                device_name: Some("Laptop".to_string()),
+            })
+            .unwrap();
+        assert_eq!(restored_login.status().as_u16(), 200);
+        let restored_auth: papercraft_sync_protocol::AuthResponse =
+            restored_login.body_mut().read_json().unwrap();
+        let mut pull_after_restore = agent
+            .get(&format!("{}/api/v1/sync/pull?since=0", srv3.base_url))
+            .header(
+                "Authorization",
+                &format!("Bearer {}", restored_auth.access_token),
+            )
+            .call()
+            .unwrap();
+        assert_eq!(pull_after_restore.status().as_u16(), 200);
+        let pulled_after_restore: papercraft_sync_protocol::SyncPullResponse =
+            pull_after_restore.body_mut().read_json().unwrap();
+        assert_eq!(pulled_after_restore.notebooks.len(), 1);
+        assert_eq!(pulled_after_restore.notebooks[0].notebook_id, "nb-trash-1");
+    }
+
+    #[test]
+    fn http_e2e_server_account_trash_auto_expires_after_30_days() {
+        let dir = temp_dir("trash_auto_expiry");
+        let agent = test_http_agent();
+        let srv = spawn_server_on(&dir.0);
+        let reg = register_and_push_single_notebook(
+            &srv.base_url,
+            &agent,
+            "expiring_nina@example.com",
+            "expiring_nina",
+            "nb-exp-1",
+        );
+        drop(srv);
+
+        let db = ServerDb::open(&dir.0.join("notecraft.redb")).unwrap();
+        let trashed = db.trash_user(&reg.user.user_id).unwrap();
+        assert_eq!(
+            db.cleanup_expired_trashed_users_at(trashed.deleted_at_ms + 29 * 24 * 60 * 60 * 1000)
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.list_trashed_users().unwrap().len(), 1);
+        assert_eq!(
+            db.cleanup_expired_trashed_users_at(trashed.expires_at_ms)
+                .unwrap(),
+            1
+        );
+        assert!(db.list_trashed_users().unwrap().is_empty());
+        assert_eq!(db.stats().unwrap().user_count, 0);
+        assert_eq!(db.stats().unwrap().trashed_user_count, 0);
+        assert_eq!(db.stats().unwrap().active_notebook_count, 0);
+
+        // Once expired and purged, the email and username are free again.
+        let re_reg = db
+            .register_user_with_email(
+                Some("expiring_nina@example.com"),
+                "expiring_nina",
+                "brand-new-password-1",
+                Some("Nina Again"),
+                Some("Desk"),
+                true,
+                TokenTtls {
+                    access_ttl_ms: 3_600_000,
+                    refresh_ttl_ms: 86_400_000,
+                },
             )
             .unwrap();
         assert_ne!(re_reg.user.user_id, reg.user.user_id);
