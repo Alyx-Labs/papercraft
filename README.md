@@ -86,7 +86,7 @@ Pre-built binaries are published on [GitHub Releases (`v0.6.0-alpha`)](https://g
       <h3>📓 PaperCraft App (Desktop)</h3>
       <p>The notebook &amp; handwriting workspace. Works <b>100% offline</b> with local accounts out of the box.</p>
       <ul>
-        <li><b>Windows</b> (<code>x86_64</code>): <a href="https://github.com/Alyx-Labs/papercraft/releases/latest/download/papercraft-windows-x86_64.exe"><code>papercraft-windows-x86_64.exe</code></a> <sub>(portable <code>.exe</code>)</sub></li>
+        <li><b>Windows</b> (<code>x86_64</code>): <a href="https://github.com/Alyx-Labs/papercraft/releases/latest/download/papercraft-windows-x86_64-portable.exe"><code>papercraft-windows-x86_64-portable.exe</code></a> <sub>(portable <code>.exe</code>)</sub></li>
         <li><b>Linux</b> (<code>x86_64</code>): <a href="https://github.com/Alyx-Labs/papercraft/releases/latest/download/papercraft-linux-x86_64.AppImage"><code>papercraft-linux-x86_64.AppImage</code></a> <sub>(<code>chmod +x</code> before running)</sub></li>
         <li><b>macOS</b> (<code>arm64</code>): <a href="https://github.com/Alyx-Labs/papercraft/releases/latest/download/papercraft-macos-arm64.dmg"><code>papercraft-macos-arm64.dmg</code></a> <sub>(Apple Silicon · experimental)</sub></li>
       </ul>
@@ -95,7 +95,7 @@ Pre-built binaries are published on [GitHub Releases (`v0.6.0-alpha`)](https://g
       <h3>☁️ PaperCraft Server (System Tray — Optional)</h3>
       <p>Optional self-hosted sync server &amp; account manager that sits in your tray (LAN or private mesh VPN).</p>
       <ul>
-        <li><b>Windows</b> (<code>x86_64</code>): <a href="https://github.com/Alyx-Labs/papercraft/releases/latest/download/papercraft-server-windows-x86_64.exe"><code>papercraft-server-windows-x86_64.exe</code></a> <sub>(portable <code>.exe</code>)</sub></li>
+        <li><b>Windows</b> (<code>x86_64</code>): <a href="https://github.com/Alyx-Labs/papercraft/releases/latest/download/papercraft-server-windows-x86_64-portable.exe"><code>papercraft-server-windows-x86_64-portable.exe</code></a> <sub>(portable <code>.exe</code>)</sub></li>
         <li><b>Linux</b> (<code>x86_64</code>): <a href="https://github.com/Alyx-Labs/papercraft/releases/latest/download/papercraft-server-linux-x86_64.AppImage"><code>papercraft-server-linux-x86_64.AppImage</code></a> <sub>(<code>chmod +x</code> before running)</sub></li>
         <li><b>macOS</b> (<code>arm64</code>): <a href="https://github.com/Alyx-Labs/papercraft/releases/latest/download/papercraft-server-macos-arm64.dmg"><code>papercraft-server-macos-arm64.dmg</code></a> <sub>(Apple Silicon · experimental)</sub></li>
       </ul>
@@ -367,7 +367,7 @@ However, the **recommended everyday setup** is to keep the lightweight **`paperc
 
 #### Option A — System-Tray Server App (`papercraft-server`, recommended for everyday use)
 
-`papercraft-server` bundles the sync engine into a single standalone GUI app (`papercraft-server-windows-x86_64.exe` on Windows, `papercraft-server-linux-x86_64.AppImage` on Linux, and `papercraft-server-macos-arm64.dmg` on macOS from GitHub Releases) that runs in your OS system tray with a minimalist control window—no terminal flags required:
+`papercraft-server` bundles the sync engine into a single standalone GUI app (`papercraft-server-windows-x86_64-portable.exe` on Windows, `papercraft-server-linux-x86_64.AppImage` on Linux, and `papercraft-server-macos-arm64.dmg` on macOS from GitHub Releases) that runs in your OS system tray with a minimalist control window—no terminal flags required:
 
 - **Switch between Server & Users**: toggle cleanly between the **Server** configuration view and the **Users** directory to inspect all registered accounts (with search filtering, join dates, notebook counts, copyable user IDs, one-time **Reset** recovery code generation, and **Delete** user actions) whether the server is running or stopped.
 - **Pick your data folder visually**: browse for where `papercraft.redb` is stored (defaults to `<executable_dir>/server-data`).

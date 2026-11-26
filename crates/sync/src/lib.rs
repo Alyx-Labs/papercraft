@@ -1,4 +1,4 @@
-//! L4 offline-first sync engine, HTTP client, and local manifest store for PaperCraft.
+//! L4 HTTP sync client, real-time server driver, and local profile metadata store for PaperCraft.
 
 #![forbid(unsafe_code)]
 #![deny(
@@ -16,21 +16,18 @@ pub mod store;
 pub mod types;
 
 pub use client::SyncHttpClient;
-pub use engine::{
-    SyncCycleDriver, build_conflict_preview_if_needed, build_prune_to_local_request,
-    make_conflict_title, outcome_from_full_pull, run_sync_cycle, run_sync_cycle_keep_local,
-};
+pub use engine::{SyncCycleDriver, outcome_from_full_pull, run_sync_cycle};
 pub use store::{
     account_library_dir, default_device_name, inspect_local_accounts_in_library, load_global_state,
     load_manifest, profile_library_dir, sanitize_account_dir_segment, sanitize_client_id,
-    sanitize_profile_nickname, save_global_state, save_manifest, write_bytes_atomic,
+    sanitize_profile_nickname, sanitize_remembered_accounts, save_global_state, save_manifest,
+    write_bytes_atomic,
 };
 pub use types::{
-    ACCOUNTS_DIR, ActiveAccountSession, ActiveWorkspace, ConflictResolutionCopy, EntitySyncStatus,
-    FolderSyncMeta, GLOBAL_SYNC_FILE, GlobalSyncState, LocalNotebookSnapshot, LocalProfile,
-    NotebookSyncMeta, NotebookTombstone, OwnerId, PROFILES_DIR, RemoteNotebookUpdate,
-    SYNC_MANIFEST_FILE, SyncBatch, SyncConflictPreview, SyncConnectionState, SyncCycleOutcome,
-    SyncError, SyncManifest, SyncStatusSummary,
+    ACCOUNTS_DIR, ActiveAccountSession, EntitySyncStatus, FolderSyncMeta, GLOBAL_SYNC_FILE,
+    GlobalSyncState, LocalNotebookSnapshot, LocalProfile, NotebookSyncMeta, NotebookTombstone,
+    OwnerId, PROFILES_DIR, RememberedServerAccount, RemoteNotebookUpdate, SYNC_MANIFEST_FILE,
+    SyncBatch, SyncConnectionState, SyncCycleOutcome, SyncError, SyncManifest, SyncStatusSummary,
 };
 
 #[cfg(test)]
@@ -41,14 +38,11 @@ mod tests {
     use papercraft_doc::{Document, NotebookCover};
     use papercraft_sync_protocol::canonical_document_hash;
 
-    use crate::engine::{build_conflict_preview_if_needed, make_conflict_title};
     use crate::store::{
         account_library_dir, inspect_local_accounts_in_library, load_global_state, load_manifest,
         profile_library_dir, save_global_state, save_manifest,
     };
-    use crate::types::{
-        GlobalSyncState, LocalNotebookSnapshot, LocalProfile, SyncBatch, SyncManifest,
-    };
+    use crate::types::{GlobalSyncState, LocalProfile, SyncManifest};
 
     struct TempDirGuard(PathBuf);
     impl Drop for TempDirGuard {
@@ -119,19 +113,54 @@ mod tests {
     }
 
     #[test]
-    fn conflict_title_generation_avoids_repeated_suffixes() {
+    fn legacy_persisted_session_migrates_to_shortcut_without_retaining_tokens() {
+        let dir = temp_dir("legacy_migrate");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let legacy_json = serde_json::json!({
+            "server_url": "http://127.0.0.1:8787",
+            "device_name": "Desk",
+            "session": {
+                "server_url": "http://127.0.0.1:8787/",
+                "user": {
+                    "user_id": "u-legacy",
+                    "email": "legacy@example.com",
+                    "username": "legacy_user",
+                    "display_name": "Legacy User",
+                    "created_at_ms": 100,
+                    "must_change_password": false
+                },
+                "access_token": "secret-access-token",
+                "refresh_token": "secret-refresh-token",
+                "access_expires_at_ms": 999999,
+                "refresh_expires_at_ms": 999999,
+                "device_name": "Desk",
+                "last_auth_ms": 100
+            }
+        });
+        std::fs::write(
+            dir.0.join(crate::types::GLOBAL_SYNC_FILE),
+            serde_json::to_vec_pretty(&legacy_json).unwrap(),
+        )
+        .unwrap();
+
+        let mut loaded = load_global_state(&dir.0);
+        assert!(loaded.legacy_session.is_none());
+        assert_eq!(loaded.remembered_server_accounts.len(), 1);
+        assert_eq!(loaded.remembered_server_accounts[0].user_id, "u-legacy");
         assert_eq!(
-            make_conflict_title("Math Notes"),
-            "Math Notes (Conflict Copy)"
+            loaded.remembered_server_accounts[0].server_url,
+            "http://127.0.0.1:8787"
         );
-        assert_eq!(
-            make_conflict_title("Math Notes (Conflict Copy)"),
-            "Math Notes (Conflict Copy) 2"
-        );
-        assert_eq!(
-            make_conflict_title("   "),
-            "Untitled Notebook (Conflict Copy)"
-        );
+
+        save_global_state(&dir.0, &loaded).unwrap();
+        let saved_raw =
+            std::fs::read_to_string(dir.0.join(crate::types::GLOBAL_SYNC_FILE)).unwrap();
+        assert!(!saved_raw.contains("secret-access-token"));
+        assert!(!saved_raw.contains("secret-refresh-token"));
+        assert!(!saved_raw.contains("\"session\""));
+
+        assert!(loaded.forget_server_account("http://127.0.0.1:8787/", "u-legacy"));
+        assert!(loaded.remembered_server_accounts.is_empty());
     }
 
     #[test]
@@ -147,21 +176,12 @@ mod tests {
                 nickname: "BrunoSecret".to_string(),
                 created_at_ms: 1,
                 last_used_at_ms: 1,
-                owner_cloud_user_id: None,
             },
             LocalProfile {
                 local_profile_id: "p2".to_string(),
                 nickname: "SecondSecret".to_string(),
                 created_at_ms: 2,
                 last_used_at_ms: 2,
-                owner_cloud_user_id: None,
-            },
-            LocalProfile {
-                local_profile_id: "p3-other".to_string(),
-                nickname: "OtherCloudLocal".to_string(),
-                created_at_ms: 3,
-                last_used_at_ms: 3,
-                owner_cloud_user_id: Some("other-cloud-user".to_string()),
             },
         ];
         save_global_state(&dir.0, &global).unwrap();
@@ -177,10 +197,6 @@ mod tests {
         std::fs::create_dir_all(&p2_dir).unwrap();
         std::fs::write(p2_dir.join("c.pcraft"), b"dummy").unwrap();
 
-        let p3_dir = profile_library_dir(&dir.0, "p3-other");
-        std::fs::create_dir_all(&p3_dir).unwrap();
-        std::fs::write(p3_dir.join("d.pcraft"), b"dummy").unwrap();
-
         let (cid, summary) = inspect_local_accounts_in_library(&dir.0).unwrap();
         assert_eq!(cid, "client-a");
         assert_eq!(summary.unsynced_local_accounts, 2);
@@ -192,54 +208,6 @@ mod tests {
         let (_, pending_summary) = inspect_local_accounts_in_library(&dir.0).unwrap();
         assert_eq!(pending_summary.unsynced_local_accounts, 0);
         assert_eq!(pending_summary.total_local_notebooks, 0);
-    }
-
-    #[test]
-    fn conflict_preview_triggers_for_offline_edits_or_divergence() {
-        let batch = SyncBatch {
-            client_cursor: 5,
-            device_name: "Laptop".to_string(),
-            local_docs: vec![LocalNotebookSnapshot {
-                notebook_id: "nb-1".to_string(),
-                base_version: 2,
-                cloud_dirty: true,
-                content_hash: "local-h".to_string(),
-                doc: Document {
-                    id: "nb-1".to_string(),
-                    title: "Physics".to_string(),
-                    ..Default::default()
-                },
-            }],
-            tombstones: Vec::new(),
-            folder_changes: Vec::new(),
-            prefs_push: None,
-            force_overwrite: false,
-        };
-        let pull = papercraft_sync_protocol::SyncPullResponse {
-            server_cursor: 5,
-            user: papercraft_sync_protocol::UserProfile {
-                user_id: "u1".to_string(),
-                email: Some("alyx@example.com".to_string()),
-                username: "Alyx".to_string(),
-                display_name: "Alyx".to_string(),
-                created_at_ms: 1,
-                must_change_password: false,
-            },
-            notebooks: Vec::new(),
-            folders: Vec::new(),
-            studio_prefs: None,
-        };
-        // Normal online edit at same server cursor -> silent sync (no prompt).
-        assert!(
-            build_conflict_preview_if_needed("Alyx", "alyx@example.com", false, &batch, &pull)
-                .is_none()
-        );
-        // Same cursor but offline edits were recorded -> must prompt.
-        let preview =
-            build_conflict_preview_if_needed("Alyx", "alyx@example.com", true, &batch, &pull)
-                .expect("offline edit conflict preview");
-        assert!(preview.offline_edits_detected);
-        assert_eq!(preview.local_dirty_titles, vec!["Physics".to_string()]);
     }
 
     #[test]

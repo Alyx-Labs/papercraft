@@ -18,16 +18,9 @@
                     if (!cache || typeof cache !== "object") return null;
 
                     var global = cache.global || {};
-                    var active = global.active_workspace;
                     var profile = null;
 
-                    if (active && active.kind === "CloudUser" && cache.accounts && active.id) {
-                        profile = cache.accounts[active.id];
-                    } else if (active && active.kind === "LocalProfile" && cache.local_profiles && active.id) {
-                        profile = cache.local_profiles[active.id];
-                    } else if (global.session && global.session.user && global.session.user.user_id && cache.accounts) {
-                        profile = cache.accounts[global.session.user.user_id];
-                    } else if (global.active_local_profile_id && cache.local_profiles) {
+                    if (global.active_local_profile_id && cache.local_profiles) {
                         profile = cache.local_profiles[global.active_local_profile_id];
                     } else if (cache.guest) {
                         profile = cache.guest;

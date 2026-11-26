@@ -24,7 +24,6 @@ pub use papercraft_compose::{
     ROBOTO_ITALIC_TTF, ROBOTO_REGULAR_TTF, RenderedPdfPage,
 };
 pub use papercraft_format::looks_like_package_bytes;
-pub use sync_state::{AuthWorkspaceMode, LocalMigrationSummary, LocalNotebookEntry};
 
 use std::collections::HashSet;
 use std::sync::Arc;

@@ -328,6 +328,8 @@ mod tests {
 
         let official_dl = "https://github.com/Alyx-Labs/papercraft/releases/download/v0.1.2/papercraft-windows-x86_64.exe";
         assert!(validate_asset_url(official_dl, DEFAULT_MANIFEST_URL, false).is_ok());
+        let portable_dl = "https://github.com/Alyx-Labs/papercraft/releases/download/v0.6.1/papercraft-windows-x86_64-portable.exe";
+        assert!(validate_asset_url(portable_dl, DEFAULT_MANIFEST_URL, false).is_ok());
         assert!(
             validate_asset_url(
                 "https://github.com/other/repo/releases/download/v1.0.0/evil.exe",
@@ -364,6 +366,14 @@ mod tests {
         assert_eq!(
             sanitize_asset_file_name("papercraft-windows-x86_64.exe").unwrap(),
             "papercraft-windows-x86_64.exe"
+        );
+        assert_eq!(
+            sanitize_asset_file_name("papercraft-windows-x86_64-portable.exe").unwrap(),
+            "papercraft-windows-x86_64-portable.exe"
+        );
+        assert_eq!(
+            sanitize_asset_file_name("papercraft-server-windows-x86_64-portable.exe").unwrap(),
+            "papercraft-server-windows-x86_64-portable.exe"
         );
         assert!(sanitize_asset_file_name("../evil.exe").is_err());
         assert!(sanitize_asset_file_name("sub/evil.exe").is_err());

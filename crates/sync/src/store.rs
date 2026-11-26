@@ -9,8 +9,9 @@ use papercraft_sync_protocol::{
 };
 
 use crate::types::{
-    ACCOUNTS_DIR, GLOBAL_SYNC_FILE, GlobalSyncState, MAX_PROFILE_NICKNAME_LEN, PROFILES_DIR,
-    SYNC_MANIFEST_FILE, SyncError, SyncManifest,
+    ACCOUNTS_DIR, GLOBAL_SYNC_FILE, GlobalSyncState, MAX_PROFILE_NICKNAME_LEN,
+    MAX_REMEMBERED_SERVER_ACCOUNTS, PROFILES_DIR, RememberedServerAccount, SYNC_MANIFEST_FILE,
+    SyncError, SyncManifest,
 };
 
 static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -133,6 +134,38 @@ pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), SyncError> {
     )))
 }
 
+pub fn sanitize_remembered_accounts(
+    entries: Vec<RememberedServerAccount>,
+) -> Vec<RememberedServerAccount> {
+    let mut cleaned = Vec::with_capacity(entries.len().min(MAX_REMEMBERED_SERVER_ACCOUNTS));
+    for mut entry in entries {
+        entry.server_url = normalize_server_url(&entry.server_url)
+            .unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string());
+        entry.user_id = entry.user_id.trim().to_string();
+        entry.username = entry.username.trim().to_string();
+        entry.display_name = entry.display_name.trim().to_string();
+        entry.email = entry
+            .email
+            .take()
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty());
+        if entry.user_id.is_empty() || entry.username.is_empty() {
+            continue;
+        }
+        let duplicate = cleaned.iter().any(|existing: &RememberedServerAccount| {
+            existing.user_id == entry.user_id
+                && existing.server_url.eq_ignore_ascii_case(&entry.server_url)
+        });
+        if !duplicate {
+            cleaned.push(entry);
+        }
+        if cleaned.len() >= MAX_REMEMBERED_SERVER_ACCOUNTS {
+            break;
+        }
+    }
+    cleaned
+}
+
 pub fn load_global_state(root_dir: &Path) -> GlobalSyncState {
     let device = default_device_name();
     let path = root_dir.join(GLOBAL_SYNC_FILE);
@@ -146,20 +179,12 @@ pub fn load_global_state(root_dir: &Path) -> GlobalSyncState {
     parsed.server_url =
         normalize_server_url(&parsed.server_url).unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string());
     parsed.device_name = sanitize_device_name(&parsed.device_name);
-    if let Some(session) = parsed.session.as_mut() {
-        if let Ok(norm) = normalize_server_url(&session.server_url) {
-            session.server_url = norm;
-        }
-        session.device_name = sanitize_device_name(&session.device_name);
-    }
+    let _ = parsed.migrate_legacy_session();
+    parsed.remembered_server_accounts =
+        sanitize_remembered_accounts(std::mem::take(&mut parsed.remembered_server_accounts));
     for profile in &mut parsed.local_profiles {
         profile.local_profile_id = sanitize_account_dir_segment(&profile.local_profile_id);
         profile.nickname = sanitize_profile_nickname(&profile.nickname);
-        profile.owner_cloud_user_id = profile
-            .owner_cloud_user_id
-            .take()
-            .map(|id| id.trim().to_string())
-            .filter(|id| !id.is_empty());
     }
     parsed.client_id = sanitize_client_id(&parsed.client_id);
     parsed

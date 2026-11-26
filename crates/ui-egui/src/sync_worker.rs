@@ -3,17 +3,13 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use papercraft_engine::AuthWorkspaceMode;
-use papercraft_sync::{ActiveAccountSession, SyncBatch, SyncConflictPreview, SyncCycleOutcome};
+use papercraft_sync::{ActiveAccountSession, SyncBatch, SyncCycleOutcome};
 #[cfg(not(target_arch = "wasm32"))]
-use papercraft_sync::{
-    SyncError, SyncHttpClient, build_conflict_preview_if_needed, outcome_from_full_pull,
-    run_sync_cycle, run_sync_cycle_keep_local,
-};
+use papercraft_sync::{SyncError, SyncHttpClient, run_sync_cycle};
 use papercraft_sync_protocol::{
     ChangeEmailRequest, ChangePasswordRequest, CompletePasswordResetRequest, LocalDiscoveryReport,
-    LoginRequest, RegisterRequest, ServerInfoResponse, UpdateProfileRequest, normalize_email,
-    normalize_username, now_unix_ms, sanitize_display_name, validate_password,
+    LoginRequest, RegisterRequest, ServerInfoResponse, SyncPullResponse, UpdateProfileRequest,
+    normalize_email, normalize_username, now_unix_ms, sanitize_display_name, validate_password,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use papercraft_sync_protocol::{
@@ -22,8 +18,8 @@ use papercraft_sync_protocol::{
 
 use crate::PaperCraftApp;
 
-const AUTO_SYNC_DEBOUNCE_MS: f64 = 8_000.0;
-const AUTO_SYNC_IDLE_PULL_MS: f64 = 60_000.0;
+const AUTO_SYNC_DEBOUNCE_MS: f64 = 600.0;
+const AUTO_SYNC_IDLE_PULL_MS: f64 = 12_000.0;
 const DISCOVERY_REPORT_INTERVAL_MS: f64 = 45_000.0;
 
 pub enum SyncWorkerCommand {
@@ -41,14 +37,12 @@ pub enum SyncWorkerCommand {
         password: String,
         display_name: Option<String>,
         device_name: String,
-        mode: AuthWorkspaceMode,
     },
     Login {
         server_url: String,
         identifier: String,
         password: String,
         device_name: String,
-        mode: AuthWorkspaceMode,
     },
     CompletePasswordReset {
         server_url: String,
@@ -56,7 +50,15 @@ pub enum SyncWorkerCommand {
         recovery_code: String,
         new_password: String,
         device_name: String,
-        mode: AuthWorkspaceMode,
+    },
+    ConvertLocalAccount {
+        server_url: String,
+        source_profile_id: String,
+        source_nickname: String,
+        email: String,
+        password: String,
+        device_name: String,
+        upload_batch: Box<SyncBatch>,
     },
     UpdateProfile {
         session: ActiveAccountSession,
@@ -76,14 +78,6 @@ pub enum SyncWorkerCommand {
     SyncNow {
         session: ActiveAccountSession,
         batch: Box<SyncBatch>,
-        offline_edits_pending: bool,
-    },
-    ResolveConflictKeepServer {
-        session: ActiveAccountSession,
-    },
-    ResolveConflictKeepLocal {
-        session: ActiveAccountSession,
-        batch: Box<SyncBatch>,
     },
     Logout {
         session: ActiveAccountSession,
@@ -101,9 +95,18 @@ pub enum SyncWorkerEvent {
     },
     AuthOk {
         auth: ActiveAccountSession,
-        mode: AuthWorkspaceMode,
+        initial_pull: Box<SyncPullResponse>,
     },
     AuthErr {
+        message: String,
+    },
+    ConvertLocalOk {
+        source_profile_id: String,
+        auth: ActiveAccountSession,
+        initial_pull: Box<SyncPullResponse>,
+    },
+    ConvertLocalErr {
+        source_profile_id: String,
         message: String,
     },
     PasswordResetRequired {
@@ -115,27 +118,27 @@ pub enum SyncWorkerEvent {
         updated_session: ActiveAccountSession,
     },
     ProfileUpdateErr {
+        offline: bool,
+        unauthorized: bool,
         message: String,
     },
     PasswordChanged {
         updated_session: ActiveAccountSession,
     },
     PasswordChangeErr {
+        offline: bool,
+        unauthorized: bool,
         message: String,
     },
     EmailChanged {
         updated_session: ActiveAccountSession,
     },
     EmailChangeErr {
+        offline: bool,
+        unauthorized: bool,
         message: String,
     },
     SyncOk {
-        outcome: Box<SyncCycleOutcome>,
-    },
-    ConflictDecisionRequired {
-        preview: SyncConflictPreview,
-    },
-    ConflictResolvedKeepServer {
         outcome: Box<SyncCycleOutcome>,
     },
     SyncErr {
@@ -284,7 +287,7 @@ pub(crate) struct BackgroundSyncWorker {
     repaint_ctx: Arc<Mutex<Option<egui::Context>>>,
     busy: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
-    pending_outcome: Option<(bool, SyncCycleOutcome)>,
+    pending_outcome: Option<SyncCycleOutcome>,
     startup_sync_queued: bool,
     last_attempt_ui_ms: f64,
     next_retry_delay_ms: f64,
@@ -418,16 +421,12 @@ pub(crate) fn maybe_report_local_discovery(
 }
 
 pub(crate) fn trigger_manual_sync(app: &mut PaperCraftApp, ctx: &egui::Context) {
-    if app.view.account.pending_conflict.is_some() {
-        return;
-    }
     let Some(acct) = app.session.active_account_session().cloned() else {
         return;
     };
     if app.session.is_sync_in_flight() {
         return;
     }
-    let offline_edits_pending = app.session.offline_edits_pending();
     let Some(batch) = app.session.prepare_sync_batch() else {
         return;
     };
@@ -439,7 +438,6 @@ pub(crate) fn trigger_manual_sync(app: &mut PaperCraftApp, ctx: &egui::Context) 
         SyncWorkerCommand::SyncNow {
             session: acct,
             batch: Box::new(batch),
-            offline_edits_pending,
         },
     ) {
         app.view.account.clear_transient_auth_status();
@@ -448,46 +446,84 @@ pub(crate) fn trigger_manual_sync(app: &mut PaperCraftApp, ctx: &egui::Context) 
     }
 }
 
-pub(crate) fn trigger_conflict_keep_server(app: &mut PaperCraftApp, ctx: &egui::Context) {
-    let Some(acct) = app.session.active_account_session().cloned() else {
-        return;
-    };
-    app.view.account.conflict_resolving = true;
-    app.view.account.error_message = None;
-    app.session.set_sync_in_flight(true);
-    if !dispatch_command(
-        app,
-        Some(ctx),
-        SyncWorkerCommand::ResolveConflictKeepServer { session: acct },
-    ) {
-        app.view.account.conflict_resolving = false;
-        app.session
-            .record_sync_failure(false, "Background sync worker unavailable.".to_string());
+/// Automatically logs out an active online server account when connectivity or authorization is lost,
+/// clearing cloud data from memory and redirecting to local account selection or initial nickname setup.
+pub(crate) fn handle_server_disconnect(
+    app: &mut PaperCraftApp,
+    ctx: &egui::Context,
+    unauthorized: bool,
+    detail: &str,
+) {
+    let server_url = app
+        .session
+        .active_account_session()
+        .map(|s| s.server_url.clone())
+        .unwrap_or_else(|| app.session.server_url().to_string());
+    if !unauthorized {
+        app.view.account.mark_server_offline(&server_url, detail);
     }
+    let has_locals = app.session.sign_out_from_server_session();
+    app.sync_worker.pending_outcome = None;
+    app.sync_worker.startup_sync_queued = false;
+    app.view.open_tabs.clear();
+    app.view.inspector_open = false;
+    app.mesh_cache.clear();
+    app.view.screen = crate::AppScreen::Home;
+    app.view.profile_return_screen = crate::AppScreen::Home;
+    app.view.account.reset_after_sign_out(&server_url);
+    app.view.account.disconnect_notice = Some(if unauthorized {
+        "Your server session expired or is no longer authorized. You were signed out automatically to protect your notes."
+            .to_string()
+    } else {
+        format!(
+            "Connection to the server was lost ({detail}). You were signed out automatically to prevent data loss or desynchronization."
+        )
+    });
+    crate::theme::apply_visuals(ctx, app.session.prefs.theme);
+    crate::sync_view_to_active_notebook(app);
+    if has_locals {
+        crate::modal::open(app, crate::modal::ActiveModal::SelectLocalAccount);
+    } else {
+        app.view.first_access_nickname.clear();
+        app.view.first_access_error = None;
+        app.view.first_access_focus_pending = true;
+        crate::modal::open(app, crate::modal::ActiveModal::FirstAccessNickname);
+    }
+    ctx.request_repaint();
 }
 
-pub(crate) fn trigger_conflict_keep_local(app: &mut PaperCraftApp, ctx: &egui::Context) {
-    let Some(acct) = app.session.active_account_session().cloned() else {
-        return;
-    };
-    let Some(batch) = app.session.prepare_force_local_sync_batch() else {
-        return;
-    };
-    app.view.account.conflict_resolving = true;
-    app.view.account.error_message = None;
-    app.session.set_sync_in_flight(true);
-    if !dispatch_command(
-        app,
-        Some(ctx),
-        SyncWorkerCommand::ResolveConflictKeepLocal {
-            session: acct,
-            batch: Box::new(batch),
-        },
-    ) {
-        app.view.account.conflict_resolving = false;
-        app.session
-            .record_sync_failure(false, "Background sync worker unavailable.".to_string());
+/// Switches into a saved local account on this device without password or network access,
+/// cleanly terminating any active cloud session in RAM and notifying the server in the background.
+pub(crate) fn switch_to_local_account_clean(
+    app: &mut PaperCraftApp,
+    ctx: &egui::Context,
+    profile_id: &str,
+) -> Result<(), String> {
+    let prev_session = app.session.active_account_session().cloned();
+    let server_url = prev_session
+        .as_ref()
+        .map(|s| s.server_url.clone())
+        .unwrap_or_else(|| app.session.server_url().to_string());
+    app.session
+        .execute(
+            "profile.switch",
+            &serde_json::json!({ "target": "local", "profile_id": profile_id }),
+        )
+        .map_err(|err| err.to_string())?;
+    if let Some(sess) = prev_session {
+        let _ = dispatch_command(app, Some(ctx), SyncWorkerCommand::Logout { session: sess });
     }
+    app.sync_worker.pending_outcome = None;
+    app.sync_worker.startup_sync_queued = false;
+    app.view.open_tabs.clear();
+    app.view.inspector_open = false;
+    app.mesh_cache.clear();
+    app.view.account.disconnect_notice = None;
+    app.view.account.reset_after_sign_out(&server_url);
+    app.view.profile_return_screen = crate::AppScreen::Home;
+    crate::theme::apply_visuals(ctx, app.session.prefs.theme);
+    crate::sync_view_to_active_notebook(app);
+    Ok(())
 }
 
 pub(crate) fn poll_and_tick(app: &mut PaperCraftApp, ctx: &egui::Context, now_ui_ms: f64) {
@@ -496,31 +532,17 @@ pub(crate) fn poll_and_tick(app: &mut PaperCraftApp, ctx: &egui::Context, now_ui
     if can_mutate_docs {
         maybe_report_local_discovery(app, ctx, now_ui_ms);
     }
-    if can_mutate_docs
-        && let Some((replace_server, outcome)) = app.sync_worker.pending_outcome.take()
-    {
+    if can_mutate_docs && let Some(outcome) = app.sync_worker.pending_outcome.take() {
         let prev_theme = app.session.prefs.theme;
         let prev_active_title = app.session.doc.title.clone();
         let prev_active_cover = app.session.doc.cover;
         let prev_rev = app.session.revision;
-        let apply_res = if replace_server {
-            app.session.apply_keep_server_version(outcome)
-        } else {
-            app.session.apply_sync_outcome(outcome)
-        };
-        if let Err(err) = apply_res {
-            app.view.account.sign_out_after_sync = false;
-            app.view.account.conflict_resolving = false;
+        if let Err(err) = app.session.apply_sync_outcome(outcome) {
             app.session.record_sync_failure(false, err);
             app.view.account.clear_transient_auth_status();
         } else {
             app.sync_worker.next_retry_delay_ms = 15_000.0;
             app.view.account.clear_transient_auth_status();
-            app.view.account.pending_conflict = None;
-            app.view.account.conflict_resolving = false;
-            if app.view.active_modal == Some(crate::modal::ActiveModal::SyncConflict) {
-                crate::modal::close(app);
-            }
             if app.session.revision != prev_rev {
                 app.mesh_cache.clear();
             }
@@ -533,17 +555,6 @@ pub(crate) fn poll_and_tick(app: &mut PaperCraftApp, ctx: &egui::Context, now_ui
                 app.view.notebook_title_draft = app.session.doc.title.clone();
                 app.view.notebook_cover_draft = app.session.doc.cover;
             }
-            if app.view.account.sign_out_after_sync {
-                app.view.account.sign_out_after_sync = false;
-                if app.session.cloud_pending_changes_count() == 0 {
-                    complete_sign_out(app, ctx);
-                } else {
-                    app.view.account.error_message = Some(
-                        "Some pending changes could not be uploaded yet. Review them before signing out."
-                            .to_string(),
-                    );
-                }
-            }
         }
     }
 
@@ -551,8 +562,6 @@ pub(crate) fn poll_and_tick(app: &mut PaperCraftApp, ctx: &egui::Context, now_ui
         || !app.session.is_viewing_cloud()
         || app.session.is_sync_in_flight()
         || app.sync_worker.pending_outcome.is_some()
-        || app.view.account.pending_conflict.is_some()
-        || app.session.needs_initial_nickname()
         || !can_mutate_docs
         || !app.session.is_sync_persistence_enabled()
     {
@@ -569,15 +578,16 @@ pub(crate) fn poll_and_tick(app: &mut PaperCraftApp, ctx: &egui::Context, now_ui
                     .next_retry_delay_ms
                     .min(AUTO_SYNC_DEBOUNCE_MS)
     });
-    if app.session.last_dirty_at_ms().is_some() && !has_dirty_ready {
-        ctx.request_repaint_after(Duration::from_secs(4));
-    }
     let periodic_pull =
         elapsed_since_last >= AUTO_SYNC_IDLE_PULL_MS.max(app.sync_worker.next_retry_delay_ms);
 
     if should_startup_sync || has_dirty_ready || periodic_pull {
         app.sync_worker.startup_sync_queued = true;
         trigger_manual_sync(app, ctx);
+    } else if app.session.last_dirty_at_ms().is_some() {
+        ctx.request_repaint_after(Duration::from_millis(250));
+    } else {
+        ctx.request_repaint_after(Duration::from_secs(6));
     }
 }
 
@@ -587,36 +597,68 @@ fn drain_worker_events(app: &mut PaperCraftApp, ctx: &egui::Context) {
     }
 }
 
-/// Applies an authenticated cloud session with `mode` and triggers the initial sync cycle.
+/// Applies an authenticated cloud session hydrated directly in RAM from `initial_pull`.
 pub(crate) fn complete_authenticated_switch(
     app: &mut PaperCraftApp,
     ctx: &egui::Context,
     auth: ActiveAccountSession,
-    mode: AuthWorkspaceMode,
+    initial_pull: SyncPullResponse,
 ) {
     let label = auth.user.primary_label();
-    app.view.account.apply_auth_ok(&auth.server_url, &label);
+    let server_url = auth.server_url.clone();
+    app.view.account.apply_auth_ok(&server_url, &label);
     app.view.account.sync_identity_from_session(Some(&auth));
+    app.view.account.disconnect_notice = None;
     app.view.profile_return_screen = crate::AppScreen::Home;
-    app.session.switch_to_authenticated_library(auth, mode);
+    app.session.enter_online_server_session(auth, initial_pull);
+    app.sync_worker.pending_outcome = None;
     app.sync_worker.next_retry_delay_ms = 15_000.0;
     app.sync_worker.startup_sync_queued = true;
+    app.sync_worker.last_attempt_ui_ms = ctx.input(|i| i.time * 1000.0);
+    app.view.open_tabs.clear();
+    app.view.inspector_open = false;
+    app.mesh_cache.clear();
+    crate::theme::apply_visuals(ctx, app.session.prefs.theme);
     crate::sync_view_to_active_notebook(app);
-    trigger_manual_sync(app, ctx);
+    if matches!(
+        app.view.active_modal,
+        Some(
+            crate::modal::ActiveModal::FirstAccessNickname
+                | crate::modal::ActiveModal::SelectLocalAccount
+                | crate::modal::ActiveModal::ConvertLocalAccount
+                | crate::modal::ActiveModal::AccountSync
+        )
+    ) {
+        crate::modal::close(app);
+    }
 }
 
-/// Completes sign-out to the local profile, notifying the server in the background.
+/// Signs out cleanly from an online server session, wiping cloud data from RAM
+/// and redirecting to local account selection or fresh nickname setup.
 pub(crate) fn complete_sign_out(app: &mut PaperCraftApp, ctx: &egui::Context) {
+    let prev_url = app
+        .session
+        .active_account_session()
+        .map(|s| s.server_url.clone())
+        .unwrap_or_else(|| app.session.server_url().to_string());
     if let Some(sess) = app.session.active_account_session().cloned() {
         let _ = dispatch_command(app, Some(ctx), SyncWorkerCommand::Logout { session: sess });
     }
-    app.session.sign_out_to_local_library();
+    let has_locals = app.session.sign_out_from_server_session();
+    app.sync_worker.pending_outcome = None;
+    app.sync_worker.startup_sync_queued = false;
+    app.view.open_tabs.clear();
+    app.view.inspector_open = false;
+    app.mesh_cache.clear();
+    app.view.screen = crate::AppScreen::Home;
     app.view.profile_return_screen = crate::AppScreen::Home;
-    app.view
-        .account
-        .reset_after_sign_out(app.session.server_url());
+    app.view.account.disconnect_notice = None;
+    app.view.account.reset_after_sign_out(&prev_url);
+    crate::theme::apply_visuals(ctx, app.session.prefs.theme);
     crate::sync_view_to_active_notebook(app);
-    if app.session.needs_initial_nickname() {
+    if has_locals {
+        crate::modal::open(app, crate::modal::ActiveModal::SelectLocalAccount);
+    } else {
         app.view.first_access_nickname.clear();
         app.view.first_access_error = None;
         app.view.first_access_focus_pending = true;
@@ -640,12 +682,42 @@ pub(crate) fn apply_worker_event(
         } => {
             app.view.account.apply_health_err(server_url, message);
         }
-        SyncWorkerEvent::AuthOk { auth, mode } => {
+        SyncWorkerEvent::AuthOk { auth, initial_pull } => {
             app.session.set_network_offline_state(false);
-            complete_authenticated_switch(app, ctx, auth, mode);
+            complete_authenticated_switch(app, ctx, auth, *initial_pull);
         }
         SyncWorkerEvent::AuthErr { message } => {
             app.view.account.apply_auth_err(message);
+        }
+        SyncWorkerEvent::ConvertLocalOk {
+            source_profile_id,
+            auth,
+            initial_pull,
+        } => {
+            app.session.set_network_offline_state(false);
+            let label = auth.user.primary_label();
+            let server_url = auth.server_url.clone();
+            app.view.account.apply_convert_local_ok(&server_url, &label);
+            app.view.account.sync_identity_from_session(Some(&auth));
+            app.view.account.disconnect_notice = None;
+            app.session
+                .complete_local_account_conversion(&source_profile_id, auth, *initial_pull);
+            app.sync_worker.pending_outcome = None;
+            app.sync_worker.next_retry_delay_ms = 15_000.0;
+            app.sync_worker.startup_sync_queued = true;
+            app.sync_worker.last_attempt_ui_ms = ctx.input(|i| i.time * 1000.0);
+            app.view.open_tabs.clear();
+            app.view.inspector_open = false;
+            app.mesh_cache.clear();
+            app.view.profile_return_screen = crate::AppScreen::Home;
+            crate::theme::apply_visuals(ctx, app.session.prefs.theme);
+            crate::sync_view_to_active_notebook(app);
+            if app.view.active_modal == Some(crate::modal::ActiveModal::ConvertLocalAccount) {
+                crate::modal::close(app);
+            }
+        }
+        SyncWorkerEvent::ConvertLocalErr { message, .. } => {
+            app.view.account.apply_convert_local_err(message);
         }
         SyncWorkerEvent::PasswordResetRequired {
             identifier,
@@ -664,53 +736,68 @@ pub(crate) fn apply_worker_event(
                 .account
                 .apply_profile_updated(&next_username, &next_display);
         }
-        SyncWorkerEvent::ProfileUpdateErr { message } => {
-            app.view.account.apply_profile_update_err(message);
+        SyncWorkerEvent::ProfileUpdateErr {
+            offline,
+            unauthorized,
+            message,
+        } => {
+            if app.session.is_viewing_cloud() && (offline || unauthorized) {
+                handle_server_disconnect(app, ctx, unauthorized, &message);
+            } else {
+                app.view.account.apply_profile_update_err(message);
+            }
         }
         SyncWorkerEvent::PasswordChanged { updated_session } => {
             app.session.update_active_session_tokens(updated_session);
             app.view.account.apply_password_changed();
         }
-        SyncWorkerEvent::PasswordChangeErr { message } => {
-            app.view.account.apply_password_change_err(message);
+        SyncWorkerEvent::PasswordChangeErr {
+            offline,
+            unauthorized,
+            message,
+        } => {
+            if app.session.is_viewing_cloud() && (offline || unauthorized) {
+                handle_server_disconnect(app, ctx, unauthorized, &message);
+            } else {
+                app.view.account.apply_password_change_err(message);
+            }
         }
         SyncWorkerEvent::EmailChanged { updated_session } => {
             let next_email = updated_session.user.email.clone();
             app.session.update_active_session_tokens(updated_session);
             app.view.account.apply_email_changed(next_email.as_deref());
         }
-        SyncWorkerEvent::EmailChangeErr { message } => {
-            app.view.account.apply_email_change_err(message);
+        SyncWorkerEvent::EmailChangeErr {
+            offline,
+            unauthorized,
+            message,
+        } => {
+            if app.session.is_viewing_cloud() && (offline || unauthorized) {
+                handle_server_disconnect(app, ctx, unauthorized, &message);
+            } else {
+                app.view.account.apply_email_change_err(message);
+            }
         }
         SyncWorkerEvent::SyncOk { outcome } => {
-            app.sync_worker.pending_outcome = Some((false, *outcome));
-        }
-        SyncWorkerEvent::ConflictDecisionRequired { preview } => {
-            app.session.set_sync_in_flight(false);
-            app.view.account.sign_out_after_sync = false;
-            app.view.account.clear_transient_auth_status();
-            app.view.account.conflict_resolving = false;
-            app.view.account.pending_conflict = Some(preview);
-            crate::modal::open(app, crate::modal::ActiveModal::SyncConflict);
-        }
-        SyncWorkerEvent::ConflictResolvedKeepServer { outcome } => {
-            app.sync_worker.pending_outcome = Some((true, *outcome));
+            app.sync_worker.pending_outcome = Some(*outcome);
         }
         SyncWorkerEvent::SyncErr {
             offline,
             unauthorized,
             message,
         } => {
-            app.view.account.sign_out_after_sync = false;
-            app.view.account.conflict_resolving = false;
             app.view.account.clear_transient_auth_status();
-            app.session.record_sync_failure(offline, message);
-            let next_backoff = if unauthorized {
-                120_000.0
+            if app.session.is_viewing_cloud() && (offline || unauthorized) {
+                handle_server_disconnect(app, ctx, unauthorized, &message);
             } else {
-                (app.sync_worker.next_retry_delay_ms * 2.0).clamp(15_000.0, 120_000.0)
-            };
-            app.sync_worker.next_retry_delay_ms = next_backoff;
+                app.session.record_sync_failure(offline, message);
+                let next_backoff = if unauthorized {
+                    120_000.0
+                } else {
+                    (app.sync_worker.next_retry_delay_ms * 2.0).clamp(15_000.0, 120_000.0)
+                };
+                app.sync_worker.next_retry_delay_ms = next_backoff;
+            }
         }
     }
 }
@@ -774,7 +861,6 @@ fn execute_worker_command(
             password,
             display_name,
             device_name,
-            mode,
         } => {
             let req = match build_register_request(
                 &email,
@@ -786,10 +872,21 @@ fn execute_worker_command(
                 Ok(req) => req,
                 Err(message) => return Some(SyncWorkerEvent::AuthErr { message }),
             };
-            match client.register(&server_url, &req, &device_name) {
-                Ok(auth) => Some(SyncWorkerEvent::AuthOk { auth, mode }),
+            let mut auth = match client.register(&server_url, &req, &device_name) {
+                Ok(auth) => auth,
+                Err(err) => {
+                    return Some(SyncWorkerEvent::AuthErr {
+                        message: friendly_auth_error(&err),
+                    });
+                }
+            };
+            match client.pull_with_refresh(&mut auth, 0) {
+                Ok((pull_resp, _)) => Some(SyncWorkerEvent::AuthOk {
+                    auth,
+                    initial_pull: Box::new(pull_resp),
+                }),
                 Err(err) => Some(SyncWorkerEvent::AuthErr {
-                    message: friendly_auth_error(&err),
+                    message: friendly_error(&err),
                 }),
             }
         }
@@ -798,35 +895,45 @@ fn execute_worker_command(
             identifier,
             password,
             device_name,
-            mode,
         } => {
             let submitted_password = password.clone();
             let req = match build_login_request(&identifier, password, &device_name) {
                 Ok(req) => req,
                 Err(message) => return Some(SyncWorkerEvent::AuthErr { message }),
             };
-            match client.login(&server_url, &req, &device_name) {
-                Ok(auth) => Some(SyncWorkerEvent::AuthOk { auth, mode }),
+            let mut auth = match client.login(&server_url, &req, &device_name) {
+                Ok(auth) => auth,
                 Err(SyncError::Server { code, message, .. })
                     if code == ERR_CODE_PASSWORD_CHANGE_REQUIRED =>
                 {
-                    Some(SyncWorkerEvent::PasswordResetRequired {
+                    return Some(SyncWorkerEvent::PasswordResetRequired {
                         identifier,
                         prefill_code: Some(submitted_password.trim().to_string()),
                         message,
-                    })
+                    });
                 }
                 Err(SyncError::Server { code, message, .. })
                     if code == ERR_CODE_PASSWORD_RESET_REQUIRED =>
                 {
-                    Some(SyncWorkerEvent::PasswordResetRequired {
+                    return Some(SyncWorkerEvent::PasswordResetRequired {
                         identifier,
                         prefill_code: None,
                         message,
-                    })
+                    });
                 }
+                Err(err) => {
+                    return Some(SyncWorkerEvent::AuthErr {
+                        message: friendly_auth_error(&err),
+                    });
+                }
+            };
+            match client.pull_with_refresh(&mut auth, 0) {
+                Ok((pull_resp, _)) => Some(SyncWorkerEvent::AuthOk {
+                    auth,
+                    initial_pull: Box::new(pull_resp),
+                }),
                 Err(err) => Some(SyncWorkerEvent::AuthErr {
-                    message: friendly_auth_error(&err),
+                    message: friendly_error(&err),
                 }),
             }
         }
@@ -836,7 +943,6 @@ fn execute_worker_command(
             recovery_code,
             new_password,
             device_name,
-            mode,
         } => {
             let req = match build_complete_password_reset_request(
                 &identifier,
@@ -847,10 +953,72 @@ fn execute_worker_command(
                 Ok(req) => req,
                 Err(message) => return Some(SyncWorkerEvent::AuthErr { message }),
             };
-            match client.complete_password_reset(&server_url, &req, &device_name) {
-                Ok(auth) => Some(SyncWorkerEvent::AuthOk { auth, mode }),
+            let mut auth = match client.complete_password_reset(&server_url, &req, &device_name) {
+                Ok(auth) => auth,
+                Err(err) => {
+                    return Some(SyncWorkerEvent::AuthErr {
+                        message: friendly_auth_error(&err),
+                    });
+                }
+            };
+            match client.pull_with_refresh(&mut auth, 0) {
+                Ok((pull_resp, _)) => Some(SyncWorkerEvent::AuthOk {
+                    auth,
+                    initial_pull: Box::new(pull_resp),
+                }),
                 Err(err) => Some(SyncWorkerEvent::AuthErr {
-                    message: friendly_auth_error(&err),
+                    message: friendly_error(&err),
+                }),
+            }
+        }
+        SyncWorkerCommand::ConvertLocalAccount {
+            server_url,
+            source_profile_id,
+            source_nickname,
+            email,
+            password,
+            device_name,
+            upload_batch,
+        } => {
+            let req = match build_register_request(
+                &email,
+                None,
+                password,
+                Some(source_nickname),
+                &device_name,
+            ) {
+                Ok(req) => req,
+                Err(message) => {
+                    return Some(SyncWorkerEvent::ConvertLocalErr {
+                        source_profile_id,
+                        message,
+                    });
+                }
+            };
+            let mut auth = match client.register(&server_url, &req, &device_name) {
+                Ok(auth) => auth,
+                Err(err) => {
+                    return Some(SyncWorkerEvent::ConvertLocalErr {
+                        source_profile_id,
+                        message: friendly_auth_error(&err),
+                    });
+                }
+            };
+            if let Err(err) = run_sync_cycle(client, &mut auth, &upload_batch) {
+                return Some(SyncWorkerEvent::ConvertLocalErr {
+                    source_profile_id,
+                    message: friendly_error(&err),
+                });
+            }
+            match client.pull_with_refresh(&mut auth, 0) {
+                Ok((pull_resp, _)) => Some(SyncWorkerEvent::ConvertLocalOk {
+                    source_profile_id,
+                    auth,
+                    initial_pull: Box::new(pull_resp),
+                }),
+                Err(err) => Some(SyncWorkerEvent::ConvertLocalErr {
+                    source_profile_id,
+                    message: friendly_error(&err),
                 }),
             }
         }
@@ -862,7 +1030,13 @@ fn execute_worker_command(
             let req =
                 match build_update_profile_request(username.as_deref(), display_name.as_deref()) {
                     Ok(req) => req,
-                    Err(message) => return Some(SyncWorkerEvent::ProfileUpdateErr { message }),
+                    Err(message) => {
+                        return Some(SyncWorkerEvent::ProfileUpdateErr {
+                            offline: false,
+                            unauthorized: false,
+                            message,
+                        });
+                    }
                 };
             match client.update_profile_with_refresh(&mut session, &req) {
                 Ok((profile, _)) => {
@@ -872,6 +1046,8 @@ fn execute_worker_command(
                     })
                 }
                 Err(err) => Some(SyncWorkerEvent::ProfileUpdateErr {
+                    offline: matches!(err, SyncError::Network(_)),
+                    unauthorized: matches!(err, SyncError::Unauthorized(_)),
                     message: friendly_error(&err),
                 }),
             }
@@ -883,7 +1059,13 @@ fn execute_worker_command(
         } => {
             let req = match build_change_password_request(current_password, new_password) {
                 Ok(req) => req,
-                Err(message) => return Some(SyncWorkerEvent::PasswordChangeErr { message }),
+                Err(message) => {
+                    return Some(SyncWorkerEvent::PasswordChangeErr {
+                        offline: false,
+                        unauthorized: false,
+                        message,
+                    });
+                }
             };
             match client.change_password_with_refresh(&mut session, &req) {
                 Ok((profile, _)) => {
@@ -893,6 +1075,8 @@ fn execute_worker_command(
                     })
                 }
                 Err(err) => Some(SyncWorkerEvent::PasswordChangeErr {
+                    offline: matches!(err, SyncError::Network(_)),
+                    unauthorized: matches!(err, SyncError::Unauthorized(_)),
                     message: friendly_error(&err),
                 }),
             }
@@ -904,7 +1088,13 @@ fn execute_worker_command(
         } => {
             let req = match build_change_email_request(&new_email, current_password) {
                 Ok(req) => req,
-                Err(message) => return Some(SyncWorkerEvent::EmailChangeErr { message }),
+                Err(message) => {
+                    return Some(SyncWorkerEvent::EmailChangeErr {
+                        offline: false,
+                        unauthorized: false,
+                        message,
+                    });
+                }
             };
             match client.change_email_with_refresh(&mut session, &req) {
                 Ok((profile, _)) => {
@@ -914,33 +1104,14 @@ fn execute_worker_command(
                     })
                 }
                 Err(err) => Some(SyncWorkerEvent::EmailChangeErr {
+                    offline: matches!(err, SyncError::Network(_)),
+                    unauthorized: matches!(err, SyncError::Unauthorized(_)),
                     message: friendly_error(&err),
                 }),
             }
         }
-        SyncWorkerCommand::SyncNow {
-            mut session,
-            batch,
-            offline_edits_pending,
-        } => Some(exec_guarded_sync_now(
-            client,
-            &mut session,
-            &batch,
-            offline_edits_pending,
-        )),
-        SyncWorkerCommand::ResolveConflictKeepServer { mut session } => {
-            match client.pull_with_refresh(&mut session, 0) {
-                Ok((pull_resp, refreshed)) => Some(SyncWorkerEvent::ConflictResolvedKeepServer {
-                    outcome: Box::new(outcome_from_full_pull(
-                        pull_resp,
-                        refreshed.then_some(session),
-                    )),
-                }),
-                Err(err) => Some(sync_err_event(&err)),
-            }
-        }
-        SyncWorkerCommand::ResolveConflictKeepLocal { mut session, batch } => {
-            match run_sync_cycle_keep_local(client, &mut session, &batch) {
+        SyncWorkerCommand::SyncNow { mut session, batch } => {
+            match run_sync_cycle(client, &mut session, &batch) {
                 Ok(outcome) => Some(SyncWorkerEvent::SyncOk {
                     outcome: Box::new(outcome),
                 }),
@@ -951,57 +1122,6 @@ fn execute_worker_command(
             let _ = client.logout(&session);
             None
         }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn exec_guarded_sync_now(
-    client: &SyncHttpClient,
-    session: &mut ActiveAccountSession,
-    batch: &SyncBatch,
-    offline_edits_pending: bool,
-) -> SyncWorkerEvent {
-    let initial_since = if offline_edits_pending || batch.client_cursor == 0 {
-        0
-    } else {
-        batch.client_cursor
-    };
-    let mut pull_resp = match client.pull_with_refresh(session, initial_since) {
-        Ok((resp, _)) => resp,
-        Err(err) => return sync_err_event(&err),
-    };
-
-    let acct_name = session.user.primary_label();
-    let acct_email = session.user.email.clone().unwrap_or_default();
-    if let Some(mut preview) = build_conflict_preview_if_needed(
-        &acct_name,
-        &acct_email,
-        offline_edits_pending,
-        batch,
-        &pull_resp,
-    ) {
-        if initial_since > 0
-            && let Ok((full_pull, _)) = client.pull_with_refresh(session, 0)
-            && let Some(full_preview) = build_conflict_preview_if_needed(
-                &acct_name,
-                &acct_email,
-                offline_edits_pending,
-                batch,
-                &full_pull,
-            )
-        {
-            pull_resp = full_pull;
-            preview = full_preview;
-        }
-        let _ = pull_resp;
-        return SyncWorkerEvent::ConflictDecisionRequired { preview };
-    }
-
-    match run_sync_cycle(client, session, batch) {
-        Ok(outcome) => SyncWorkerEvent::SyncOk {
-            outcome: Box::new(outcome),
-        },
-        Err(err) => sync_err_event(&err),
     }
 }
 
@@ -1068,13 +1188,9 @@ mod tests {
     }
 
     #[test]
-    fn conflict_decision_required_opens_sync_conflict_modal_and_pauses_sync() {
+    fn offline_sync_error_auto_logs_out_and_redirects_by_local_account_presence() {
         let ctx = egui::Context::default();
-        let mut app = PaperCraftApp::new(
-            papercraft_engine::Session::open_web_cache(None),
-            crate::PlatformHooks::default(),
-        );
-        let auth = ActiveAccountSession {
+        let make_auth = || ActiveAccountSession {
             server_url: "http://127.0.0.1:8787".to_string(),
             user: papercraft_sync_protocol::UserProfile {
                 user_id: "u-existing".to_string(),
@@ -1091,34 +1207,118 @@ mod tests {
             device_name: "TestPC".to_string(),
             last_auth_ms: 1000,
         };
-        app.session
-            .switch_to_authenticated_library(auth, AuthWorkspaceMode::SwitchOnly);
-        app.session.set_sync_in_flight(true);
+
+        // Case A: saved local accounts exist -> redirect to SelectLocalAccount.
+        let mut sess_with_local = papercraft_engine::Session::open_web_cache(None);
+        sess_with_local
+            .execute("profile.completeFirstAccess", &json_nick("Personal"))
+            .unwrap();
+        let mut app_with_local =
+            PaperCraftApp::new(sess_with_local, crate::PlatformHooks::default());
+        let auth = make_auth();
+        let empty_pull = SyncPullResponse {
+            server_cursor: 0,
+            user: auth.user.clone(),
+            notebooks: Vec::new(),
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        app_with_local
+            .session
+            .enter_online_server_session(auth.clone(), empty_pull.clone());
+        apply_worker_event(
+            &mut app_with_local,
+            &ctx,
+            SyncWorkerEvent::SyncErr {
+                offline: true,
+                unauthorized: false,
+                message: "Connection refused".to_string(),
+            },
+        );
+        assert!(!app_with_local.session.is_signed_in());
+        assert!(!app_with_local.session.is_viewing_cloud());
+        assert_eq!(
+            app_with_local.view.active_modal,
+            Some(crate::modal::ActiveModal::SelectLocalAccount)
+        );
+        assert!(app_with_local.view.account.disconnect_notice.is_some());
+
+        // Case B: zero saved local accounts -> redirect to FirstAccessNickname.
+        let sess_no_local = papercraft_engine::Session::open_web_cache(None);
+        let mut app_no_local = PaperCraftApp::new(sess_no_local, crate::PlatformHooks::default());
+        app_no_local
+            .session
+            .enter_online_server_session(auth, empty_pull);
+        apply_worker_event(
+            &mut app_no_local,
+            &ctx,
+            SyncWorkerEvent::SyncErr {
+                offline: true,
+                unauthorized: false,
+                message: "Connection refused".to_string(),
+            },
+        );
+        assert!(!app_no_local.session.is_signed_in());
+        assert_eq!(
+            app_no_local.view.active_modal,
+            Some(crate::modal::ActiveModal::FirstAccessNickname)
+        );
+        assert!(app_no_local.view.account.disconnect_notice.is_some());
+    }
+
+    #[test]
+    fn convert_local_ok_deletes_local_account_and_enters_cloud_session() {
+        let ctx = egui::Context::default();
+        let mut session = papercraft_engine::Session::open_web_cache(None);
+        session
+            .execute("profile.completeFirstAccess", &json_nick("LocalUser"))
+            .unwrap();
+        let local_id = session
+            .active_local_profile()
+            .unwrap()
+            .local_profile_id
+            .clone();
+        let mut app = PaperCraftApp::new(session, crate::PlatformHooks::default());
+        app.view.active_modal = Some(crate::modal::ActiveModal::ConvertLocalAccount);
+        let auth = ActiveAccountSession {
+            server_url: "http://127.0.0.1:8787".to_string(),
+            user: papercraft_sync_protocol::UserProfile {
+                user_id: "u-conv".to_string(),
+                email: Some("conv@example.com".to_string()),
+                username: "localuser".to_string(),
+                display_name: "LocalUser".to_string(),
+                created_at_ms: 1000,
+                must_change_password: false,
+            },
+            access_token: "acc".to_string(),
+            refresh_token: "ref".to_string(),
+            access_expires_at_ms: 99_999,
+            refresh_expires_at_ms: 99_999,
+            device_name: "TestPC".to_string(),
+            last_auth_ms: 1000,
+        };
+        let pull = SyncPullResponse {
+            server_cursor: 1,
+            user: auth.user.clone(),
+            notebooks: Vec::new(),
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
 
         apply_worker_event(
             &mut app,
             &ctx,
-            SyncWorkerEvent::ConflictDecisionRequired {
-                preview: SyncConflictPreview {
-                    account_name: "Alyx".to_string(),
-                    account_email: "alyx@example.com".to_string(),
-                    server_notebook_count: 2,
-                    local_notebook_count: 1,
-                    server_cursor: 4,
-                    local_pending_changes: 1,
-                    local_dirty_titles: vec!["Offline Draft".to_string()],
-                    server_notebook_titles: vec!["Cloud Note".to_string()],
-                    offline_edits_detected: true,
-                },
+            SyncWorkerEvent::ConvertLocalOk {
+                source_profile_id: local_id,
+                auth,
+                initial_pull: Box::new(pull),
             },
         );
 
-        assert!(!app.session.is_sync_in_flight());
-        assert_eq!(
-            app.view.active_modal,
-            Some(crate::modal::ActiveModal::SyncConflict)
-        );
-        assert!(app.view.account.pending_conflict.is_some());
+        assert!(app.session.is_signed_in());
+        assert!(app.session.is_viewing_cloud());
+        assert!(!app.session.has_saved_local_accounts());
+        assert_eq!(app.view.active_modal, None);
     }
 
     #[test]

@@ -494,27 +494,17 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "sync.status",
         label: "Get Sync Status",
-        description: "Return the current account session, server URL, and pending synchronization count",
+        description: "Return the current account session, server URL, and pending write count",
     },
     CommandSpec {
         id: "sync.setServerUrl",
         label: "Set Sync Server URL",
-        description: "Update the configured self-hosted server URL for future authentication and synchronization",
+        description: "Update the configured self-hosted server URL for server login and live cloud sessions",
     },
     CommandSpec {
         id: "sync.signOut",
-        label: "Sign Out Local Session",
-        description: "Flush local changes and return the session to the active local profile",
-    },
-    CommandSpec {
-        id: "sync.transferNotebook",
-        label: "Transfer Local Notebook to Cloud",
-        description: "Move or copy an individual notebook from a local profile into the connected cloud account",
-    },
-    CommandSpec {
-        id: "sync.migrateLocalAccount",
-        label: "Migrate Local Account to Cloud",
-        description: "Move all notebooks and data from a local account into the signed-in account and delete the old local account",
+        label: "Sign Out Server Session",
+        description: "Clear the active in-memory server session and check for saved local profiles",
     },
     CommandSpec {
         id: "profile.completeFirstAccess",
@@ -543,13 +533,18 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "profile.switch",
-        label: "Switch Active Workspace",
-        description: "Switch between a local profile and the connected cloud account without mixing data",
+        label: "Switch Local Profile",
+        description: "Switch the workspace to a saved local profile on this device (disconnects any active cloud session)",
     },
     CommandSpec {
         id: "profile.delete",
         label: "Delete Local Profile",
-        description: "Remove a non-last local profile from this device",
+        description: "Remove a local profile from this device",
+    },
+    CommandSpec {
+        id: "profile.forgetServerAccount",
+        label: "Forget Server Account Shortcut",
+        description: "Remove a remembered server account shortcut from this device without deleting server data",
     },
 ];
 
@@ -1354,8 +1349,6 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
         "sync.status" => cmd_sync_status(session),
         "sync.setServerUrl" => cmd_sync_set_server_url(session, id, params),
         "sync.signOut" => cmd_sync_sign_out(session),
-        "sync.transferNotebook" => cmd_sync_transfer_notebook(session, id, params),
-        "sync.migrateLocalAccount" => cmd_sync_migrate_local_account(session, id, params),
         "profile.completeFirstAccess" => cmd_profile_complete_first_access(session, id, params),
         "profile.dismissWelcomeBanner" => cmd_profile_dismiss_welcome_banner(session),
         "profile.dismissFirstNotebookDataNotice" => {
@@ -1365,6 +1358,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
         "profile.rename" => cmd_profile_rename(session, id, params),
         "profile.switch" => cmd_profile_switch(session, id, params),
         "profile.delete" => cmd_profile_delete(session, id, params),
+        "profile.forgetServerAccount" => cmd_profile_forget_server_account(session, id, params),
         _ => return Err(EngineError::UnknownCommand(id.to_string())),
     };
     if result.is_ok() {
@@ -1406,9 +1400,8 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
                     | "profile.rename"
                     | "profile.switch"
                     | "profile.delete"
+                    | "profile.forgetServerAccount"
                     | "sync.signOut"
-                    | "sync.transferNotebook"
-                    | "sync.migrateLocalAccount"
                     | "package.export"
                     | "package.import"
             )
@@ -1428,7 +1421,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
             ) {
                 session.bump_active_doc_modified_timestamp();
             }
-            session.mark_offline_edits_if_disconnected();
+            session.touch_cloud_dirty_clock_if_needed();
         }
         session.sync_active_notebook_slot();
     }
@@ -6276,68 +6269,35 @@ fn cmd_sync_set_server_url(
 }
 
 fn cmd_sync_sign_out(session: &mut Session) -> Result<Value, EngineError> {
-    session.sign_out_to_local_library();
+    let has_saved_local_accounts = session.sign_out_from_server_session();
     let summary = session.sync_status_summary();
     Ok(json!({
         "signedIn": summary.signed_in,
+        "hasSavedLocalAccounts": has_saved_local_accounts,
         "notebookCount": session.notebooks.len(),
     }))
 }
 
 #[derive(Deserialize)]
-struct TransferNotebookParams {
-    #[serde(default, alias = "sourceProfileId")]
-    source_profile_id: Option<String>,
-    #[serde(alias = "notebookId")]
-    notebook_id: String,
-    #[serde(default, alias = "move", alias = "moveNotebook")]
-    move_notebook: bool,
+struct ForgetServerAccountParams {
+    #[serde(alias = "serverUrl")]
+    server_url: String,
+    #[serde(alias = "userId")]
+    user_id: String,
 }
 
-fn cmd_sync_transfer_notebook(
+fn cmd_profile_forget_server_account(
     session: &mut Session,
     id: &str,
     params: &Value,
 ) -> Result<Value, EngineError> {
-    let p: TransferNotebookParams = parse_params(id, params)?;
-    let source_id = p
-        .source_profile_id
-        .or_else(|| {
-            session
-                .active_local_profile()
-                .map(|prof| prof.local_profile_id.clone())
-        })
-        .ok_or_else(|| invalid(id, "no source local profile available"))?;
-    let transferred_id = session
-        .transfer_local_notebook_to_cloud(&source_id, &p.notebook_id, p.move_notebook)
+    let p: ForgetServerAccountParams = parse_params(id, params)?;
+    let forgotten = session
+        .forget_server_account(&p.server_url, &p.user_id)
         .map_err(|reason| invalid(id, reason))?;
     Ok(json!({
-        "notebookId": transferred_id,
-        "moved": p.move_notebook,
-    }))
-}
-
-#[derive(Deserialize)]
-struct MigrateLocalAccountParams {
-    #[serde(alias = "profileId")]
-    profile_id: String,
-}
-
-fn cmd_sync_migrate_local_account(
-    session: &mut Session,
-    id: &str,
-    params: &Value,
-) -> Result<Value, EngineError> {
-    let p: MigrateLocalAccountParams = parse_params(id, params)?;
-    let summary = session
-        .migrate_local_account_to_cloud(&p.profile_id)
-        .map_err(|reason| invalid(id, reason))?;
-    Ok(json!({
-        "sourceProfileId": summary.source_profile_id,
-        "sourceNickname": summary.source_nickname,
-        "targetAccountName": summary.target_account_name,
-        "movedNotebooks": summary.moved_notebooks,
-        "movedTrash": summary.moved_trash,
+        "forgotten": forgotten,
+        "rememberedCount": session.remembered_server_accounts().len(),
     }))
 }
 
@@ -6485,21 +6445,24 @@ fn cmd_profile_switch(
     let effective_target = match p.target.as_deref() {
         Some(t) => t,
         None if p.profile_id.is_some() => "local",
-        None => return Err(invalid(id, "target must be `local` or `cloud`")),
+        None => return Err(invalid(id, "target must be `local`")),
     };
     match effective_target {
-        "cloud" => session
-            .switch_to_cloud_workspace()
-            .map_err(|reason| invalid(id, reason))?,
         "local" => {
             let pid = p
                 .profile_id
-                .ok_or_else(|| invalid(id, "provide `profile_id` when target is `local`"))?;
+                .ok_or_else(|| invalid(id, "provide `profile_id` when switching local profiles"))?;
             session
                 .switch_to_local_profile(&pid)
                 .map_err(|reason| invalid(id, reason))?;
         }
-        _ => return Err(invalid(id, "target must be `local` or `cloud`")),
+        "cloud" => {
+            return Err(invalid(
+                id,
+                "cloud accounts require live password authentication and do not persist locally",
+            ));
+        }
+        _ => return Err(invalid(id, "target must be `local`")),
     }
     Ok(json!({
         "viewingCloud": session.is_viewing_cloud(),

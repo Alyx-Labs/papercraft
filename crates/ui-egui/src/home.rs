@@ -1247,7 +1247,6 @@ struct CardInteraction {
     settings: bool,
     export: bool,
     favorite: bool,
-    transfer_to_cloud_move: Option<bool>,
     deferred: Vec<LibraryAction>,
 }
 
@@ -1255,7 +1254,6 @@ struct NotebookMenuCtx<'a> {
     idx: usize,
     doc: &'a Document,
     folder_tree: &'a [FolderNode],
-    can_transfer_to_cloud: bool,
 }
 
 fn draw_notebook_context_menu(
@@ -1290,15 +1288,6 @@ fn draw_notebook_context_menu(
         t,
         &mut out.deferred,
     );
-    if menu_ctx.can_transfer_to_cloud && !menu_ctx.doc.id.is_empty() {
-        ui.add_space(4.0);
-        if menu_item(ui, Icon::Duplicate, "Copy to Cloud", true, false, t).clicked() {
-            out.transfer_to_cloud_move = Some(false);
-        }
-        if menu_item(ui, Icon::Transfer, "Move to Cloud", true, false, t).clicked() {
-            out.transfer_to_cloud_move = Some(true);
-        }
-    }
     ui.add_space(4.0);
     if menu_item(ui, Icon::Trash, "Move to Trash...", true, true, t).clicked() {
         out.deferred
@@ -1337,23 +1326,6 @@ fn apply_notebook_card_interaction(
         }
     } else if action.open {
         crate::open_notebook_in_editor(app, idx);
-    }
-    if let Some(move_notebook) = action.transfer_to_cloud_move
-        && let Some(prof_id) = app
-            .session
-            .active_local_profile()
-            .map(|p| p.local_profile_id.clone())
-        && !doc.id.is_empty()
-    {
-        let _ = app.session.execute(
-            "sync.transferNotebook",
-            &json!({
-                "source_profile_id": prof_id,
-                "notebook_id": doc.id,
-                "move_notebook": move_notebook,
-            }),
-        );
-        crate::sync_view_to_active_notebook(app);
     }
     for deferred in action.deferred {
         apply_library_action(app, deferred);
@@ -1447,7 +1419,6 @@ fn draw_notebook_list_row(
         return Rect::NOTHING;
     };
     let status = app.session.notebook_sync_status(idx);
-    let can_transfer_to_cloud = !app.session.is_viewing_cloud() && app.session.is_signed_in();
     let hover_id = ui.make_persistent_id(("papercraft_home_list_hover", idx));
     let (was_hovered, hover_t) = rect_hover_factor(ui.ctx(), hover_id);
     let row_h = 64.0_f32;
@@ -1577,7 +1548,6 @@ fn draw_notebook_list_row(
                     idx,
                     doc: &doc,
                     folder_tree,
-                    can_transfer_to_cloud,
                 },
                 t,
                 &mut interaction,
@@ -1896,7 +1866,6 @@ fn draw_notebook_card(
         return (Rect::NOTHING, Rect::NOTHING);
     };
     let status = app.session.notebook_sync_status(idx);
-    let can_transfer_to_cloud = !app.session.is_viewing_cloud() && app.session.is_signed_in();
     let (status_label, _, _, _) = crate::account_modal::notebook_status_badge_style(status, t);
     let is_last_open = idx == app.session.active_notebook;
     let hover_id = ui.make_persistent_id(("papercraft_home_card_hover", idx));
@@ -1970,7 +1939,6 @@ fn draw_notebook_card(
                     idx,
                     doc: &doc,
                     folder_tree,
-                    can_transfer_to_cloud,
                 },
                 t,
                 &mut interaction,
@@ -4119,26 +4087,31 @@ mod tests {
             "missing Local only badge in:\n{local_text}"
         );
 
-        app.session.switch_to_authenticated_library(
-            papercraft_sync::ActiveAccountSession {
-                server_url: papercraft_sync_protocol::DEFAULT_SERVER_URL.to_string(),
-                user: papercraft_sync_protocol::UserProfile {
-                    user_id: "u-home".to_string(),
-                    email: Some("alex@example.com".to_string()),
-                    username: "alex".to_string(),
-                    display_name: "Alex".to_string(),
-                    created_at_ms: 1000,
-                    must_change_password: false,
-                },
-                access_token: "a".to_string(),
-                refresh_token: "r".to_string(),
-                access_expires_at_ms: 99_999,
-                refresh_expires_at_ms: 99_999,
-                device_name: "WinPC".to_string(),
-                last_auth_ms: 1000,
+        let acct = papercraft_sync::ActiveAccountSession {
+            server_url: papercraft_sync_protocol::DEFAULT_SERVER_URL.to_string(),
+            user: papercraft_sync_protocol::UserProfile {
+                user_id: "u-home".to_string(),
+                email: Some("alex@example.com".to_string()),
+                username: "alex".to_string(),
+                display_name: "Alex".to_string(),
+                created_at_ms: 1000,
+                must_change_password: false,
             },
-            papercraft_engine::AuthWorkspaceMode::SwitchOnly,
-        );
+            access_token: "a".to_string(),
+            refresh_token: "r".to_string(),
+            access_expires_at_ms: 99_999,
+            refresh_expires_at_ms: 99_999,
+            device_name: "WinPC".to_string(),
+            last_auth_ms: 1000,
+        };
+        let empty_pull = papercraft_sync_protocol::SyncPullResponse {
+            server_cursor: 0,
+            user: acct.user.clone(),
+            notebooks: Vec::new(),
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        app.session.enter_online_server_session(acct, empty_pull);
         app.session
             .execute("notebook.create", &json!({ "title": "Cloud Notes" }))
             .unwrap();
@@ -4157,8 +4130,8 @@ mod tests {
             "expected cloud status dot ({expected_cloud_dot:?}) on header sync button, got {cloud_dots:?}"
         );
         assert!(
-            cloud_text.contains("Waiting to sync"),
-            "missing Waiting to sync badge in:\n{cloud_text}"
+            cloud_text.contains("Saving..."),
+            "missing Saving... badge in:\n{cloud_text}"
         );
     }
 

@@ -22,8 +22,8 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: papercraft-windows-x86_64.exe
-            server_artifact: papercraft-server-windows-x86_64.exe
+            artifact: papercraft-windows-x86_64-portable.exe
+            server_artifact: papercraft-server-windows-x86_64-portable.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: papercraft-linux-x86_64.AppImage
@@ -336,12 +336,12 @@ jobs:
 
           spec = {
               "papercraft": {
-                  "windows-x86_64": ("papercraft-windows-x86_64.exe", "exe"),
+                  "windows-x86_64": ("papercraft-windows-x86_64-portable.exe", "exe"),
                   "linux-x86_64": ("papercraft-linux-x86_64.AppImage", "appimage"),
                   "macos-aarch64": ("papercraft-macos-arm64.tar.gz", "macos-app-tar-gz"),
               },
               "papercraft-server": {
-                  "windows-x86_64": ("papercraft-server-windows-x86_64.exe", "exe"),
+                  "windows-x86_64": ("papercraft-server-windows-x86_64-portable.exe", "exe"),
                   "linux-x86_64": ("papercraft-server-linux-x86_64.AppImage", "appimage"),
                   "macos-aarch64": ("papercraft-server-macos-arm64.tar.gz", "macos-app-tar-gz"),
               },

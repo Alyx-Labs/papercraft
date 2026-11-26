@@ -3,30 +3,16 @@ use std::ops::Range;
 
 use papercraft_sync_protocol::{
     AcceptedFolderSync, ConflictNotebookSync, LocalNotebookChange, MAX_PUSH_BATCH_SIZE,
-    PruneToLocalRequest, RemoteFolderRecord, RemoteNotebookRecord, RemotePrefsRecord,
-    SyncPullResponse, SyncPushRequest, SyncPushResponse, canonical_document_body_hash,
-    canonical_document_hash, canonical_document_meta_hash, now_unix_ms,
+    RemoteFolderRecord, RemoteNotebookRecord, RemotePrefsRecord, SyncPullResponse, SyncPushRequest,
+    SyncPushResponse, canonical_document_body_hash, canonical_document_meta_hash, now_unix_ms,
 };
-use uuid::Uuid;
 
 use crate::client::SyncHttpClient;
 use crate::types::{
-    ActiveAccountSession, ConflictResolutionCopy, LocalNotebookSnapshot, RemoteNotebookUpdate,
-    SyncBatch, SyncConflictPreview, SyncCycleOutcome, SyncError,
+    ActiveAccountSession, RemoteNotebookUpdate, SyncBatch, SyncCycleOutcome, SyncError,
 };
 
 const TARGET_PUSH_CHUNK_BYTES: usize = 24 * 1024 * 1024;
-
-pub fn make_conflict_title(original_title: &str) -> String {
-    let base = original_title.trim();
-    if base.is_empty() {
-        "Untitled Notebook (Conflict Copy)".to_string()
-    } else if base.ends_with(" (Conflict Copy)") {
-        format!("{base} 2")
-    } else {
-        format!("{base} (Conflict Copy)")
-    }
-}
 
 /// Pure step-by-step sync state machine shared by blocking desktop HTTP and async web `fetch`.
 pub struct SyncCycleDriver {
@@ -38,7 +24,7 @@ pub struct SyncCycleDriver {
 }
 
 impl SyncCycleDriver {
-    /// Prepares chunked push requests from a captured local [`SyncBatch`].
+    /// Prepares chunked push requests from a captured [`SyncBatch`].
     pub fn new(batch: &SyncBatch) -> Self {
         let changes = build_pending_changes(batch);
         let ranges = plan_push_chunk_ranges(&changes, MAX_PUSH_BATCH_SIZE, TARGET_PUSH_CHUNK_BYTES);
@@ -94,7 +80,7 @@ impl SyncCycleDriver {
         } else {
             None
         };
-        record_push_response(resp, batch, sent_prefs, &mut self.accum);
+        record_push_response(resp, sent_prefs, &mut self.accum);
         if self.prefs_only_pending {
             self.prefs_only_pending = false;
         } else if self.cursor < self.ranges.len() {
@@ -136,15 +122,12 @@ impl SyncCycleDriver {
             accepted_uploads: self.accum.accepted_uploads,
             accepted_folders: self.accum.accepted_folders,
             cleared_tombstones: self.accum.cleared_tombstones,
-            resolved_conflicts: self.accum.resolved_conflicts,
             pulled_count: self.accum.downloaded_updates.len(),
             downloaded_updates: self.accum.downloaded_updates,
             downloaded_folders,
             updated_prefs,
             ack_prefs: self.accum.ack_prefs,
-            prefs_conflict: self.accum.prefs_conflict,
             pushed_count: self.accum.pushed_count,
-            conflict_count: self.accum.conflict_count,
             synced_at_ms: now_unix_ms(),
         }
     }
@@ -168,53 +151,7 @@ pub fn run_sync_cycle(
     Ok(driver.finish(pull_resp, token_changed.then(|| session.clone())))
 }
 
-/// Authoritatively pushes the local version with `force_overwrite` and prunes any
-/// unchosen server notebooks/folders not present in `batch`.
-pub fn run_sync_cycle_keep_local(
-    client: &SyncHttpClient,
-    session: &mut ActiveAccountSession,
-    batch: &SyncBatch,
-) -> Result<SyncCycleOutcome, SyncError> {
-    let mut forced = batch.clone();
-    forced.force_overwrite = true;
-    let initial_refresh = session.access_token.clone();
-    let mut driver = SyncCycleDriver::new(&forced);
-
-    while let Some(req) = driver.next_push_request(&forced) {
-        let (resp, _) = client.push_with_refresh(session, &req)?;
-        driver.record_push_chunk_response(resp, &forced);
-    }
-
-    let prune_req = build_prune_to_local_request(&forced);
-    let (prune_resp, _) = client.prune_to_local_with_refresh(session, &prune_req)?;
-    let (pull_resp, refreshed_on_pull) = client.pull_with_refresh(session, 0)?;
-    let token_changed = refreshed_on_pull || session.access_token != initial_refresh;
-    let mut outcome = driver.finish(pull_resp, token_changed.then(|| session.clone()));
-    outcome.new_cursor = outcome.new_cursor.max(prune_resp.server_cursor);
-    Ok(outcome)
-}
-
-/// Builds a prune request retaining only the notebooks and folders present locally.
-#[must_use]
-pub fn build_prune_to_local_request(batch: &SyncBatch) -> PruneToLocalRequest {
-    PruneToLocalRequest {
-        keep_notebook_ids: batch
-            .local_docs
-            .iter()
-            .map(|d| d.notebook_id.clone())
-            .collect(),
-        keep_folder_ids: batch
-            .folder_changes
-            .iter()
-            .filter(|f| !f.deleted)
-            .map(|f| f.folder_id.clone())
-            .collect(),
-        device_name: batch.device_name.clone(),
-    }
-}
-
-/// Converts a full `since=0` pull response into a clean [`SyncCycleOutcome`] for
-/// "Keep Server Version" conflict resolution (discarding unchosen local edits).
+/// Converts a full `since=0` pull response into a [`SyncCycleOutcome`] for live server session hydration.
 #[must_use]
 pub fn outcome_from_full_pull(
     pull_resp: SyncPullResponse,
@@ -244,90 +181,14 @@ pub fn outcome_from_full_pull(
         accepted_uploads: Vec::new(),
         accepted_folders: Vec::new(),
         cleared_tombstones: Vec::new(),
-        resolved_conflicts: Vec::new(),
         pulled_count: downloaded_updates.len(),
         downloaded_updates,
         downloaded_folders: pull_resp.folders,
         updated_prefs: pull_resp.studio_prefs,
         ack_prefs: None,
-        prefs_conflict: None,
         pushed_count: 0,
-        conflict_count: 0,
         synced_at_ms: now_unix_ms(),
     }
-}
-
-/// Detects whether offline edits or server/local divergence require user resolution
-/// between **Server Version** and **Local Version**.
-#[must_use]
-pub fn build_conflict_preview_if_needed(
-    account_name: &str,
-    account_email: &str,
-    offline_edits_pending: bool,
-    batch: &SyncBatch,
-    server_pull: &SyncPullResponse,
-) -> Option<SyncConflictPreview> {
-    let server_active: Vec<&RemoteNotebookRecord> = server_pull
-        .notebooks
-        .iter()
-        .filter(|r| !r.deleted)
-        .collect();
-    let server_has_history = server_pull.server_cursor > 0
-        || !server_pull.notebooks.is_empty()
-        || !server_pull.folders.is_empty()
-        || server_pull.studio_prefs.is_some();
-
-    let local_pending_changes = batch
-        .local_docs
-        .iter()
-        .filter(|d| d.cloud_dirty || d.base_version == 0)
-        .count()
-        .saturating_add(batch.tombstones.len())
-        .saturating_add(usize::from(batch.prefs_push.is_some()));
-
-    let has_local_edits = offline_edits_pending || local_pending_changes > 0;
-    let offline_conflict = offline_edits_pending && server_has_history;
-    let diverged_conflict = has_local_edits
-        && (server_pull.server_cursor > batch.client_cursor
-            || (batch.client_cursor == 0 && !server_active.is_empty()));
-
-    if !offline_conflict && !diverged_conflict {
-        return None;
-    }
-
-    let mut local_dirty_titles: Vec<String> = batch
-        .local_docs
-        .iter()
-        .filter(|d| d.cloud_dirty || d.base_version == 0)
-        .map(|d| d.doc.title.clone())
-        .take(5)
-        .collect();
-    if local_dirty_titles.is_empty() {
-        local_dirty_titles = batch
-            .local_docs
-            .iter()
-            .map(|d| d.doc.title.clone())
-            .take(5)
-            .collect();
-    }
-
-    let server_notebook_titles: Vec<String> = server_active
-        .iter()
-        .filter_map(|r| r.document.as_ref().map(|d| d.title.clone()))
-        .take(5)
-        .collect();
-
-    Some(SyncConflictPreview {
-        account_name: account_name.to_string(),
-        account_email: account_email.to_string(),
-        server_notebook_count: server_active.len(),
-        local_notebook_count: batch.local_docs.len(),
-        server_cursor: server_pull.server_cursor,
-        local_pending_changes: local_pending_changes.max(usize::from(offline_edits_pending)),
-        local_dirty_titles,
-        server_notebook_titles,
-        offline_edits_detected: offline_edits_pending,
-    })
 }
 
 #[derive(Default)]
@@ -335,13 +196,10 @@ struct PushAccum {
     accepted_uploads: Vec<papercraft_sync_protocol::AcceptedNotebookSync>,
     accepted_folders: Vec<AcceptedFolderSync>,
     cleared_tombstones: Vec<String>,
-    resolved_conflicts: Vec<ConflictResolutionCopy>,
     downloaded_updates: Vec<RemoteNotebookUpdate>,
     ack_prefs: Option<(u64, String)>,
-    prefs_conflict: Option<RemotePrefsRecord>,
     highest_cursor: u64,
     pushed_count: usize,
-    conflict_count: usize,
 }
 
 fn build_pending_changes(batch: &SyncBatch) -> Vec<LocalNotebookChange> {
@@ -446,14 +304,13 @@ fn plan_push_chunk_ranges(
 
 fn record_push_response(
     resp: SyncPushResponse,
-    batch: &SyncBatch,
     sent_prefs: Option<&papercraft_sync_protocol::LocalPrefsPush>,
     accum: &mut PushAccum,
 ) {
     accum.highest_cursor = accum.highest_cursor.max(resp.server_cursor);
-    if let Some(conflict) = resp.prefs_conflict {
-        accum.prefs_conflict = Some(conflict);
-    } else if let Some(prefs) = sent_prefs {
+    if resp.prefs_conflict.is_none()
+        && let Some(prefs) = sent_prefs
+    {
         accum.ack_prefs = Some((resp.prefs_version, prefs.content_hash.clone()));
     }
 
@@ -468,50 +325,14 @@ fn record_push_response(
     accum.accepted_folders.extend(resp.accepted_folders);
 
     for conflict in resp.conflicts {
-        handle_conflict(&conflict, &batch.local_docs, accum);
+        handle_conflict(&conflict, accum);
     }
 }
 
-fn handle_conflict(
-    conflict: &ConflictNotebookSync,
-    local_docs: &[LocalNotebookSnapshot],
-    accum: &mut PushAccum,
-) {
-    let remote = &conflict.server_record;
-    let local_match = local_docs
-        .iter()
-        .find(|snap| snap.notebook_id == conflict.notebook_id);
-
-    if let Some(local) = local_match {
-        let identical_content = !remote.deleted && remote.content_hash == local.content_hash;
-        let same_body = !remote.deleted
-            && !remote.body_hash.is_empty()
-            && remote.body_hash == canonical_document_body_hash(&local.doc);
-        if !identical_content && !same_body {
-            accum.conflict_count += 1;
-            let conflict_id = Uuid::new_v4().to_string();
-            let mut copy_doc = local.doc.clone();
-            let conflict_title = make_conflict_title(&copy_doc.title);
-            copy_doc.id = conflict_id.clone();
-            copy_doc.title = conflict_title.clone();
-            let local_hash = canonical_document_hash(&copy_doc);
-            accum.resolved_conflicts.push(ConflictResolutionCopy {
-                original_notebook_id: conflict.notebook_id.clone(),
-                conflict_notebook_id: conflict_id,
-                conflict_title,
-                local_doc: copy_doc,
-                local_hash,
-            });
-        }
-    } else if !remote.deleted {
-        // Local tombstone conflicted with newer server edit -> clear tombstone & apply remote.
-        accum.conflict_count += 1;
-        accum.cleared_tombstones.push(conflict.notebook_id.clone());
-    } else {
-        accum.cleared_tombstones.push(conflict.notebook_id.clone());
-    }
-
-    upsert_downloaded_update(remote, &mut accum.downloaded_updates);
+fn handle_conflict(conflict: &ConflictNotebookSync, accum: &mut PushAccum) {
+    // Real-time cloud sessions never create "(Conflict Copy)" files; apply the authoritative server record.
+    accum.cleared_tombstones.push(conflict.notebook_id.clone());
+    upsert_downloaded_update(&conflict.server_record, &mut accum.downloaded_updates);
 }
 
 fn merge_pulled_records(

@@ -4066,7 +4066,7 @@ fn draw_right_utility_controls(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &T
     draw_sync_profile_button(app, ui, t);
 }
 
-/// Renders the `36x36` Profile & Cloud Sync icon button with a live connection status dot.
+/// Renders the `36x36` Profile & Accounts icon button with a live connection status dot.
 pub(crate) fn draw_sync_profile_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     let acct_active = app.view.screen == crate::AppScreen::Profile
         || app.view.active_modal == Some(crate::modal::ActiveModal::AccountSync);
@@ -4084,34 +4084,21 @@ pub(crate) fn draw_sync_profile_button(app: &mut PaperCraftApp, ui: &mut egui::U
             .as_deref()
             .map_or_else(String::new, |u| format!(" · @{u}"));
         format!(
-            "Profile: {}{handle}\nStatus: {} ({cloud_pending} waiting to sync)\nServer: {}\nClick to open Profile & Cloud Sync.",
+            "Profile: {}{handle}\nStatus: {} ({cloud_pending} saving to server)\nServer: {} · Zero Local Cache\nClick to switch accounts or manage Profile.",
             summary.workspace_badge_text(),
             state_label,
             summary.server_url
-        )
-    } else if summary.signed_in {
-        let prof = summary
-            .active_local_profile_name
-            .as_deref()
-            .unwrap_or("Personal");
-        format!(
-            "Workspace: Local Only ({prof})\nCloud account ({}) is connected separately.\nClick to open Profile & Cloud Sync.",
-            summary
-                .email
-                .as_deref()
-                .or(summary.username.as_deref())
-                .unwrap_or("account")
         )
     } else {
         let prof = summary
             .active_local_profile_name
             .as_deref()
-            .unwrap_or("Personal");
+            .unwrap_or("Local");
         format!(
-            "Workspace: Local Only ({prof})\nStored only on this device. Click to open Profile, manage local profiles, or connect Cloud Sync."
+            "Profile: Local Only ({prof})\nStored only on this device. Click to switch accounts, sign in to a server, or sync this account to the cloud."
         )
     };
-    let sync_resp = toolbar_icon_button(ui, Icon::Sync, None, acct_active, true, t);
+    let sync_resp = toolbar_icon_button(ui, Icon::Account, None, acct_active, true, t);
     if ui.is_rect_visible(sync_resp.rect) {
         let dot_c = egui::pos2(sync_resp.rect.right() - 6.5, sync_resp.rect.bottom() - 6.5);
         ui.painter().circle_filled(dot_c, 4.2, t.header_bg);

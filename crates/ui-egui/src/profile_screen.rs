@@ -1,17 +1,16 @@
-//! Dedicated full-window Profile, Account Security, Sync & Workspace screen.
+//! Dedicated full-window Profile, Account Switching, Security & Server screen.
 
 use egui::{CornerRadius, Margin, Sense, Stroke, Vec2};
 use papercraft_sync::{SyncConnectionState, SyncStatusSummary};
 
 use crate::PaperCraftApp;
 use crate::account_modal::{
-    BannerTone, ProfileSection, SignedOutProfileSection, draw_cloud_workspace_block, draw_hairline,
-    draw_section_card, draw_status_banner, handle_auth_submit_on_enter, render_account_email_card,
-    render_auth_banners, render_auth_card_contents, render_change_password_card,
-    render_detected_local_accounts_migration_card, render_local_profiles_manager,
-    render_logout_safeguard_actions, render_logout_safeguard_body, render_profile_identity_card,
-    render_server_probe_section, render_session_sign_out_card, render_signed_in_account_card,
-    render_signed_in_server_card, status_badge_style, trigger_test_connection,
+    ProfileSection, draw_hairline, draw_section_card, draw_status_banner,
+    handle_auth_submit_on_enter, probe_all_known_servers, render_account_email_card,
+    render_accounts_switcher_section, render_auth_banners, render_auth_card_contents,
+    render_change_password_card, render_profile_identity_card, render_server_probe_section,
+    render_session_sign_out_card, render_signed_in_account_card, render_signed_in_server_card,
+    status_badge_style, trigger_test_connection,
 };
 use crate::icons::{
     Icon, SidebarEdge, SidebarEdgeButtonSpec, SidebarEdgeSize, SwitchLayout, SwitchOption,
@@ -29,9 +28,22 @@ const COMPACT_BREAKPOINT: f32 = 760.0;
 
 /// Renders the dedicated Profile & Cloud Sync screen.
 pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
+    if std::mem::take(&mut app.view.account.profile_probe_pending) {
+        probe_all_known_servers(app, ui.ctx());
+    }
+
     let t = Tokens::for_theme(app.session.prefs.theme);
     let summary = app.session.sync_status_summary();
     let cloud_pending = app.session.cloud_pending_changes_count();
+
+    if !summary.signed_in
+        && matches!(
+            app.view.account.profile_section,
+            ProfileSection::Profile | ProfileSection::Security
+        )
+    {
+        app.view.account.profile_section = ProfileSection::Accounts;
+    }
 
     draw_profile_header(app, ui, &summary, cloud_pending, &t);
     crate::inspector::show(app, ui);
@@ -135,43 +147,50 @@ fn draw_profile_header(
                     }
 
                     let in_flight = app.session.is_sync_in_flight();
-                    let can_sync = summary.signed_in && summary.viewing_cloud && !in_flight;
                     let (state_label, _) = status_badge_style(summary.connection, t);
                     let dot_color = if summary.viewing_cloud {
                         crate::account_modal::header_status_dot_color(summary.connection, t)
+                    } else if app
+                        .view
+                        .account
+                        .probe_for(app.session.server_url())
+                        .is_connected()
+                    {
+                        t.success_fg
                     } else {
                         t.header_fg_muted
                     };
                     let sync_tip = if summary.viewing_cloud {
                         if in_flight {
-                            format!("Syncing cloud workspace...\nServer: {}", summary.server_url)
+                            format!("Saving to server...\nServer: {}", summary.server_url)
                         } else {
                             format!(
                                 "Sync Now ({state_label}, {cloud_pending} pending)\nServer: {}",
                                 summary.server_url
                             )
                         }
-                    } else if summary.signed_in {
-                        "Viewing Local Workspace\nSwitch to Cloud Workspace below to sync."
-                            .to_string()
                     } else {
-                        "Local Only Workspace\nStored only on this device. Sign in to enable Cloud Sync."
-                            .to_string()
+                        format!(
+                            "Local Account Active\nClick to check sync server status ({}).",
+                            app.session.server_url()
+                        )
                     };
                     let sync_resp =
-                        toolbar_icon_button(ui, Icon::Sync, None, in_flight, can_sync, t);
+                        toolbar_icon_button(ui, Icon::Sync, None, in_flight, !in_flight, t);
                     if ui.is_rect_visible(sync_resp.rect) {
-                        let dot_c = egui::pos2(
-                            sync_resp.rect.right() - 6.5,
-                            sync_resp.rect.bottom() - 6.5,
-                        );
+                        let dot_c =
+                            egui::pos2(sync_resp.rect.right() - 6.5, sync_resp.rect.bottom() - 6.5);
                         ui.painter().circle_filled(dot_c, 4.2, t.header_bg);
                         ui.painter().circle_filled(dot_c, 3.0, dot_color);
                     }
                     if sync_resp.on_hover_text(sync_tip).clicked() {
                         app.view.account.error_message = None;
                         app.view.account.status_message = None;
-                        trigger_manual_sync(app, ui.ctx());
+                        if summary.viewing_cloud {
+                            trigger_manual_sync(app, ui.ctx());
+                        } else {
+                            probe_all_known_servers(app, ui.ctx());
+                        }
                     }
                 });
             });
@@ -229,6 +248,18 @@ fn draw_compact_layout(
     if summary.signed_in {
         let options = [
             SwitchOption::new(
+                Some(Icon::Inbox),
+                Some("Accounts"),
+                "Switch local & server accounts",
+                true,
+            ),
+            SwitchOption::new(
+                Some(Icon::Server),
+                Some("Server"),
+                "Server address & login",
+                true,
+            ),
+            SwitchOption::new(
                 Some(Icon::Account),
                 Some("Profile"),
                 "Profile & email",
@@ -240,19 +271,12 @@ fn draw_compact_layout(
                 "Password & sign-out",
                 true,
             ),
-            SwitchOption::new(Some(Icon::Sync), Some("Sync"), "Server & sync status", true),
-            SwitchOption::new(
-                Some(Icon::Inbox),
-                Some("Workspaces"),
-                "Local profiles",
-                true,
-            ),
         ];
         let active = match app.view.account.profile_section {
-            ProfileSection::Profile => 0,
-            ProfileSection::Security => 1,
-            ProfileSection::SyncServer => 2,
-            ProfileSection::Workspaces => 3,
+            ProfileSection::Accounts => 0,
+            ProfileSection::ServerLogin => 1,
+            ProfileSection::Profile => 2,
+            ProfileSection::Security => 3,
         };
         let (clicked, _) = segmented_switch(
             ui,
@@ -264,30 +288,30 @@ fn draw_compact_layout(
         );
         if let Some(idx) = clicked {
             app.view.account.profile_section = match idx {
-                0 => ProfileSection::Profile,
-                1 => ProfileSection::Security,
-                2 => ProfileSection::SyncServer,
-                _ => ProfileSection::Workspaces,
+                0 => ProfileSection::Accounts,
+                1 => ProfileSection::ServerLogin,
+                2 => ProfileSection::Profile,
+                _ => ProfileSection::Security,
             };
         }
     } else {
         let options = [
             SwitchOption::new(
-                Some(Icon::Server),
-                Some("Cloud Account"),
-                "Sign in, create account, or complete password reset",
+                Some(Icon::Inbox),
+                Some("Accounts"),
+                "Local accounts & server shortcuts",
                 true,
             ),
             SwitchOption::new(
-                Some(Icon::Inbox),
-                Some("Local Workspaces"),
-                "Manage offline local profiles",
+                Some(Icon::Server),
+                Some("Server Sign-In"),
+                "Sign in, create account, or reset password",
                 true,
             ),
         ];
-        let active = match app.view.account.signed_out_section {
-            SignedOutProfileSection::CloudAccount => 0,
-            SignedOutProfileSection::LocalWorkspaces => 1,
+        let active = match app.view.account.profile_section {
+            ProfileSection::Accounts => 0,
+            _ => 1,
         };
         let (clicked, _) = segmented_switch(
             ui,
@@ -298,10 +322,10 @@ fn draw_compact_layout(
             t,
         );
         if let Some(idx) = clicked {
-            app.view.account.signed_out_section = if idx == 0 {
-                SignedOutProfileSection::CloudAccount
+            app.view.account.profile_section = if idx == 0 {
+                ProfileSection::Accounts
             } else {
-                SignedOutProfileSection::LocalWorkspaces
+                ProfileSection::ServerLogin
             };
         }
     }
@@ -336,6 +360,18 @@ fn draw_sidebar_rail(
             if summary.signed_in {
                 let items = [
                     (
+                        ProfileSection::Accounts,
+                        Icon::Inbox,
+                        "Accounts",
+                        "Local & server shortcuts",
+                    ),
+                    (
+                        ProfileSection::ServerLogin,
+                        Icon::Server,
+                        "Server Sign-In",
+                        "Server URL or switch account",
+                    ),
+                    (
                         ProfileSection::Profile,
                         Icon::Account,
                         "Profile",
@@ -347,18 +383,6 @@ fn draw_sidebar_rail(
                         "Security",
                         "Password & active session",
                     ),
-                    (
-                        ProfileSection::SyncServer,
-                        Icon::Sync,
-                        "Sync & Server",
-                        "Sync state & server URL",
-                    ),
-                    (
-                        ProfileSection::Workspaces,
-                        Icon::Inbox,
-                        "Workspaces",
-                        "Cloud & local profiles",
-                    ),
                 ];
                 for (sec, icon, title, subtitle) in items {
                     let active = app.view.account.profile_section == sec;
@@ -369,22 +393,22 @@ fn draw_sidebar_rail(
             } else {
                 let items = [
                     (
-                        SignedOutProfileSection::CloudAccount,
-                        Icon::Server,
-                        "Cloud Account",
-                        "Sign in, sign up, or reset password",
+                        ProfileSection::Accounts,
+                        Icon::Inbox,
+                        "Accounts",
+                        "Local accounts & server shortcuts",
                     ),
                     (
-                        SignedOutProfileSection::LocalWorkspaces,
-                        Icon::Inbox,
-                        "Local Workspaces",
-                        "Offline profiles on this device",
+                        ProfileSection::ServerLogin,
+                        Icon::Server,
+                        "Server Sign-In",
+                        "Sign in, sign up, or reset password",
                     ),
                 ];
                 for (sec, icon, title, subtitle) in items {
-                    let active = app.view.account.signed_out_section == sec;
+                    let active = app.view.account.profile_section == sec;
                     if draw_rail_nav_button(ui, icon, title, subtitle, active, t) {
-                        app.view.account.signed_out_section = sec;
+                        app.view.account.profile_section = sec;
                     }
                 }
             }
@@ -552,17 +576,26 @@ fn draw_active_section_content(
 ) {
     ui.spacing_mut().item_spacing.y = 0.0;
 
-    if summary.signed_in && app.view.account.logout_confirm_open {
-        render_logout_safeguard_body(app, ui, t);
-        ui.add_space(10.0);
-        draw_section_card(ui, t, |ui| {
-            render_logout_safeguard_actions(app, ui, t);
-        });
-        return;
-    }
-
     if summary.signed_in {
         match app.view.account.profile_section {
+            ProfileSection::Accounts => {
+                render_accounts_switcher_section(app, ui, summary, cloud_pending, t);
+            }
+            ProfileSection::ServerLogin => {
+                draw_section_card(ui, t, |ui| {
+                    render_signed_in_account_card(app, ui, summary, cloud_pending, t);
+                });
+                ui.add_space(10.0);
+                let mut test_on_enter = false;
+                draw_section_card(ui, t, |ui| {
+                    test_on_enter = render_signed_in_server_card(app, ui, summary, t);
+                });
+                if test_on_enter && !app.view.account.is_testing() {
+                    trigger_test_connection(app, ui.ctx());
+                }
+                ui.add_space(10.0);
+                draw_self_hosted_download_disclaimer(app, ui, t);
+            }
             ProfileSection::Profile => {
                 draw_section_card(ui, t, |ui| {
                     render_profile_identity_card(app, ui, t);
@@ -581,32 +614,13 @@ fn draw_active_section_content(
                     render_session_sign_out_card(app, ui, summary, t);
                 });
             }
-            ProfileSection::SyncServer => {
-                draw_section_card(ui, t, |ui| {
-                    render_signed_in_account_card(app, ui, summary, cloud_pending, t);
-                });
-                if !app.session.accessible_local_profiles().is_empty() {
-                    ui.add_space(10.0);
-                    draw_section_card(ui, t, |ui| {
-                        render_detected_local_accounts_migration_card(app, ui, summary, t);
-                    });
-                }
-                ui.add_space(10.0);
-                let mut test_on_enter = false;
-                draw_section_card(ui, t, |ui| {
-                    test_on_enter = render_signed_in_server_card(app, ui, summary, t);
-                });
-                if test_on_enter && !app.view.account.is_testing() {
-                    trigger_test_connection(app, ui.ctx());
-                }
-            }
-            ProfileSection::Workspaces => {
-                draw_signed_in_workspaces_section(app, ui, summary, t);
-            }
         }
     } else {
-        match app.view.account.signed_out_section {
-            SignedOutProfileSection::CloudAccount => {
+        match app.view.account.profile_section {
+            ProfileSection::Accounts => {
+                render_accounts_switcher_section(app, ui, summary, cloud_pending, t);
+            }
+            _ => {
                 let mut test_on_enter = false;
                 draw_section_card(ui, t, |ui| {
                     test_on_enter = render_server_probe_section(app, ui, t, true);
@@ -625,53 +639,15 @@ fn draw_active_section_content(
                     handle_auth_submit_on_enter(app, ui.ctx());
                 }
             }
-            SignedOutProfileSection::LocalWorkspaces => {
-                draw_section_card(ui, t, |ui| {
-                    let active_name = summary
-                        .active_local_profile_name
-                        .as_deref()
-                        .unwrap_or("Personal");
-                    let nb_count = app.session.notebooks.len();
-                    ui.horizontal(|ui| {
-                        let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                        paint_icon(ui.painter(), ir, Icon::Inbox, t.accent);
-                        ui.label(
-                            egui::RichText::new(format!("On This Device: {active_name}"))
-                                .size(13.5)
-                                .strong()
-                                .color(t.text),
-                        );
-                    });
-                    ui.add_space(3.0);
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!(
-                                "{nb_count} notebook(s) in this local workspace. Local profiles stay completely offline until you sign in or transfer notebooks."
-                            ))
-                            .size(11.0)
-                            .color(t.text_muted),
-                        )
-                        .wrap(),
-                    );
-                    ui.add_space(10.0);
-                    draw_hairline(ui, t);
-                    ui.add_space(10.0);
-                    render_local_profiles_manager(app, ui, t);
-                });
-            }
         }
     }
 
-    if let Some(ref conflict) = summary.last_conflict_notice {
-        ui.add_space(8.0);
-        draw_status_banner(ui, BannerTone::Info, conflict, t);
-    }
     if let Some(ref err) = summary.last_error
         && app.view.account.error_message.is_none()
         && summary.connection == SyncConnectionState::Error
     {
         ui.add_space(8.0);
-        draw_status_banner(ui, BannerTone::Error, err, t);
+        draw_status_banner(ui, crate::account_modal::BannerTone::Error, err, t);
     }
     render_auth_banners(app, ui, t);
 }
@@ -765,50 +741,6 @@ fn draw_self_hosted_download_disclaimer(app: &mut PaperCraftApp, ui: &mut egui::
     }
 }
 
-fn draw_signed_in_workspaces_section(
-    app: &mut PaperCraftApp,
-    ui: &mut egui::Ui,
-    summary: &SyncStatusSummary,
-    t: &Tokens,
-) {
-    draw_section_card(ui, t, |ui| {
-        ui.horizontal(|ui| {
-            let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-            paint_icon(ui.painter(), ir, Icon::Inbox, t.accent);
-            ui.label(
-                egui::RichText::new("Workspaces")
-                    .size(13.5)
-                    .strong()
-                    .color(t.text),
-            );
-        });
-        ui.add_space(3.0);
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(
-                    "Separate blocks for your Cloud Sync account and each offline Local Only account on this device.",
-                )
-                .size(11.0)
-                .color(t.text_muted),
-            )
-            .wrap(),
-        );
-        ui.add_space(10.0);
-        draw_cloud_workspace_block(app, ui, summary, t);
-        ui.add_space(10.0);
-        draw_hairline(ui, t);
-        ui.add_space(10.0);
-        render_local_profiles_manager(app, ui, t);
-    });
-
-    if !app.session.accessible_local_profiles().is_empty() {
-        ui.add_space(10.0);
-        draw_section_card(ui, t, |ui| {
-            render_detected_local_accounts_migration_card(app, ui, summary, t);
-        });
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -817,9 +749,8 @@ mod tests {
     use crate::account_modal::AuthTab;
     use crate::sync_worker::{SyncWorkerEvent, apply_worker_event};
     use egui::{Shape, epaint::ClippedShape};
-    use papercraft_engine::AuthWorkspaceMode;
     use papercraft_sync::ActiveAccountSession;
-    use papercraft_sync_protocol::{DEFAULT_SERVER_URL, UserProfile};
+    use papercraft_sync_protocol::{DEFAULT_SERVER_URL, SyncPullResponse, UserProfile};
 
     fn collect_text(shapes: &[ClippedShape]) -> String {
         let mut out = String::new();
@@ -871,7 +802,9 @@ mod tests {
         let mut app = PaperCraftApp::default();
         crate::open_profile_screen(&mut app);
         assert_eq!(app.view.screen, AppScreen::Profile);
+        assert_eq!(app.view.account.profile_section, ProfileSection::Accounts);
 
+        app.view.account.profile_section = ProfileSection::ServerLogin;
         app.view.account.tab = AuthTab::CreateAccount;
         let signup_text = render_profile_text(&ctx, &mut app);
         assert!(signup_text.contains("Profile & Cloud Sync"));
@@ -906,27 +839,43 @@ mod tests {
         let _ = app
             .session
             .execute("profile.create", &serde_json::json!({ "nickname": "Ana" }));
-        app.session.switch_to_authenticated_library(
-            ActiveAccountSession {
-                server_url: DEFAULT_SERVER_URL.to_string(),
-                user: UserProfile {
-                    user_id: "u-prof-1".to_string(),
-                    email: Some("alex@example.com".to_string()),
-                    username: "alex_notes".to_string(),
-                    display_name: "Alex Silva".to_string(),
-                    created_at_ms: 1000,
-                    must_change_password: false,
-                },
-                access_token: "acc".to_string(),
-                refresh_token: "ref".to_string(),
-                access_expires_at_ms: 99_999,
-                refresh_expires_at_ms: 99_999,
-                device_name: "Desk".to_string(),
-                last_auth_ms: 1000,
+        let acct = ActiveAccountSession {
+            server_url: DEFAULT_SERVER_URL.to_string(),
+            user: UserProfile {
+                user_id: "u-prof-1".to_string(),
+                email: Some("alex@example.com".to_string()),
+                username: "alex_notes".to_string(),
+                display_name: "Alex Silva".to_string(),
+                created_at_ms: 1000,
+                must_change_password: false,
             },
-            AuthWorkspaceMode::SwitchOnly,
-        );
+            access_token: "acc".to_string(),
+            refresh_token: "ref".to_string(),
+            access_expires_at_ms: 99_999,
+            refresh_expires_at_ms: 99_999,
+            device_name: "Desk".to_string(),
+            last_auth_ms: 1000,
+        };
+        let empty_pull = SyncPullResponse {
+            server_cursor: 0,
+            user: acct.user.clone(),
+            notebooks: Vec::new(),
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        app.session.enter_online_server_session(acct, empty_pull);
         crate::open_profile_screen(&mut app);
+        assert_eq!(app.view.account.profile_section, ProfileSection::Accounts);
+
+        let accts_text = render_profile_text(&ctx, &mut app);
+        assert!(accts_text.contains("Local Accounts (1)"), "{accts_text}");
+        assert!(
+            accts_text.contains("Server Accounts (Zero Local Cache)"),
+            "{accts_text}"
+        );
+        assert!(accts_text.contains("Ana"));
+        assert!(accts_text.contains("0 notebooks"));
+        assert!(accts_text.contains("Local Only"));
 
         app.view.account.profile_section = ProfileSection::Profile;
         let profile_text = render_profile_text(&ctx, &mut app);
@@ -944,17 +893,10 @@ mod tests {
         assert!(sec_text.contains("Update Password"));
         assert!(sec_text.contains("Session & Sign Out"));
 
-        app.view.account.profile_section = ProfileSection::SyncServer;
+        app.view.account.profile_section = ProfileSection::ServerLogin;
         let sync_text = render_profile_text(&ctx, &mut app);
         assert!(sync_text.contains("Server Address"));
-        assert!(sync_text.contains("PENDING UPLOADS"));
-
-        app.view.account.profile_section = ProfileSection::Workspaces;
-        let ws_text = render_profile_text(&ctx, &mut app);
-        assert!(ws_text.contains("Cloud Workspace"));
-        assert!(ws_text.contains("Ana"));
-        assert!(ws_text.contains("0 notebooks"));
-        assert!(ws_text.contains("Local Only"));
+        assert!(sync_text.contains("SERVER WRITES"));
 
         crate::close_profile_screen(&mut app);
         assert_eq!(app.view.screen, AppScreen::Home);
@@ -976,6 +918,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = PaperCraftApp::new(papercraft_engine::Session::default(), hooks);
         crate::open_profile_screen(&mut app);
+        app.view.account.profile_section = ProfileSection::ServerLogin;
 
         let find_text_center = |shapes: &[ClippedShape], needle: &str| -> Option<egui::Pos2> {
             fn visit(shape: &Shape, needle: &str) -> Option<egui::Pos2> {

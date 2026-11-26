@@ -22,7 +22,8 @@ pub enum ActiveModal {
     ConfirmReorderPage,
     AccountSync,
     FirstAccessNickname,
-    SyncConflict,
+    SelectLocalAccount,
+    ConvertLocalAccount,
     TransferPages,
     NewFolder,
     RenameFolder,
@@ -74,7 +75,8 @@ impl ActiveModal {
             Self::ConfirmDeleteNotebook => 4,
             Self::AccountSync => 5,
             Self::FirstAccessNickname => 14,
-            Self::SyncConflict => 15,
+            Self::SelectLocalAccount => 15,
+            Self::ConvertLocalAccount => 20,
             Self::TransferPages => 6,
             Self::NewFolder => 7,
             Self::RenameFolder => 8,
@@ -129,7 +131,7 @@ impl ActiveModal {
             Self::AccountSync => DialogSpec {
                 icon: Icon::Account,
                 title: "Account & Cloud Sync",
-                subtitle: "Manage offline local profiles, email account linking, and cloud sync.",
+                subtitle: "Switch between device-local accounts and zero-cache cloud accounts.",
                 width: 530.0,
                 min_body_height: 0.0,
             },
@@ -182,12 +184,19 @@ impl ActiveModal {
                 width: 420.0,
                 min_body_height: 0.0,
             },
-            Self::SyncConflict => DialogSpec {
-                icon: Icon::AlertCircle,
-                title: "Sync Conflict Detected",
-                subtitle: "Changes were made while offline. Choose which version should prevail.",
+            Self::SelectLocalAccount => DialogSpec {
+                icon: Icon::Account,
+                title: "Select a Local Account",
+                subtitle: "Choose a saved local account on this device or create a new local session.",
+                width: 500.0,
+                min_body_height: 220.0,
+            },
+            Self::ConvertLocalAccount => DialogSpec {
+                icon: Icon::Sync,
+                title: "Sync Local Account to Server",
+                subtitle: "Upload your local notebooks and settings to a cloud account with zero local cache.",
                 width: 480.0,
-                min_body_height: 0.0,
+                min_body_height: 220.0,
             },
             Self::AppUpdate => DialogSpec {
                 icon: Icon::MoveDown,
@@ -324,7 +333,6 @@ pub(crate) fn open(app: &mut PaperCraftApp, target: ActiveModal) {
         | ActiveModal::DeleteFolder
         | ActiveModal::FolderColor
         | ActiveModal::TagColor
-        | ActiveModal::SyncConflict
         | ActiveModal::AppUpdate
         | ActiveModal::KeyboardShortcuts
         | ActiveModal::WelcomeBanner
@@ -332,6 +340,15 @@ pub(crate) fn open(app: &mut PaperCraftApp, target: ActiveModal) {
         ActiveModal::FirstAccessNickname => {
             app.view.first_access_error = None;
             app.view.first_access_focus_pending = true;
+        }
+        ActiveModal::SelectLocalAccount => {
+            app.view.account.select_local_new_name.clear();
+            app.view.account.select_local_error = None;
+        }
+        ActiveModal::ConvertLocalAccount => {
+            app.view.account.convert_error = None;
+            app.view.account.convert_busy = false;
+            app.view.account.convert_focus_pending = true;
         }
         ActiveModal::AccountSync => {
             crate::account_modal::sync_draft_from_session(app);
@@ -571,13 +588,21 @@ fn show_inner_with_motion(
             crate::account_modal::render_first_access_body,
             crate::account_modal::render_first_access_footer,
         ),
-        ActiveModal::SyncConflict => show_dialog(
+        ActiveModal::SelectLocalAccount => show_dialog(
             app,
             ui,
             active,
             motion,
-            crate::account_modal::render_conflict_body,
-            crate::account_modal::render_conflict_footer,
+            crate::account_modal::render_select_local_account_body,
+            crate::account_modal::render_select_local_account_footer,
+        ),
+        ActiveModal::ConvertLocalAccount => show_dialog(
+            app,
+            ui,
+            active,
+            motion,
+            crate::account_modal::render_convert_local_account_body,
+            crate::account_modal::render_convert_local_account_footer,
         ),
         ActiveModal::TransferPages => show_dialog(
             app,
@@ -688,7 +713,8 @@ fn modal_steps(active: ActiveModal) -> Option<&'static [ModalStepSpec]> {
         | ActiveModal::ConfirmReorderPage
         | ActiveModal::AccountSync
         | ActiveModal::FirstAccessNickname
-        | ActiveModal::SyncConflict
+        | ActiveModal::SelectLocalAccount
+        | ActiveModal::ConvertLocalAccount
         | ActiveModal::TransferPages
         | ActiveModal::NewFolder
         | ActiveModal::RenameFolder
@@ -788,6 +814,12 @@ fn show_dialog(
         0.0,
         (1.0 - motion.eased) * crate::motion::MODAL_SETTLE_OFFSET_Y,
     );
+    let allow_close = !matches!(
+        active,
+        ActiveModal::FirstAccessNickname | ActiveModal::SelectLocalAccount
+    ) && !(active == ActiveModal::ConvertLocalAccount
+        && app.view.account.convert_busy);
+
     let modal_resp = egui::Area::new(modal_id)
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_CENTER, settle_offset)
@@ -805,7 +837,6 @@ fn show_dialog(
                 ui.set_max_width(inner_w);
                 ui.spacing_mut().item_spacing.y = 0.0;
 
-                let allow_close = active != ActiveModal::FirstAccessNickname;
                 let (close_clicked, x_rect) =
                     draw_dialog_header(ui, &spec, inner_w, allow_close, &t);
                 close_btn_rect = x_rect;
@@ -878,11 +909,7 @@ fn show_dialog(
     let pointer_in_modal = backdrop_resp
         .interact_pointer_pos()
         .is_some_and(|pos| modal_rect.contains(pos));
-    if active != ActiveModal::FirstAccessNickname
-        && motion.interactive
-        && backdrop_resp.clicked()
-        && !pointer_in_modal
-    {
+    if allow_close && motion.interactive && backdrop_resp.clicked() && !pointer_in_modal {
         should_close = true;
     }
 
@@ -1649,6 +1676,8 @@ mod tests {
             ActiveModal::NewNotebook,
             ActiveModal::NotebookSettings,
             ActiveModal::AccountSync,
+            ActiveModal::SelectLocalAccount,
+            ActiveModal::ConvertLocalAccount,
             ActiveModal::TransferPages,
         ];
 

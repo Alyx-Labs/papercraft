@@ -43,7 +43,7 @@ If you want to run your own sync server with zero command-line flags or environm
 ### Launch & Download Options
 
 - **GitHub Releases (standalone GUI download)**:
-  - **Windows**: `papercraft-server-windows-x86_64.exe` (single portable executable — place it in its own folder and double-click to launch; no console window opens).
+  - **Windows**: `papercraft-server-windows-x86_64-portable.exe` (single portable executable — place it in its own folder and double-click to launch; no console window opens).
   - **Linux**: `papercraft-server-linux-x86_64.AppImage` (single portable AppImage — mark executable and launch; stores config and `server-data/` beside the `.AppImage`).
   - **macOS (Apple Silicon)**: `papercraft-server-macos-arm64.dmg` (drag `PaperCraft Server.app` into `Applications`; stores config and `server-data/` in `~/Library/Application Support/PaperCraft Server`).
 - **From source (development or local release build)**:
@@ -336,28 +336,26 @@ cargo run -p papercraft-server-cli -- delete-user --data-dir target/dev-server-d
 
 ---
 
-## 7. Offline-First Client Storage & Sync Behavior
+## 7. Strict Online / Offline Client Storage & Sync Behavior
 
-### Desktop Local Libraries
+### Zero Local Cache for Server Accounts
 
-Default library location across all desktop OSes (Windows, macOS, and Linux):
-- `<executable_dir>/library/` (a portable `library/` subfolder next to the `papercraft` executable)
+When you sign into or convert an account to a PaperCraft Server account, **zero notebooks, folders, studio preferences, or authentication tokens are stored locally on the device** (neither under `<executable_dir>/library/accounts/` on Desktop nor in browser `localStorage` on Web).
 
-Inside the desktop library folder:
-- **Local profiles & workspaces**: `.pcraft` notebooks and `studio_prefs.json` reside cleanly per local profile under `profiles/<profile_id>/`.
-- **Global sync state**: `global_sync.json` stores the configured server URL, device name, active user profile, and bearer/refresh tokens.
-- **Per-account isolation**: each signed-in cloud account stores its local `.pcraft` files, `studio_prefs.json`, and `sync_manifest.json` under `accounts/<user_id>/`, preventing cross-account data mixing and allowing full offline use immediately on launch.
+- **Live in-memory sessions**: Server-linked notebooks and preferences are read from and saved directly to the server in real time (`force_overwrite: true`), eliminating offline sync queues, manual conflict resolution modals, and `"<Title> (Conflict Copy)"` duplicates.
+- **Remembered shortcuts**: `global_sync.json` (Desktop) and `papercraft_workspace_v1` (Web `localStorage`) remember only non-sensitive server account shortcuts (`server_url`, `user_id`, `username`, `email`, `display_name`) for quick password sign-in when that server is online. Clicking **Forget Account** in **Profile -> Accounts** removes the shortcut from the device without touching any server data.
+- **Automatic disconnect handling**: If connectivity or session authorization is lost during an online server session, PaperCraft signs out automatically to prevent desynchronization, clears cloud state from memory, and redirects to local account selection (or new local session creation if none exist).
 
-### Web (Browser) Cache
+### Local Accounts (Device-Only)
 
-In `papercraft-web`, notebooks, trash, studio preferences, the active session, and isolated per-account sync caches are persisted automatically in browser `localStorage` under the key `papercraft_workspace_v1`.
+- **Desktop local libraries**: Stored per local profile under `<executable_dir>/library/profiles/<profile_id>/`.
+- **Web local cache**: Local profiles are stored in browser `localStorage` under `papercraft_workspace_v1`.
+- **Convert local to server ("Sync")**: When a configured server is online, any local account card in **Profile -> Accounts** exposes a **Sync** button that prompts for email and password, uploads all local notebooks, folders, and studio preferences to a new server account, clears the local copy from the device, and switches into real-time server mode.
 
-### How Synchronization Works
-1. **Non-blocking triggers**: Sync runs asynchronously (dedicated worker thread `papercraft-sync` on Desktop; async browser `fetch` via `wasm-bindgen-futures` on Web) at startup, ~8 seconds after edits stop, every 60 seconds when idle, or manually via **Sync Now**.
+### How Real-Time Server Sync Works
+1. **Non-blocking triggers**: Sync runs asynchronously (dedicated worker thread `papercraft-sync` on Desktop; async browser `fetch` via `wasm-bindgen-futures` on Web) ~600 ms after edits stop, every 12 seconds when idle, or manually via **Sync Now**.
 2. **Active-stroke protection**: Pulled updates are held until `live_stroke` and `live_eraser` are idle so active handwriting is never interrupted.
-3. **Local migration & transfer**: When signing in or creating a cloud account, you can keep local workspaces separate, migrate a local profile into your cloud account, or transfer individual notebooks.
-4. **Non-destructive conflicts**: When two clients edit the same notebook offline before syncing, the server accepts the first upload (`version + 1`) and returns a conflict for the second client's upload. The client saves its local conflicting version as a separate notebook titled `"<Original Title> (Conflict Copy)"` (`server_version = 0`) and pulls the authoritative server version so zero ink or pages are lost.
-5. **Offline deletions**: Deleting a previously synced notebook records a tombstone in `sync_manifest.json` (`base_version > 0`) and propagates the deletion on the next sync.
+3. **Tombstone deletions**: Deleting a server notebook records a deletion tombstone synced directly to the server.
 
 ---
 

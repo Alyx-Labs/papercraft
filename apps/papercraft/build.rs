@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .set("InternalName", "papercraft")
             .set(
                 "Comments",
-                "Native notebook and handwriting studio by Alyx Labs.",
+                "Portable standalone notebook and handwriting studio for Windows by Alyx Labs.",
             );
         // TODO(signing): Sign release .exe binaries with an Alyx Labs Authenticode certificate so
         // Windows SmartScreen and Task Manager show a cryptographically verified publisher.

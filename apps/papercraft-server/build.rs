@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .set("InternalName", "papercraft-server")
             .set(
                 "Comments",
-                "Self-hosted sync server and system-tray control center for PaperCraft by Alyx Labs.",
+                "Portable standalone self-hosted sync server and system-tray control center for PaperCraft by Alyx Labs.",
             );
         // TODO(signing): Sign release .exe binaries with an Alyx Labs Authenticode certificate so
         // Windows SmartScreen and Task Manager show a cryptographically verified publisher.

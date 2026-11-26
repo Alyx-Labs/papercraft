@@ -825,21 +825,6 @@ impl Session {
         Ok(())
     }
 
-    /// Deletes all Trash entries cleanly from memory and disk.
-    pub(crate) fn clear_trash_persisted(&mut self) {
-        for entry in self.trashed_notebooks.drain(..) {
-            if let Some(path) = entry.path.as_ref() {
-                let _ = fs::remove_file(path);
-            }
-        }
-        if let Some(dir) = self.library.dir.as_ref() {
-            let trash_dir = dir.join(TRASH_DIR);
-            if trash_dir.is_dir() {
-                let _ = fs::remove_dir_all(trash_dir);
-            }
-        }
-    }
-
     /// Restores a notebook from Trash and makes it the active notebook.
     pub(crate) fn restore_trashed_notebook(&mut self, index: usize) -> Result<(), String> {
         if self.notebooks.len() >= MAX_NOTEBOOKS {

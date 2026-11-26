@@ -913,6 +913,8 @@ struct WebCacheStateKey {
     signed_in: bool,
     viewing_cloud: bool,
     local_profile_count: usize,
+    remembered_server_count: usize,
+    needs_initial_nickname: bool,
     last_sync_at_ms: Option<i64>,
     active_notebook: usize,
 }
@@ -1698,7 +1700,9 @@ impl PaperCraftApp {
             trashed_count: self.session.trashed_notebooks.len(),
             signed_in: self.session.is_signed_in(),
             viewing_cloud: self.session.is_viewing_cloud(),
-            local_profile_count: self.session.accessible_local_profiles().len(),
+            local_profile_count: self.session.saved_local_profiles().len(),
+            remembered_server_count: self.session.remembered_server_accounts().len(),
+            needs_initial_nickname: self.session.needs_initial_nickname(),
             last_sync_at_ms: self.session.sync_status_summary().last_sync_at_ms,
             active_notebook: self.session.active_notebook,
         };
@@ -1726,10 +1730,13 @@ impl PaperCraftApp {
                     self.view.active_modal,
                     Some(
                         modal::ActiveModal::FirstAccessNickname
+                            | modal::ActiveModal::SelectLocalAccount
                             | modal::ActiveModal::WelcomeBanner
                             | modal::ActiveModal::FirstNotebookDataNotice
                     )
-                ) {
+                ) || (self.view.active_modal == Some(modal::ActiveModal::ConvertLocalAccount)
+                    && self.view.account.convert_busy)
+                {
                     return;
                 }
                 if self.view.tag_edit_index.is_some() {
@@ -3435,6 +3442,11 @@ pub(crate) fn open_profile_screen(app: &mut PaperCraftApp) {
     app.view.profile_return_screen = app.view.screen;
     app.view.inspector_open = false;
     crate::account_modal::sync_draft_from_session(app);
+    app.view.account.profile_section = account_modal::ProfileSection::Accounts;
+    app.view.account.profile_probe_pending = true;
+    app.view.account.quick_login_key = None;
+    app.view.account.quick_login_password.clear();
+    app.view.account.quick_login_error = None;
     app.view.screen = AppScreen::Profile;
 }
 

@@ -981,159 +981,160 @@ mod tests {
     }
 
     #[test]
-    fn two_desktop_sessions_offline_edits_conflict_recovery_and_restart_converge() {
+    fn two_desktop_sessions_zero_cache_realtime_and_local_conversion_work_end_to_end() {
         use papercraft_doc::{PenSettings, StrokeSample, UiTheme};
         use papercraft_engine::Session;
-        use papercraft_sync::{SyncHttpClient, run_sync_cycle};
+        use papercraft_sync::{
+            ACCOUNTS_DIR, GLOBAL_SYNC_FILE, SyncHttpClient, profile_library_dir, run_sync_cycle,
+        };
         use papercraft_sync_protocol::{LoginRequest, RegisterRequest};
         use serde_json::json;
 
-        let srv_dir = temp_dir("two_pc_srv");
-        let pc1_dir = temp_dir("two_pc_1");
-        let pc2_dir = temp_dir("two_pc_2");
+        let srv_dir = temp_dir("zero_cache_srv");
+        let pc1_dir = temp_dir("zero_cache_1");
+        let pc2_dir = temp_dir("zero_cache_2");
         let client = SyncHttpClient::new();
 
-        // Start server phase 1 and create account on PC1 with custom offline notebook.
-        {
-            let srv = spawn_server_on(&srv_dir.0);
-            let mut pc1 = Session::open_desktop_library(pc1_dir.0.clone());
-            pc1.execute("notebook.create", &json!({ "title": "Linear Algebra" }))
-                .unwrap();
+        let srv = spawn_server_on(&srv_dir.0);
 
-            let auth1 = client
-                .register(
-                    &srv.base_url,
-                    &RegisterRequest {
-                        email: Some("carlos@example.com".to_string()),
-                        username: "carlos".to_string(),
-                        password: "tunnel-secret-pass".to_string(),
-                        display_name: Some("Carlos".to_string()),
-                        device_name: Some("PC1".to_string()),
-                    },
-                    "PC1",
-                )
-                .unwrap();
-            let prof1 = pc1.active_local_profile().unwrap().local_profile_id.clone();
-            pc1.switch_to_authenticated_library(
-                auth1,
-                papercraft_engine::AuthWorkspaceMode::PromoteLocalProfile {
-                    source_profile_id: prof1,
-                },
-            );
-            let mut acct1 = pc1.active_account_session().unwrap().clone();
-            let batch1 = pc1.prepare_sync_batch().unwrap();
-            let outcome1 = run_sync_cycle(&client, &mut acct1, &batch1).unwrap();
-            pc1.apply_sync_outcome(outcome1).unwrap();
-            assert_eq!(pc1.sync_status_summary().pending_changes, 0);
-
-            // PC2 logs in fresh and pulls cleanly without duplicating notebooks.
-            let mut pc2 = Session::open_desktop_library(pc2_dir.0.clone());
-            let auth2 = client
-                .login(
-                    &srv.base_url,
-                    &LoginRequest {
-                        email: Some("carlos@example.com".to_string()),
-                        username: String::new(),
-                        password: "tunnel-secret-pass".to_string(),
-                        device_name: Some("PC2".to_string()),
-                    },
-                    "PC2",
-                )
-                .unwrap();
-            pc2.switch_to_authenticated_library(
-                auth2,
-                papercraft_engine::AuthWorkspaceMode::SwitchOnly,
-            );
-            let mut acct2 = pc2.active_account_session().unwrap().clone();
-            let batch2 = pc2.prepare_sync_batch().unwrap();
-            let outcome2 = run_sync_cycle(&client, &mut acct2, &batch2).unwrap();
-            pc2.apply_sync_outcome(outcome2).unwrap();
-
-            assert_eq!(pc2.notebooks.len(), pc1.notebooks.len());
-            assert!(pc2.notebooks.iter().any(|n| n.title == "Linear Algebra"));
-            assert_eq!(pc2.sync_status_summary().pending_changes, 0);
-        }
-
-        // Server is OFFLINE now. Both PCs work completely offline and restart!
-        {
-            let mut pc1_reopened = Session::open_desktop_library(pc1_dir.0.clone());
-            let idx1 = pc1_reopened
-                .notebooks
-                .iter()
-                .position(|n| n.title == "Linear Algebra")
-                .unwrap();
-            assert!(pc1_reopened.switch_notebook(idx1));
-            pc1_reopened.commit_raw_stroke(
-                PenSettings::fountain_pen(),
-                vec![
-                    StrokeSample::from_xy_pressure(12.0, 12.0, 0.5),
-                    StrokeSample::from_xy_pressure(80.0, 60.0, 0.7),
-                ],
-            );
-            pc1_reopened
-                .execute("theme.set", &json!({ "theme": UiTheme::Dark }))
-                .unwrap();
-            let _ = pc1_reopened.save_library();
-
-            let mut pc2_reopened = Session::open_desktop_library(pc2_dir.0.clone());
-            let idx2 = pc2_reopened
-                .notebooks
-                .iter()
-                .position(|n| n.title == "Linear Algebra")
-                .unwrap();
-            assert!(pc2_reopened.switch_notebook(idx2));
-            pc2_reopened.commit_raw_stroke(
-                PenSettings::ball_pen(),
-                vec![
-                    StrokeSample::from_xy_pressure(100.0, 100.0, 0.6),
-                    StrokeSample::from_xy_pressure(160.0, 140.0, 0.8),
-                ],
-            );
-            let _ = pc2_reopened.save_library();
-        }
-
-        // Server restarts at a NEW port (like reconnecting tunnel / restart).
-        let srv2 = spawn_server_on(&srv_dir.0);
+        // PC1 starts with a local account, converts it to cloud via Sync, and wipes local cache.
         let mut pc1 = Session::open_desktop_library(pc1_dir.0.clone());
-        let mut pc2 = Session::open_desktop_library(pc2_dir.0.clone());
-        pc1.set_server_url_preference(&srv2.base_url).unwrap();
-        pc2.set_server_url_preference(&srv2.base_url).unwrap();
+        pc1.execute(
+            "profile.completeFirstAccess",
+            &json!({ "nickname": "Carlos Local" }),
+        )
+        .unwrap();
+        let prof1 = pc1.active_local_profile().unwrap().local_profile_id.clone();
+        pc1.execute("notebook.create", &json!({ "title": "Linear Algebra" }))
+            .unwrap();
+        pc1.execute("theme.set", &json!({ "theme": UiTheme::Dark }))
+            .unwrap();
+        let prof1_dir = profile_library_dir(&pc1_dir.0, &prof1);
+        assert!(prof1_dir.is_dir());
 
-        // PC1 syncs first -> pushes stroke + Dark theme cleanly.
+        let (nick, conv_batch) = pc1.prepare_local_account_conversion_batch(&prof1).unwrap();
+        assert_eq!(nick, "Carlos Local");
+        assert!(conv_batch.force_overwrite);
+
+        let mut auth1 = client
+            .register(
+                &srv.base_url,
+                &RegisterRequest {
+                    email: Some("carlos@example.com".to_string()),
+                    username: String::new(),
+                    password: "tunnel-secret-pass".to_string(),
+                    display_name: Some(nick),
+                    device_name: Some("PC1".to_string()),
+                },
+                "PC1",
+            )
+            .unwrap();
+        let _conv_out = run_sync_cycle(&client, &mut auth1, &conv_batch).unwrap();
+        let (pull1, _) = client.pull_with_refresh(&mut auth1, 0).unwrap();
+        pc1.complete_local_account_conversion(&prof1, auth1, pull1);
+
+        assert!(
+            !prof1_dir.exists(),
+            "local profile folder must be deleted after conversion"
+        );
+        assert!(
+            pc1.library_dir().is_none(),
+            "cloud session must hold zero disk paths"
+        );
+        assert!(!pc1_dir.0.join(ACCOUNTS_DIR).exists());
+        assert_eq!(pc1.prefs.theme, UiTheme::Dark);
+        assert!(pc1.notebooks.iter().any(|n| n.title == "Linear Algebra"));
+
+        // PC2 logs in -> loads directly into RAM with zero local cache files.
+        let mut pc2 = Session::open_desktop_library(pc2_dir.0.clone());
+        let mut auth2 = client
+            .login(
+                &srv.base_url,
+                &LoginRequest {
+                    email: Some("carlos@example.com".to_string()),
+                    username: String::new(),
+                    password: "tunnel-secret-pass".to_string(),
+                    device_name: Some("PC2".to_string()),
+                },
+                "PC2",
+            )
+            .unwrap();
+        let (pull2, _) = client.pull_with_refresh(&mut auth2, 0).unwrap();
+        pc2.enter_online_server_session(auth2, pull2);
+
+        assert!(pc2.library_dir().is_none());
+        assert!(!pc2_dir.0.join(ACCOUNTS_DIR).exists());
+        assert_eq!(pc2.prefs.theme, UiTheme::Dark);
+        assert!(pc2.notebooks.iter().any(|n| n.title == "Linear Algebra"));
+
+        // Real-time edits on PC1 and PC2 converge cleanly via force_overwrite with zero Conflict Copies.
+        let idx1 = pc1
+            .notebooks
+            .iter()
+            .position(|n| n.title == "Linear Algebra")
+            .unwrap();
+        assert!(pc1.switch_notebook(idx1));
+        pc1.commit_raw_stroke(
+            PenSettings::fountain_pen(),
+            vec![
+                StrokeSample::from_xy_pressure(12.0, 12.0, 0.5),
+                StrokeSample::from_xy_pressure(80.0, 60.0, 0.7),
+            ],
+        );
         let mut acct1 = pc1.active_account_session().unwrap().clone();
         let batch1 = pc1.prepare_sync_batch().unwrap();
+        assert!(batch1.force_overwrite);
         let out1 = run_sync_cycle(&client, &mut acct1, &batch1).unwrap();
         pc1.apply_sync_outcome(out1).unwrap();
 
-        // PC2 syncs next -> hits conflict, preserves Conflict Copy + pulls PC1 edit & Dark theme!
+        let idx2 = pc2
+            .notebooks
+            .iter()
+            .position(|n| n.title == "Linear Algebra")
+            .unwrap();
+        assert!(pc2.switch_notebook(idx2));
+        pc2.commit_raw_stroke(
+            PenSettings::ball_pen(),
+            vec![
+                StrokeSample::from_xy_pressure(100.0, 100.0, 0.6),
+                StrokeSample::from_xy_pressure(160.0, 140.0, 0.8),
+            ],
+        );
         let mut acct2 = pc2.active_account_session().unwrap().clone();
         let batch2 = pc2.prepare_sync_batch().unwrap();
+        assert!(batch2.force_overwrite);
         let out2 = run_sync_cycle(&client, &mut acct2, &batch2).unwrap();
-        assert_eq!(out2.conflict_count, 1);
+        assert!(!out2.accepted_uploads.is_empty());
         pc2.apply_sync_outcome(out2).unwrap();
-        assert_eq!(pc2.prefs.theme, UiTheme::Dark);
-        assert!(
-            pc2.notebooks
-                .iter()
-                .any(|n| n.title == "Linear Algebra (Conflict Copy)")
-        );
-
-        // Next sync on PC2 uploads the preserved Conflict Copy, then PC1 pulls it -> convergence!
-        let batch2_followup = pc2.prepare_sync_batch().unwrap();
-        let out2_followup = run_sync_cycle(&client, &mut acct2, &batch2_followup).unwrap();
-        pc2.apply_sync_outcome(out2_followup).unwrap();
-        assert_eq!(pc2.sync_status_summary().pending_changes, 0);
 
         let batch1_pull = pc1.prepare_sync_batch().unwrap();
         let out1_pull = run_sync_cycle(&client, &mut acct1, &batch1_pull).unwrap();
         pc1.apply_sync_outcome(out1_pull).unwrap();
-
-        assert_eq!(pc1.notebooks.len(), pc2.notebooks.len());
         assert!(
-            pc1.notebooks
+            !pc1.notebooks
                 .iter()
-                .any(|n| n.title == "Linear Algebra (Conflict Copy)")
+                .any(|n| n.title.contains("Conflict Copy"))
         );
+        assert!(
+            !pc2.notebooks
+                .iter()
+                .any(|n| n.title.contains("Conflict Copy"))
+        );
+
+        // Verify zero tokens or cloud data on disk when restarting PC1 or PC2!
+        let global1_raw = std::fs::read_to_string(pc1_dir.0.join(GLOBAL_SYNC_FILE)).unwrap();
+        assert!(!global1_raw.contains("tunnel-secret-pass"));
+        assert!(global1_raw.contains("carlos@example.com"));
+        drop(pc2);
+        let pc2_reopened = Session::open_desktop_library(pc2_dir.0.clone());
+        assert!(!pc2_reopened.is_signed_in());
+        assert!(
+            !pc2_reopened
+                .notebooks
+                .iter()
+                .any(|n| n.title == "Linear Algebra")
+        );
+        assert_eq!(pc2_reopened.remembered_server_accounts().len(), 1);
     }
 
     #[test]
@@ -1237,7 +1238,6 @@ mod tests {
             nickname: "BrunoPrivateNickname".to_string(),
             created_at_ms: 1,
             last_used_at_ms: 1,
-            owner_cloud_user_id: None,
         }];
         save_global_state(&client_lib, &global).unwrap();
         let prof_dir = profile_library_dir(&client_lib, "loc-bruno");

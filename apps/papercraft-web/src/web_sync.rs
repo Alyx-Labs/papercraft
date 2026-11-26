@@ -2,13 +2,12 @@ use std::sync::mpsc;
 
 use papercraft_sync::{
     ActiveAccountSession, SyncBatch, SyncCycleDriver, SyncCycleOutcome, SyncError,
-    build_conflict_preview_if_needed, build_prune_to_local_request, outcome_from_full_pull,
 };
 use papercraft_sync_protocol::{
     ApiErrorBody, AuthResponse, ChangeEmailRequest, ERR_CODE_PASSWORD_CHANGE_REQUIRED,
-    ERR_CODE_PASSWORD_RESET_REQUIRED, LocalDiscoverySummary, LogoutRequest, PruneToLocalRequest,
-    PruneToLocalResponse, RefreshRequest, ServerInfoResponse, SyncPullResponse, SyncPushRequest,
-    SyncPushResponse, UserProfile, normalize_server_url, now_unix_ms,
+    ERR_CODE_PASSWORD_RESET_REQUIRED, LocalDiscoverySummary, LogoutRequest, RefreshRequest,
+    ServerInfoResponse, SyncPullResponse, SyncPushRequest, SyncPushResponse, UserProfile,
+    normalize_server_url, now_unix_ms,
 };
 use papercraft_ui_egui::sync_worker::{
     SyncWorkerCommand, SyncWorkerEvent, build_change_email_request, build_change_password_request,
@@ -70,7 +69,6 @@ async fn execute_async_command(cmd: SyncWorkerCommand) -> Option<SyncWorkerEvent
             password,
             display_name,
             device_name,
-            mode,
         } => {
             let req = match build_register_request(
                 &email,
@@ -82,10 +80,22 @@ async fn execute_async_command(cmd: SyncWorkerCommand) -> Option<SyncWorkerEvent
                 Ok(req) => req,
                 Err(message) => return Some(SyncWorkerEvent::AuthErr { message }),
             };
-            match web_auth("/api/v1/auth/register", &server_url, &req, &device_name).await {
-                Ok(auth) => Some(SyncWorkerEvent::AuthOk { auth, mode }),
+            let mut auth =
+                match web_auth("/api/v1/auth/register", &server_url, &req, &device_name).await {
+                    Ok(auth) => auth,
+                    Err(err) => {
+                        return Some(SyncWorkerEvent::AuthErr {
+                            message: friendly_web_auth_error(&err),
+                        });
+                    }
+                };
+            match pull_with_refresh(&mut auth, 0).await {
+                Ok((pull_resp, _)) => Some(SyncWorkerEvent::AuthOk {
+                    auth,
+                    initial_pull: Box::new(pull_resp),
+                }),
                 Err(err) => Some(SyncWorkerEvent::AuthErr {
-                    message: friendly_web_auth_error(&err),
+                    message: friendly_web_error(&err),
                 }),
             }
         }
@@ -94,15 +104,13 @@ async fn execute_async_command(cmd: SyncWorkerCommand) -> Option<SyncWorkerEvent
             identifier,
             password,
             device_name,
-            mode,
-        } => Some(exec_web_login(&server_url, identifier, password, &device_name, mode).await),
+        } => Some(exec_web_login(&server_url, identifier, password, &device_name).await),
         SyncWorkerCommand::CompletePasswordReset {
             server_url,
             identifier,
             recovery_code,
             new_password,
             device_name,
-            mode,
         } => Some(
             exec_web_complete_password_reset(
                 &server_url,
@@ -110,7 +118,26 @@ async fn execute_async_command(cmd: SyncWorkerCommand) -> Option<SyncWorkerEvent
                 &recovery_code,
                 new_password,
                 &device_name,
-                mode,
+            )
+            .await,
+        ),
+        SyncWorkerCommand::ConvertLocalAccount {
+            server_url,
+            source_profile_id,
+            source_nickname,
+            email,
+            password,
+            device_name,
+            upload_batch,
+        } => Some(
+            exec_web_convert_local_account(
+                &server_url,
+                source_profile_id,
+                source_nickname,
+                &email,
+                password,
+                &device_name,
+                &upload_batch,
             )
             .await,
         ),
@@ -131,7 +158,13 @@ async fn execute_async_command(cmd: SyncWorkerCommand) -> Option<SyncWorkerEvent
         } => {
             let req = match build_change_email_request(&new_email, current_password) {
                 Ok(req) => req,
-                Err(message) => return Some(SyncWorkerEvent::EmailChangeErr { message }),
+                Err(message) => {
+                    return Some(SyncWorkerEvent::EmailChangeErr {
+                        offline: false,
+                        unauthorized: false,
+                        message,
+                    });
+                }
             };
             match web_change_email_with_refresh(&mut session, &req).await {
                 Ok(profile) => {
@@ -141,28 +174,14 @@ async fn execute_async_command(cmd: SyncWorkerCommand) -> Option<SyncWorkerEvent
                     })
                 }
                 Err(err) => Some(SyncWorkerEvent::EmailChangeErr {
+                    offline: matches!(err, SyncError::Network(_)),
+                    unauthorized: matches!(err, SyncError::Unauthorized(_)),
                     message: friendly_web_error(&err),
                 }),
             }
         }
-        SyncWorkerCommand::SyncNow {
-            mut session,
-            batch,
-            offline_edits_pending,
-        } => Some(exec_web_guarded_sync_now(&mut session, &batch, offline_edits_pending).await),
-        SyncWorkerCommand::ResolveConflictKeepServer { mut session } => {
-            match pull_with_refresh(&mut session, 0).await {
-                Ok((pull_resp, refreshed)) => Some(SyncWorkerEvent::ConflictResolvedKeepServer {
-                    outcome: Box::new(outcome_from_full_pull(
-                        pull_resp,
-                        refreshed.then_some(session),
-                    )),
-                }),
-                Err(err) => Some(web_sync_err_event(&err)),
-            }
-        }
-        SyncWorkerCommand::ResolveConflictKeepLocal { mut session, batch } => {
-            match run_web_sync_cycle_keep_local(&mut session, &batch).await {
+        SyncWorkerCommand::SyncNow { mut session, batch } => {
+            match run_web_sync_cycle(&mut session, &batch).await {
                 Ok(outcome) => Some(SyncWorkerEvent::SyncOk {
                     outcome: Box::new(outcome),
                 }),
@@ -186,35 +205,45 @@ async fn exec_web_login(
     identifier: String,
     password: String,
     device_name: &str,
-    mode: papercraft_engine::AuthWorkspaceMode,
 ) -> SyncWorkerEvent {
     let submitted_password = password.clone();
     let req = match build_login_request(&identifier, password, device_name) {
         Ok(req) => req,
         Err(message) => return SyncWorkerEvent::AuthErr { message },
     };
-    match web_auth("/api/v1/auth/login", server_url, &req, device_name).await {
-        Ok(auth) => SyncWorkerEvent::AuthOk { auth, mode },
+    let mut auth = match web_auth("/api/v1/auth/login", server_url, &req, device_name).await {
+        Ok(auth) => auth,
         Err(SyncError::Server { code, message, .. })
             if code == ERR_CODE_PASSWORD_CHANGE_REQUIRED =>
         {
-            SyncWorkerEvent::PasswordResetRequired {
+            return SyncWorkerEvent::PasswordResetRequired {
                 identifier,
                 prefill_code: Some(submitted_password.trim().to_string()),
                 message,
-            }
+            };
         }
         Err(SyncError::Server { code, message, .. })
             if code == ERR_CODE_PASSWORD_RESET_REQUIRED =>
         {
-            SyncWorkerEvent::PasswordResetRequired {
+            return SyncWorkerEvent::PasswordResetRequired {
                 identifier,
                 prefill_code: None,
                 message,
-            }
+            };
         }
+        Err(err) => {
+            return SyncWorkerEvent::AuthErr {
+                message: friendly_web_auth_error(&err),
+            };
+        }
+    };
+    match pull_with_refresh(&mut auth, 0).await {
+        Ok((pull_resp, _)) => SyncWorkerEvent::AuthOk {
+            auth,
+            initial_pull: Box::new(pull_resp),
+        },
         Err(err) => SyncWorkerEvent::AuthErr {
-            message: friendly_web_auth_error(&err),
+            message: friendly_web_error(&err),
         },
     }
 }
@@ -225,7 +254,6 @@ async fn exec_web_complete_password_reset(
     recovery_code: &str,
     new_password: String,
     device_name: &str,
-    mode: papercraft_engine::AuthWorkspaceMode,
 ) -> SyncWorkerEvent {
     let req = match build_complete_password_reset_request(
         identifier,
@@ -236,7 +264,7 @@ async fn exec_web_complete_password_reset(
         Ok(req) => req,
         Err(message) => return SyncWorkerEvent::AuthErr { message },
     };
-    match web_auth(
+    let mut auth = match web_auth(
         "/api/v1/auth/complete-password-reset",
         server_url,
         &req,
@@ -244,9 +272,67 @@ async fn exec_web_complete_password_reset(
     )
     .await
     {
-        Ok(auth) => SyncWorkerEvent::AuthOk { auth, mode },
+        Ok(auth) => auth,
+        Err(err) => {
+            return SyncWorkerEvent::AuthErr {
+                message: friendly_web_auth_error(&err),
+            };
+        }
+    };
+    match pull_with_refresh(&mut auth, 0).await {
+        Ok((pull_resp, _)) => SyncWorkerEvent::AuthOk {
+            auth,
+            initial_pull: Box::new(pull_resp),
+        },
         Err(err) => SyncWorkerEvent::AuthErr {
-            message: friendly_web_auth_error(&err),
+            message: friendly_web_error(&err),
+        },
+    }
+}
+
+async fn exec_web_convert_local_account(
+    server_url: &str,
+    source_profile_id: String,
+    source_nickname: String,
+    email: &str,
+    password: String,
+    device_name: &str,
+    upload_batch: &SyncBatch,
+) -> SyncWorkerEvent {
+    let req =
+        match build_register_request(email, None, password, Some(source_nickname), device_name) {
+            Ok(req) => req,
+            Err(message) => {
+                return SyncWorkerEvent::ConvertLocalErr {
+                    source_profile_id,
+                    message,
+                };
+            }
+        };
+    let mut auth = match web_auth("/api/v1/auth/register", server_url, &req, device_name).await {
+        Ok(auth) => auth,
+        Err(err) => {
+            return SyncWorkerEvent::ConvertLocalErr {
+                source_profile_id,
+                message: friendly_web_auth_error(&err),
+            };
+        }
+    };
+    if let Err(err) = run_web_sync_cycle(&mut auth, upload_batch).await {
+        return SyncWorkerEvent::ConvertLocalErr {
+            source_profile_id,
+            message: friendly_web_error(&err),
+        };
+    }
+    match pull_with_refresh(&mut auth, 0).await {
+        Ok((pull_resp, _)) => SyncWorkerEvent::ConvertLocalOk {
+            source_profile_id,
+            auth,
+            initial_pull: Box::new(pull_resp),
+        },
+        Err(err) => SyncWorkerEvent::ConvertLocalErr {
+            source_profile_id,
+            message: friendly_web_error(&err),
         },
     }
 }
@@ -258,7 +344,13 @@ async fn exec_web_update_profile(
 ) -> SyncWorkerEvent {
     let req = match build_update_profile_request(username.as_deref(), display_name.as_deref()) {
         Ok(req) => req,
-        Err(message) => return SyncWorkerEvent::ProfileUpdateErr { message },
+        Err(message) => {
+            return SyncWorkerEvent::ProfileUpdateErr {
+                offline: false,
+                unauthorized: false,
+                message,
+            };
+        }
     };
     match web_post_profile_with_refresh(&mut session, "/api/v1/auth/update-profile", &req).await {
         Ok(profile) => {
@@ -268,6 +360,8 @@ async fn exec_web_update_profile(
             }
         }
         Err(err) => SyncWorkerEvent::ProfileUpdateErr {
+            offline: matches!(err, SyncError::Network(_)),
+            unauthorized: matches!(err, SyncError::Unauthorized(_)),
             message: friendly_web_error(&err),
         },
     }
@@ -280,7 +374,13 @@ async fn exec_web_change_password(
 ) -> SyncWorkerEvent {
     let req = match build_change_password_request(current_password, new_password) {
         Ok(req) => req,
-        Err(message) => return SyncWorkerEvent::PasswordChangeErr { message },
+        Err(message) => {
+            return SyncWorkerEvent::PasswordChangeErr {
+                offline: false,
+                unauthorized: false,
+                message,
+            };
+        }
     };
     match web_post_profile_with_refresh(&mut session, "/api/v1/auth/change-password", &req).await {
         Ok(profile) => {
@@ -290,6 +390,8 @@ async fn exec_web_change_password(
             }
         }
         Err(err) => SyncWorkerEvent::PasswordChangeErr {
+            offline: matches!(err, SyncError::Network(_)),
+            unauthorized: matches!(err, SyncError::Unauthorized(_)),
             message: friendly_web_error(&err),
         },
     }
@@ -305,94 +407,6 @@ fn web_sync_err_event(err: &SyncError) -> SyncWorkerEvent {
         offline: matches!(err, SyncError::Network(_)),
         unauthorized: matches!(err, SyncError::Unauthorized(_)),
         message: friendly_web_error(err),
-    }
-}
-
-async fn exec_web_guarded_sync_now(
-    session: &mut ActiveAccountSession,
-    batch: &SyncBatch,
-    offline_edits_pending: bool,
-) -> SyncWorkerEvent {
-    let initial_since = if offline_edits_pending || batch.client_cursor == 0 {
-        0
-    } else {
-        batch.client_cursor
-    };
-    let pull_resp = match pull_with_refresh(session, initial_since).await {
-        Ok((resp, _)) => resp,
-        Err(err) => return web_sync_err_event(&err),
-    };
-
-    let acct_name = session.user.primary_label();
-    let acct_email = session.user.email.clone().unwrap_or_default();
-    if let Some(mut preview) = build_conflict_preview_if_needed(
-        &acct_name,
-        &acct_email,
-        offline_edits_pending,
-        batch,
-        &pull_resp,
-    ) {
-        if initial_since > 0
-            && let Ok((full_pull, _)) = pull_with_refresh(session, 0).await
-            && let Some(full_preview) = build_conflict_preview_if_needed(
-                &acct_name,
-                &acct_email,
-                offline_edits_pending,
-                batch,
-                &full_pull,
-            )
-        {
-            preview = full_preview;
-        }
-        return SyncWorkerEvent::ConflictDecisionRequired { preview };
-    }
-
-    match run_web_sync_cycle(session, batch).await {
-        Ok(outcome) => SyncWorkerEvent::SyncOk {
-            outcome: Box::new(outcome),
-        },
-        Err(err) => web_sync_err_event(&err),
-    }
-}
-
-async fn run_web_sync_cycle_keep_local(
-    session: &mut ActiveAccountSession,
-    batch: &SyncBatch,
-) -> Result<SyncCycleOutcome, SyncError> {
-    let mut forced = batch.clone();
-    forced.force_overwrite = true;
-    let initial_access = session.access_token.clone();
-    let mut driver = SyncCycleDriver::new(&forced);
-
-    while let Some(req) = driver.next_push_request(&forced) {
-        let resp = push_with_refresh(session, &req).await?;
-        driver.record_push_chunk_response(resp, &forced);
-    }
-
-    let prune_req = build_prune_to_local_request(&forced);
-    let _ = prune_with_refresh(session, &prune_req).await?;
-    let (pull_resp, refreshed_on_pull) = pull_with_refresh(session, 0).await?;
-    let token_changed = refreshed_on_pull || session.access_token != initial_access;
-    Ok(driver.finish(pull_resp, token_changed.then(|| session.clone())))
-}
-
-async fn prune_with_refresh(
-    session: &mut ActiveAccountSession,
-    req: &PruneToLocalRequest,
-) -> Result<PruneToLocalResponse, SyncError> {
-    let url = format!("{}/api/v1/sync/prune-to-local", session.server_url);
-    match fetch_json(&url, "POST", Some(&session.access_token), Some(req)).await {
-        Ok(resp) => Ok(resp),
-        Err(SyncError::Unauthorized(_)) => {
-            *session = web_refresh(
-                &session.server_url,
-                &session.refresh_token,
-                &session.device_name,
-            )
-            .await?;
-            fetch_json(&url, "POST", Some(&session.access_token), Some(req)).await
-        }
-        Err(err) => Err(err),
     }
 }
 

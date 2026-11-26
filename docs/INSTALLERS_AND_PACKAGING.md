@@ -13,7 +13,7 @@ PaperCraft is built in **pure Rust** (`eframe` / `egui` / `wgpu` on Desktop, plu
 
 | Platform | Current release artifacts | Current data location | Current self-update behavior |
 |---|---|---|---|
-| **Windows (`x86_64`)** | Unsigned standalone `.exe` (`papercraft`, `papercraft-server`) | `library/` and `server-data/` beside the `.exe` | Downloads `.exe` from `latest.json`, verifies SHA-256, swaps in place, relaunches |
+| **Windows (`x86_64`)** | Unsigned standalone portable `.exe` (`papercraft-windows-x86_64-portable.exe`, `papercraft-server-windows-x86_64-portable.exe`) | `library/` and `server-data/` beside the `.exe` | Downloads `.exe` from `latest.json`, verifies SHA-256, swaps in place, relaunches |
 | **Linux (`x86_64`)** | `.AppImage` (`papercraft`, `papercraft-server`) | `library/` and `server-data/` beside the `.AppImage` (or exe) | Downloads `.AppImage`, verifies SHA-256, swaps file in place, relaunches |
 | **macOS (`arm64`, experimental)** | Ad-hoc signed `.dmg` and `.tar.gz` | `~/Library/Application Support/PaperCraft/` and `PaperCraft Server/` | Replaces `.app` bundle via `.tar.gz` when running from a writable `.app` |
 | **Web (`wasm32`)** | `papercraft-web.zip` (`trunk build --release`) | Browser `localStorage` (`papercraft_workspace_v1`) | Static web deployment |

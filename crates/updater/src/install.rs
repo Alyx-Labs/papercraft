@@ -592,7 +592,9 @@ mod tests {
     fn windows_swap_moves_current_to_old_and_cleanup_removes_stale_files() {
         let tmp = temp_dir("swap");
         let target = tmp.0.join("papercraft.exe");
-        let staged = tmp.0.join("papercraft-windows-x86_64.exe.update.stage");
+        let staged = tmp
+            .0
+            .join("papercraft-windows-x86_64-portable.exe.update.stage");
         fs::write(&target, b"old-binary-v1").unwrap();
         fs::write(&staged, b"new-binary-v2").unwrap();
 
@@ -602,7 +604,9 @@ mod tests {
         let backup = tmp.0.join("papercraft.exe.old");
         assert_eq!(fs::read(&backup).unwrap(), b"old-binary-v1");
 
-        let partial = tmp.0.join("papercraft-windows-x86_64.exe.update.part");
+        let partial = tmp
+            .0
+            .join("papercraft-windows-x86_64-portable.exe.update.part");
         fs::write(&partial, b"partial").unwrap();
 
         cleanup_stale_files_near_target(&target, AppId::PaperCraft);

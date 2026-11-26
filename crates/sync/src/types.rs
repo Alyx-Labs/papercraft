@@ -1,7 +1,8 @@
 use papercraft_doc::Document;
 use papercraft_sync_protocol::{
     AcceptedFolderSync, AcceptedNotebookSync, DEFAULT_SERVER_URL, LocalFolderChange,
-    LocalPrefsPush, ProtocolError, RemoteFolderRecord, RemotePrefsRecord, UserProfile, now_unix_ms,
+    LocalPrefsPush, ProtocolError, RemoteFolderRecord, RemotePrefsRecord, UserProfile,
+    normalize_server_url, now_unix_ms,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -11,9 +12,10 @@ pub const SYNC_MANIFEST_FILE: &str = "sync_manifest.json";
 pub const ACCOUNTS_DIR: &str = "accounts";
 pub const PROFILES_DIR: &str = "profiles";
 pub const MAX_PROFILE_NICKNAME_LEN: usize = 48;
+pub const MAX_REMEMBERED_SERVER_ACCOUNTS: usize = 32;
 pub const SYNC_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
-/// Strict ownership boundary for workspaces, folders, notebooks, and sync manifests.
+/// Strict ownership boundary for local workspaces and in-memory server sessions.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id")]
 pub enum OwnerId {
@@ -34,15 +36,7 @@ impl OwnerId {
     }
 }
 
-/// Identifies which workspace the UI is currently viewing (`LocalProfile` vs `CloudUser`).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "id")]
-pub enum ActiveWorkspace {
-    LocalProfile(String),
-    CloudUser(String),
-}
-
-/// Client-side local workspace profile (mandatory offline-first identity).
+/// Client-side local workspace profile stored exclusively on this device.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalProfile {
     pub local_profile_id: String,
@@ -50,34 +44,52 @@ pub struct LocalProfile {
     pub created_at_ms: i64,
     #[serde(default)]
     pub last_used_at_ms: i64,
-    /// Cloud `user_id` that owns this local profile when created inside a signed-in account.
-    ///
-    /// Unlinked offline profiles (`None`) may be offered for migration when a cloud account signs
-    /// in, whereas profiles bound to a specific cloud account (`Some(uid)`) are never offered to
-    /// other accounts.
-    #[serde(default)]
-    pub owner_cloud_user_id: Option<String>,
 }
 
-impl LocalProfile {
-    /// Returns `true` when this local profile is unlinked or owned by `cloud_user_id`.
-    pub fn is_accessible_to_cloud_user(&self, cloud_user_id: Option<&str>) -> bool {
-        match (&self.owner_cloud_user_id, cloud_user_id) {
-            (None, _) => true,
-            (Some(owner), Some(current)) => owner == current,
-            (Some(_), None) => false,
+/// Device-local quick-access shortcut for a server account (metadata only, zero tokens or notebooks).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RememberedServerAccount {
+    pub user_id: String,
+    pub server_url: String,
+    pub username: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    pub display_name: String,
+    #[serde(default)]
+    pub last_used_at_ms: i64,
+}
+
+impl RememberedServerAccount {
+    pub fn primary_label(&self) -> String {
+        let disp = self.display_name.trim();
+        if !disp.is_empty() {
+            return disp.to_string();
         }
+        if let Some(ref email) = self.email
+            && !email.trim().is_empty()
+        {
+            return email.trim().to_string();
+        }
+        format!("@{}", self.username)
+    }
+
+    pub fn login_identifier(&self) -> &str {
+        if let Some(ref email) = self.email
+            && !email.trim().is_empty()
+        {
+            return email.trim();
+        }
+        &self.username
     }
 }
 
-/// Explicit per-entity synchronization state tracked locally and surfaced in UI badges.
+/// Explicit per-entity live status surfaced in UI badges.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntitySyncStatus {
     #[default]
     LocalOnly,
     PendingPush,
     Synced,
-    Conflict,
     SyncError,
 }
 
@@ -97,14 +109,16 @@ pub struct ActiveAccountSession {
 pub struct GlobalSyncState {
     pub server_url: String,
     pub device_name: String,
+    /// Legacy persisted session field retained deserialize-only so upgrades discard tokens
+    /// while converting the account into a metadata-only shortcut.
+    #[serde(default, skip_serializing, rename = "session")]
+    pub legacy_session: Option<ActiveAccountSession>,
     #[serde(default)]
-    pub session: Option<ActiveAccountSession>,
+    pub remembered_server_accounts: Vec<RememberedServerAccount>,
     #[serde(default)]
     pub local_profiles: Vec<LocalProfile>,
     #[serde(default)]
     pub active_local_profile_id: String,
-    #[serde(default)]
-    pub active_workspace: Option<ActiveWorkspace>,
     #[serde(default)]
     pub needs_initial_nickname: bool,
     #[serde(default)]
@@ -122,10 +136,10 @@ impl GlobalSyncState {
         Self {
             server_url: DEFAULT_SERVER_URL.to_string(),
             device_name,
-            session: None,
+            legacy_session: None,
+            remembered_server_accounts: Vec::new(),
             local_profiles: Vec::new(),
             active_local_profile_id: String::new(),
-            active_workspace: None,
             needs_initial_nickname: false,
             welcome_banner_seen: false,
             welcome_banner_seen_version: None,
@@ -134,39 +148,85 @@ impl GlobalSyncState {
         }
     }
 
-    pub fn active_cloud_user_id(&self) -> Option<&str> {
-        self.session.as_ref().map(|s| s.user.user_id.as_str())
+    /// Converts any legacy persisted server session into a metadata-only shortcut and discards tokens.
+    pub fn migrate_legacy_session(&mut self) -> bool {
+        let Some(old) = self.legacy_session.take() else {
+            return false;
+        };
+        if !old.user.user_id.trim().is_empty() && !old.user.username.trim().is_empty() {
+            self.remember_server_account(&old);
+        }
+        true
+    }
+
+    /// Records or refreshes a server account shortcut (metadata only; never stores credentials or tokens).
+    pub fn remember_server_account(&mut self, auth: &ActiveAccountSession) {
+        let norm_url =
+            normalize_server_url(&auth.server_url).unwrap_or_else(|_| auth.server_url.clone());
+        let user_id = auth.user.user_id.trim().to_string();
+        let username = auth.user.username.trim().to_string();
+        if user_id.is_empty() || username.is_empty() {
+            return;
+        }
+        let email = auth
+            .user
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let display_name = auth.user.display_name.trim().to_string();
+        self.remembered_server_accounts.retain(|entry| {
+            !(entry.user_id == user_id && entry.server_url.eq_ignore_ascii_case(&norm_url))
+        });
+        self.remembered_server_accounts.insert(
+            0,
+            RememberedServerAccount {
+                user_id,
+                server_url: norm_url,
+                username,
+                email,
+                display_name,
+                last_used_at_ms: now_unix_ms(),
+            },
+        );
+        self.remembered_server_accounts
+            .truncate(MAX_REMEMBERED_SERVER_ACCOUNTS);
+    }
+
+    /// Removes the local quick-access shortcut for `(server_url, user_id)` without altering server data.
+    pub fn forget_server_account(&mut self, server_url: &str, user_id: &str) -> bool {
+        let norm_url =
+            normalize_server_url(server_url).unwrap_or_else(|_| server_url.trim().to_string());
+        let clean_uid = user_id.trim();
+        let before = self.remembered_server_accounts.len();
+        self.remembered_server_accounts.retain(|entry| {
+            !(entry.user_id == clean_uid && entry.server_url.eq_ignore_ascii_case(&norm_url))
+        });
+        self.remembered_server_accounts.len() != before
+    }
+
+    pub fn has_saved_local_accounts(&self) -> bool {
+        !self.needs_initial_nickname && !self.local_profiles.is_empty()
+    }
+
+    pub fn saved_local_profiles(&self) -> &[LocalProfile] {
+        if self.needs_initial_nickname {
+            &[]
+        } else {
+            &self.local_profiles
+        }
     }
 
     pub fn accessible_local_profiles(&self) -> Vec<&LocalProfile> {
-        let uid = self.active_cloud_user_id();
-        self.local_profiles
-            .iter()
-            .filter(|p| p.is_accessible_to_cloud_user(uid))
-            .collect()
+        self.saved_local_profiles().iter().collect()
     }
 
     pub fn active_local_profile(&self) -> Option<&LocalProfile> {
-        let uid = self.active_cloud_user_id();
         self.local_profiles
             .iter()
-            .find(|p| {
-                p.local_profile_id == self.active_local_profile_id
-                    && p.is_accessible_to_cloud_user(uid)
-            })
-            .or_else(|| {
-                self.local_profiles
-                    .iter()
-                    .find(|p| p.is_accessible_to_cloud_user(uid))
-            })
-    }
-
-    pub fn is_viewing_cloud(&self) -> bool {
-        match (&self.session, &self.active_workspace) {
-            (Some(sess), Some(ActiveWorkspace::CloudUser(uid))) => sess.user.user_id == *uid,
-            (Some(_), None) => true,
-            _ => false,
-        }
+            .find(|p| p.local_profile_id == self.active_local_profile_id)
+            .or_else(|| self.local_profiles.first())
     }
 }
 
@@ -193,17 +253,12 @@ pub struct NotebookSyncMeta {
     pub deleted_at_ms: Option<i64>,
     #[serde(default)]
     pub last_error: Option<String>,
-    #[serde(default)]
-    pub conflict_of_notebook_id: Option<String>,
 }
 
 impl NotebookSyncMeta {
     pub fn effective_status(&self, is_cloud: bool) -> EntitySyncStatus {
         if !is_cloud {
             return EntitySyncStatus::LocalOnly;
-        }
-        if self.status == EntitySyncStatus::Conflict {
-            return EntitySyncStatus::Conflict;
         }
         if self.status == EntitySyncStatus::SyncError && self.last_error.is_some() {
             return EntitySyncStatus::SyncError;
@@ -254,8 +309,6 @@ pub struct SyncManifest {
     #[serde(default)]
     pub prefs_dirty: bool,
     #[serde(default)]
-    pub offline_edits_pending: bool,
-    #[serde(default)]
     pub notebooks: Vec<NotebookSyncMeta>,
     #[serde(default)]
     pub folders: Vec<FolderSyncMeta>,
@@ -274,7 +327,6 @@ impl Default for SyncManifest {
             prefs_version: 0,
             prefs_hash: String::new(),
             prefs_dirty: false,
-            offline_edits_pending: false,
             notebooks: Vec::new(),
             folders: Vec::new(),
             tombstones: Vec::new(),
@@ -323,17 +375,13 @@ impl SyncManifest {
             existing.cloud_dirty = dirty;
             existing.updated_at_ms = existing.updated_at_ms.max(now);
             existing.last_error = None;
-            if existing.conflict_of_notebook_id.is_some() && !is_cloud {
-                existing.status = EntitySyncStatus::LocalOnly;
-            } else if existing.conflict_of_notebook_id.is_some() && existing.server_version == 0 {
-                existing.status = EntitySyncStatus::Conflict;
-            } else if !is_cloud {
-                existing.status = EntitySyncStatus::LocalOnly;
+            existing.status = if !is_cloud {
+                EntitySyncStatus::LocalOnly
             } else if dirty {
-                existing.status = EntitySyncStatus::PendingPush;
+                EntitySyncStatus::PendingPush
             } else {
-                existing.status = EntitySyncStatus::Synced;
-            }
+                EntitySyncStatus::Synced
+            };
         } else {
             self.notebooks.push(NotebookSyncMeta {
                 notebook_id: notebook_id.to_string(),
@@ -353,29 +401,7 @@ impl SyncManifest {
                 updated_at_ms: now,
                 deleted_at_ms: None,
                 last_error: None,
-                conflict_of_notebook_id: None,
             });
-        }
-    }
-
-    pub fn mark_notebook_conflict(
-        &mut self,
-        notebook_id: &str,
-        conflict_of_notebook_id: &str,
-        current_hash: &str,
-    ) {
-        self.mark_notebook_dirty(notebook_id, current_hash);
-        if let Some(existing) = self
-            .notebooks
-            .iter_mut()
-            .find(|item| item.notebook_id == notebook_id)
-        {
-            existing.conflict_of_notebook_id = Some(conflict_of_notebook_id.to_string());
-            existing.status = if self.owner_id.as_ref().is_some_and(OwnerId::is_cloud) {
-                EntitySyncStatus::Conflict
-            } else {
-                EntitySyncStatus::LocalOnly
-            };
         }
     }
 
@@ -388,7 +414,6 @@ impl SyncManifest {
         self.notebooks
             .retain(|item| item.notebook_id != notebook_id);
 
-        // Only previously synced notebooks require a remote tombstone.
         if existing_version == 0 {
             return;
         }
@@ -441,9 +466,6 @@ impl SyncManifest {
             meta.last_synced_at_ms = synced_at_ms;
             meta.deleted_at_ms = None;
             meta.last_error = None;
-            if !still_dirty {
-                meta.conflict_of_notebook_id = None;
-            }
             meta.status = next_status;
         } else {
             self.notebooks.push(NotebookSyncMeta {
@@ -460,7 +482,6 @@ impl SyncManifest {
                 updated_at_ms: synced_at_ms,
                 deleted_at_ms: None,
                 last_error: None,
-                conflict_of_notebook_id: None,
             });
         }
     }
@@ -551,7 +572,6 @@ pub struct SyncStatusSummary {
     pub pending_changes: usize,
     pub last_sync_at_ms: Option<i64>,
     pub last_error: Option<String>,
-    pub last_conflict_notice: Option<String>,
 }
 
 impl SyncStatusSummary {
@@ -589,20 +609,6 @@ pub struct SyncBatch {
     pub force_overwrite: bool,
 }
 
-/// Summary presented when offline/divergent edits require choosing Server vs Local version.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SyncConflictPreview {
-    pub account_name: String,
-    pub account_email: String,
-    pub server_notebook_count: usize,
-    pub local_notebook_count: usize,
-    pub server_cursor: u64,
-    pub local_pending_changes: usize,
-    pub local_dirty_titles: Vec<String>,
-    pub server_notebook_titles: Vec<String>,
-    pub offline_edits_detected: bool,
-}
-
 #[derive(Clone, Debug)]
 pub struct RemoteNotebookUpdate {
     pub notebook_id: String,
@@ -619,15 +625,6 @@ pub struct RemoteNotebookUpdate {
 }
 
 #[derive(Clone, Debug)]
-pub struct ConflictResolutionCopy {
-    pub original_notebook_id: String,
-    pub conflict_notebook_id: String,
-    pub conflict_title: String,
-    pub local_doc: Document,
-    pub local_hash: String,
-}
-
-#[derive(Clone, Debug)]
 pub struct SyncCycleOutcome {
     pub new_cursor: u64,
     pub refreshed_session: Option<ActiveAccountSession>,
@@ -635,15 +632,12 @@ pub struct SyncCycleOutcome {
     pub accepted_uploads: Vec<AcceptedNotebookSync>,
     pub accepted_folders: Vec<AcceptedFolderSync>,
     pub cleared_tombstones: Vec<String>,
-    pub resolved_conflicts: Vec<ConflictResolutionCopy>,
     pub downloaded_updates: Vec<RemoteNotebookUpdate>,
     pub downloaded_folders: Vec<RemoteFolderRecord>,
     pub updated_prefs: Option<RemotePrefsRecord>,
     pub ack_prefs: Option<(u64, String)>,
-    pub prefs_conflict: Option<RemotePrefsRecord>,
     pub pushed_count: usize,
     pub pulled_count: usize,
-    pub conflict_count: usize,
     pub synced_at_ms: i64,
 }
 
