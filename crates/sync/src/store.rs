@@ -9,9 +9,9 @@ use papercraft_sync_protocol::{
 };
 
 use crate::types::{
-    ACCOUNTS_DIR, GLOBAL_SYNC_FILE, GlobalSyncState, MAX_PROFILE_NICKNAME_LEN,
-    MAX_REMEMBERED_SERVER_ACCOUNTS, PROFILES_DIR, RememberedServerAccount, SYNC_MANIFEST_FILE,
-    SyncError, SyncManifest,
+    ACCOUNTS_DIR, ActiveAccountSession, ActiveWorkspaceTarget, GLOBAL_SYNC_FILE, GlobalSyncState,
+    MAX_PROFILE_NICKNAME_LEN, MAX_REMEMBERED_SERVER_ACCOUNTS, PROFILES_DIR,
+    RememberedServerAccount, SYNC_MANIFEST_FILE, SyncError, SyncManifest,
 };
 
 static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -166,6 +166,38 @@ pub fn sanitize_remembered_accounts(
     cleaned
 }
 
+fn sanitize_cached_sessions(entries: Vec<ActiveAccountSession>) -> Vec<ActiveAccountSession> {
+    let mut cleaned = Vec::with_capacity(entries.len().min(MAX_REMEMBERED_SERVER_ACCOUNTS));
+    for mut entry in entries {
+        entry.server_url = normalize_server_url(&entry.server_url)
+            .unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string());
+        entry.user.user_id = entry.user.user_id.trim().to_string();
+        entry.user.username = entry.user.username.trim().to_string();
+        entry.user.display_name = entry.user.display_name.trim().to_string();
+        entry.user.email = entry
+            .user
+            .email
+            .take()
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty());
+        entry.device_name = sanitize_device_name(&entry.device_name);
+        if entry.user.user_id.is_empty() || entry.user.username.is_empty() {
+            continue;
+        }
+        let duplicate = cleaned.iter().any(|existing: &ActiveAccountSession| {
+            existing.user.user_id == entry.user.user_id
+                && existing.server_url.eq_ignore_ascii_case(&entry.server_url)
+        });
+        if !duplicate {
+            cleaned.push(entry);
+        }
+        if cleaned.len() >= MAX_REMEMBERED_SERVER_ACCOUNTS {
+            break;
+        }
+    }
+    cleaned
+}
+
 pub fn load_global_state(root_dir: &Path) -> GlobalSyncState {
     let device = default_device_name();
     let path = root_dir.join(GLOBAL_SYNC_FILE);
@@ -182,6 +214,28 @@ pub fn load_global_state(root_dir: &Path) -> GlobalSyncState {
     let _ = parsed.migrate_legacy_session();
     parsed.remembered_server_accounts =
         sanitize_remembered_accounts(std::mem::take(&mut parsed.remembered_server_accounts));
+    parsed.cached_server_sessions =
+        sanitize_cached_sessions(std::mem::take(&mut parsed.cached_server_sessions));
+    for sess in parsed.cached_server_sessions.clone() {
+        let already_remembered = parsed.remembered_server_accounts.iter().any(|r| {
+            r.user_id == sess.user.user_id && r.server_url.eq_ignore_ascii_case(&sess.server_url)
+        });
+        if !already_remembered {
+            parsed.remember_server_account(&sess);
+        }
+    }
+    if let ActiveWorkspaceTarget::Cloud {
+        ref mut server_url,
+        ref mut user_id,
+    } = parsed.active_workspace
+    {
+        *server_url =
+            normalize_server_url(server_url).unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string());
+        *user_id = user_id.trim().to_string();
+        if user_id.is_empty() {
+            parsed.active_workspace = ActiveWorkspaceTarget::Local;
+        }
+    }
     for profile in &mut parsed.local_profiles {
         profile.local_profile_id = sanitize_account_dir_segment(&profile.local_profile_id);
         profile.nickname = sanitize_profile_nickname(&profile.nickname);

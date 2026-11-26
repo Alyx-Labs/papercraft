@@ -336,26 +336,27 @@ cargo run -p papercraft-server-cli -- delete-user --data-dir target/dev-server-d
 
 ---
 
-## 7. Strict Online / Offline Client Storage & Sync Behavior
+## 7. Offline-First Storage, Account Modes & Sync Behavior
 
-### Zero Local Cache for Server Accounts
+### Offline-First Server Accounts
 
-When you sign into or convert an account to a PaperCraft Server account, **zero notebooks, folders, studio preferences, or authentication tokens are stored locally on the device** (neither under `<executable_dir>/library/accounts/` on Desktop nor in browser `localStorage` on Web).
-
-- **Live in-memory sessions**: Server-linked notebooks and preferences are read from and saved directly to the server in real time (`force_overwrite: true`), eliminating offline sync queues, manual conflict resolution modals, and `"<Title> (Conflict Copy)"` duplicates.
-- **Remembered shortcuts**: `global_sync.json` (Desktop) and `papercraft_workspace_v1` (Web `localStorage`) remember only non-sensitive server account shortcuts (`server_url`, `user_id`, `username`, `email`, `display_name`) for quick password sign-in when that server is online. Clicking **Forget Account** in **Profile -> Accounts** removes the shortcut from the device without touching any server data.
-- **Automatic disconnect handling**: If connectivity or session authorization is lost during an online server session, PaperCraft signs out automatically to prevent desynchronization, clears cloud state from memory, and redirects to local account selection (or new local session creation if none exist).
+- **First sign-in / registration**: Requires an online server connection to authenticate and download the account's notebooks, folders, and studio preferences.
+- **Persistent per-account local cache**: Once signed in on a device, notebooks, folders, preferences, and pending upload manifests are persisted locally per server account (`<executable_dir>/library/accounts/<user_id>/` on Desktop and `papercraft_workspace_v1` `localStorage` on Web).
+- **Resilient offline work & sync queue**: If connectivity or server availability drops during a session, PaperCraft never signs you out or locks your notes. Edits continue smoothly against the cached copy (`Offline — changes saved locally`), enter the pending sync queue, and upload automatically upon reconnect.
+- **Switching accounts offline**: Local accounts are always accessible. Previously signed-in server accounts with a cache on the device show **"Offline mode — will sync on reconnect"** and can be opened anytime; new server sign-ins without a local cache are blocked until online.
+- **Forget Account (Privacy Wipe)**: Clicking **Forget Account** on a server account warns if unsynced local changes exist, then removes the shortcut and deletes **only** that account's local cache on the device while leaving all server data intact.
+- **Safe conflict resolution**: Offline changes made on different pages of the same notebook are combined automatically via 3-way page-level merge. If two devices modify the same page offline, PaperCraft keeps the authoritative server copy and preserves the local edits as `"<Title> (Conflict Copy)"`.
 
 ### Local Accounts (Device-Only)
 
 - **Desktop local libraries**: Stored per local profile under `<executable_dir>/library/profiles/<profile_id>/`.
 - **Web local cache**: Local profiles are stored in browser `localStorage` under `papercraft_workspace_v1`.
-- **Convert local to server ("Sync")**: When a configured server is online, any local account card in **Profile -> Accounts** exposes a **Sync** button that prompts for email and password, uploads all local notebooks, folders, and studio preferences to a new server account, clears the local copy from the device, and switches into real-time server mode.
+- **Convert local to server ("Sync")**: When a configured server is online, any local account card in **Profile -> Accounts** exposes a **Sync** button that prompts for email and password, uploads all local notebooks, folders, and studio preferences to a new server account, retains all data on the device as the active Offline-First cache, and begins background sync.
 
-### How Real-Time Server Sync Works
-1. **Non-blocking triggers**: Sync runs asynchronously (dedicated worker thread `papercraft-sync` on Desktop; async browser `fetch` via `wasm-bindgen-futures` on Web) ~600 ms after edits stop, every 12 seconds when idle, or manually via **Sync Now**.
+### How Background Server Sync Works
+1. **Non-blocking triggers**: Sync runs asynchronously (dedicated worker thread `papercraft-sync` on Desktop; async browser `fetch` via `wasm-bindgen-futures` on Web) with SHA-256 content & per-page hashing offloaded from the UI thread and an adaptive trailing debounce (1.5 s normally, scaling to 3.5 s at >= 4 MiB or 6.0 s at >= 32 MiB of pending binary attachments), plus every 12 seconds when idle or manually via **Sync Now**.
 2. **Active-stroke protection**: Pulled updates are held until `live_stroke` and `live_eraser` are idle so active handwriting is never interrupted.
-3. **Tombstone deletions**: Deleting a server notebook records a deletion tombstone synced directly to the server.
+3. **Tombstone deletions**: Deleting a server notebook records a deletion tombstone synced directly to the server (unless concurrent offline edits exist remotely).
 
 ---
 

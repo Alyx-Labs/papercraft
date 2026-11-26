@@ -914,6 +914,7 @@ struct WebCacheStateKey {
     viewing_cloud: bool,
     local_profile_count: usize,
     remembered_server_count: usize,
+    pending_changes: usize,
     needs_initial_nickname: bool,
     last_sync_at_ms: Option<i64>,
     active_notebook: usize,
@@ -1702,6 +1703,7 @@ impl PaperCraftApp {
             viewing_cloud: self.session.is_viewing_cloud(),
             local_profile_count: self.session.saved_local_profiles().len(),
             remembered_server_count: self.session.remembered_server_accounts().len(),
+            pending_changes: self.session.cloud_pending_changes_count(),
             needs_initial_nickname: self.session.needs_initial_nickname(),
             last_sync_at_ms: self.session.sync_status_summary().last_sync_at_ms,
             active_notebook: self.session.active_notebook,
@@ -1744,9 +1746,11 @@ impl PaperCraftApp {
                     self.view.tag_edit_draft.clear();
                     self.view.tag_edit_focus_pending = false;
                 } else if self.view.active_modal == Some(modal::ActiveModal::AccountSync)
-                    && self.view.account.pending_delete_profile_id.is_some()
+                    && (self.view.account.pending_delete_profile_id.is_some()
+                        || self.view.account.pending_forget_server_key.is_some())
                 {
                     self.view.account.clear_pending_delete_profile();
+                    self.view.account.clear_pending_forget_server();
                 } else {
                     modal::close(self);
                 }
@@ -2098,7 +2102,7 @@ impl PaperCraftApp {
         if let Some(mut worker) = self.autosave.take() {
             worker.shutdown(&mut self.session);
         }
-        let _ = self.session.save_library();
+        self.session.flush_for_exit();
     }
 
     fn pump_background_autosave(&mut self, now_s: f64) {
@@ -2678,7 +2682,7 @@ impl eframe::App for PaperCraftApp {
         if let Some(mut worker) = self.autosave.take() {
             worker.shutdown(&mut self.session);
         }
-        let _ = self.session.save_library();
+        self.session.flush_for_exit();
         self.flush_web_cache_if_needed();
     }
 }

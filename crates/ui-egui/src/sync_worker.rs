@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use papercraft_sync::{ActiveAccountSession, SyncBatch, SyncCycleOutcome};
 #[cfg(not(target_arch = "wasm32"))]
-use papercraft_sync::{SyncError, SyncHttpClient, run_sync_cycle};
+use papercraft_sync::{SyncCycleDriver, SyncError, SyncHttpClient, run_sync_cycle};
 use papercraft_sync_protocol::{
     ChangeEmailRequest, ChangePasswordRequest, CompletePasswordResetRequest, LocalDiscoveryReport,
     LoginRequest, RegisterRequest, ServerInfoResponse, SyncPullResponse, UpdateProfileRequest,
@@ -18,9 +18,23 @@ use papercraft_sync_protocol::{
 
 use crate::PaperCraftApp;
 
-const AUTO_SYNC_DEBOUNCE_MS: f64 = 600.0;
+const AUTO_SYNC_DEBOUNCE_NORMAL_MS: f64 = 1_500.0;
+const AUTO_SYNC_DEBOUNCE_MEDIUM_MS: f64 = 3_500.0;
+const AUTO_SYNC_DEBOUNCE_HEAVY_MS: f64 = 6_000.0;
+const SYNC_MEDIUM_PAYLOAD_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+const SYNC_HEAVY_PAYLOAD_THRESHOLD_BYTES: usize = 32 * 1024 * 1024;
 const AUTO_SYNC_IDLE_PULL_MS: f64 = 12_000.0;
 const DISCOVERY_REPORT_INTERVAL_MS: f64 = 45_000.0;
+
+pub(crate) fn adaptive_sync_debounce_ms(estimated_dirty_bytes: usize) -> f64 {
+    if estimated_dirty_bytes >= SYNC_HEAVY_PAYLOAD_THRESHOLD_BYTES {
+        AUTO_SYNC_DEBOUNCE_HEAVY_MS
+    } else if estimated_dirty_bytes >= SYNC_MEDIUM_PAYLOAD_THRESHOLD_BYTES {
+        AUTO_SYNC_DEBOUNCE_MEDIUM_MS
+    } else {
+        AUTO_SYNC_DEBOUNCE_NORMAL_MS
+    }
+}
 
 pub enum SyncWorkerCommand {
     TestConnection {
@@ -98,7 +112,14 @@ pub enum SyncWorkerEvent {
         initial_pull: Box<SyncPullResponse>,
     },
     AuthErr {
+        offline: bool,
         message: String,
+    },
+    ConvertLocalProgress {
+        source_profile_id: String,
+        stage: String,
+        completed: usize,
+        total: usize,
     },
     ConvertLocalOk {
         source_profile_id: String,
@@ -107,6 +128,7 @@ pub enum SyncWorkerEvent {
     },
     ConvertLocalErr {
         source_profile_id: String,
+        offline: bool,
         message: String,
     },
     PasswordResetRequired {
@@ -327,7 +349,7 @@ impl BackgroundSyncWorker {
             pending_outcome: None,
             startup_sync_queued: false,
             last_attempt_ui_ms: -100_000.0,
-            next_retry_delay_ms: 15_000.0,
+            next_retry_delay_ms: 8_000.0,
             last_discovery_sent: None,
             last_discovery_check_ui_ms: None,
             last_discovery_state_key: None,
@@ -446,73 +468,20 @@ pub(crate) fn trigger_manual_sync(app: &mut PaperCraftApp, ctx: &egui::Context) 
     }
 }
 
-/// Automatically logs out an active online server account when connectivity or authorization is lost,
-/// clearing cloud data from memory and redirecting to local account selection or initial nickname setup.
-pub(crate) fn handle_server_disconnect(
-    app: &mut PaperCraftApp,
-    ctx: &egui::Context,
-    unauthorized: bool,
-    detail: &str,
-) {
-    let server_url = app
-        .session
-        .active_account_session()
-        .map(|s| s.server_url.clone())
-        .unwrap_or_else(|| app.session.server_url().to_string());
-    if !unauthorized {
-        app.view.account.mark_server_offline(&server_url, detail);
-    }
-    let has_locals = app.session.sign_out_from_server_session();
-    app.sync_worker.pending_outcome = None;
-    app.sync_worker.startup_sync_queued = false;
-    app.view.open_tabs.clear();
-    app.view.inspector_open = false;
-    app.mesh_cache.clear();
-    app.view.screen = crate::AppScreen::Home;
-    app.view.profile_return_screen = crate::AppScreen::Home;
-    app.view.account.reset_after_sign_out(&server_url);
-    app.view.account.disconnect_notice = Some(if unauthorized {
-        "Your server session expired or is no longer authorized. You were signed out automatically to protect your notes."
-            .to_string()
-    } else {
-        format!(
-            "Connection to the server was lost ({detail}). You were signed out automatically to prevent data loss or desynchronization."
-        )
-    });
-    crate::theme::apply_visuals(ctx, app.session.prefs.theme);
-    crate::sync_view_to_active_notebook(app);
-    if has_locals {
-        crate::modal::open(app, crate::modal::ActiveModal::SelectLocalAccount);
-    } else {
-        app.view.first_access_nickname.clear();
-        app.view.first_access_error = None;
-        app.view.first_access_focus_pending = true;
-        crate::modal::open(app, crate::modal::ActiveModal::FirstAccessNickname);
-    }
-    ctx.request_repaint();
-}
-
 /// Switches into a saved local account on this device without password or network access,
-/// cleanly terminating any active cloud session in RAM and notifying the server in the background.
+/// persisting any active Offline-First cloud workspace cache while keeping cloud sessions cached.
 pub(crate) fn switch_to_local_account_clean(
     app: &mut PaperCraftApp,
-    ctx: &egui::Context,
+    _ctx: &egui::Context,
     profile_id: &str,
 ) -> Result<(), String> {
-    let prev_session = app.session.active_account_session().cloned();
-    let server_url = prev_session
-        .as_ref()
-        .map(|s| s.server_url.clone())
-        .unwrap_or_else(|| app.session.server_url().to_string());
+    let server_url = app.session.server_url().to_string();
     app.session
         .execute(
             "profile.switch",
             &serde_json::json!({ "target": "local", "profile_id": profile_id }),
         )
         .map_err(|err| err.to_string())?;
-    if let Some(sess) = prev_session {
-        let _ = dispatch_command(app, Some(ctx), SyncWorkerCommand::Logout { session: sess });
-    }
     app.sync_worker.pending_outcome = None;
     app.sync_worker.startup_sync_queued = false;
     app.view.open_tabs.clear();
@@ -520,9 +489,97 @@ pub(crate) fn switch_to_local_account_clean(
     app.mesh_cache.clear();
     app.view.account.disconnect_notice = None;
     app.view.account.reset_after_sign_out(&server_url);
+    app.view.account.status_message = Some("Switched to local account.".to_string());
+    app.view.profile_return_screen = crate::AppScreen::Home;
+    crate::theme::apply_visuals(_ctx, app.session.prefs.theme);
+    crate::sync_view_to_active_notebook(app);
+    Ok(())
+}
+
+/// Switches into a previously cached Offline-First server account without needing internet
+/// or re-entering a password, queueing a background sync attempt on the next frame.
+pub(crate) fn switch_to_cached_cloud_account_clean(
+    app: &mut PaperCraftApp,
+    ctx: &egui::Context,
+    server_url: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    app.session
+        .execute(
+            "profile.switch",
+            &serde_json::json!({
+                "target": "cloud",
+                "server_url": server_url,
+                "user_id": user_id
+            }),
+        )
+        .map_err(|err| err.to_string())?;
+    app.sync_worker.pending_outcome = None;
+    app.sync_worker.next_retry_delay_ms = 8_000.0;
+    app.sync_worker.startup_sync_queued = false;
+    app.sync_worker.last_attempt_ui_ms = ctx.input(|i| i.time * 1000.0);
+    app.view.open_tabs.clear();
+    app.view.inspector_open = false;
+    app.mesh_cache.clear();
+    app.view.account.disconnect_notice = None;
+    app.view.account.clear_transient_auth_status();
+    crate::account_modal::sync_draft_from_session(app);
     app.view.profile_return_screen = crate::AppScreen::Home;
     crate::theme::apply_visuals(ctx, app.session.prefs.theme);
     crate::sync_view_to_active_notebook(app);
+    ctx.request_repaint();
+    Ok(())
+}
+
+/// Forgets a remembered server account from this device, deleting only its local cache
+/// while keeping server data intact, and returning gracefully to local state if it was active.
+pub(crate) fn complete_forget_server_account(
+    app: &mut PaperCraftApp,
+    ctx: &egui::Context,
+    server_url: &str,
+    user_id: &str,
+    label: &str,
+) -> Result<(), String> {
+    let cached_sess = app.session.cached_server_session_for(server_url, user_id);
+    let was_active = app.session.active_account_session().is_some_and(|s| {
+        s.user.user_id == user_id
+            && (s.server_url.eq_ignore_ascii_case(server_url)
+                || papercraft_sync_protocol::normalize_server_url(server_url)
+                    .is_ok_and(|u| u.eq_ignore_ascii_case(&s.server_url)))
+    });
+    app.session
+        .execute(
+            "profile.forgetServerAccount",
+            &serde_json::json!({ "serverUrl": server_url, "userId": user_id }),
+        )
+        .map_err(|err| err.to_string())?;
+    if let Some(sess) = cached_sess {
+        let _ = dispatch_command(app, Some(ctx), SyncWorkerCommand::Logout { session: sess });
+    }
+    app.view.account.clear_pending_forget_server();
+    if was_active {
+        app.sync_worker.pending_outcome = None;
+        app.sync_worker.startup_sync_queued = false;
+        app.view.open_tabs.clear();
+        app.view.inspector_open = false;
+        app.mesh_cache.clear();
+        app.view.account.disconnect_notice = None;
+        app.view.account.reset_after_sign_out(server_url);
+        app.view.profile_return_screen = crate::AppScreen::Home;
+        crate::theme::apply_visuals(ctx, app.session.prefs.theme);
+        crate::sync_view_to_active_notebook(app);
+        if !app.session.has_saved_local_accounts() {
+            app.view.screen = crate::AppScreen::Home;
+            app.view.first_access_nickname.clear();
+            app.view.first_access_error = None;
+            app.view.first_access_focus_pending = true;
+            crate::modal::open(app, crate::modal::ActiveModal::FirstAccessNickname);
+        }
+    }
+    app.view.account.error_message = None;
+    app.view.account.status_message = Some(format!(
+        "Forgot {label} and cleared its local cache on this device. Your server data remains intact."
+    ));
     Ok(())
 }
 
@@ -541,8 +598,13 @@ pub(crate) fn poll_and_tick(app: &mut PaperCraftApp, ctx: &egui::Context, now_ui
             app.session.record_sync_failure(false, err);
             app.view.account.clear_transient_auth_status();
         } else {
-            app.sync_worker.next_retry_delay_ms = 15_000.0;
+            app.sync_worker.next_retry_delay_ms = 8_000.0;
             app.view.account.clear_transient_auth_status();
+            let active_url = app.session.server_url().to_string();
+            app.view.account.clear_offline_after_sync(&active_url);
+            if let Some(msg) = app.session.take_last_conflict_notice() {
+                app.view.account.status_message = Some(msg);
+            }
             if app.session.revision != prev_rev {
                 app.mesh_cache.clear();
             }
@@ -568,15 +630,20 @@ pub(crate) fn poll_and_tick(app: &mut PaperCraftApp, ctx: &egui::Context, now_ui
         return;
     }
 
+    let debounce_ms = adaptive_sync_debounce_ms(app.session.dirty_sync_estimated_payload_bytes());
     let elapsed_since_last = now_ui_ms - app.sync_worker.last_attempt_ui_ms;
+    let is_disconnected = matches!(
+        app.session.sync_status_summary().connection,
+        papercraft_sync::SyncConnectionState::Offline | papercraft_sync::SyncConnectionState::Error
+    );
+    let dirty_gate_ms = if is_disconnected {
+        app.sync_worker.next_retry_delay_ms
+    } else {
+        debounce_ms
+    };
     let should_startup_sync = !app.sync_worker.startup_sync_queued;
     let has_dirty_ready = app.session.last_dirty_at_ms().is_some_and(|dirty_wall_ms| {
-        now_unix_ms() - dirty_wall_ms >= AUTO_SYNC_DEBOUNCE_MS as i64
-            && elapsed_since_last
-                >= app
-                    .sync_worker
-                    .next_retry_delay_ms
-                    .min(AUTO_SYNC_DEBOUNCE_MS)
+        now_unix_ms() - dirty_wall_ms >= debounce_ms as i64 && elapsed_since_last >= dirty_gate_ms
     });
     let periodic_pull =
         elapsed_since_last >= AUTO_SYNC_IDLE_PULL_MS.max(app.sync_worker.next_retry_delay_ms);
@@ -585,7 +652,7 @@ pub(crate) fn poll_and_tick(app: &mut PaperCraftApp, ctx: &egui::Context, now_ui
         app.sync_worker.startup_sync_queued = true;
         trigger_manual_sync(app, ctx);
     } else if app.session.last_dirty_at_ms().is_some() {
-        ctx.request_repaint_after(Duration::from_millis(250));
+        ctx.request_repaint_after(Duration::from_millis(500));
     } else {
         ctx.request_repaint_after(Duration::from_secs(6));
     }
@@ -597,7 +664,7 @@ fn drain_worker_events(app: &mut PaperCraftApp, ctx: &egui::Context) {
     }
 }
 
-/// Applies an authenticated cloud session hydrated directly in RAM from `initial_pull`.
+/// Applies an authenticated cloud session hydrated into the Offline-First cache from `initial_pull`.
 pub(crate) fn complete_authenticated_switch(
     app: &mut PaperCraftApp,
     ctx: &egui::Context,
@@ -611,8 +678,11 @@ pub(crate) fn complete_authenticated_switch(
     app.view.account.disconnect_notice = None;
     app.view.profile_return_screen = crate::AppScreen::Home;
     app.session.enter_online_server_session(auth, initial_pull);
+    if let Some(msg) = app.session.take_last_conflict_notice() {
+        app.view.account.status_message = Some(msg);
+    }
     app.sync_worker.pending_outcome = None;
-    app.sync_worker.next_retry_delay_ms = 15_000.0;
+    app.sync_worker.next_retry_delay_ms = 8_000.0;
     app.sync_worker.startup_sync_queued = true;
     app.sync_worker.last_attempt_ui_ms = ctx.input(|i| i.time * 1000.0);
     app.view.open_tabs.clear();
@@ -633,8 +703,8 @@ pub(crate) fn complete_authenticated_switch(
     }
 }
 
-/// Signs out cleanly from an online server session, wiping cloud data from RAM
-/// and redirecting to local account selection or fresh nickname setup.
+/// Signs out cleanly from a server session after flushing local changes, keeping Offline-First
+/// server caches or local accounts accessible according to the session settings.
 pub(crate) fn complete_sign_out(app: &mut PaperCraftApp, ctx: &egui::Context) {
     let prev_url = app
         .session
@@ -666,6 +736,24 @@ pub(crate) fn complete_sign_out(app: &mut PaperCraftApp, ctx: &egui::Context) {
     }
 }
 
+fn handle_health_ok_reconnect(app: &mut PaperCraftApp, ctx: &egui::Context, server_url: &str) {
+    let matches_active = app
+        .session
+        .active_account_session()
+        .is_some_and(|s| crate::account_modal::urls_match(&s.server_url, server_url));
+    if !app.session.is_viewing_cloud() || !matches_active {
+        return;
+    }
+    app.sync_worker.next_retry_delay_ms = 5_000.0;
+    let was_offline = app.session.sync_status_summary().connection
+        == papercraft_sync::SyncConnectionState::Offline;
+    if (was_offline || app.session.cloud_pending_changes_count() > 0)
+        && !app.session.is_sync_in_flight()
+    {
+        trigger_manual_sync(app, ctx);
+    }
+}
+
 pub(crate) fn apply_worker_event(
     app: &mut PaperCraftApp,
     ctx: &egui::Context,
@@ -674,7 +762,8 @@ pub(crate) fn apply_worker_event(
     match evt {
         SyncWorkerEvent::HealthOk { server_url, info } => {
             app.session.set_network_offline_state(false);
-            app.view.account.apply_health_ok(server_url, info);
+            app.view.account.apply_health_ok(server_url.clone(), info);
+            handle_health_ok_reconnect(app, ctx, &server_url);
         }
         SyncWorkerEvent::HealthErr {
             server_url,
@@ -686,8 +775,24 @@ pub(crate) fn apply_worker_event(
             app.session.set_network_offline_state(false);
             complete_authenticated_switch(app, ctx, auth, *initial_pull);
         }
-        SyncWorkerEvent::AuthErr { message } => {
+        SyncWorkerEvent::AuthErr { offline, message } => {
+            if offline {
+                let target_url = app.view.account.server_url.clone();
+                app.view.account.mark_server_offline(&target_url, &message);
+            }
             app.view.account.apply_auth_err(message);
+        }
+        SyncWorkerEvent::ConvertLocalProgress {
+            source_profile_id,
+            stage,
+            completed,
+            total,
+        } => {
+            if app.view.account.convert_source_profile_id == source_profile_id {
+                app.view
+                    .account
+                    .apply_convert_local_progress(stage, completed, total);
+            }
         }
         SyncWorkerEvent::ConvertLocalOk {
             source_profile_id,
@@ -703,7 +808,7 @@ pub(crate) fn apply_worker_event(
             app.session
                 .complete_local_account_conversion(&source_profile_id, auth, *initial_pull);
             app.sync_worker.pending_outcome = None;
-            app.sync_worker.next_retry_delay_ms = 15_000.0;
+            app.sync_worker.next_retry_delay_ms = 8_000.0;
             app.sync_worker.startup_sync_queued = true;
             app.sync_worker.last_attempt_ui_ms = ctx.input(|i| i.time * 1000.0);
             app.view.open_tabs.clear();
@@ -716,7 +821,13 @@ pub(crate) fn apply_worker_event(
                 crate::modal::close(app);
             }
         }
-        SyncWorkerEvent::ConvertLocalErr { message, .. } => {
+        SyncWorkerEvent::ConvertLocalErr {
+            offline, message, ..
+        } => {
+            if offline {
+                let target_url = app.session.server_url().to_string();
+                app.view.account.mark_server_offline(&target_url, &message);
+            }
             app.view.account.apply_convert_local_err(message);
         }
         SyncWorkerEvent::PasswordResetRequired {
@@ -741,8 +852,23 @@ pub(crate) fn apply_worker_event(
             unauthorized,
             message,
         } => {
-            if app.session.is_viewing_cloud() && (offline || unauthorized) {
-                handle_server_disconnect(app, ctx, unauthorized, &message);
+            if offline {
+                if let Some(url) = app
+                    .session
+                    .active_account_session()
+                    .map(|s| s.server_url.clone())
+                {
+                    app.view.account.mark_server_offline(&url, &message);
+                }
+                app.view.account.apply_profile_update_err(
+                    "Server is offline — updating your profile requires an online connection."
+                        .to_string(),
+                );
+            } else if unauthorized {
+                app.view.account.apply_profile_update_err(
+                    "Session expired — sign in again when online to update your profile."
+                        .to_string(),
+                );
             } else {
                 app.view.account.apply_profile_update_err(message);
             }
@@ -756,8 +882,23 @@ pub(crate) fn apply_worker_event(
             unauthorized,
             message,
         } => {
-            if app.session.is_viewing_cloud() && (offline || unauthorized) {
-                handle_server_disconnect(app, ctx, unauthorized, &message);
+            if offline {
+                if let Some(url) = app
+                    .session
+                    .active_account_session()
+                    .map(|s| s.server_url.clone())
+                {
+                    app.view.account.mark_server_offline(&url, &message);
+                }
+                app.view.account.apply_password_change_err(
+                    "Server is offline — changing your password requires an online connection."
+                        .to_string(),
+                );
+            } else if unauthorized {
+                app.view.account.apply_password_change_err(
+                    "Session expired — sign in again when online to change your password."
+                        .to_string(),
+                );
             } else {
                 app.view.account.apply_password_change_err(message);
             }
@@ -772,8 +913,22 @@ pub(crate) fn apply_worker_event(
             unauthorized,
             message,
         } => {
-            if app.session.is_viewing_cloud() && (offline || unauthorized) {
-                handle_server_disconnect(app, ctx, unauthorized, &message);
+            if offline {
+                if let Some(url) = app
+                    .session
+                    .active_account_session()
+                    .map(|s| s.server_url.clone())
+                {
+                    app.view.account.mark_server_offline(&url, &message);
+                }
+                app.view.account.apply_email_change_err(
+                    "Server is offline — updating your email requires an online connection."
+                        .to_string(),
+                );
+            } else if unauthorized {
+                app.view.account.apply_email_change_err(
+                    "Session expired — sign in again when online to update your email.".to_string(),
+                );
             } else {
                 app.view.account.apply_email_change_err(message);
             }
@@ -787,18 +942,63 @@ pub(crate) fn apply_worker_event(
             message,
         } => {
             app.view.account.clear_transient_auth_status();
-            if app.session.is_viewing_cloud() && (offline || unauthorized) {
-                handle_server_disconnect(app, ctx, unauthorized, &message);
+            let active_url = app
+                .session
+                .active_account_session()
+                .map(|s| s.server_url.clone())
+                .unwrap_or_else(|| app.session.server_url().to_string());
+            if offline {
+                app.view.account.mark_server_offline(&active_url, &message);
+                app.session.record_sync_failure(true, message);
+                app.sync_worker.next_retry_delay_ms =
+                    (app.sync_worker.next_retry_delay_ms * 1.5).clamp(5_000.0, 20_000.0);
+            } else if unauthorized {
+                app.session.record_sync_failure(
+                    false,
+                    "Session expired — sign in again when online to resume cloud sync. Changes remain saved locally."
+                        .to_string(),
+                );
+                app.sync_worker.next_retry_delay_ms = 60_000.0;
             } else {
-                app.session.record_sync_failure(offline, message);
-                let next_backoff = if unauthorized {
-                    120_000.0
-                } else {
-                    (app.sync_worker.next_retry_delay_ms * 2.0).clamp(15_000.0, 120_000.0)
-                };
-                app.sync_worker.next_retry_delay_ms = next_backoff;
+                app.session.record_sync_failure(false, message);
+                app.sync_worker.next_retry_delay_ms =
+                    (app.sync_worker.next_retry_delay_ms * 2.0).clamp(15_000.0, 120_000.0);
             }
         }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const CONVERT_OFFLINE_ERR_MSG: &str = "Connection lost while syncing. Your local account and notebooks remain safely saved on this device — retry when the server is back online.";
+
+#[cfg(not(target_arch = "wasm32"))]
+fn emit_worker_progress(
+    evt_tx: &mpsc::Sender<SyncWorkerEvent>,
+    repaint_ctx: &Arc<Mutex<Option<egui::Context>>>,
+    evt: SyncWorkerEvent,
+) {
+    let _ = evt_tx.send(evt);
+    if let Ok(guard) = repaint_ctx.lock()
+        && let Some(ref ctx) = *guard
+    {
+        ctx.request_repaint();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn convert_err_event(source_profile_id: String, err: &SyncError, is_auth: bool) -> SyncWorkerEvent {
+    let offline = matches!(err, SyncError::Network(_));
+    let message = if offline {
+        CONVERT_OFFLINE_ERR_MSG.to_string()
+    } else if is_auth {
+        friendly_auth_error(err)
+    } else {
+        friendly_error(err)
+    };
+    SyncWorkerEvent::ConvertLocalErr {
+        source_profile_id,
+        offline,
+        message,
     }
 }
 
@@ -812,7 +1012,7 @@ fn worker_loop(
     let client = SyncHttpClient::new();
     while let Ok(cmd) = cmd_rx.recv() {
         busy.store(true, Ordering::Relaxed);
-        let maybe_event = execute_worker_command(&client, cmd);
+        let maybe_event = execute_worker_command(&client, cmd, &evt_tx, &repaint_ctx);
         busy.store(false, Ordering::Relaxed);
 
         if let Some(evt) = maybe_event {
@@ -829,9 +1029,245 @@ fn worker_loop(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn exec_convert_local_account(
+    client: &SyncHttpClient,
+    evt_tx: &mpsc::Sender<SyncWorkerEvent>,
+    repaint_ctx: &Arc<Mutex<Option<egui::Context>>>,
+    cmd: SyncWorkerCommand,
+) -> SyncWorkerEvent {
+    let SyncWorkerCommand::ConvertLocalAccount {
+        server_url,
+        source_profile_id,
+        source_nickname,
+        email,
+        password,
+        device_name,
+        upload_batch,
+    } = cmd
+    else {
+        return SyncWorkerEvent::ConvertLocalErr {
+            source_profile_id: String::new(),
+            offline: false,
+            message: "Invalid conversion command.".to_string(),
+        };
+    };
+
+    let req =
+        match build_register_request(&email, None, password, Some(source_nickname), &device_name) {
+            Ok(req) => req,
+            Err(message) => {
+                return SyncWorkerEvent::ConvertLocalErr {
+                    source_profile_id,
+                    offline: false,
+                    message,
+                };
+            }
+        };
+
+    let total_docs = upload_batch.local_docs.len();
+    let total_steps = total_docs.max(1) + 2;
+    emit_worker_progress(
+        evt_tx,
+        repaint_ctx,
+        SyncWorkerEvent::ConvertLocalProgress {
+            source_profile_id: source_profile_id.clone(),
+            stage: "Creating cloud account...".to_string(),
+            completed: 0,
+            total: total_steps,
+        },
+    );
+
+    let mut auth = match client.register(&server_url, &req, &device_name) {
+        Ok(auth) => auth,
+        Err(err) => return convert_err_event(source_profile_id, &err, true),
+    };
+
+    emit_worker_progress(
+        evt_tx,
+        repaint_ctx,
+        SyncWorkerEvent::ConvertLocalProgress {
+            source_profile_id: source_profile_id.clone(),
+            stage: format!("Uploading notebooks (0/{total_docs})..."),
+            completed: 1,
+            total: total_steps,
+        },
+    );
+
+    let mut driver = SyncCycleDriver::new(&upload_batch);
+    let mut uploaded_docs = 0usize;
+    while let Some(push_req) = driver.next_push_request(&upload_batch) {
+        let chunk_docs = push_req.changes.len();
+        let (resp, _) = match client.push_with_refresh(&mut auth, &push_req) {
+            Ok(res) => res,
+            Err(err) => return convert_err_event(source_profile_id, &err, false),
+        };
+        driver.record_push_chunk_response(resp, &upload_batch);
+        uploaded_docs = uploaded_docs.saturating_add(chunk_docs).min(total_docs);
+        let done_step = if total_docs == 0 {
+            2
+        } else {
+            1 + uploaded_docs
+        };
+        emit_worker_progress(
+            evt_tx,
+            repaint_ctx,
+            SyncWorkerEvent::ConvertLocalProgress {
+                source_profile_id: source_profile_id.clone(),
+                stage: format!("Uploading notebooks ({uploaded_docs}/{total_docs})..."),
+                completed: done_step,
+                total: total_steps,
+            },
+        );
+    }
+
+    emit_worker_progress(
+        evt_tx,
+        repaint_ctx,
+        SyncWorkerEvent::ConvertLocalProgress {
+            source_profile_id: source_profile_id.clone(),
+            stage: "Finalizing Offline-First cache...".to_string(),
+            completed: total_steps.saturating_sub(1),
+            total: total_steps,
+        },
+    );
+    match client.pull_with_refresh(&mut auth, 0) {
+        Ok((pull_resp, _)) => SyncWorkerEvent::ConvertLocalOk {
+            source_profile_id,
+            auth,
+            initial_pull: Box::new(pull_resp),
+        },
+        Err(err) => convert_err_event(source_profile_id, &err, false),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pull_initial_auth_event(
+    client: &SyncHttpClient,
+    mut auth: ActiveAccountSession,
+) -> SyncWorkerEvent {
+    match client.pull_with_refresh(&mut auth, 0) {
+        Ok((pull_resp, _)) => SyncWorkerEvent::AuthOk {
+            auth,
+            initial_pull: Box::new(pull_resp),
+        },
+        Err(err) => SyncWorkerEvent::AuthErr {
+            offline: matches!(err, SyncError::Network(_)),
+            message: friendly_error(&err),
+        },
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn exec_worker_register(
+    client: &SyncHttpClient,
+    server_url: &str,
+    email: &str,
+    username: Option<&str>,
+    password: String,
+    display_name: Option<String>,
+    device_name: &str,
+) -> SyncWorkerEvent {
+    let req = match build_register_request(email, username, password, display_name, device_name) {
+        Ok(req) => req,
+        Err(message) => {
+            return SyncWorkerEvent::AuthErr {
+                offline: false,
+                message,
+            };
+        }
+    };
+    match client.register(server_url, &req, device_name) {
+        Ok(auth) => pull_initial_auth_event(client, auth),
+        Err(err) => SyncWorkerEvent::AuthErr {
+            offline: matches!(err, SyncError::Network(_)),
+            message: friendly_auth_error(&err),
+        },
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn exec_worker_login(
+    client: &SyncHttpClient,
+    server_url: &str,
+    identifier: String,
+    password: String,
+    device_name: &str,
+) -> SyncWorkerEvent {
+    let submitted_password = password.clone();
+    let req = match build_login_request(&identifier, password, device_name) {
+        Ok(req) => req,
+        Err(message) => {
+            return SyncWorkerEvent::AuthErr {
+                offline: false,
+                message,
+            };
+        }
+    };
+    match client.login(server_url, &req, device_name) {
+        Ok(auth) => pull_initial_auth_event(client, auth),
+        Err(SyncError::Server { code, message, .. })
+            if code == ERR_CODE_PASSWORD_CHANGE_REQUIRED =>
+        {
+            SyncWorkerEvent::PasswordResetRequired {
+                identifier,
+                prefill_code: Some(submitted_password.trim().to_string()),
+                message,
+            }
+        }
+        Err(SyncError::Server { code, message, .. })
+            if code == ERR_CODE_PASSWORD_RESET_REQUIRED =>
+        {
+            SyncWorkerEvent::PasswordResetRequired {
+                identifier,
+                prefill_code: None,
+                message,
+            }
+        }
+        Err(err) => SyncWorkerEvent::AuthErr {
+            offline: matches!(err, SyncError::Network(_)),
+            message: friendly_auth_error(&err),
+        },
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn exec_worker_complete_password_reset(
+    client: &SyncHttpClient,
+    server_url: &str,
+    identifier: &str,
+    recovery_code: &str,
+    new_password: String,
+    device_name: &str,
+) -> SyncWorkerEvent {
+    let req = match build_complete_password_reset_request(
+        identifier,
+        recovery_code,
+        new_password,
+        device_name,
+    ) {
+        Ok(req) => req,
+        Err(message) => {
+            return SyncWorkerEvent::AuthErr {
+                offline: false,
+                message,
+            };
+        }
+    };
+    match client.complete_password_reset(server_url, &req, device_name) {
+        Ok(auth) => pull_initial_auth_event(client, auth),
+        Err(err) => SyncWorkerEvent::AuthErr {
+            offline: matches!(err, SyncError::Network(_)),
+            message: friendly_auth_error(&err),
+        },
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn execute_worker_command(
     client: &SyncHttpClient,
     cmd: SyncWorkerCommand,
+    evt_tx: &mpsc::Sender<SyncWorkerEvent>,
+    repaint_ctx: &Arc<Mutex<Option<egui::Context>>>,
 ) -> Option<SyncWorkerEvent> {
     match cmd {
         SyncWorkerCommand::TestConnection { server_url } => {
@@ -861,166 +1297,43 @@ fn execute_worker_command(
             password,
             display_name,
             device_name,
-        } => {
-            let req = match build_register_request(
-                &email,
-                username.as_deref(),
-                password,
-                display_name,
-                &device_name,
-            ) {
-                Ok(req) => req,
-                Err(message) => return Some(SyncWorkerEvent::AuthErr { message }),
-            };
-            let mut auth = match client.register(&server_url, &req, &device_name) {
-                Ok(auth) => auth,
-                Err(err) => {
-                    return Some(SyncWorkerEvent::AuthErr {
-                        message: friendly_auth_error(&err),
-                    });
-                }
-            };
-            match client.pull_with_refresh(&mut auth, 0) {
-                Ok((pull_resp, _)) => Some(SyncWorkerEvent::AuthOk {
-                    auth,
-                    initial_pull: Box::new(pull_resp),
-                }),
-                Err(err) => Some(SyncWorkerEvent::AuthErr {
-                    message: friendly_error(&err),
-                }),
-            }
-        }
+        } => Some(exec_worker_register(
+            client,
+            &server_url,
+            &email,
+            username.as_deref(),
+            password,
+            display_name,
+            &device_name,
+        )),
         SyncWorkerCommand::Login {
             server_url,
             identifier,
             password,
             device_name,
-        } => {
-            let submitted_password = password.clone();
-            let req = match build_login_request(&identifier, password, &device_name) {
-                Ok(req) => req,
-                Err(message) => return Some(SyncWorkerEvent::AuthErr { message }),
-            };
-            let mut auth = match client.login(&server_url, &req, &device_name) {
-                Ok(auth) => auth,
-                Err(SyncError::Server { code, message, .. })
-                    if code == ERR_CODE_PASSWORD_CHANGE_REQUIRED =>
-                {
-                    return Some(SyncWorkerEvent::PasswordResetRequired {
-                        identifier,
-                        prefill_code: Some(submitted_password.trim().to_string()),
-                        message,
-                    });
-                }
-                Err(SyncError::Server { code, message, .. })
-                    if code == ERR_CODE_PASSWORD_RESET_REQUIRED =>
-                {
-                    return Some(SyncWorkerEvent::PasswordResetRequired {
-                        identifier,
-                        prefill_code: None,
-                        message,
-                    });
-                }
-                Err(err) => {
-                    return Some(SyncWorkerEvent::AuthErr {
-                        message: friendly_auth_error(&err),
-                    });
-                }
-            };
-            match client.pull_with_refresh(&mut auth, 0) {
-                Ok((pull_resp, _)) => Some(SyncWorkerEvent::AuthOk {
-                    auth,
-                    initial_pull: Box::new(pull_resp),
-                }),
-                Err(err) => Some(SyncWorkerEvent::AuthErr {
-                    message: friendly_error(&err),
-                }),
-            }
-        }
+        } => Some(exec_worker_login(
+            client,
+            &server_url,
+            identifier,
+            password,
+            &device_name,
+        )),
         SyncWorkerCommand::CompletePasswordReset {
             server_url,
             identifier,
             recovery_code,
             new_password,
             device_name,
-        } => {
-            let req = match build_complete_password_reset_request(
-                &identifier,
-                &recovery_code,
-                new_password,
-                &device_name,
-            ) {
-                Ok(req) => req,
-                Err(message) => return Some(SyncWorkerEvent::AuthErr { message }),
-            };
-            let mut auth = match client.complete_password_reset(&server_url, &req, &device_name) {
-                Ok(auth) => auth,
-                Err(err) => {
-                    return Some(SyncWorkerEvent::AuthErr {
-                        message: friendly_auth_error(&err),
-                    });
-                }
-            };
-            match client.pull_with_refresh(&mut auth, 0) {
-                Ok((pull_resp, _)) => Some(SyncWorkerEvent::AuthOk {
-                    auth,
-                    initial_pull: Box::new(pull_resp),
-                }),
-                Err(err) => Some(SyncWorkerEvent::AuthErr {
-                    message: friendly_error(&err),
-                }),
-            }
-        }
-        SyncWorkerCommand::ConvertLocalAccount {
-            server_url,
-            source_profile_id,
-            source_nickname,
-            email,
-            password,
-            device_name,
-            upload_batch,
-        } => {
-            let req = match build_register_request(
-                &email,
-                None,
-                password,
-                Some(source_nickname),
-                &device_name,
-            ) {
-                Ok(req) => req,
-                Err(message) => {
-                    return Some(SyncWorkerEvent::ConvertLocalErr {
-                        source_profile_id,
-                        message,
-                    });
-                }
-            };
-            let mut auth = match client.register(&server_url, &req, &device_name) {
-                Ok(auth) => auth,
-                Err(err) => {
-                    return Some(SyncWorkerEvent::ConvertLocalErr {
-                        source_profile_id,
-                        message: friendly_auth_error(&err),
-                    });
-                }
-            };
-            if let Err(err) = run_sync_cycle(client, &mut auth, &upload_batch) {
-                return Some(SyncWorkerEvent::ConvertLocalErr {
-                    source_profile_id,
-                    message: friendly_error(&err),
-                });
-            }
-            match client.pull_with_refresh(&mut auth, 0) {
-                Ok((pull_resp, _)) => Some(SyncWorkerEvent::ConvertLocalOk {
-                    source_profile_id,
-                    auth,
-                    initial_pull: Box::new(pull_resp),
-                }),
-                Err(err) => Some(SyncWorkerEvent::ConvertLocalErr {
-                    source_profile_id,
-                    message: friendly_error(&err),
-                }),
-            }
+        } => Some(exec_worker_complete_password_reset(
+            client,
+            &server_url,
+            &identifier,
+            &recovery_code,
+            new_password,
+            &device_name,
+        )),
+        cmd @ SyncWorkerCommand::ConvertLocalAccount { .. } => {
+            Some(exec_convert_local_account(client, evt_tx, repaint_ctx, cmd))
         }
         SyncWorkerCommand::UpdateProfile {
             mut session,
@@ -1188,9 +1501,9 @@ mod tests {
     }
 
     #[test]
-    fn offline_sync_error_auto_logs_out_and_redirects_by_local_account_presence() {
+    fn offline_sync_error_keeps_cloud_account_accessible_and_queues_changes() {
         let ctx = egui::Context::default();
-        let make_auth = || ActiveAccountSession {
+        let auth = ActiveAccountSession {
             server_url: "http://127.0.0.1:8787".to_string(),
             user: papercraft_sync_protocol::UserProfile {
                 user_id: "u-existing".to_string(),
@@ -1208,14 +1521,12 @@ mod tests {
             last_auth_ms: 1000,
         };
 
-        // Case A: saved local accounts exist -> redirect to SelectLocalAccount.
-        let mut sess_with_local = papercraft_engine::Session::open_web_cache(None);
-        sess_with_local
+        let mut session = papercraft_engine::Session::open_web_cache(None);
+        session
             .execute("profile.completeFirstAccess", &json_nick("Personal"))
             .unwrap();
-        let mut app_with_local =
-            PaperCraftApp::new(sess_with_local, crate::PlatformHooks::default());
-        let auth = make_auth();
+        let mut app = PaperCraftApp::new(session, crate::PlatformHooks::default());
+        app.view.active_modal = None;
         let empty_pull = SyncPullResponse {
             server_cursor: 0,
             user: auth.user.clone(),
@@ -1223,34 +1534,11 @@ mod tests {
             folders: Vec::new(),
             studio_prefs: None,
         };
-        app_with_local
-            .session
-            .enter_online_server_session(auth.clone(), empty_pull.clone());
-        apply_worker_event(
-            &mut app_with_local,
-            &ctx,
-            SyncWorkerEvent::SyncErr {
-                offline: true,
-                unauthorized: false,
-                message: "Connection refused".to_string(),
-            },
-        );
-        assert!(!app_with_local.session.is_signed_in());
-        assert!(!app_with_local.session.is_viewing_cloud());
-        assert_eq!(
-            app_with_local.view.active_modal,
-            Some(crate::modal::ActiveModal::SelectLocalAccount)
-        );
-        assert!(app_with_local.view.account.disconnect_notice.is_some());
+        app.session.enter_online_server_session(auth, empty_pull);
 
-        // Case B: zero saved local accounts -> redirect to FirstAccessNickname.
-        let sess_no_local = papercraft_engine::Session::open_web_cache(None);
-        let mut app_no_local = PaperCraftApp::new(sess_no_local, crate::PlatformHooks::default());
-        app_no_local
-            .session
-            .enter_online_server_session(auth, empty_pull);
+        // Going offline must NEVER log out or block the user's cached cloud notebooks.
         apply_worker_event(
-            &mut app_no_local,
+            &mut app,
             &ctx,
             SyncWorkerEvent::SyncErr {
                 offline: true,
@@ -1258,20 +1546,36 @@ mod tests {
                 message: "Connection refused".to_string(),
             },
         );
-        assert!(!app_no_local.session.is_signed_in());
+        assert!(app.session.is_signed_in());
+        assert!(app.session.is_viewing_cloud());
         assert_eq!(
-            app_no_local.view.active_modal,
-            Some(crate::modal::ActiveModal::FirstAccessNickname)
+            app.session.sync_status_summary().connection,
+            papercraft_sync::SyncConnectionState::Offline
         );
-        assert!(app_no_local.view.account.disconnect_notice.is_some());
+        assert_eq!(app.view.active_modal, None);
+
+        // Editing offline queues changes locally to push automatically upon reconnect.
+        app.session
+            .execute(
+                "notebook.create",
+                &serde_json::json!({ "title": "Plane Notes" }),
+            )
+            .unwrap();
+        assert!(app.session.cloud_pending_changes_count() >= 1);
     }
 
     #[test]
-    fn convert_local_ok_deletes_local_account_and_enters_cloud_session() {
+    fn convert_local_ok_preserves_local_cache_and_enters_cloud_session() {
         let ctx = egui::Context::default();
         let mut session = papercraft_engine::Session::open_web_cache(None);
         session
             .execute("profile.completeFirstAccess", &json_nick("LocalUser"))
+            .unwrap();
+        session
+            .execute(
+                "notebook.create",
+                &serde_json::json!({ "title": "Physics Notes" }),
+            )
             .unwrap();
         let local_id = session
             .active_local_profile()
@@ -1318,6 +1622,13 @@ mod tests {
         assert!(app.session.is_signed_in());
         assert!(app.session.is_viewing_cloud());
         assert!(!app.session.has_saved_local_accounts());
+        assert!(
+            app.session
+                .notebooks
+                .iter()
+                .any(|d| d.title == "Physics Notes"),
+            "converted local notebooks must stay cached locally for Offline-First access"
+        );
         assert_eq!(app.view.active_modal, None);
     }
 
@@ -1372,6 +1683,145 @@ mod tests {
         poll_and_tick(&mut app, &ctx, 2200.0);
         assert_eq!(app.sync_worker.last_discovery_check_ui_ms, Some(2200.0));
         assert_eq!(dispatch_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn adaptive_sync_debounce_scales_with_dirty_payload_size() {
+        assert_eq!(adaptive_sync_debounce_ms(0), 1_500.0);
+        assert_eq!(adaptive_sync_debounce_ms(1024), 1_500.0);
+        assert_eq!(adaptive_sync_debounce_ms(4 * 1024 * 1024), 3_500.0);
+        assert_eq!(adaptive_sync_debounce_ms(12 * 1024 * 1024), 3_500.0);
+        assert_eq!(adaptive_sync_debounce_ms(32 * 1024 * 1024), 6_000.0);
+        assert_eq!(adaptive_sync_debounce_ms(128 * 1024 * 1024), 6_000.0);
+    }
+
+    #[test]
+    fn convert_progress_offline_interrupt_preserves_local_and_health_ok_triggers_reconnect_sync() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ctx = egui::Context::default();
+        let mut session = papercraft_engine::Session::open_web_cache(None);
+        session
+            .execute("profile.completeFirstAccess", &json_nick("LocalSafe"))
+            .unwrap();
+        session
+            .execute(
+                "notebook.create",
+                &serde_json::json!({ "title": "Important Sketch" }),
+            )
+            .unwrap();
+        let local_id = session
+            .active_local_profile()
+            .unwrap()
+            .local_profile_id
+            .clone();
+
+        let sync_dispatches = Arc::new(AtomicUsize::new(0));
+        let sync_clone = Arc::clone(&sync_dispatches);
+        let hooks = crate::PlatformHooks {
+            web_sync_dispatch: Some(Box::new(move |cmd, _tx, _ctx| {
+                if matches!(cmd, SyncWorkerCommand::SyncNow { .. }) {
+                    sync_clone.fetch_add(1, Ordering::Relaxed);
+                }
+            })),
+            ..crate::PlatformHooks::default()
+        };
+        let mut app = PaperCraftApp::new(session, hooks);
+        app.view.active_modal = Some(crate::modal::ActiveModal::ConvertLocalAccount);
+        app.view.account.convert_source_profile_id = local_id.clone();
+        app.view.account.convert_busy = true;
+
+        // Progress updates reflect stage and counts accurately.
+        apply_worker_event(
+            &mut app,
+            &ctx,
+            SyncWorkerEvent::ConvertLocalProgress {
+                source_profile_id: local_id.clone(),
+                stage: "Uploading notebooks (1/2)...".to_string(),
+                completed: 2,
+                total: 4,
+            },
+        );
+        assert_eq!(
+            app.view.account.convert_progress_stage,
+            "Uploading notebooks (1/2)..."
+        );
+        assert_eq!(app.view.account.convert_progress_completed, 2);
+        assert_eq!(app.view.account.convert_progress_total, 4);
+
+        // Mid-sync network drop keeps the modal open, marks server offline, and keeps all local notebooks intact.
+        apply_worker_event(
+            &mut app,
+            &ctx,
+            SyncWorkerEvent::ConvertLocalErr {
+                source_profile_id: local_id,
+                offline: true,
+                message: "Connection lost while syncing. Your local account and notebooks remain safely saved on this device — retry when the server is back online.".to_string(),
+            },
+        );
+        assert!(!app.view.account.convert_busy);
+        assert!(!app.session.is_viewing_cloud());
+        assert!(
+            app.session
+                .notebooks
+                .iter()
+                .any(|d| d.title == "Important Sketch")
+        );
+        assert!(matches!(
+            app.view.account.probe_for("http://127.0.0.1:8787"),
+            crate::account_modal::ServerProbeState::Failed { .. }
+        ));
+
+        // Now simulate viewing an offline cloud session whose connection probe recovers via HealthOk.
+        let auth = ActiveAccountSession {
+            server_url: "http://127.0.0.1:8787".to_string(),
+            user: papercraft_sync_protocol::UserProfile {
+                user_id: "u-rec".to_string(),
+                email: Some("rec@example.com".to_string()),
+                username: "rec".to_string(),
+                display_name: "Rec".to_string(),
+                created_at_ms: 1000,
+                must_change_password: false,
+            },
+            access_token: "acc".to_string(),
+            refresh_token: "ref".to_string(),
+            access_expires_at_ms: 99_999,
+            refresh_expires_at_ms: 99_999,
+            device_name: "PC".to_string(),
+            last_auth_ms: 1000,
+        };
+        let pull = SyncPullResponse {
+            server_cursor: 1,
+            user: auth.user.clone(),
+            notebooks: Vec::new(),
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        app.session.enter_online_server_session(auth, pull);
+        app.session
+            .record_sync_failure(true, "Connection refused".to_string());
+        app.sync_worker.next_retry_delay_ms = 20_000.0;
+        let before = sync_dispatches.load(Ordering::Relaxed);
+
+        apply_worker_event(
+            &mut app,
+            &ctx,
+            SyncWorkerEvent::HealthOk {
+                server_url: "http://127.0.0.1:8787".to_string(),
+                info: papercraft_sync_protocol::ServerInfoResponse {
+                    status: "ok".to_string(),
+                    service: "papercraft-server".to_string(),
+                    version: "0.1.0".to_string(),
+                    protocol_version: 1,
+                    registration_open: true,
+                    storage_engine: "redb".to_string(),
+                    max_notebook_bytes: 1_048_576,
+                    local_discovery: papercraft_sync_protocol::LocalDiscoverySummary::default(),
+                },
+            },
+        );
+        assert_eq!(sync_dispatches.load(Ordering::Relaxed), before + 1);
+        assert_eq!(app.sync_worker.next_retry_delay_ms, 5_000.0);
     }
 
     fn json_nick(nick: &str) -> serde_json::Value {

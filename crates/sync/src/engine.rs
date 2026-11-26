@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::ops::Range;
 
 use papercraft_sync_protocol::{
     AcceptedFolderSync, ConflictNotebookSync, LocalNotebookChange, MAX_PUSH_BATCH_SIZE,
     RemoteFolderRecord, RemoteNotebookRecord, RemotePrefsRecord, SyncPullResponse, SyncPushRequest,
-    SyncPushResponse, canonical_document_body_hash, canonical_document_meta_hash, now_unix_ms,
+    SyncPushResponse, canonical_document_body_hash, canonical_document_hash,
+    canonical_document_meta_hash, canonical_document_page_hashes, now_unix_ms,
 };
 
 use crate::client::SyncHttpClient;
@@ -17,6 +19,7 @@ const TARGET_PUSH_CHUNK_BYTES: usize = 24 * 1024 * 1024;
 /// Pure step-by-step sync state machine shared by blocking desktop HTTP and async web `fetch`.
 pub struct SyncCycleDriver {
     changes: Vec<LocalNotebookChange>,
+    sent_page_hashes: HashMap<String, Vec<String>>,
     ranges: Vec<Range<usize>>,
     cursor: usize,
     prefs_only_pending: bool,
@@ -26,12 +29,13 @@ pub struct SyncCycleDriver {
 impl SyncCycleDriver {
     /// Prepares chunked push requests from a captured [`SyncBatch`].
     pub fn new(batch: &SyncBatch) -> Self {
-        let changes = build_pending_changes(batch);
+        let (changes, sent_page_hashes) = build_pending_changes(batch);
         let ranges = plan_push_chunk_ranges(&changes, MAX_PUSH_BATCH_SIZE, TARGET_PUSH_CHUNK_BYTES);
         let prefs_only_pending =
             changes.is_empty() && (batch.prefs_push.is_some() || !batch.folder_changes.is_empty());
         Self {
             changes,
+            sent_page_hashes,
             ranges,
             cursor: 0,
             prefs_only_pending,
@@ -80,7 +84,7 @@ impl SyncCycleDriver {
         } else {
             None
         };
-        record_push_response(resp, sent_prefs, &mut self.accum);
+        record_push_response(resp, sent_prefs, &self.sent_page_hashes, &mut self.accum);
         if self.prefs_only_pending {
             self.prefs_only_pending = false;
         } else if self.cursor < self.ranges.len() {
@@ -98,6 +102,7 @@ impl SyncCycleDriver {
             &pull_resp.notebooks,
             &self.accum.accepted_uploads,
             &self.accum.cleared_tombstones,
+            &self.accum.conflict_updates,
             &mut self.accum.downloaded_updates,
         );
         let downloaded_folders: Vec<RemoteFolderRecord> = pull_resp
@@ -120,10 +125,16 @@ impl SyncCycleDriver {
             refreshed_session,
             server_user: pull_resp.user,
             accepted_uploads: self.accum.accepted_uploads,
+            accepted_page_hashes: self.accum.accepted_page_hashes,
             accepted_folders: self.accum.accepted_folders,
             cleared_tombstones: self.accum.cleared_tombstones,
-            pulled_count: self.accum.downloaded_updates.len(),
+            pulled_count: self
+                .accum
+                .downloaded_updates
+                .len()
+                .saturating_add(self.accum.conflict_updates.len()),
             downloaded_updates: self.accum.downloaded_updates,
+            conflict_updates: self.accum.conflict_updates,
             downloaded_folders,
             updated_prefs,
             ack_prefs: self.accum.ack_prefs,
@@ -160,18 +171,26 @@ pub fn outcome_from_full_pull(
     let downloaded_updates: Vec<RemoteNotebookUpdate> = pull_resp
         .notebooks
         .into_iter()
-        .map(|record| RemoteNotebookUpdate {
-            notebook_id: record.notebook_id,
-            version: record.version,
-            cursor: record.cursor,
-            deleted: record.deleted,
-            updated_at_ms: record.updated_at_ms,
-            deleted_at_ms: record.deleted_at_ms,
-            content_hash: record.content_hash,
-            body_hash: record.body_hash,
-            meta_hash: record.meta_hash,
-            meta_updated_at_ms: record.meta_updated_at_ms,
-            document: record.document,
+        .map(|record| {
+            let page_hashes = record
+                .document
+                .as_ref()
+                .map(canonical_document_page_hashes)
+                .unwrap_or_default();
+            RemoteNotebookUpdate {
+                notebook_id: record.notebook_id,
+                version: record.version,
+                cursor: record.cursor,
+                deleted: record.deleted,
+                updated_at_ms: record.updated_at_ms,
+                deleted_at_ms: record.deleted_at_ms,
+                content_hash: record.content_hash,
+                body_hash: record.body_hash,
+                meta_hash: record.meta_hash,
+                meta_updated_at_ms: record.meta_updated_at_ms,
+                document: record.document,
+                page_hashes,
+            }
         })
         .collect();
     SyncCycleOutcome {
@@ -179,10 +198,12 @@ pub fn outcome_from_full_pull(
         refreshed_session,
         server_user: pull_resp.user,
         accepted_uploads: Vec::new(),
+        accepted_page_hashes: HashMap::new(),
         accepted_folders: Vec::new(),
         cleared_tombstones: Vec::new(),
         pulled_count: downloaded_updates.len(),
         downloaded_updates,
+        conflict_updates: Vec::new(),
         downloaded_folders: pull_resp.folders,
         updated_prefs: pull_resp.studio_prefs,
         ack_prefs: None,
@@ -194,16 +215,21 @@ pub fn outcome_from_full_pull(
 #[derive(Default)]
 struct PushAccum {
     accepted_uploads: Vec<papercraft_sync_protocol::AcceptedNotebookSync>,
+    accepted_page_hashes: HashMap<String, Vec<String>>,
     accepted_folders: Vec<AcceptedFolderSync>,
     cleared_tombstones: Vec<String>,
     downloaded_updates: Vec<RemoteNotebookUpdate>,
+    conflict_updates: Vec<RemoteNotebookUpdate>,
     ack_prefs: Option<(u64, String)>,
     highest_cursor: u64,
     pushed_count: usize,
 }
 
-fn build_pending_changes(batch: &SyncBatch) -> Vec<LocalNotebookChange> {
+fn build_pending_changes(
+    batch: &SyncBatch,
+) -> (Vec<LocalNotebookChange>, HashMap<String, Vec<String>>) {
     let mut changes = Vec::new();
+    let mut page_hashes_map = HashMap::new();
     let now = now_unix_ms();
 
     for snap in &batch.local_docs {
@@ -214,8 +240,17 @@ fn build_pending_changes(batch: &SyncBatch) -> Vec<LocalNotebookChange> {
         if doc.id.is_empty() {
             doc.id = snap.notebook_id.clone();
         }
+        let content_hash = if snap.content_hash.is_empty() {
+            canonical_document_hash(&doc)
+        } else {
+            snap.content_hash.clone()
+        };
         let body_hash = canonical_document_body_hash(&doc);
         let meta_hash = canonical_document_meta_hash(&doc);
+        page_hashes_map.insert(
+            snap.notebook_id.clone(),
+            canonical_document_page_hashes(&doc),
+        );
         let updated_at_ms = doc.updated_at_ms.max(now);
         let meta_updated_at_ms = doc.meta_updated_at_ms.max(updated_at_ms);
         changes.push(LocalNotebookChange {
@@ -224,7 +259,7 @@ fn build_pending_changes(batch: &SyncBatch) -> Vec<LocalNotebookChange> {
             deleted: false,
             updated_at_ms,
             deleted_at_ms: None,
-            content_hash: snap.content_hash.clone(),
+            content_hash,
             body_hash,
             meta_hash,
             meta_updated_at_ms,
@@ -246,7 +281,7 @@ fn build_pending_changes(batch: &SyncBatch) -> Vec<LocalNotebookChange> {
             document: None,
         });
     }
-    changes
+    (changes, page_hashes_map)
 }
 
 struct ByteCounter(usize);
@@ -305,6 +340,7 @@ fn plan_push_chunk_ranges(
 fn record_push_response(
     resp: SyncPushResponse,
     sent_prefs: Option<&papercraft_sync_protocol::LocalPrefsPush>,
+    sent_page_hashes: &HashMap<String, Vec<String>>,
     accum: &mut PushAccum,
 ) {
     accum.highest_cursor = accum.highest_cursor.max(resp.server_cursor);
@@ -319,6 +355,11 @@ fn record_push_response(
         if acc.deleted {
             accum.cleared_tombstones.push(acc.notebook_id);
         } else {
+            if let Some(hashes) = sent_page_hashes.get(&acc.notebook_id) {
+                accum
+                    .accepted_page_hashes
+                    .insert(acc.notebook_id.clone(), hashes.clone());
+            }
             accum.accepted_uploads.push(acc);
         }
     }
@@ -330,15 +371,17 @@ fn record_push_response(
 }
 
 fn handle_conflict(conflict: &ConflictNotebookSync, accum: &mut PushAccum) {
-    // Real-time cloud sessions never create "(Conflict Copy)" files; apply the authoritative server record.
+    // Queue full server record into `conflict_updates` so the session engine runs
+    // safe 3-way page merging or creates a conflict copy without ever dropping user edits.
     accum.cleared_tombstones.push(conflict.notebook_id.clone());
-    upsert_downloaded_update(&conflict.server_record, &mut accum.downloaded_updates);
+    upsert_downloaded_update(&conflict.server_record, &mut accum.conflict_updates);
 }
 
 fn merge_pulled_records(
     records: &[RemoteNotebookRecord],
     accepted: &[papercraft_sync_protocol::AcceptedNotebookSync],
     cleared_tombstones: &[String],
+    conflict_updates: &[RemoteNotebookUpdate],
     target: &mut Vec<RemoteNotebookUpdate>,
 ) {
     for record in records {
@@ -350,7 +393,10 @@ fn merge_pulled_records(
             && cleared_tombstones
                 .iter()
                 .any(|id| id == &record.notebook_id);
-        if is_own_upload || is_own_delete {
+        let already_in_conflicts = conflict_updates
+            .iter()
+            .any(|c| c.notebook_id == record.notebook_id && c.version >= record.version);
+        if is_own_upload || is_own_delete || already_in_conflicts {
             continue;
         }
         upsert_downloaded_update(record, target);
@@ -358,6 +404,11 @@ fn merge_pulled_records(
 }
 
 fn upsert_downloaded_update(record: &RemoteNotebookRecord, target: &mut Vec<RemoteNotebookUpdate>) {
+    let page_hashes = record
+        .document
+        .as_ref()
+        .map(canonical_document_page_hashes)
+        .unwrap_or_default();
     let candidate = RemoteNotebookUpdate {
         notebook_id: record.notebook_id.clone(),
         version: record.version,
@@ -370,6 +421,7 @@ fn upsert_downloaded_update(record: &RemoteNotebookRecord, target: &mut Vec<Remo
         meta_hash: record.meta_hash.clone(),
         meta_updated_at_ms: record.meta_updated_at_ms,
         document: record.document.clone(),
+        page_hashes,
     };
 
     if let Some(existing) = target

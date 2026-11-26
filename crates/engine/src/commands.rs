@@ -6239,9 +6239,13 @@ struct SetServerUrlParams {
 
 fn cmd_sync_status(session: &Session) -> Result<Value, EngineError> {
     let summary = session.sync_status_summary();
+    let has_cached = session
+        .active_account_session()
+        .is_some_and(|s| session.has_cached_server_account(&s.server_url, &s.user.user_id));
     Ok(json!({
         "signedIn": summary.signed_in,
         "viewingCloud": summary.viewing_cloud,
+        "hasCachedSession": has_cached,
         "serverUrl": summary.server_url,
         "deviceName": summary.device_name,
         "username": summary.username,
@@ -6434,6 +6438,10 @@ struct SwitchWorkspaceParams {
     target: Option<String>,
     #[serde(default, alias = "profileId")]
     profile_id: Option<String>,
+    #[serde(default, alias = "serverUrl")]
+    server_url: Option<String>,
+    #[serde(default, alias = "userId")]
+    user_id: Option<String>,
 }
 
 fn cmd_profile_switch(
@@ -6445,7 +6453,8 @@ fn cmd_profile_switch(
     let effective_target = match p.target.as_deref() {
         Some(t) => t,
         None if p.profile_id.is_some() => "local",
-        None => return Err(invalid(id, "target must be `local`")),
+        None if p.user_id.is_some() => "cloud",
+        None => return Err(invalid(id, "target must be `local` or `cloud`")),
     };
     match effective_target {
         "local" => {
@@ -6457,12 +6466,20 @@ fn cmd_profile_switch(
                 .map_err(|reason| invalid(id, reason))?;
         }
         "cloud" => {
-            return Err(invalid(
-                id,
-                "cloud accounts require live password authentication and do not persist locally",
-            ));
+            let uid = p.user_id.ok_or_else(|| {
+                invalid(
+                    id,
+                    "provide `user_id` when switching cached server accounts",
+                )
+            })?;
+            let url = p
+                .server_url
+                .unwrap_or_else(|| session.server_url().to_string());
+            session
+                .switch_to_cached_server_account(&url, &uid)
+                .map_err(|reason| invalid(id, reason))?;
         }
-        _ => return Err(invalid(id, "target must be `local`")),
+        _ => return Err(invalid(id, "target must be `local` or `cloud`")),
     }
     Ok(json!({
         "viewingCloud": session.is_viewing_cloud(),

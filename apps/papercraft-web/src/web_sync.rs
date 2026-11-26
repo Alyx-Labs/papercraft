@@ -26,7 +26,7 @@ pub fn dispatch_sync_command(
     ctx: Option<egui::Context>,
 ) {
     spawn_local(async move {
-        let evt = execute_async_command(cmd).await;
+        let evt = execute_async_command(cmd, &evt_tx, ctx.as_ref()).await;
         if let Some(event) = evt {
             let _ = evt_tx.send(event);
             if let Some(egui_ctx) = ctx {
@@ -36,7 +36,44 @@ pub fn dispatch_sync_command(
     });
 }
 
-async fn execute_async_command(cmd: SyncWorkerCommand) -> Option<SyncWorkerEvent> {
+const CONVERT_OFFLINE_ERR_MSG: &str = "Connection lost while syncing. Your local account and notebooks remain safely saved on this device — retry when the server is back online.";
+
+fn emit_web_progress(
+    evt_tx: &mpsc::Sender<SyncWorkerEvent>,
+    ctx: Option<&egui::Context>,
+    evt: SyncWorkerEvent,
+) {
+    let _ = evt_tx.send(evt);
+    if let Some(egui_ctx) = ctx {
+        egui_ctx.request_repaint();
+    }
+}
+
+fn web_convert_err_event(
+    source_profile_id: String,
+    err: &SyncError,
+    is_auth: bool,
+) -> SyncWorkerEvent {
+    let offline = matches!(err, SyncError::Network(_));
+    let message = if offline {
+        CONVERT_OFFLINE_ERR_MSG.to_string()
+    } else if is_auth {
+        friendly_web_auth_error(err)
+    } else {
+        friendly_web_error(err)
+    };
+    SyncWorkerEvent::ConvertLocalErr {
+        source_profile_id,
+        offline,
+        message,
+    }
+}
+
+async fn execute_async_command(
+    cmd: SyncWorkerCommand,
+    evt_tx: &mpsc::Sender<SyncWorkerEvent>,
+    ctx: Option<&egui::Context>,
+) -> Option<SyncWorkerEvent> {
     match cmd {
         SyncWorkerCommand::TestConnection { server_url } => {
             let norm = normalize_server_url(&server_url).unwrap_or_else(|_| server_url.clone());
@@ -78,13 +115,19 @@ async fn execute_async_command(cmd: SyncWorkerCommand) -> Option<SyncWorkerEvent
                 &device_name,
             ) {
                 Ok(req) => req,
-                Err(message) => return Some(SyncWorkerEvent::AuthErr { message }),
+                Err(message) => {
+                    return Some(SyncWorkerEvent::AuthErr {
+                        offline: false,
+                        message,
+                    });
+                }
             };
             let mut auth =
                 match web_auth("/api/v1/auth/register", &server_url, &req, &device_name).await {
                     Ok(auth) => auth,
                     Err(err) => {
                         return Some(SyncWorkerEvent::AuthErr {
+                            offline: matches!(err, SyncError::Network(_)),
                             message: friendly_web_auth_error(&err),
                         });
                     }
@@ -95,6 +138,7 @@ async fn execute_async_command(cmd: SyncWorkerCommand) -> Option<SyncWorkerEvent
                     initial_pull: Box::new(pull_resp),
                 }),
                 Err(err) => Some(SyncWorkerEvent::AuthErr {
+                    offline: matches!(err, SyncError::Network(_)),
                     message: friendly_web_error(&err),
                 }),
             }
@@ -138,6 +182,8 @@ async fn execute_async_command(cmd: SyncWorkerCommand) -> Option<SyncWorkerEvent
                 password,
                 &device_name,
                 &upload_batch,
+                evt_tx,
+                ctx,
             )
             .await,
         ),
@@ -209,7 +255,12 @@ async fn exec_web_login(
     let submitted_password = password.clone();
     let req = match build_login_request(&identifier, password, device_name) {
         Ok(req) => req,
-        Err(message) => return SyncWorkerEvent::AuthErr { message },
+        Err(message) => {
+            return SyncWorkerEvent::AuthErr {
+                offline: false,
+                message,
+            };
+        }
     };
     let mut auth = match web_auth("/api/v1/auth/login", server_url, &req, device_name).await {
         Ok(auth) => auth,
@@ -233,6 +284,7 @@ async fn exec_web_login(
         }
         Err(err) => {
             return SyncWorkerEvent::AuthErr {
+                offline: matches!(err, SyncError::Network(_)),
                 message: friendly_web_auth_error(&err),
             };
         }
@@ -243,6 +295,7 @@ async fn exec_web_login(
             initial_pull: Box::new(pull_resp),
         },
         Err(err) => SyncWorkerEvent::AuthErr {
+            offline: matches!(err, SyncError::Network(_)),
             message: friendly_web_error(&err),
         },
     }
@@ -262,7 +315,12 @@ async fn exec_web_complete_password_reset(
         device_name,
     ) {
         Ok(req) => req,
-        Err(message) => return SyncWorkerEvent::AuthErr { message },
+        Err(message) => {
+            return SyncWorkerEvent::AuthErr {
+                offline: false,
+                message,
+            };
+        }
     };
     let mut auth = match web_auth(
         "/api/v1/auth/complete-password-reset",
@@ -275,6 +333,7 @@ async fn exec_web_complete_password_reset(
         Ok(auth) => auth,
         Err(err) => {
             return SyncWorkerEvent::AuthErr {
+                offline: matches!(err, SyncError::Network(_)),
                 message: friendly_web_auth_error(&err),
             };
         }
@@ -285,11 +344,13 @@ async fn exec_web_complete_password_reset(
             initial_pull: Box::new(pull_resp),
         },
         Err(err) => SyncWorkerEvent::AuthErr {
+            offline: matches!(err, SyncError::Network(_)),
             message: friendly_web_error(&err),
         },
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn exec_web_convert_local_account(
     server_url: &str,
     source_profile_id: String,
@@ -298,6 +359,8 @@ async fn exec_web_convert_local_account(
     password: String,
     device_name: &str,
     upload_batch: &SyncBatch,
+    evt_tx: &mpsc::Sender<SyncWorkerEvent>,
+    ctx: Option<&egui::Context>,
 ) -> SyncWorkerEvent {
     let req =
         match build_register_request(email, None, password, Some(source_nickname), device_name) {
@@ -305,35 +368,84 @@ async fn exec_web_convert_local_account(
             Err(message) => {
                 return SyncWorkerEvent::ConvertLocalErr {
                     source_profile_id,
+                    offline: false,
                     message,
                 };
             }
         };
+    let total_docs = upload_batch.local_docs.len();
+    let total_steps = total_docs.max(1) + 2;
+    emit_web_progress(
+        evt_tx,
+        ctx,
+        SyncWorkerEvent::ConvertLocalProgress {
+            source_profile_id: source_profile_id.clone(),
+            stage: "Creating cloud account...".to_string(),
+            completed: 0,
+            total: total_steps,
+        },
+    );
+
     let mut auth = match web_auth("/api/v1/auth/register", server_url, &req, device_name).await {
         Ok(auth) => auth,
-        Err(err) => {
-            return SyncWorkerEvent::ConvertLocalErr {
-                source_profile_id,
-                message: friendly_web_auth_error(&err),
-            };
-        }
+        Err(err) => return web_convert_err_event(source_profile_id, &err, true),
     };
-    if let Err(err) = run_web_sync_cycle(&mut auth, upload_batch).await {
-        return SyncWorkerEvent::ConvertLocalErr {
-            source_profile_id,
-            message: friendly_web_error(&err),
+
+    emit_web_progress(
+        evt_tx,
+        ctx,
+        SyncWorkerEvent::ConvertLocalProgress {
+            source_profile_id: source_profile_id.clone(),
+            stage: format!("Uploading notebooks (0/{total_docs})..."),
+            completed: 1,
+            total: total_steps,
+        },
+    );
+
+    let mut driver = SyncCycleDriver::new(upload_batch);
+    let mut uploaded_docs = 0usize;
+    while let Some(push_req) = driver.next_push_request(upload_batch) {
+        let chunk_docs = push_req.changes.len();
+        let resp = match push_with_refresh(&mut auth, &push_req).await {
+            Ok(resp) => resp,
+            Err(err) => return web_convert_err_event(source_profile_id, &err, false),
         };
+        driver.record_push_chunk_response(resp, upload_batch);
+        uploaded_docs = uploaded_docs.saturating_add(chunk_docs).min(total_docs);
+        let done_step = if total_docs == 0 {
+            2
+        } else {
+            1 + uploaded_docs
+        };
+        emit_web_progress(
+            evt_tx,
+            ctx,
+            SyncWorkerEvent::ConvertLocalProgress {
+                source_profile_id: source_profile_id.clone(),
+                stage: format!("Uploading notebooks ({uploaded_docs}/{total_docs})..."),
+                completed: done_step,
+                total: total_steps,
+            },
+        );
     }
+
+    emit_web_progress(
+        evt_tx,
+        ctx,
+        SyncWorkerEvent::ConvertLocalProgress {
+            source_profile_id: source_profile_id.clone(),
+            stage: "Finalizing Offline-First cache...".to_string(),
+            completed: total_steps.saturating_sub(1),
+            total: total_steps,
+        },
+    );
     match pull_with_refresh(&mut auth, 0).await {
         Ok((pull_resp, _)) => SyncWorkerEvent::ConvertLocalOk {
             source_profile_id,
             auth,
             initial_pull: Box::new(pull_resp),
         },
-        Err(err) => SyncWorkerEvent::ConvertLocalErr {
-            source_profile_id,
-            message: friendly_web_error(&err),
-        },
+        Err(err) => web_convert_err_event(source_profile_id, &err, false),
     }
 }
 

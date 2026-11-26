@@ -24,10 +24,11 @@ pub use store::{
     write_bytes_atomic,
 };
 pub use types::{
-    ACCOUNTS_DIR, ActiveAccountSession, EntitySyncStatus, FolderSyncMeta, GLOBAL_SYNC_FILE,
-    GlobalSyncState, LocalNotebookSnapshot, LocalProfile, NotebookSyncMeta, NotebookTombstone,
-    OwnerId, PROFILES_DIR, RememberedServerAccount, RemoteNotebookUpdate, SYNC_MANIFEST_FILE,
-    SyncBatch, SyncConnectionState, SyncCycleOutcome, SyncError, SyncManifest, SyncStatusSummary,
+    ACCOUNTS_DIR, ActiveAccountSession, ActiveWorkspaceTarget, EntitySyncStatus, FolderSyncMeta,
+    GLOBAL_SYNC_FILE, GlobalSyncState, LocalNotebookSnapshot, LocalProfile, NotebookSyncMeta,
+    NotebookTombstone, OwnerId, PROFILES_DIR, RememberedServerAccount, RemoteNotebookUpdate,
+    SYNC_MANIFEST_FILE, SyncBatch, SyncConnectionState, SyncCycleOutcome, SyncError, SyncManifest,
+    SyncStatusSummary,
 };
 
 #[cfg(test)]
@@ -113,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_persisted_session_migrates_to_shortcut_without_retaining_tokens() {
+    fn legacy_persisted_session_migrates_to_cached_session_and_forgets_cleanly() {
         let dir = temp_dir("legacy_migrate");
         std::fs::create_dir_all(&dir.0).unwrap();
         let legacy_json = serde_json::json!({
@@ -146,6 +147,8 @@ mod tests {
         let mut loaded = load_global_state(&dir.0);
         assert!(loaded.legacy_session.is_none());
         assert_eq!(loaded.remembered_server_accounts.len(), 1);
+        assert_eq!(loaded.cached_server_sessions.len(), 1);
+        assert!(loaded.has_cached_server_session("http://127.0.0.1:8787", "u-legacy"));
         assert_eq!(loaded.remembered_server_accounts[0].user_id, "u-legacy");
         assert_eq!(
             loaded.remembered_server_accounts[0].server_url,
@@ -153,14 +156,13 @@ mod tests {
         );
 
         save_global_state(&dir.0, &loaded).unwrap();
-        let saved_raw =
-            std::fs::read_to_string(dir.0.join(crate::types::GLOBAL_SYNC_FILE)).unwrap();
-        assert!(!saved_raw.contains("secret-access-token"));
-        assert!(!saved_raw.contains("secret-refresh-token"));
-        assert!(!saved_raw.contains("\"session\""));
+        let reloaded = load_global_state(&dir.0);
+        assert_eq!(reloaded.cached_server_sessions.len(), 1);
 
         assert!(loaded.forget_server_account("http://127.0.0.1:8787/", "u-legacy"));
         assert!(loaded.remembered_server_accounts.is_empty());
+        assert!(loaded.cached_server_sessions.is_empty());
+        assert!(!loaded.has_cached_server_session("http://127.0.0.1:8787", "u-legacy"));
     }
 
     #[test]

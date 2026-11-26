@@ -4083,8 +4083,8 @@ mod tests {
             "expected muted local status dot on header sync button, got {local_dots:?}"
         );
         assert!(
-            local_text.contains("Local only"),
-            "missing Local only badge in:\n{local_text}"
+            local_text.contains("On device"),
+            "missing On device badge in:\n{local_text}"
         );
 
         let acct = papercraft_sync::ActiveAccountSession {
@@ -4130,8 +4130,8 @@ mod tests {
             "expected cloud status dot ({expected_cloud_dot:?}) on header sync button, got {cloud_dots:?}"
         );
         assert!(
-            cloud_text.contains("Saving..."),
-            "missing Saving... badge in:\n{cloud_text}"
+            cloud_text.contains("Pending sync"),
+            "missing Pending sync badge in:\n{cloud_text}"
         );
     }
 

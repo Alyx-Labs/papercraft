@@ -162,7 +162,12 @@ fn draw_profile_header(
                     };
                     let sync_tip = if summary.viewing_cloud {
                         if in_flight {
-                            format!("Saving to server...\nServer: {}", summary.server_url)
+                            format!("Syncing with server...\nServer: {}", summary.server_url)
+                        } else if summary.connection == SyncConnectionState::Offline {
+                            format!(
+                                "Offline — changes saved locally ({cloud_pending} queued for reconnect)\nServer: {}",
+                                summary.server_url
+                            )
                         } else {
                             format!(
                                 "Sync Now ({state_label}, {cloud_pending} pending)\nServer: {}",
@@ -171,7 +176,7 @@ fn draw_profile_header(
                         }
                     } else {
                         format!(
-                            "Local Account Active\nClick to check sync server status ({}).",
+                            "Local Account Active (Saved on this device)\nClick to check sync server status ({}).",
                             app.session.server_url()
                         )
                     };
@@ -870,7 +875,7 @@ mod tests {
         let accts_text = render_profile_text(&ctx, &mut app);
         assert!(accts_text.contains("Local Accounts (1)"), "{accts_text}");
         assert!(
-            accts_text.contains("Server Accounts (Zero Local Cache)"),
+            accts_text.contains("Server Accounts (Offline-First)"),
             "{accts_text}"
         );
         assert!(accts_text.contains("Ana"));
@@ -896,7 +901,7 @@ mod tests {
         app.view.account.profile_section = ProfileSection::ServerLogin;
         let sync_text = render_profile_text(&ctx, &mut app);
         assert!(sync_text.contains("Server Address"));
-        assert!(sync_text.contains("SERVER WRITES"));
+        assert!(sync_text.contains("SYNC QUEUE"));
 
         crate::close_profile_screen(&mut app);
         assert_eq!(app.view.screen, AppScreen::Home);

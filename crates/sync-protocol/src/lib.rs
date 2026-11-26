@@ -889,6 +889,40 @@ pub fn canonical_document_hash(doc: &Document) -> String {
     bytes_to_hex(&hasher.finalize())
 }
 
+/// Computes a deterministic SHA-256 hash covering a single [`NotebookPage`] including ink strokes,
+/// text items, vector shapes, raster images, paper style, templates, and backdrops.
+pub fn canonical_page_hash(page: &NotebookPage) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"papercraft-page-canonical-v1");
+    hash_page_into(&mut hasher, page);
+    if !page.images.is_empty() {
+        hasher.update([0xD7]);
+        hasher.update((page.images.len() as u64).to_le_bytes());
+        for img in &page.images {
+            let clean = img.sanitized();
+            hasher.update(clean.x.to_bits().to_le_bytes());
+            hasher.update(clean.y.to_bits().to_le_bytes());
+            hasher.update(clean.width.to_bits().to_le_bytes());
+            hasher.update(clean.height.to_bits().to_le_bytes());
+            hasher.update(clean.angle_degrees.to_bits().to_le_bytes());
+            hasher.update(clean.pixel_width.to_le_bytes());
+            hasher.update(clean.pixel_height.to_le_bytes());
+            hasher.update(clean.z_order.to_le_bytes());
+            hash_len_bytes(&mut hasher, &clean.png_bytes);
+        }
+    }
+    bytes_to_hex(&hasher.finalize())
+}
+
+/// Computes deterministic per-page hashes across `doc.resolved_pages()` for 3-way page conflict
+/// merging in Offline-First sync sessions.
+pub fn canonical_document_page_hashes(doc: &Document) -> Vec<String> {
+    doc.resolved_pages()
+        .iter()
+        .map(canonical_page_hash)
+        .collect()
+}
+
 /// Computes a deterministic SHA-256 content hash for [`UserStudioConfig`].
 pub fn canonical_prefs_hash(prefs: &UserStudioConfig) -> String {
     let clean = prefs.sanitized();
@@ -1095,5 +1129,48 @@ mod tests {
         let prune_json = serde_json::to_string(&prune).unwrap();
         let prune_round: PruneToLocalRequest = serde_json::from_str(&prune_json).unwrap();
         assert_eq!(prune_round, prune);
+    }
+
+    #[test]
+    fn canonical_document_page_hashes_track_single_page_changes() {
+        let page1 = NotebookPage::new(
+            1404,
+            1872,
+            papercraft_doc::PaperTemplate::RuledNarrow,
+            papercraft_doc::PaperColor::PureWhite,
+        );
+        let page2 = NotebookPage::new(
+            1404,
+            1872,
+            papercraft_doc::PaperTemplate::Grid,
+            papercraft_doc::PaperColor::PureWhite,
+        );
+        let doc = Document {
+            pages: vec![page1, page2],
+            current_page: 0,
+            ..Default::default()
+        };
+        let base_hashes = canonical_document_page_hashes(&doc);
+        assert_eq!(base_hashes.len(), 2);
+        assert_ne!(base_hashes[0], base_hashes[1]);
+
+        let mut modified = doc.clone();
+        modified.pages[1]
+            .images
+            .push(std::sync::Arc::new(papercraft_doc::PageImage {
+                x: 20.0,
+                y: 30.0,
+                width: 120.0,
+                height: 80.0,
+                angle_degrees: 0.0,
+                pixel_width: 4,
+                pixel_height: 4,
+                png_bytes: std::sync::Arc::new(vec![137, 80, 78, 71]),
+                z_order: 1,
+            }));
+        let next_hashes = canonical_document_page_hashes(&modified);
+        assert_eq!(next_hashes.len(), 2);
+        assert_eq!(next_hashes[0], base_hashes[0]);
+        assert_ne!(next_hashes[1], base_hashes[1]);
     }
 }

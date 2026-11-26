@@ -131,7 +131,7 @@ impl ActiveModal {
             Self::AccountSync => DialogSpec {
                 icon: Icon::Account,
                 title: "Account & Cloud Sync",
-                subtitle: "Switch between device-local accounts and zero-cache cloud accounts.",
+                subtitle: "Switch between device-local accounts and Offline-First cloud accounts.",
                 width: 530.0,
                 min_body_height: 0.0,
             },
@@ -194,7 +194,7 @@ impl ActiveModal {
             Self::ConvertLocalAccount => DialogSpec {
                 icon: Icon::Sync,
                 title: "Sync Local Account to Server",
-                subtitle: "Upload your local notebooks and settings to a cloud account with zero local cache.",
+                subtitle: "Upload local notebooks and settings while keeping an Offline-First copy on this device.",
                 width: 480.0,
                 min_body_height: 220.0,
             },
@@ -352,6 +352,7 @@ pub(crate) fn open(app: &mut PaperCraftApp, target: ActiveModal) {
         }
         ActiveModal::AccountSync => {
             crate::account_modal::sync_draft_from_session(app);
+            app.view.account.profile_probe_pending = true;
         }
         ActiveModal::TransferPages => {
             if app.view.transfer_pages_list.is_empty()

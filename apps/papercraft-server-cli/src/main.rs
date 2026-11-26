@@ -981,23 +981,25 @@ mod tests {
     }
 
     #[test]
-    fn two_desktop_sessions_zero_cache_realtime_and_local_conversion_work_end_to_end() {
+    fn two_desktop_sessions_offline_first_sync_conversion_and_conflict_resolution_work_end_to_end()
+    {
         use papercraft_doc::{PenSettings, StrokeSample, UiTheme};
         use papercraft_engine::Session;
         use papercraft_sync::{
-            ACCOUNTS_DIR, GLOBAL_SYNC_FILE, SyncHttpClient, profile_library_dir, run_sync_cycle,
+            GLOBAL_SYNC_FILE, SyncHttpClient, account_library_dir, profile_library_dir,
+            run_sync_cycle,
         };
         use papercraft_sync_protocol::{LoginRequest, RegisterRequest};
         use serde_json::json;
 
-        let srv_dir = temp_dir("zero_cache_srv");
-        let pc1_dir = temp_dir("zero_cache_1");
-        let pc2_dir = temp_dir("zero_cache_2");
+        let srv_dir = temp_dir("offline_first_srv");
+        let pc1_dir = temp_dir("offline_first_1");
+        let pc2_dir = temp_dir("offline_first_2");
         let client = SyncHttpClient::new();
 
         let srv = spawn_server_on(&srv_dir.0);
 
-        // PC1 starts with a local account, converts it to cloud via Sync, and wipes local cache.
+        // PC1 starts with a local account (with 2 pages), converts it via Sync, and retains local Offline-First cache.
         let mut pc1 = Session::open_desktop_library(pc1_dir.0.clone());
         pc1.execute(
             "profile.completeFirstAccess",
@@ -1007,6 +1009,8 @@ mod tests {
         let prof1 = pc1.active_local_profile().unwrap().local_profile_id.clone();
         pc1.execute("notebook.create", &json!({ "title": "Linear Algebra" }))
             .unwrap();
+        pc1.execute("page.add", &json!({})).unwrap();
+        pc1.execute("page.select", &json!({ "index": 0 })).unwrap();
         pc1.execute("theme.set", &json!({ "theme": UiTheme::Dark }))
             .unwrap();
         let prof1_dir = profile_library_dir(&pc1_dir.0, &prof1);
@@ -1031,22 +1035,24 @@ mod tests {
             .unwrap();
         let _conv_out = run_sync_cycle(&client, &mut auth1, &conv_batch).unwrap();
         let (pull1, _) = client.pull_with_refresh(&mut auth1, 0).unwrap();
+        let uid = auth1.user.user_id.clone();
         pc1.complete_local_account_conversion(&prof1, auth1, pull1);
 
+        let pc1_cloud_dir = account_library_dir(&pc1_dir.0, &uid);
         assert!(
             !prof1_dir.exists(),
-            "local profile folder must be deleted after conversion"
+            "source local profile dir should be migrated into accounts/<user_id>"
         );
         assert!(
-            pc1.library_dir().is_none(),
-            "cloud session must hold zero disk paths"
+            pc1_cloud_dir.is_dir(),
+            "Offline-First cache directory must stay preserved after conversion"
         );
-        assert!(!pc1_dir.0.join(ACCOUNTS_DIR).exists());
+        assert_eq!(pc1.library_dir(), Some(pc1_cloud_dir.as_path()));
         assert_eq!(pc1.prefs.theme, UiTheme::Dark);
         assert!(pc1.notebooks.iter().any(|n| n.title == "Linear Algebra"));
 
-        // PC2 logs in -> loads directly into RAM with zero local cache files.
-        let mut pc2 = Session::open_desktop_library(pc2_dir.0.clone());
+        // PC2 logs in -> persists persistent Offline-First cache under accounts/<user_id> and survives offline reopen!
+        let mut pc2_init = Session::open_desktop_library(pc2_dir.0.clone());
         let mut auth2 = client
             .login(
                 &srv.base_url,
@@ -1060,20 +1066,24 @@ mod tests {
             )
             .unwrap();
         let (pull2, _) = client.pull_with_refresh(&mut auth2, 0).unwrap();
-        pc2.enter_online_server_session(auth2, pull2);
+        pc2_init.enter_online_server_session(auth2, pull2);
+        let pc2_cloud_dir = account_library_dir(&pc2_dir.0, &uid);
+        assert_eq!(pc2_init.library_dir(), Some(pc2_cloud_dir.as_path()));
+        assert_eq!(pc2_init.prefs.theme, UiTheme::Dark);
+        drop(pc2_init);
 
-        assert!(pc2.library_dir().is_none());
-        assert!(!pc2_dir.0.join(ACCOUNTS_DIR).exists());
-        assert_eq!(pc2.prefs.theme, UiTheme::Dark);
+        let mut pc2 = Session::open_desktop_library(pc2_dir.0.clone());
+        assert!(pc2.is_signed_in());
         assert!(pc2.notebooks.iter().any(|n| n.title == "Linear Algebra"));
 
-        // Real-time edits on PC1 and PC2 converge cleanly via force_overwrite with zero Conflict Copies.
+        // Offline disjoint-page edits: PC1 edits Page 0 while PC2 edits Page 1!
         let idx1 = pc1
             .notebooks
             .iter()
             .position(|n| n.title == "Linear Algebra")
             .unwrap();
         assert!(pc1.switch_notebook(idx1));
+        pc1.execute("page.select", &json!({ "index": 0 })).unwrap();
         pc1.commit_raw_stroke(
             PenSettings::fountain_pen(),
             vec![
@@ -1081,11 +1091,6 @@ mod tests {
                 StrokeSample::from_xy_pressure(80.0, 60.0, 0.7),
             ],
         );
-        let mut acct1 = pc1.active_account_session().unwrap().clone();
-        let batch1 = pc1.prepare_sync_batch().unwrap();
-        assert!(batch1.force_overwrite);
-        let out1 = run_sync_cycle(&client, &mut acct1, &batch1).unwrap();
-        pc1.apply_sync_outcome(out1).unwrap();
 
         let idx2 = pc2
             .notebooks
@@ -1093,6 +1098,7 @@ mod tests {
             .position(|n| n.title == "Linear Algebra")
             .unwrap();
         assert!(pc2.switch_notebook(idx2));
+        pc2.execute("page.select", &json!({ "index": 1 })).unwrap();
         pc2.commit_raw_stroke(
             PenSettings::ball_pen(),
             vec![
@@ -1100,41 +1106,78 @@ mod tests {
                 StrokeSample::from_xy_pressure(160.0, 140.0, 0.8),
             ],
         );
+
+        // PC1 reconnects first, then PC2 reconnects -> 3-way page merge combines both pages with ZERO conflict copy!
+        let mut acct1 = pc1.active_account_session().unwrap().clone();
+        let batch1 = pc1.prepare_sync_batch().unwrap();
+        assert!(!batch1.force_overwrite);
+        let out1 = run_sync_cycle(&client, &mut acct1, &batch1).unwrap();
+        pc1.apply_sync_outcome(out1).unwrap();
+
         let mut acct2 = pc2.active_account_session().unwrap().clone();
         let batch2 = pc2.prepare_sync_batch().unwrap();
-        assert!(batch2.force_overwrite);
+        assert!(!batch2.force_overwrite);
         let out2 = run_sync_cycle(&client, &mut acct2, &batch2).unwrap();
-        assert!(!out2.accepted_uploads.is_empty());
         pc2.apply_sync_outcome(out2).unwrap();
 
-        let batch1_pull = pc1.prepare_sync_batch().unwrap();
-        let out1_pull = run_sync_cycle(&client, &mut acct1, &batch1_pull).unwrap();
-        pc1.apply_sync_outcome(out1_pull).unwrap();
-        assert!(
-            !pc1.notebooks
-                .iter()
-                .any(|n| n.title.contains("Conflict Copy"))
-        );
         assert!(
             !pc2.notebooks
                 .iter()
                 .any(|n| n.title.contains("Conflict Copy"))
         );
+        let merged_idx2 = pc2
+            .notebooks
+            .iter()
+            .position(|n| n.title == "Linear Algebra")
+            .unwrap();
+        assert_eq!(pc2.notebooks[merged_idx2].pages[0].strokes.len(), 1);
+        assert_eq!(pc2.notebooks[merged_idx2].pages[1].strokes.len(), 1);
 
-        // Verify zero tokens or cloud data on disk when restarting PC1 or PC2!
+        // PC2 pushes the merged notebook and PC1 pulls it!
+        let batch2_merged = pc2.prepare_sync_batch().unwrap();
+        let out2_merged = run_sync_cycle(&client, &mut acct2, &batch2_merged).unwrap();
+        pc2.apply_sync_outcome(out2_merged).unwrap();
+        let batch1_pull = pc1.prepare_sync_batch().unwrap();
+        let out1_pull = run_sync_cycle(&client, &mut acct1, &batch1_pull).unwrap();
+        pc1.apply_sync_outcome(out1_pull).unwrap();
+        assert_eq!(pc1.notebooks[idx1].pages[0].strokes.len(), 1);
+        assert_eq!(pc1.notebooks[idx1].pages[1].strokes.len(), 1);
+
+        // Offline same-page collision on Page 0 -> preserves BOTH devices' work via a Conflict Copy!
+        pc1.execute("page.select", &json!({ "index": 0 })).unwrap();
+        pc1.commit_raw_stroke(
+            PenSettings::fountain_pen(),
+            vec![
+                StrokeSample::from_xy_pressure(22.0, 22.0, 0.5),
+                StrokeSample::from_xy_pressure(42.0, 42.0, 0.7),
+            ],
+        );
+        pc2.execute("page.select", &json!({ "index": 0 })).unwrap();
+        pc2.commit_raw_stroke(
+            PenSettings::ball_pen(),
+            vec![
+                StrokeSample::from_xy_pressure(200.0, 200.0, 0.5),
+                StrokeSample::from_xy_pressure(240.0, 240.0, 0.8),
+            ],
+        );
+
+        let out1_same =
+            run_sync_cycle(&client, &mut acct1, &pc1.prepare_sync_batch().unwrap()).unwrap();
+        pc1.apply_sync_outcome(out1_same).unwrap();
+        let out2_same =
+            run_sync_cycle(&client, &mut acct2, &pc2.prepare_sync_batch().unwrap()).unwrap();
+        pc2.apply_sync_outcome(out2_same).unwrap();
+
+        assert!(
+            pc2.notebooks
+                .iter()
+                .any(|n| n.title == "Linear Algebra (Conflict Copy)"),
+            "same-page offline collision must create a labeled backup copy"
+        );
+
         let global1_raw = std::fs::read_to_string(pc1_dir.0.join(GLOBAL_SYNC_FILE)).unwrap();
         assert!(!global1_raw.contains("tunnel-secret-pass"));
         assert!(global1_raw.contains("carlos@example.com"));
-        drop(pc2);
-        let pc2_reopened = Session::open_desktop_library(pc2_dir.0.clone());
-        assert!(!pc2_reopened.is_signed_in());
-        assert!(
-            !pc2_reopened
-                .notebooks
-                .iter()
-                .any(|n| n.title == "Linear Algebra")
-        );
-        assert_eq!(pc2_reopened.remembered_server_accounts().len(), 1);
     }
 
     #[test]

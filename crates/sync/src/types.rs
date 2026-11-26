@@ -15,7 +15,7 @@ pub const MAX_PROFILE_NICKNAME_LEN: usize = 48;
 pub const MAX_REMEMBERED_SERVER_ACCOUNTS: usize = 32;
 pub const SYNC_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
-/// Strict ownership boundary for local workspaces and in-memory server sessions.
+/// Strict ownership boundary for local profiles and Offline-First server accounts.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id")]
 pub enum OwnerId {
@@ -46,7 +46,7 @@ pub struct LocalProfile {
     pub last_used_at_ms: i64,
 }
 
-/// Device-local quick-access shortcut for a server account (metadata only, zero tokens or notebooks).
+/// Device-local metadata shortcut for a server account stored alongside Offline-First caches.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RememberedServerAccount {
     pub user_id: String,
@@ -105,14 +105,30 @@ pub struct ActiveAccountSession {
     pub last_auth_ms: i64,
 }
 
+/// Identifies which Offline-First workspace is currently active on this device.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ActiveWorkspaceTarget {
+    #[default]
+    Local,
+    Cloud {
+        server_url: String,
+        user_id: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalSyncState {
     pub server_url: String,
     pub device_name: String,
-    /// Legacy persisted session field retained deserialize-only so upgrades discard tokens
-    /// while converting the account into a metadata-only shortcut.
+    /// Legacy persisted session field retained deserialize-only so upgrades migrate it into
+    /// `cached_server_sessions` and `remembered_server_accounts`.
     #[serde(default, skip_serializing, rename = "session")]
     pub legacy_session: Option<ActiveAccountSession>,
+    #[serde(default)]
+    pub cached_server_sessions: Vec<ActiveAccountSession>,
+    #[serde(default)]
+    pub active_workspace: ActiveWorkspaceTarget,
     #[serde(default)]
     pub remembered_server_accounts: Vec<RememberedServerAccount>,
     #[serde(default)]
@@ -137,6 +153,8 @@ impl GlobalSyncState {
             server_url: DEFAULT_SERVER_URL.to_string(),
             device_name,
             legacy_session: None,
+            cached_server_sessions: Vec::new(),
+            active_workspace: ActiveWorkspaceTarget::Local,
             remembered_server_accounts: Vec::new(),
             local_profiles: Vec::new(),
             active_local_profile_id: String::new(),
@@ -148,18 +166,73 @@ impl GlobalSyncState {
         }
     }
 
-    /// Converts any legacy persisted server session into a metadata-only shortcut and discards tokens.
+    /// Migrates any legacy single-session field into Offline-First cached sessions and shortcuts.
     pub fn migrate_legacy_session(&mut self) -> bool {
         let Some(old) = self.legacy_session.take() else {
             return false;
         };
         if !old.user.user_id.trim().is_empty() && !old.user.username.trim().is_empty() {
             self.remember_server_account(&old);
+            self.upsert_cached_server_session(old);
         }
         true
     }
 
-    /// Records or refreshes a server account shortcut (metadata only; never stores credentials or tokens).
+    /// Saves or refreshes an authenticated server session on this device for Offline-First access.
+    pub fn upsert_cached_server_session(&mut self, mut auth: ActiveAccountSession) {
+        let norm_url =
+            normalize_server_url(&auth.server_url).unwrap_or_else(|_| auth.server_url.clone());
+        let user_id = auth.user.user_id.trim().to_string();
+        let username = auth.user.username.trim().to_string();
+        if user_id.is_empty() || username.is_empty() {
+            return;
+        }
+        auth.server_url = norm_url.clone();
+        auth.user.user_id = user_id.clone();
+        auth.user.username = username;
+        self.cached_server_sessions.retain(|entry| {
+            !(entry.user.user_id == user_id && entry.server_url.eq_ignore_ascii_case(&norm_url))
+        });
+        self.cached_server_sessions.insert(0, auth);
+        self.cached_server_sessions
+            .truncate(MAX_REMEMBERED_SERVER_ACCOUNTS);
+    }
+
+    /// Looks up a previously signed-in server session cached on this device.
+    pub fn cached_server_session(
+        &self,
+        server_url: &str,
+        user_id: &str,
+    ) -> Option<&ActiveAccountSession> {
+        let norm_url =
+            normalize_server_url(server_url).unwrap_or_else(|_| server_url.trim().to_string());
+        let clean_uid = user_id.trim();
+        self.cached_server_sessions.iter().find(|entry| {
+            entry.user.user_id == clean_uid && entry.server_url.eq_ignore_ascii_case(&norm_url)
+        })
+    }
+
+    /// Returns `true` when `(server_url, user_id)` has a cached local workspace session on this device.
+    pub fn has_cached_server_session(&self, server_url: &str, user_id: &str) -> bool {
+        self.cached_server_session(server_url, user_id).is_some()
+    }
+
+    /// Removes the cached session tokens for `(server_url, user_id)` when signing out explicitly or forgetting.
+    pub fn remove_cached_server_session(
+        &mut self,
+        server_url: &str,
+        user_id: &str,
+    ) -> Option<ActiveAccountSession> {
+        let norm_url =
+            normalize_server_url(server_url).unwrap_or_else(|_| server_url.trim().to_string());
+        let clean_uid = user_id.trim();
+        let pos = self.cached_server_sessions.iter().position(|entry| {
+            entry.user.user_id == clean_uid && entry.server_url.eq_ignore_ascii_case(&norm_url)
+        })?;
+        Some(self.cached_server_sessions.remove(pos))
+    }
+
+    /// Records or refreshes a server account shortcut alongside its Offline-First workspace cache.
     pub fn remember_server_account(&mut self, auth: &ActiveAccountSession) {
         let norm_url =
             normalize_server_url(&auth.server_url).unwrap_or_else(|_| auth.server_url.clone());
@@ -194,7 +267,7 @@ impl GlobalSyncState {
             .truncate(MAX_REMEMBERED_SERVER_ACCOUNTS);
     }
 
-    /// Removes the local quick-access shortcut for `(server_url, user_id)` without altering server data.
+    /// Removes the local shortcut and cached session for `(server_url, user_id)` without altering server data.
     pub fn forget_server_account(&mut self, server_url: &str, user_id: &str) -> bool {
         let norm_url =
             normalize_server_url(server_url).unwrap_or_else(|_| server_url.trim().to_string());
@@ -203,7 +276,19 @@ impl GlobalSyncState {
         self.remembered_server_accounts.retain(|entry| {
             !(entry.user_id == clean_uid && entry.server_url.eq_ignore_ascii_case(&norm_url))
         });
-        self.remembered_server_accounts.len() != before
+        let removed_cached = self
+            .remove_cached_server_session(&norm_url, clean_uid)
+            .is_some();
+        if let ActiveWorkspaceTarget::Cloud {
+            server_url: ref cur_url,
+            user_id: ref cur_uid,
+        } = self.active_workspace
+            && cur_uid == clean_uid
+            && cur_url.eq_ignore_ascii_case(&norm_url)
+        {
+            self.active_workspace = ActiveWorkspaceTarget::Local;
+        }
+        self.remembered_server_accounts.len() != before || removed_cached
     }
 
     pub fn has_saved_local_accounts(&self) -> bool {
@@ -245,6 +330,8 @@ pub struct NotebookSyncMeta {
     pub last_synced_body_hash: String,
     #[serde(default)]
     pub last_synced_meta_hash: String,
+    #[serde(default)]
+    pub last_synced_page_hashes: Vec<String>,
     pub cloud_dirty: bool,
     pub last_synced_at_ms: i64,
     #[serde(default)]
@@ -371,7 +458,9 @@ impl SyncManifest {
             .iter_mut()
             .find(|item| item.notebook_id == notebook_id)
         {
-            let dirty = existing.server_version == 0 || existing.last_synced_hash != current_hash;
+            let dirty = existing.server_version == 0
+                || current_hash.is_empty()
+                || existing.last_synced_hash != current_hash;
             existing.cloud_dirty = dirty;
             existing.updated_at_ms = existing.updated_at_ms.max(now);
             existing.last_error = None;
@@ -396,6 +485,7 @@ impl SyncManifest {
                 last_synced_hash: String::new(),
                 last_synced_body_hash: String::new(),
                 last_synced_meta_hash: String::new(),
+                last_synced_page_hashes: Vec::new(),
                 cloud_dirty: true,
                 last_synced_at_ms: 0,
                 updated_at_ms: now,
@@ -446,6 +536,23 @@ impl SyncManifest {
         synced_at_ms: i64,
     ) {
         let still_dirty = current_hash != synced_hash;
+        self.mark_notebook_synced_with_dirty(
+            notebook_id,
+            new_version,
+            synced_hash,
+            still_dirty,
+            synced_at_ms,
+        );
+    }
+
+    pub fn mark_notebook_synced_with_dirty(
+        &mut self,
+        notebook_id: &str,
+        new_version: u64,
+        synced_hash: String,
+        still_dirty: bool,
+        synced_at_ms: i64,
+    ) {
         let is_cloud = self.owner_id.as_ref().is_some_and(OwnerId::is_cloud);
         let next_status = if !is_cloud {
             EntitySyncStatus::LocalOnly
@@ -477,12 +584,24 @@ impl SyncManifest {
                 last_synced_hash: synced_hash,
                 last_synced_body_hash: String::new(),
                 last_synced_meta_hash: String::new(),
+                last_synced_page_hashes: Vec::new(),
                 cloud_dirty: still_dirty,
                 last_synced_at_ms: synced_at_ms,
                 updated_at_ms: synced_at_ms,
                 deleted_at_ms: None,
                 last_error: None,
             });
+        }
+    }
+
+    /// Updates the stored per-page base hashes used for 3-way conflict resolution.
+    pub fn set_notebook_synced_page_hashes(&mut self, notebook_id: &str, page_hashes: Vec<String>) {
+        if let Some(meta) = self
+            .notebooks
+            .iter_mut()
+            .find(|item| item.notebook_id == notebook_id)
+        {
+            meta.last_synced_page_hashes = page_hashes;
         }
     }
 
@@ -496,6 +615,7 @@ impl SyncManifest {
                 nb.last_synced_hash.clear();
                 nb.last_synced_body_hash.clear();
                 nb.last_synced_meta_hash.clear();
+                nb.last_synced_page_hashes.clear();
                 nb.cloud_dirty = true;
                 nb.last_synced_at_ms = 0;
                 nb.status = EntitySyncStatus::PendingPush;
@@ -622,6 +742,7 @@ pub struct RemoteNotebookUpdate {
     pub meta_hash: String,
     pub meta_updated_at_ms: i64,
     pub document: Option<Document>,
+    pub page_hashes: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -630,9 +751,11 @@ pub struct SyncCycleOutcome {
     pub refreshed_session: Option<ActiveAccountSession>,
     pub server_user: UserProfile,
     pub accepted_uploads: Vec<AcceptedNotebookSync>,
+    pub accepted_page_hashes: std::collections::HashMap<String, Vec<String>>,
     pub accepted_folders: Vec<AcceptedFolderSync>,
     pub cleared_tombstones: Vec<String>,
     pub downloaded_updates: Vec<RemoteNotebookUpdate>,
+    pub conflict_updates: Vec<RemoteNotebookUpdate>,
     pub downloaded_folders: Vec<RemoteFolderRecord>,
     pub updated_prefs: Option<RemotePrefsRecord>,
     pub ack_prefs: Option<(u64, String)>,

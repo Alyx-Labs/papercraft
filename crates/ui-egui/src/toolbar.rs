@@ -4084,7 +4084,7 @@ pub(crate) fn draw_sync_profile_button(app: &mut PaperCraftApp, ui: &mut egui::U
             .as_deref()
             .map_or_else(String::new, |u| format!(" · @{u}"));
         format!(
-            "Profile: {}{handle}\nStatus: {} ({cloud_pending} saving to server)\nServer: {} · Zero Local Cache\nClick to switch accounts or manage Profile.",
+            "Profile: {}{handle}\nStatus: {} ({cloud_pending} pending sync)\nServer: {} · Offline-First Cache\nClick to switch accounts or manage Profile.",
             summary.workspace_badge_text(),
             state_label,
             summary.server_url
@@ -4095,7 +4095,7 @@ pub(crate) fn draw_sync_profile_button(app: &mut PaperCraftApp, ui: &mut egui::U
             .as_deref()
             .unwrap_or("Local");
         format!(
-            "Profile: Local Only ({prof})\nStored only on this device. Click to switch accounts, sign in to a server, or sync this account to the cloud."
+            "Profile: Local Account ({prof})\nSaved only on this device. Click to switch accounts, sign in to a server, or sync to the cloud."
         )
     };
     let sync_resp = toolbar_icon_button(ui, Icon::Account, None, acct_active, true, t);

@@ -1678,6 +1678,8 @@ fn can_start_on_canvas(ui: &egui::Ui, resp: &egui::Response, pos: Pos2) -> bool 
             .is_none_or(|layer| layer == resp.layer_id)
 }
 
+const RULER_MAX_PAGE_LENGTH: f64 = 100_000.0;
+
 pub(crate) fn ruler_dimensions_for_view(
     app: &PaperCraftApp,
     zoom: f32,
@@ -1686,7 +1688,7 @@ pub(crate) fn ruler_dimensions_for_view(
 ) -> (f64, f64) {
     let page_w = f64::from(app.session.doc.width).max(64.0);
     let page_h = f64::from(app.session.doc.height).max(64.0);
-    let safe_zoom = if zoom.is_finite() && zoom > 0.05 {
+    let safe_zoom = if zoom.is_finite() && zoom >= 0.05 {
         f64::from(zoom)
     } else {
         1.0
@@ -1708,10 +1710,13 @@ pub(crate) fn ruler_dimensions_for_view(
         lx.min(ly)
     };
 
-    let page_span = span_limit(page_w * RULER_PAGE_FILL, page_h * RULER_PAGE_FILL);
-    let view_span = canvas_rect
+    let fallback_span = span_limit(
+        (page_w * RULER_PAGE_FILL) / safe_zoom,
+        (page_h * RULER_PAGE_FILL) / safe_zoom,
+    );
+    let raw_length = canvas_rect
         .filter(|rect| rect.is_finite() && rect.width() > 32.0 && rect.height() > 32.0)
-        .map_or(f64::INFINITY, |rect| {
+        .map_or(fallback_span, |rect| {
             let eff_w =
                 (f64::from(rect.width()) * RULER_VIEWPORT_FILL).min(RULER_MAX_SCREEN_LENGTH);
             let eff_h =
@@ -1719,16 +1724,15 @@ pub(crate) fn ruler_dimensions_for_view(
             span_limit(eff_w / safe_zoom, eff_h / safe_zoom)
         });
 
-    let max_page_len = page_w.max(page_h);
-    let raw_length = page_span.min(view_span);
-    let min_length = (64.0 / safe_zoom).min(page_span).clamp(8.0, max_page_len);
+    let min_length = (64.0 / safe_zoom)
+        .min(raw_length)
+        .clamp(8.0, RULER_MAX_PAGE_LENGTH);
     let length = if raw_length.is_finite() {
-        raw_length.clamp(min_length, max_page_len)
+        raw_length.clamp(min_length, RULER_MAX_PAGE_LENGTH)
     } else {
-        (page_w * RULER_PAGE_FILL).clamp(64.0, max_page_len)
+        ((page_w * RULER_PAGE_FILL) / safe_zoom).clamp(64.0, RULER_MAX_PAGE_LENGTH)
     };
 
-    let page_cap = (page_w.min(page_h) * 0.25).max(8.0);
     let aspect_cap = (length / 6.5).max(8.0);
     let view_depth_cap = canvas_rect
         .filter(|rect| rect.is_finite() && rect.height() > 32.0)
@@ -1737,14 +1741,10 @@ pub(crate) fn ruler_dimensions_for_view(
         });
     let target_depth = RULER_TARGET_SCREEN_DEPTH / safe_zoom;
     let min_depth = (RULER_MIN_SCREEN_DEPTH / safe_zoom)
-        .min(page_cap)
         .min(length * 0.35)
         .max(6.0);
-    let max_depth = target_depth
-        .min(aspect_cap)
-        .min(page_cap)
-        .min(view_depth_cap);
-    let depth = max_depth.max(min_depth).min(page_cap).max(6.0);
+    let max_depth = target_depth.min(aspect_cap).min(view_depth_cap);
+    let depth = max_depth.max(min_depth).max(6.0);
     (length, depth)
 }
 
@@ -15452,8 +15452,17 @@ mod tests {
         let len_fit = app.view.ruler_length;
         let depth_fit = app.view.ruler_depth;
         let canvas_w = f64::from(app.view.last_canvas_rect.expect("canvas rect").width());
-        assert!((len_fit - 864.0).abs() < 1.0);
-        assert!(depth_fit * 0.45 >= 26.0 && depth_fit * 0.45 <= 60.5);
+        let expected_screen_w = (canvas_w * RULER_VIEWPORT_FILL).min(RULER_MAX_SCREEN_LENGTH);
+        assert!(
+            len_fit > 864.0 && (len_fit * 0.45 - expected_screen_w).abs() < 1.0,
+            "expected ruler at 45% zoom to scale beyond page cap to viewport proportion ({expected_screen_w} px), got len={len_fit} ({} px)",
+            len_fit * 0.45
+        );
+        assert!(
+            (depth_fit * 0.45 - RULER_TARGET_SCREEN_DEPTH).abs() < 1e-3,
+            "expected ruler screen depth ~{RULER_TARGET_SCREEN_DEPTH} at 45% zoom, got {}",
+            depth_fit * 0.45
+        );
 
         // Zoom in via Ctrl+MouseWheel while ruler stays open -> page-space length & depth scale down.
         let zoom_anchor = pos2(640.0, 400.0);
@@ -15504,12 +15513,41 @@ mod tests {
             "expected 3x zoomed ruler screen depth 60.0 (zoom={z_3x}), got {screen_depth_3x}"
         );
 
-        // Zooming back out restores larger page-space dimensions smoothly.
+        // Zooming back out restores larger page-space dimensions smoothly all the way to min zoom (15%).
         app.view.zoom = 0.5;
         app.session.zoom = 0.5;
         run_editor_frame(&ctx, &mut app, 0.34, Vec::new());
         assert!(app.view.ruler_length > len_3x);
         assert!(app.view.ruler_depth > depth_3x);
+
+        run_editor_frame(&ctx, &mut app, 1.48, Vec::new());
+        app.view.zoom = 0.15;
+        app.session.zoom = 0.15;
+        run_editor_frame(&ctx, &mut app, 1.50, Vec::new());
+        let z_min = f64::from(app.view.zoom);
+        assert!(
+            (z_min - 0.15).abs() < 1e-3,
+            "expected zoom settled at 15% min zoom, got {z_min}"
+        );
+        let canvas_w_min = f64::from(app.view.last_canvas_rect.expect("canvas rect").width());
+        let expected_screen_w_min =
+            (canvas_w_min * RULER_VIEWPORT_FILL).min(RULER_MAX_SCREEN_LENGTH);
+        let len_min_zoom = app.view.ruler_length;
+        let depth_min_zoom = app.view.ruler_depth;
+        assert!(
+            len_min_zoom > len_fit && len_min_zoom > 1200.0,
+            "expected ruler length in page units to keep growing down to 15% min zoom (fit={len_fit}, min={len_min_zoom})"
+        );
+        assert!(
+            (len_min_zoom * z_min - expected_screen_w_min).abs() < 1.0,
+            "expected 15% zoomed ruler screen length {expected_screen_w_min}, got {}",
+            len_min_zoom * z_min
+        );
+        assert!(
+            (depth_min_zoom * z_min - RULER_TARGET_SCREEN_DEPTH).abs() < 1e-3,
+            "expected 15% zoomed ruler screen depth {RULER_TARGET_SCREEN_DEPTH}, got {}",
+            depth_min_zoom * z_min
+        );
     }
 
     #[test]
@@ -15658,6 +15696,20 @@ mod tests {
         );
         assert!(texts_3x.iter().any(|s| s == "20"));
         assert!(texts_3x.iter().any(|s| s == "40"));
+
+        // Zooming all the way out to 15% grows the ruler proportionally in pt and keeps labels readable.
+        app.view.zoom = 0.15;
+        app.session.zoom = 0.15;
+        app.view.pan = [640.0 - 600.0 * 0.15, 400.0 - 400.0 * 0.15];
+        app.view.ruler_angle = 0.0;
+        let texts_min = collect_rendered_text(&ctx, &mut app, 0.048);
+        let expected_span_min = format!("+0° · {:.0} pt", app.view.ruler_length.round());
+        assert!(
+            texts_min.iter().any(|s| s == &expected_span_min),
+            "expected min-zoom ruler badge {expected_span_min:?} in {texts_min:?}"
+        );
+        assert!(texts_min.iter().any(|s| s == "500"));
+        assert!(texts_min.iter().any(|s| s == "1000"));
     }
 
     #[test]
