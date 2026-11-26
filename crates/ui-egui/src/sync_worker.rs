@@ -622,6 +622,7 @@ pub(crate) fn poll_and_tick(app: &mut PaperCraftApp, ctx: &egui::Context, now_ui
 
     if !app.session.is_signed_in()
         || !app.session.is_viewing_cloud()
+        || app.session.is_session_expired()
         || app.session.is_sync_in_flight()
         || app.sync_worker.pending_outcome.is_some()
         || !can_mutate_docs
@@ -700,6 +701,9 @@ pub(crate) fn complete_authenticated_switch(
         )
     ) {
         crate::modal::close(app);
+    }
+    if app.session.cloud_pending_changes_count() > 0 && !app.session.is_sync_in_flight() {
+        trigger_manual_sync(app, ctx);
     }
 }
 
@@ -865,8 +869,12 @@ pub(crate) fn apply_worker_event(
                         .to_string(),
                 );
             } else if unauthorized {
+                app.session.record_session_expired(
+                    "Session expired — enter your password to resume syncing. Changes remain saved locally."
+                        .to_string(),
+                );
                 app.view.account.apply_profile_update_err(
-                    "Session expired — sign in again when online to update your profile."
+                    "Session expired — enter your password in Accounts below to update your profile."
                         .to_string(),
                 );
             } else {
@@ -895,8 +903,12 @@ pub(crate) fn apply_worker_event(
                         .to_string(),
                 );
             } else if unauthorized {
+                app.session.record_session_expired(
+                    "Session expired — enter your password to resume syncing. Changes remain saved locally."
+                        .to_string(),
+                );
                 app.view.account.apply_password_change_err(
-                    "Session expired — sign in again when online to change your password."
+                    "Session expired — enter your password in Accounts below to change your password."
                         .to_string(),
                 );
             } else {
@@ -926,8 +938,13 @@ pub(crate) fn apply_worker_event(
                         .to_string(),
                 );
             } else if unauthorized {
+                app.session.record_session_expired(
+                    "Session expired — enter your password to resume syncing. Changes remain saved locally."
+                        .to_string(),
+                );
                 app.view.account.apply_email_change_err(
-                    "Session expired — sign in again when online to update your email.".to_string(),
+                    "Session expired — enter your password in Accounts below to update your email."
+                        .to_string(),
                 );
             } else {
                 app.view.account.apply_email_change_err(message);
@@ -953,9 +970,8 @@ pub(crate) fn apply_worker_event(
                 app.sync_worker.next_retry_delay_ms =
                     (app.sync_worker.next_retry_delay_ms * 1.5).clamp(5_000.0, 20_000.0);
             } else if unauthorized {
-                app.session.record_sync_failure(
-                    false,
-                    "Session expired — sign in again when online to resume cloud sync. Changes remain saved locally."
+                app.session.record_session_expired(
+                    "Session expired — enter your password to resume syncing. Changes remain saved locally."
                         .to_string(),
                 );
                 app.sync_worker.next_retry_delay_ms = 60_000.0;
@@ -1822,6 +1838,134 @@ mod tests {
         );
         assert_eq!(sync_dispatches.load(Ordering::Relaxed), before + 1);
         assert_eq!(app.sync_worker.next_retry_delay_ms, 5_000.0);
+    }
+
+    #[test]
+    fn expired_session_pauses_polling_and_reauth_immediately_uploads_queued_edits() {
+        use papercraft_sync_protocol::{
+            RemoteNotebookRecord, canonical_document_body_hash, canonical_document_hash,
+            canonical_document_meta_hash,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ctx = egui::Context::default();
+        let mut session = papercraft_engine::Session::open_web_cache(None);
+        session
+            .execute("profile.completeFirstAccess", &json_nick("ReauthUser"))
+            .unwrap();
+
+        let sync_dispatches = Arc::new(AtomicUsize::new(0));
+        let sync_clone = Arc::clone(&sync_dispatches);
+        let hooks = crate::PlatformHooks {
+            web_sync_dispatch: Some(Box::new(move |cmd, _tx, _ctx| {
+                if matches!(cmd, SyncWorkerCommand::SyncNow { .. }) {
+                    sync_clone.fetch_add(1, Ordering::Relaxed);
+                }
+            })),
+            ..crate::PlatformHooks::default()
+        };
+        let mut app = PaperCraftApp::new(session, hooks);
+        let auth = ActiveAccountSession {
+            server_url: "http://127.0.0.1:8787".to_string(),
+            user: papercraft_sync_protocol::UserProfile {
+                user_id: "u-exp-ui".to_string(),
+                email: Some("reauth@example.com".to_string()),
+                username: "reauthuser".to_string(),
+                display_name: "Reauth".to_string(),
+                created_at_ms: 1000,
+                must_change_password: false,
+            },
+            access_token: "old_tok".to_string(),
+            refresh_token: "old_ref".to_string(),
+            access_expires_at_ms: 99_999,
+            refresh_expires_at_ms: 99_999,
+            device_name: "PC".to_string(),
+            last_auth_ms: 1000,
+        };
+        let synced_doc = papercraft_doc::Document {
+            id: "nb-reauth".to_string(),
+            title: "Original Title".to_string(),
+            ..Default::default()
+        };
+        let record = RemoteNotebookRecord {
+            notebook_id: "nb-reauth".to_string(),
+            version: 1,
+            cursor: 1,
+            deleted: false,
+            updated_at_ms: 1000,
+            deleted_at_ms: None,
+            title: "Original Title".to_string(),
+            content_hash: canonical_document_hash(&synced_doc),
+            body_hash: canonical_document_body_hash(&synced_doc),
+            meta_hash: canonical_document_meta_hash(&synced_doc),
+            meta_updated_at_ms: 1000,
+            document: Some(synced_doc),
+        };
+        let pull = SyncPullResponse {
+            server_cursor: 1,
+            user: auth.user.clone(),
+            notebooks: vec![record.clone()],
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        app.session.enter_online_server_session(auth.clone(), pull);
+
+        // Token expires online: keep viewing cloud, do NOT log out, mark expired, pause polling.
+        apply_worker_event(
+            &mut app,
+            &ctx,
+            SyncWorkerEvent::SyncErr {
+                offline: false,
+                unauthorized: true,
+                message: "expired".to_string(),
+            },
+        );
+        assert!(app.session.is_signed_in());
+        assert!(app.session.is_viewing_cloud());
+        assert!(app.session.is_session_expired());
+
+        app.session
+            .execute(
+                "notebook.rename",
+                &serde_json::json!({ "title": "Queued While Expired" }),
+            )
+            .unwrap();
+        assert_eq!(app.session.cloud_pending_changes_count(), 1);
+
+        let before = sync_dispatches.load(Ordering::Relaxed);
+        poll_and_tick(&mut app, &ctx, 200_000.0);
+        assert_eq!(
+            sync_dispatches.load(Ordering::Relaxed),
+            before,
+            "background polling must pause while waiting for password re-entry"
+        );
+
+        // Re-authentication succeeds: clears expired flag and immediately dispatches SyncNow for queued edits!
+        let mut renewed_auth = auth;
+        renewed_auth.access_token = "new_tok".to_string();
+        let renewed_pull = SyncPullResponse {
+            server_cursor: 1,
+            user: renewed_auth.user.clone(),
+            notebooks: vec![record],
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        apply_worker_event(
+            &mut app,
+            &ctx,
+            SyncWorkerEvent::AuthOk {
+                auth: renewed_auth,
+                initial_pull: Box::new(renewed_pull),
+            },
+        );
+        assert!(!app.session.is_session_expired());
+        assert_eq!(app.session.notebooks.len(), 1);
+        assert_eq!(app.session.notebooks[0].title, "Queued While Expired");
+        assert_eq!(
+            sync_dispatches.load(Ordering::Relaxed),
+            before + 1,
+            "re-authenticating with queued offline changes must immediately trigger sync"
+        );
     }
 
     fn json_nick(nick: &str) -> serde_json::Value {

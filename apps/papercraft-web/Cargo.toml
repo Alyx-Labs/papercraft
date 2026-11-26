@@ -15,6 +15,7 @@ name = "papercraft_app"
 path = "src/main.rs"
 
 [dependencies]
+papercraft-doc.workspace = true
 papercraft-engine.workspace = true
 papercraft-sync.workspace = true
 papercraft-sync-protocol.workspace = true
@@ -24,19 +25,24 @@ egui.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
 web-sys = { version = "0.3", features = [
+    "BeforeUnloadEvent",
     "Blob",
     "BlobPropertyBag",
+    "BroadcastChannel",
     "ClipboardEvent",
     "DataTransfer",
     "DataTransferItem",
     "DataTransferItemList",
     "Document",
+    "DomException",
     "DomRect",
+    "DomStringList",
     "Element",
     "Event",
     "EventTarget",
@@ -46,17 +52,35 @@ web-sys = { version = "0.3", features = [
     "HtmlAnchorElement",
     "HtmlCanvasElement",
     "HtmlInputElement",
+    "IdbCursor",
+    "IdbCursorWithValue",
+    "IdbDatabase",
+    "IdbFactory",
+    "IdbKeyRange",
+    "IdbObjectStore",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbVersionChangeEvent",
+    "MessageEvent",
     "MouseEvent",
+    "Navigator",
+    "Node",
+    "PageTransitionEvent",
     "PointerEvent",
     "Request",
     "RequestInit",
     "RequestMode",
     "Response",
     "Storage",
+    "StorageEstimate",
+    "StorageManager",
     "Touch",
     "TouchEvent",
     "TouchList",
     "Url",
+    "VisibilityState",
     "Window",
     "console",
 ] }

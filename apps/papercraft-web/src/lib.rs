@@ -11,6 +11,8 @@
 #[cfg(target_arch = "wasm32")]
 mod web_files;
 #[cfg(target_arch = "wasm32")]
+mod web_storage;
+#[cfg(target_arch = "wasm32")]
 mod web_stylus;
 #[cfg(target_arch = "wasm32")]
 mod web_sync;
@@ -24,7 +26,7 @@ mod web {
     use wasm_bindgen::prelude::wasm_bindgen;
     use wasm_bindgen::{JsCast, JsValue};
 
-    use super::{web_files, web_stylus, web_sync};
+    use super::{web_files, web_storage, web_stylus, web_sync};
 
     /// Starts the PaperCraft web application on the specified HTML canvas and removes
     /// the loading overlay once initialization completes.
@@ -47,17 +49,21 @@ mod web {
             .map_err(|_| JsValue::from_str("element is not an HtmlCanvasElement"))?;
 
         let stylus_canvas = canvas.clone();
+        let ctx_slot: web_files::SharedEguiCtx = Arc::new(Mutex::new(None));
+        let (storage_ctrl, loaded_state) =
+            web_storage::WebStorageController::init_and_load(Arc::clone(&ctx_slot)).await;
+
         let web_options = eframe::WebOptions::default();
         runner
             .start(
                 canvas,
                 web_options,
                 Box::new(move |cc| {
-                    let cached = web_files::load_workspace_cache();
-                    let session = Session::open_web_cache(cached.as_deref());
+                    let session = Session::open_web_storage(loaded_state);
                     let file_events: web_files::SharedFileEvents = Arc::new(Mutex::new(Vec::new()));
-                    let ctx_slot: web_files::SharedEguiCtx =
-                        Arc::new(Mutex::new(Some(cc.egui_ctx.clone())));
+                    if let Ok(mut guard) = ctx_slot.lock() {
+                        *guard = Some(cc.egui_ctx.clone());
+                    }
 
                     let stylus =
                         web_stylus::WebStylusHandle::install(&stylus_canvas, Arc::clone(&ctx_slot));
@@ -85,6 +91,10 @@ mod web {
                         Arc::clone(&file_events),
                         Arc::clone(&ctx_slot),
                     );
+
+                    let flush_ctrl = storage_ctrl.clone();
+                    let poll_ctrl = storage_ctrl.clone();
+                    let retry_ctrl = storage_ctrl;
 
                     let hooks = PlatformHooks {
                         tablet_poll: Some(Box::new(move || stylus_poll.drain_samples())),
@@ -147,8 +157,12 @@ mod web {
                                 Arc::clone(&drop_ctx),
                             );
                         })),
-                        save_web_cache: Some(Box::new(|json| {
-                            web_files::save_workspace_cache(json);
+                        flush_web_storage_delta: Some(Box::new(move |delta| {
+                            flush_ctrl.enqueue_delta(delta);
+                        })),
+                        poll_web_storage_events: Some(Box::new(move || poll_ctrl.drain_events())),
+                        retry_web_storage_write: Some(Box::new(move || {
+                            retry_ctrl.retry_failed();
                         })),
                         web_sync_dispatch: Some(Box::new(|cmd, evt_tx, ctx| {
                             web_sync::dispatch_sync_command(cmd, evt_tx, ctx);

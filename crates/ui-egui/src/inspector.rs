@@ -885,7 +885,65 @@ fn system_renderer_label(wgpu_enabled: bool) -> &'static str {
     }
 }
 
+pub(crate) fn format_storage_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn web_storage_info_from_status(status: &crate::WebStorageStatus) -> (String, Option<String>) {
+    let mut tip = match status.backend {
+        crate::WebStorageBackend::IndexedDb => {
+            if status.persisted == Some(true) {
+                "Browser granted persistent storage so your notebooks are protected from automatic cleanup."
+                    .to_string()
+            } else {
+                "Managed in best-effort mode. Some browsers (such as Safari after 7 days of inactivity, or under low disk space) may automatically clear site data. Sync to a server or export a .pcraftpkg backup regularly."
+                    .to_string()
+            }
+        }
+        crate::WebStorageBackend::LocalStorageFallback => {
+            "IndexedDB was unavailable in this browser context. Storage is limited to roughly 5 MB."
+                .to_string()
+        }
+        crate::WebStorageBackend::MemoryOnly => {
+            "Browser storage is blocked or private mode is active. Notebooks will be lost when this tab closes — export a .pcraftpkg backup."
+                .to_string()
+        }
+    };
+    if status.other_tab_active {
+        tip.push_str(" Another PaperCraft tab is currently open on this browser.");
+    }
+    let label = match status.backend {
+        crate::WebStorageBackend::IndexedDb => {
+            if status.persisted == Some(true) {
+                "IndexedDB (Persistent)".to_string()
+            } else {
+                "IndexedDB (Best-effort)".to_string()
+            }
+        }
+        crate::WebStorageBackend::LocalStorageFallback => {
+            "Browser localStorage (Fallback)".to_string()
+        }
+        crate::WebStorageBackend::MemoryOnly => "Memory-only (Temporary)".to_string(),
+    };
+    (label, Some(tip))
+}
+
 fn system_storage_info(app: &PaperCraftApp) -> (String, Option<String>) {
+    if let Some(status) = app.web_storage_status.as_ref() {
+        return web_storage_info_from_status(status);
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         if let Some(dir) = app.session.library_dir() {
@@ -902,8 +960,29 @@ fn system_storage_info(app: &PaperCraftApp) -> (String, Option<String>) {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = app;
-        ("Browser localStorage".to_string(), None)
+        ("IndexedDB (Best-effort)".to_string(), None)
+    }
+}
+
+fn web_storage_usage_row(status: &crate::WebStorageStatus) -> Option<(String, Option<String>)> {
+    match (status.usage_bytes, status.quota_bytes) {
+        (Some(usage), Some(quota)) if quota > 0 => {
+            let pct = (usage as f64 / quota as f64 * 100.0).clamp(0.0, 100.0);
+            let value = format!(
+                "{} / {} ({pct:.1}%)",
+                format_storage_bytes(usage),
+                format_storage_bytes(quota)
+            );
+            let tip = status.remaining_bytes().map(|rem| {
+                format!(
+                    "{} estimated free space remaining.",
+                    format_storage_bytes(rem)
+                )
+            });
+            Some((value, tip))
+        }
+        (Some(usage), _) => Some((format_storage_bytes(usage), None)),
+        _ => None,
     }
 }
 
@@ -979,7 +1058,34 @@ fn draw_system_info_card(app: &PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
                 );
                 draw_system_info_row(ui, "Notebooks", &notebooks, false, None, t);
                 draw_system_info_row(ui, "Storage", &storage, true, storage_tip.as_deref(), t);
+                if let Some(status) = app.web_storage_status.as_ref()
+                    && let Some((usage_text, usage_tip)) = web_storage_usage_row(status)
+                {
+                    draw_system_info_row(
+                        ui,
+                        "Storage Used",
+                        &usage_text,
+                        true,
+                        usage_tip.as_deref(),
+                        t,
+                    );
+                }
             });
+        if let Some(err) = app
+            .web_storage_status
+            .as_ref()
+            .and_then(|s| s.last_error.as_deref())
+        {
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("Storage error: {err}"))
+                        .size(11.0)
+                        .color(t.danger_fg),
+                )
+                .wrap(),
+            );
+        }
     });
 }
 
@@ -1505,6 +1611,46 @@ mod tests {
         assert!(!sys_texts.contains("Hardware Stylus Active"));
         assert!(!sys_texts.contains("Auto-adapt canvas colors to theme"));
         assert!(!sys_texts.contains("Paper Ruling"));
+    }
+
+    #[test]
+    fn system_tab_renders_web_storage_status_persistence_and_usage() {
+        let mut app = PaperCraftApp {
+            web_storage_status: Some(crate::WebStorageStatus {
+                backend: crate::WebStorageBackend::IndexedDb,
+                persisted: Some(false),
+                usage_bytes: Some(12 * 1024 * 1024),
+                quota_bytes: Some(4 * 1024 * 1024 * 1024),
+                in_flight: false,
+                has_unsaved_error: false,
+                quota_exceeded: false,
+                last_error: None,
+                other_tab_active: false,
+                other_tab_wrote: false,
+            }),
+            ..PaperCraftApp::default()
+        };
+        let (_, sys_texts) = render_inspector_tab(&mut app, SettingsTab::System);
+        assert!(sys_texts.contains("IndexedDB (Best-effort)"));
+        assert!(sys_texts.contains("Storage Used"));
+        assert!(sys_texts.contains("12.0 MB / 4.0 GB"));
+
+        app.web_storage_status = Some(crate::WebStorageStatus {
+            backend: crate::WebStorageBackend::IndexedDb,
+            persisted: Some(true),
+            usage_bytes: Some(250 * 1024),
+            quota_bytes: Some(2 * 1024 * 1024 * 1024),
+            in_flight: false,
+            has_unsaved_error: true,
+            quota_exceeded: true,
+            last_error: Some("QuotaExceededError".to_string()),
+            other_tab_active: true,
+            other_tab_wrote: false,
+        });
+        let (_, persisted_texts) = render_inspector_tab(&mut app, SettingsTab::System);
+        assert!(persisted_texts.contains("IndexedDB (Persistent)"));
+        assert!(persisted_texts.contains("250.0 KB / 2.0 GB"));
+        assert!(persisted_texts.contains("Storage error: QuotaExceededError"));
     }
 
     #[test]

@@ -27,6 +27,7 @@ const MAX_TRASH_SCAN_FILES: usize = 4096;
 /// A notebook held for recovery after it is removed from the active library.
 #[derive(Clone, Debug)]
 pub struct TrashedNotebook {
+    pub(crate) trash_id: String,
     pub doc: Arc<Document>,
     pub deleted_at_ms: i64,
     pub(crate) path: Option<PathBuf>,
@@ -450,6 +451,7 @@ fn read_trash_entries(dir: &Path) -> Vec<TrashedNotebook> {
         doc.sync_active_to_pages();
         doc.load_active_from_pages();
         loaded.push(TrashedNotebook {
+            trash_id: Uuid::new_v4().to_string(),
             doc: Arc::new(doc),
             deleted_at_ms,
             path: Some(path),
@@ -730,6 +732,7 @@ impl Session {
             .map_err(|err| format!("failed to serialize notebook for Trash: {err}"))?;
         let deleted_at_ms = unix_now_ms();
         let mut trash_entry = TrashedNotebook {
+            trash_id: Uuid::new_v4().to_string(),
             doc: Arc::clone(&doc),
             deleted_at_ms,
             path: None,
@@ -791,6 +794,7 @@ impl Session {
         doc.sync_active_to_pages();
         let doc_arc = Arc::new(doc);
         let mut trash_entry = TrashedNotebook {
+            trash_id: Uuid::new_v4().to_string(),
             doc: Arc::clone(&doc_arc),
             deleted_at_ms,
             path: None,

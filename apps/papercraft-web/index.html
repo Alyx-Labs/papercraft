@@ -12,7 +12,11 @@
                 if (!meta) return;
 
                 function resolveTheme() {
-                    var raw = window.localStorage && window.localStorage.getItem("papercraft_workspace_v1");
+                    if (!window.localStorage) return null;
+                    var hint = window.localStorage.getItem("papercraft_theme_v1");
+                    if (hint === "light" || hint === "dark") return hint;
+
+                    var raw = window.localStorage.getItem("papercraft_workspace_v1");
                     if (!raw) return null;
                     var cache = JSON.parse(raw);
                     if (!cache || typeof cache !== "object") return null;
@@ -38,7 +42,12 @@
 
                 applyTheme();
                 window.addEventListener("storage", function (e) {
-                    if (!e || e.key === null || e.key === "papercraft_workspace_v1") {
+                    if (
+                        !e ||
+                        e.key === null ||
+                        e.key === "papercraft_theme_v1" ||
+                        e.key === "papercraft_workspace_v1"
+                    ) {
                         applyTheme();
                     }
                 });

@@ -13,6 +13,7 @@
 pub mod commands;
 pub mod library;
 pub mod sync_state;
+pub mod web_storage;
 
 pub use commands::{
     PackageImportSummary, PdfImportMode, PreparedPdfImport, prepare_pdf_import_from_bytes,
@@ -637,6 +638,7 @@ impl Session {
             self.library
                 .mark_dirty(self.active_notebook, self.notebooks.len());
             self.sync_mark_slot_dirty(self.active_notebook);
+            self.bump_revision();
             true
         } else {
             false

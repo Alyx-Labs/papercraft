@@ -8,6 +8,7 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 const WEB_CACHE_STORAGE_KEY: &str = "papercraft_workspace_v1";
 const LEGACY_WEB_CACHE_STORAGE_KEY: &str = "badnotescraft_workspace_v1";
+const WEB_THEME_STORAGE_KEY: &str = "papercraft_theme_v1";
 
 pub type SharedFileEvents = Arc<Mutex<Vec<AsyncFileEvent>>>;
 pub type SharedEguiCtx = Arc<Mutex<Option<egui::Context>>>;
@@ -24,11 +25,35 @@ pub fn load_workspace_cache() -> Option<String> {
         .flatten()
 }
 
-pub fn save_workspace_cache(json: &str) {
+pub fn save_workspace_cache(json: &str) -> Result<(), String> {
+    let window = web_sys::window().ok_or_else(|| "browser window unavailable".to_string())?;
+    let storage = window
+        .local_storage()
+        .map_err(|err| format_js_error("localStorage unavailable", &err))?
+        .ok_or_else(|| "localStorage unavailable".to_string())?;
+    storage
+        .set_item(WEB_CACHE_STORAGE_KEY, json)
+        .map_err(|err| format_js_error("localStorage write failed", &err))
+}
+
+pub fn save_theme_hint(theme: papercraft_doc::UiTheme) {
+    let label = match theme {
+        papercraft_doc::UiTheme::Light => "light",
+        papercraft_doc::UiTheme::Dark => "dark",
+    };
     if let Some(window) = web_sys::window()
         && let Ok(Some(storage)) = window.local_storage()
     {
-        let _ = storage.set_item(WEB_CACHE_STORAGE_KEY, json);
+        let _ = storage.set_item(WEB_THEME_STORAGE_KEY, label);
+    }
+}
+
+pub fn remove_legacy_workspace_caches() {
+    if let Some(window) = web_sys::window()
+        && let Ok(Some(storage)) = window.local_storage()
+    {
+        let _ = storage.remove_item(WEB_CACHE_STORAGE_KEY);
+        let _ = storage.remove_item(LEGACY_WEB_CACHE_STORAGE_KEY);
     }
 }
 

@@ -716,6 +716,65 @@ pub enum ClipboardImagePayload {
     FilePath(PathBuf),
 }
 
+/// Active browser persistence backend reported by the WebAssembly shell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebStorageBackend {
+    IndexedDb,
+    LocalStorageFallback,
+    MemoryOnly,
+}
+
+/// Live browser storage status, quota metrics, error state, and multi-tab activity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebStorageStatus {
+    pub backend: WebStorageBackend,
+    pub persisted: Option<bool>,
+    pub usage_bytes: Option<u64>,
+    pub quota_bytes: Option<u64>,
+    pub in_flight: bool,
+    pub has_unsaved_error: bool,
+    pub quota_exceeded: bool,
+    pub last_error: Option<String>,
+    pub other_tab_active: bool,
+    pub other_tab_wrote: bool,
+}
+
+impl WebStorageStatus {
+    /// Returns the fraction of estimated storage quota currently consumed (`0.0..=1.0`).
+    #[must_use]
+    pub fn usage_ratio(&self) -> Option<f64> {
+        let usage = self.usage_bytes?;
+        let quota = self.quota_bytes.filter(|&q| q > 0)?;
+        Some((usage as f64 / quota as f64).clamp(0.0, 1.0))
+    }
+
+    /// Returns the estimated free storage capacity in bytes.
+    #[must_use]
+    pub fn remaining_bytes(&self) -> Option<u64> {
+        let usage = self.usage_bytes?;
+        let quota = self.quota_bytes?;
+        Some(quota.saturating_sub(usage))
+    }
+
+    /// Returns `true` when browser storage usage reaches 80% or less than 50 MiB remains.
+    #[must_use]
+    pub fn is_low_quota(&self) -> bool {
+        let ratio_high = self.usage_ratio().is_some_and(|r| r >= 0.80);
+        let free_low = self
+            .quota_bytes
+            .filter(|&q| q > 0)
+            .and(self.remaining_bytes())
+            .is_some_and(|rem| rem < 50 * 1024 * 1024);
+        ratio_high || free_low
+    }
+}
+
+/// Asynchronous storage status update emitted by the WebAssembly persistence controller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WebStorageEvent {
+    Status(WebStorageStatus),
+}
+
 pub type TabletPollFn = Box<dyn FnMut() -> Vec<stylus::PenSample>>;
 pub type PenPointerIdFn = Box<dyn Fn() -> Option<u64>>;
 pub type PenInProximityFn = Box<dyn Fn() -> bool>;
@@ -732,6 +791,9 @@ pub type PickOpenFileFn = Box<dyn FnMut(FileDialogKind) -> Option<PickedOpenFile
 pub type PollFileEventsFn = Box<dyn FnMut() -> Vec<AsyncFileEvent>>;
 pub type OpenDroppedFileFn = Box<dyn FnMut(Arc<dyn egui::DroppedFile + Send + Sync>)>;
 pub type SaveWebCacheFn = Box<dyn FnMut(&str)>;
+pub type FlushWebStorageDeltaFn = Box<dyn FnMut(papercraft_engine::web_storage::WebStorageDelta)>;
+pub type PollWebStorageEventsFn = Box<dyn FnMut() -> Vec<WebStorageEvent>>;
+pub type RetryWebStorageWriteFn = Box<dyn FnMut()>;
 pub type PickImageFileFn = Box<dyn FnMut() -> Option<PickedOpenFile>>;
 pub type ClipboardImageFn = Box<dyn FnMut() -> Option<ClipboardImagePayload>>;
 pub type ClipboardImageCandidatesFn = Box<dyn FnMut() -> Vec<ClipboardImagePayload>>;
@@ -761,6 +823,9 @@ pub struct PlatformHooks {
     pub poll_file_events: Option<PollFileEventsFn>,
     pub open_dropped_file: Option<OpenDroppedFileFn>,
     pub save_web_cache: Option<SaveWebCacheFn>,
+    pub flush_web_storage_delta: Option<FlushWebStorageDeltaFn>,
+    pub poll_web_storage_events: Option<PollWebStorageEventsFn>,
+    pub retry_web_storage_write: Option<RetryWebStorageWriteFn>,
     pub web_sync_dispatch: Option<sync_worker::WebSyncDispatchFn>,
     pub pick_image_file: Option<PickImageFileFn>,
     pub clipboard_image: Option<ClipboardImageFn>,
@@ -903,6 +968,9 @@ pub struct PaperCraftApp {
     last_stylus_device_poll_s: f64,
     stylus_synced_in_raw_hook: bool,
     pub(crate) wgpu_enabled: bool,
+    pub web_storage_status: Option<WebStorageStatus>,
+    web_storage_low_quota_dismissed: bool,
+    web_storage_multitab_dismissed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -984,6 +1052,9 @@ impl PaperCraftApp {
             last_stylus_device_poll_s: -10.0,
             stylus_synced_in_raw_hook: false,
             wgpu_enabled: false,
+            web_storage_status: None,
+            web_storage_low_quota_dismissed: false,
+            web_storage_multitab_dismissed: false,
         }
     }
 
@@ -1689,10 +1760,11 @@ impl PaperCraftApp {
     }
 
     pub(crate) fn flush_web_cache_if_needed(&mut self) {
-        if self.hooks.save_web_cache.is_none()
-            || self.session.live_stroke.is_some()
-            || self.session.live_eraser.is_some()
-        {
+        self.flush_web_storage(false);
+    }
+
+    pub(crate) fn flush_web_storage(&mut self, force_urgent: bool) {
+        if self.session.live_stroke.is_some() || self.session.live_eraser.is_some() {
             return;
         }
         let state_key = WebCacheStateKey {
@@ -1708,7 +1780,23 @@ impl PaperCraftApp {
             last_sync_at_ms: self.session.sync_status_summary().last_sync_at_ms,
             active_notebook: self.session.active_notebook,
         };
-        if self.last_saved_cache_state == Some(state_key) {
+        if self.hooks.flush_web_storage_delta.is_some() {
+            if !force_urgent
+                && self.last_saved_cache_state == Some(state_key)
+                && !self.session.has_pending_web_storage_changes()
+            {
+                return;
+            }
+            let delta = self.session.take_web_storage_delta(force_urgent);
+            if !delta.is_empty()
+                && let Some(flush) = self.hooks.flush_web_storage_delta.as_mut()
+            {
+                flush(delta);
+            }
+            self.last_saved_cache_state = Some(state_key);
+            return;
+        }
+        if self.hooks.save_web_cache.is_none() || self.last_saved_cache_state == Some(state_key) {
             return;
         }
         if let Ok(json) = self.session.export_web_cache_json()
@@ -1716,6 +1804,37 @@ impl PaperCraftApp {
         {
             save(&json);
             self.last_saved_cache_state = Some(state_key);
+        }
+    }
+
+    fn poll_web_storage_events(&mut self) {
+        let Some(poll) = self.hooks.poll_web_storage_events.as_mut() else {
+            return;
+        };
+        let events = poll();
+        for event in events {
+            let WebStorageEvent::Status(status) = event;
+            let prev_low = self
+                .web_storage_status
+                .as_ref()
+                .is_some_and(WebStorageStatus::is_low_quota);
+            let prev_other_active = self
+                .web_storage_status
+                .as_ref()
+                .is_some_and(|s| s.other_tab_active);
+            let prev_other_wrote = self
+                .web_storage_status
+                .as_ref()
+                .is_some_and(|s| s.other_tab_wrote);
+            if status.is_low_quota() && !prev_low {
+                self.web_storage_low_quota_dismissed = false;
+            }
+            if (status.other_tab_wrote && !prev_other_wrote)
+                || (status.other_tab_active && !prev_other_active)
+            {
+                self.web_storage_multitab_dismissed = false;
+            }
+            self.web_storage_status = Some(status);
         }
     }
 
@@ -2283,6 +2402,7 @@ impl PaperCraftApp {
         self.handle_shortcuts(&ctx);
         self.handle_page_clipboard_events(&ctx, &events);
         self.poll_async_file_events_and_drops(&ctx);
+        self.poll_web_storage_events();
         sync_worker::poll_and_tick(self, &ctx, now_ms);
         self.pump_background_autosave(now_s);
 
@@ -2350,6 +2470,7 @@ impl PaperCraftApp {
         if let Some(name) = self.view.pdf_import_in_flight.as_deref() {
             render_importing_pdf_banner(&ctx, name, &tokens);
         }
+        render_web_storage_banner(self, &ctx, &tokens);
         if ctx.output(|o| o.cursor_icon != egui::CursorIcon::None && o.cursor_image.is_some()) {
             ctx.set_cursor_image(None);
         }
@@ -2683,8 +2804,154 @@ impl eframe::App for PaperCraftApp {
             worker.shutdown(&mut self.session);
         }
         self.session.flush_for_exit();
-        self.flush_web_cache_if_needed();
+        self.flush_web_storage(true);
     }
+}
+
+enum WebStorageBannerKind {
+    Error { message: String, allow_retry: bool },
+    Warning { message: String, dismiss_target: u8 },
+}
+
+fn resolve_web_storage_banner(app: &PaperCraftApp) -> Option<WebStorageBannerKind> {
+    let status = app.web_storage_status.as_ref()?;
+    if status.has_unsaved_error {
+        let message = if status.quota_exceeded {
+            "Could not save changes — browser storage is full. Clear Trash or export a .pcraftpkg backup before closing this tab.".to_string()
+        } else {
+            "Could not save changes to browser storage. Export a .pcraftpkg backup before closing this tab.".to_string()
+        };
+        return Some(WebStorageBannerKind::Error {
+            message,
+            allow_retry: app.hooks.retry_web_storage_write.is_some(),
+        });
+    }
+    if status.backend == WebStorageBackend::MemoryOnly {
+        return Some(WebStorageBannerKind::Error {
+            message: "Browser storage is unavailable (private mode or blocked). Export a .pcraftpkg backup before closing this tab.".to_string(),
+            allow_retry: false,
+        });
+    }
+    if (status.other_tab_wrote || status.other_tab_active) && !app.web_storage_multitab_dismissed {
+        let message = if status.other_tab_wrote {
+            "Another PaperCraft tab saved newer changes. Reload this tab before editing to avoid overwriting work.".to_string()
+        } else {
+            "PaperCraft is open in another browser tab. Close extra tabs to prevent conflicting edits.".to_string()
+        };
+        return Some(WebStorageBannerKind::Warning {
+            message,
+            dismiss_target: 1,
+        });
+    }
+    if status.is_low_quota() && !app.web_storage_low_quota_dismissed {
+        let pct = status
+            .usage_ratio()
+            .map_or(80u64, |r| (r * 100.0).round() as u64);
+        let free = status
+            .remaining_bytes()
+            .map(inspector::format_storage_bytes)
+            .unwrap_or_else(|| "low space".to_string());
+        return Some(WebStorageBannerKind::Warning {
+            message: format!(
+                "Browser storage is running low ({pct}% used · {free} free). Clear Trash or export a .pcraftpkg backup."
+            ),
+            dismiss_target: 2,
+        });
+    }
+    None
+}
+
+fn render_web_storage_banner(app: &mut PaperCraftApp, ctx: &egui::Context, t: &theme::Tokens) {
+    let Some(banner) = resolve_web_storage_banner(app) else {
+        return;
+    };
+
+    let top_offset = if app.view.pdf_import_in_flight.is_some() {
+        56.0
+    } else {
+        14.0
+    };
+    let rect = ctx.content_rect();
+    let max_w = (rect.width() - 32.0).clamp(240.0, 620.0);
+
+    egui::Area::new(egui::Id::unique("papercraft_web_storage_banner"))
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::CENTER_TOP)
+        .fixed_pos(egui::pos2(rect.center().x, rect.top() + top_offset))
+        .fade_in(false)
+        .show(ctx, |ui| {
+            ui.set_max_width(max_w);
+            let (fill, border_color, icon_color) = match &banner {
+                WebStorageBannerKind::Error { .. } => (t.danger_bg, t.danger_border, t.danger_fg),
+                WebStorageBannerKind::Warning { .. } => (t.panel_bg, t.warning_fg, t.warning_fg),
+            };
+            egui::Frame::NONE
+                .fill(fill)
+                .stroke(egui::Stroke::new(1.0, border_color))
+                .corner_radius(egui::CornerRadius::same(8))
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let (icon_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                        icons::paint_icon(
+                            ui.painter(),
+                            icon_rect,
+                            icons::Icon::AlertCircle,
+                            icon_color,
+                        );
+                        let msg = match &banner {
+                            WebStorageBannerKind::Error { message, .. }
+                            | WebStorageBannerKind::Warning { message, .. } => message,
+                        };
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(msg).size(12.0).color(t.text))
+                                .wrap(),
+                        );
+                        match banner {
+                            WebStorageBannerKind::Error { allow_retry, .. } => {
+                                if allow_retry
+                                    && icons::compact_icon_button(
+                                        ui,
+                                        icons::Icon::RotateCw,
+                                        Some("Retry"),
+                                        false,
+                                        true,
+                                        t,
+                                    )
+                                    .on_hover_text(
+                                        "Retry saving pending changes to browser storage",
+                                    )
+                                    .clicked()
+                                    && let Some(retry) = app.hooks.retry_web_storage_write.as_mut()
+                                {
+                                    retry();
+                                }
+                            }
+                            WebStorageBannerKind::Warning { dismiss_target, .. } => {
+                                if icons::compact_icon_button(
+                                    ui,
+                                    icons::Icon::Close,
+                                    None,
+                                    false,
+                                    true,
+                                    t,
+                                )
+                                .on_hover_text("Dismiss notice")
+                                .clicked()
+                                {
+                                    if dismiss_target == 1 {
+                                        app.web_storage_multitab_dismissed = true;
+                                    } else {
+                                        app.web_storage_low_quota_dismissed = true;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                });
+        });
 }
 
 fn render_importing_pdf_banner(ctx: &egui::Context, name: &str, t: &theme::Tokens) {
@@ -3432,7 +3699,7 @@ pub(crate) fn return_to_home(app: &mut PaperCraftApp) {
     app.session.cancel_live_eraser();
     app.session.sync_active_notebook_slot();
     let _ = app.session.save_library();
-    app.flush_web_cache_if_needed();
+    app.flush_web_storage(true);
     app.view.inspector_open = false;
     app.view.profile_return_screen = AppScreen::Home;
     app.view.screen = AppScreen::Home;
@@ -4870,5 +5137,171 @@ mod tests {
         assert!(has_copy_cmd);
         assert_eq!(remaining_texts, 0);
         assert_eq!(copied_slot.lock().unwrap().as_str(), "Cut note");
+    }
+
+    #[test]
+    fn web_storage_delta_hooks_and_alert_banners_render_and_retry_cleanly() {
+        fn run_banner_frame(
+            ctx: &egui::Context,
+            app: &mut PaperCraftApp,
+            time: f64,
+            events: Vec<egui::Event>,
+        ) -> (String, Option<egui::Pos2>) {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 800.0),
+                    )),
+                    time: Some(time),
+                    predicted_dt: 0.016,
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.show_ui(ui),
+            );
+            let mut txt = String::new();
+            let mut retry_pos = None;
+            fn visit_shape(
+                s: &egui::Shape,
+                out_str: &mut String,
+                retry_pos: &mut Option<egui::Pos2>,
+            ) {
+                match s {
+                    egui::Shape::Text(t) => {
+                        let label = t.galley.text();
+                        out_str.push_str(label);
+                        out_str.push('\n');
+                        if label == "Retry" {
+                            *retry_pos =
+                                Some(egui::Rect::from_min_size(t.pos, t.galley.size()).center());
+                        }
+                    }
+                    egui::Shape::Vec(items) => {
+                        for item in items {
+                            visit_shape(item, out_str, retry_pos);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for cs in &out.shapes {
+                visit_shape(&cs.shape, &mut txt, &mut retry_pos);
+            }
+            out.drop_without_applying_deltas();
+            (txt, retry_pos)
+        }
+
+        let flushed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let flushed_cb = Arc::clone(&flushed);
+        let retried = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let retried_cb = Arc::clone(&retried);
+        let pending_events = Arc::new(std::sync::Mutex::new(vec![WebStorageEvent::Status(
+            WebStorageStatus {
+                backend: WebStorageBackend::IndexedDb,
+                persisted: Some(false),
+                usage_bytes: Some(85 * 1024 * 1024),
+                quota_bytes: Some(100 * 1024 * 1024),
+                in_flight: false,
+                has_unsaved_error: false,
+                quota_exceeded: false,
+                last_error: None,
+                other_tab_active: false,
+                other_tab_wrote: false,
+            },
+        )]));
+        let poll_events = Arc::clone(&pending_events);
+
+        let hooks = PlatformHooks {
+            flush_web_storage_delta: Some(Box::new(move |delta| {
+                if let Ok(mut guard) = flushed_cb.lock() {
+                    guard.push(delta);
+                }
+            })),
+            poll_web_storage_events: Some(Box::new(move || {
+                if let Ok(mut guard) = poll_events.lock() {
+                    std::mem::take(&mut *guard)
+                } else {
+                    Vec::new()
+                }
+            })),
+            retry_web_storage_write: Some(Box::new(move || {
+                retried_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            })),
+            ..PlatformHooks::default()
+        };
+
+        let mut session = Session::open_web_storage(None);
+        session
+            .complete_first_access_nickname("BannerUser")
+            .unwrap();
+        let mut app = PaperCraftApp::new(session, hooks);
+        let ctx = egui::Context::default();
+        let mut time = 0.02;
+        let _ = run_banner_frame(&ctx, &mut app, time, Vec::new());
+        time += 0.04;
+        let (low_texts, _) = run_banner_frame(&ctx, &mut app, time, Vec::new());
+        assert!(low_texts.contains("Browser storage is running low"));
+        assert!(!flushed.lock().unwrap().is_empty());
+
+        if let Ok(mut guard) = pending_events.lock() {
+            guard.push(WebStorageEvent::Status(WebStorageStatus {
+                backend: WebStorageBackend::IndexedDb,
+                persisted: Some(false),
+                usage_bytes: Some(100 * 1024 * 1024),
+                quota_bytes: Some(100 * 1024 * 1024),
+                in_flight: false,
+                has_unsaved_error: true,
+                quota_exceeded: true,
+                last_error: Some("QuotaExceededError".to_string()),
+                other_tab_active: false,
+                other_tab_wrote: false,
+            }));
+        }
+        time += 0.04;
+        let _ = run_banner_frame(&ctx, &mut app, time, Vec::new());
+        time += 0.04;
+        let (err_text, retry_pos) = run_banner_frame(&ctx, &mut app, time, Vec::new());
+        assert!(err_text.contains("browser storage is full"));
+        let retry_center = retry_pos.expect("Retry button should render on save error");
+        for pressed in [true, false] {
+            time += 0.02;
+            let _ = run_banner_frame(
+                &ctx,
+                &mut app,
+                time,
+                vec![
+                    egui::Event::PointerMoved(retry_center),
+                    egui::Event::PointerButton {
+                        pos: retry_center,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(retried.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // Multi-tab warning renders when another tab is active.
+        if let Ok(mut guard) = pending_events.lock() {
+            guard.push(WebStorageEvent::Status(WebStorageStatus {
+                backend: WebStorageBackend::IndexedDb,
+                persisted: Some(true),
+                usage_bytes: Some(1024 * 1024),
+                quota_bytes: Some(1024 * 1024 * 1024),
+                in_flight: false,
+                has_unsaved_error: false,
+                quota_exceeded: false,
+                last_error: None,
+                other_tab_active: true,
+                other_tab_wrote: true,
+            }));
+        }
+        time += 0.04;
+        let _ = run_banner_frame(&ctx, &mut app, time, Vec::new());
+        time += 0.04;
+        let (multi_texts, _) = run_banner_frame(&ctx, &mut app, time, Vec::new());
+        assert!(multi_texts.contains("Another PaperCraft tab saved newer changes"));
     }
 }

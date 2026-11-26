@@ -125,6 +125,10 @@ pub struct AccountDraftState {
     pub quick_login_password: String,
     pub quick_login_show_password: bool,
     pub quick_login_error: Option<String>,
+    pub reauth_password: String,
+    pub reauth_show_password: bool,
+    pub reauth_error: Option<String>,
+    pub reauth_pending: bool,
     pub disconnect_notice: Option<String>,
     pub select_local_new_name: String,
     pub select_local_error: Option<String>,
@@ -187,6 +191,10 @@ impl Default for AccountDraftState {
             quick_login_password: String::new(),
             quick_login_show_password: false,
             quick_login_error: None,
+            reauth_password: String::new(),
+            reauth_show_password: false,
+            reauth_error: None,
+            reauth_pending: false,
             disconnect_notice: None,
             select_local_new_name: String::new(),
             select_local_error: None,
@@ -361,6 +369,13 @@ impl AccountDraftState {
         self.quick_login_error = None;
     }
 
+    pub fn clear_reauth_draft(&mut self) {
+        self.reauth_password.clear();
+        self.reauth_show_password = false;
+        self.reauth_error = None;
+        self.reauth_pending = false;
+    }
+
     fn clear_convert_draft(&mut self) {
         self.convert_source_profile_id.clear();
         self.convert_source_nickname.clear();
@@ -395,6 +410,7 @@ impl AccountDraftState {
         self.signup_username.clear();
         self.password_reset = PasswordResetFlowState::default();
         self.clear_quick_login_draft();
+        self.clear_reauth_draft();
         self.clear_convert_draft();
         self.clear_pending_delete_profile();
         self.clear_pending_forget_server();
@@ -440,6 +456,10 @@ impl AccountDraftState {
         self.auth_busy = false;
         self.password_reset.busy = false;
         self.status_message = None;
+        if self.reauth_pending {
+            self.reauth_pending = false;
+            self.reauth_error = Some(message.clone());
+        }
         if self.quick_login_key.is_some() {
             self.quick_login_error = Some(message.clone());
         }
@@ -456,6 +476,7 @@ impl AccountDraftState {
         self.auth_busy = false;
         self.password.clear();
         self.clear_quick_login_draft();
+        self.clear_reauth_draft();
         self.error_message = None;
         self.status_message = None;
         self.profile_section = ProfileSection::ServerLogin;
@@ -557,6 +578,7 @@ impl AccountDraftState {
         self.probe = self.probe_for(&norm);
         self.auth_busy = false;
         self.clear_quick_login_draft();
+        self.clear_reauth_draft();
         self.clear_convert_draft();
         self.clear_pending_delete_profile();
         self.clear_pending_forget_server();
@@ -585,6 +607,7 @@ pub(crate) fn sync_draft_from_session(app: &mut PaperCraftApp) {
     app.view.account.error_message = None;
     app.view.account.status_message = None;
     app.view.account.clear_quick_login_draft();
+    app.view.account.clear_reauth_draft();
     app.view.account.clear_pending_delete_profile();
     app.view.account.clear_pending_forget_server();
     app.view.account.profile_save_busy = false;
@@ -2054,6 +2077,14 @@ fn render_signed_in_body(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens)
         render_signed_in_account_card(app, ui, &summary, cloud_pending, t);
     });
 
+    if app.session.is_session_expired()
+        && let Some(acct) = app.session.active_account_session().cloned()
+    {
+        ui.add_space(6.0);
+        render_expired_session_reauth_box(app, ui, &acct, cloud_pending, "modal_reauth_pw", t);
+        ui.add_space(6.0);
+    }
+
     let mut test_on_enter = false;
     draw_section_card(ui, t, |ui| {
         test_on_enter = render_signed_in_server_card(app, ui, &summary, t);
@@ -2965,9 +2996,161 @@ fn render_active_cloud_account_block(
                     cloud_pending,
                     t,
                 );
+            } else if app.session.is_session_expired() {
+                ui.add_space(6.0);
+                render_expired_session_reauth_box(
+                    app,
+                    ui,
+                    &acct,
+                    cloud_pending,
+                    "profile_reauth_pw",
+                    t,
+                );
             }
         },
     );
+}
+
+fn render_expired_session_reauth_box(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    acct: &papercraft_sync::ActiveAccountSession,
+    cloud_pending: usize,
+    pw_id_salt: &str,
+    t: &Tokens,
+) {
+    let queue_note = match cloud_pending {
+        0 => "Your session expired. Enter your password to resume cloud sync.".to_string(),
+        1 => "Your session expired. 1 offline change is queued locally and will sync as soon as you sign in.".to_string(),
+        n => format!("Your session expired. {n} offline changes are queued locally and will sync as soon as you sign in."),
+    };
+    let server_offline = matches!(
+        app.view.account.probe_for(&acct.server_url),
+        ServerProbeState::Failed { .. }
+    );
+    let busy = app.view.account.auth_busy;
+
+    egui::Frame::new()
+        .fill(t.field_bg)
+        .stroke(Stroke::new(1.0, t.danger_border))
+        .corner_radius(CornerRadius::same(7))
+        .inner_margin(Margin::symmetric(10, 9))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (ir, _) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::hover());
+                paint_icon(ui.painter(), ir, Icon::AlertCircle, t.danger_fg);
+                ui.label(
+                    egui::RichText::new("Session Expired — Sign In Again")
+                        .size(12.0)
+                        .strong()
+                        .color(t.danger_fg),
+                );
+            });
+            ui.add_space(3.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(queue_note)
+                        .size(11.0)
+                        .color(t.text_muted),
+                )
+                .wrap(),
+            );
+            if server_offline {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Server is currently unreachable — reconnect to re-authenticate. Your edits stay safely saved locally.",
+                    )
+                    .size(10.5)
+                    .color(t.warning_fg),
+                );
+            }
+            ui.add_space(6.0);
+            let mut submit_now = false;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let btn_w = 108.0_f32;
+                let input_w = (ui.available_width() - btn_w - 6.0).max(120.0);
+                let pw_resp = draw_password_input(
+                    ui,
+                    pw_id_salt,
+                    input_w,
+                    &mut app.view.account.reauth_password,
+                    &mut app.view.account.reauth_show_password,
+                    t,
+                );
+                if pw_resp.changed {
+                    app.view.account.reauth_error = None;
+                }
+                if pw_resp.enter_pressed && !busy && !server_offline {
+                    submit_now = true;
+                }
+                let can_submit =
+                    !busy && !server_offline && !app.view.account.reauth_password.is_empty();
+                let cta = if busy { "Signing In..." } else { "Sign In & Sync" };
+                if primary_action_button(ui, cta, can_submit, t).clicked() {
+                    submit_now = true;
+                }
+            });
+            if let Some(ref err) = app.view.account.reauth_error {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(err).size(11.0).color(t.danger_fg));
+            }
+            if submit_now && !busy {
+                submit_active_session_reauth(app, ui.ctx(), acct);
+            }
+        });
+}
+
+fn submit_active_session_reauth(
+    app: &mut PaperCraftApp,
+    ctx: &egui::Context,
+    acct: &papercraft_sync::ActiveAccountSession,
+) {
+    let password = app.view.account.reauth_password.clone();
+    if password.is_empty() {
+        app.view.account.reauth_error = Some("Enter your password to resume sync.".to_string());
+        return;
+    }
+    let identifier = acct
+        .user
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| acct.user.username.clone());
+    if identifier.is_empty() {
+        app.view.account.reauth_error =
+            Some("Account session is missing an email or username.".to_string());
+        return;
+    }
+    let norm_url = norm_probe_url_key(&acct.server_url);
+    app.view.account.server_url = norm_url.clone();
+    let _ = app.session.set_server_url_preference(&norm_url);
+    app.view.account.auth_busy = true;
+    app.view.account.reauth_pending = true;
+    app.view.account.reauth_error = None;
+    app.view.account.error_message = None;
+    app.view.account.status_message = Some(format!(
+        "Renewing session for {}...",
+        acct.user.primary_label()
+    ));
+
+    let cmd = SyncWorkerCommand::Login {
+        server_url: norm_url,
+        identifier,
+        password,
+        device_name: app.session.device_name().to_string(),
+    };
+    if !crate::sync_worker::dispatch_command(app, Some(ctx), cmd) {
+        app.view.account.auth_busy = false;
+        app.view.account.reauth_pending = false;
+        app.view.account.status_message = None;
+        app.view.account.reauth_error =
+            Some("Background network worker is unavailable.".to_string());
+    }
 }
 
 fn render_forget_server_account_confirmation(
@@ -5745,6 +5928,46 @@ mod tests {
         assert_eq!(
             app.view.account.status_message.as_deref(),
             Some("Deleted local profile 'SideNotes'.")
+        );
+    }
+
+    #[test]
+    fn expired_session_renders_inline_reauth_form_in_profile() {
+        let ctx = egui::Context::default();
+        let session = papercraft_engine::Session::open_web_cache(None);
+        let mut app = PaperCraftApp::new(session, crate::PlatformHooks::default());
+        app.view.active_modal = None;
+        let acct = test_account("u-reauth-ui", "reauth@example.com");
+        let pull = SyncPullResponse {
+            server_cursor: 1,
+            user: acct.user.clone(),
+            notebooks: Vec::new(),
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        app.session.enter_online_server_session(acct, pull);
+        app.session
+            .execute(
+                "notebook.create",
+                &serde_json::json!({ "title": "Offline Before Expire" }),
+            )
+            .unwrap();
+        app.session
+            .record_session_expired("Session expired".to_string());
+        crate::open_profile_screen(&mut app);
+
+        let (text, _) = render_profile_frames(&ctx, &mut app, 0.0, 3);
+        assert!(
+            text.contains("Session Expired — Sign In Again"),
+            "missing inline expired-session header:\n{text}"
+        );
+        assert!(
+            text.contains("1 offline change is queued locally"),
+            "missing pending offline count in re-auth box:\n{text}"
+        );
+        assert!(
+            text.contains("Sign In & Sync"),
+            "missing Sign In & Sync button:\n{text}"
         );
     }
 }

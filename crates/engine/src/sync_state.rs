@@ -30,6 +30,11 @@ use crate::library::{
     LIBRARY_MARKER_FILE, LibraryInitMode, LibraryState, STUDIO_PREFS_FILE, TrashedNotebook,
     count_ncraft_files_in_dir, seed_starter_library_prefs, starter_documents,
 };
+use crate::web_storage::{
+    WebPersistTracker, WebStorageDelta, WebStorageLoadedState, build_tracker_from_loaded_state,
+    cloud_workspace_key, local_workspace_key, trashed_to_cached_entry,
+    workspace_bundle_to_loaded_meta,
+};
 use crate::{MAX_NOTEBOOKS, Session};
 
 const WEB_CACHE_VERSION: u32 = 4;
@@ -40,6 +45,8 @@ const TRASH_SUBDIR: &str = "trash";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct CachedTrashEntry {
+    #[serde(default)]
+    pub(crate) trash_id: String,
     pub(crate) doc: Document,
     pub(crate) deleted_at_ms: i64,
 }
@@ -70,15 +77,15 @@ pub(crate) struct CachedLibraryBundle {
 /// Persisted browser `localStorage` payload storing offline local profiles, cached cloud
 /// account workspaces, pending sync manifests, and server shortcuts.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct WebWorkspaceCache {
-    version: u32,
-    global: GlobalSyncState,
+pub(crate) struct WebWorkspaceCache {
+    pub(crate) version: u32,
+    pub(crate) global: GlobalSyncState,
     #[serde(default)]
-    guest: Option<CachedLibraryBundle>,
+    pub(crate) guest: Option<CachedLibraryBundle>,
     #[serde(default)]
-    local_profiles: HashMap<String, CachedLibraryBundle>,
+    pub(crate) local_profiles: HashMap<String, CachedLibraryBundle>,
     #[serde(default)]
-    cloud_accounts: HashMap<String, CachedLibraryBundle>,
+    pub(crate) cloud_accounts: HashMap<String, CachedLibraryBundle>,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +95,8 @@ pub(crate) struct SessionSyncState {
     pub(crate) web_cache_enabled: bool,
     pub(crate) web_local_bundles: HashMap<String, CachedLibraryBundle>,
     pub(crate) web_cloud_bundles: HashMap<String, CachedLibraryBundle>,
+    pub(crate) web_tracker: WebPersistTracker,
+    pub(crate) pending_web_delta: WebStorageDelta,
     pub(crate) global: GlobalSyncState,
     /// Active authenticated server session (persisted inside `global.cached_server_sessions` for Offline-First access).
     pub(crate) active_server_session: Option<ActiveAccountSession>,
@@ -104,6 +113,7 @@ pub(crate) struct SessionSyncState {
     pub(crate) last_dirty_at_ms: Option<i64>,
     pub(crate) sync_in_flight: bool,
     pub(crate) network_probed_offline: bool,
+    pub(crate) session_expired: bool,
 }
 
 impl Default for SessionSyncState {
@@ -114,6 +124,8 @@ impl Default for SessionSyncState {
             web_cache_enabled: false,
             web_local_bundles: HashMap::new(),
             web_cloud_bundles: HashMap::new(),
+            web_tracker: WebPersistTracker::default(),
+            pending_web_delta: WebStorageDelta::default(),
             global: GlobalSyncState::with_defaults(default_device_name()),
             active_server_session: None,
             manifest: SyncManifest::default(),
@@ -129,6 +141,7 @@ impl Default for SessionSyncState {
             last_dirty_at_ms: None,
             sync_in_flight: false,
             network_probed_offline: false,
+            session_expired: false,
         }
     }
 }
@@ -139,10 +152,39 @@ impl Session {
         self.sync.desktop_root.is_some() || self.sync.web_cache_enabled
     }
 
+    /// Opens (or initializes) a browser workspace from hydrated IndexedDB state, restoring
+    /// either the last active Offline-First server account cache or the active local profile.
+    pub fn open_web_storage(loaded: Option<WebStorageLoadedState>) -> Self {
+        let Some(mut state) = loaded else {
+            return Self::open_web_cache(None);
+        };
+        sanitize_global_state(&mut state.global);
+        let tracker = build_tracker_from_loaded_state(&state);
+        let mut local_profiles = HashMap::new();
+        let mut cloud_accounts = HashMap::new();
+        for ws in &state.workspaces {
+            let bundle = workspace_bundle_to_loaded_meta(ws);
+            if let Some(pid) = ws.workspace_key.strip_prefix("local:") {
+                local_profiles.insert(pid.to_string(), bundle);
+            } else if let Some(acct_key) = ws.workspace_key.strip_prefix("cloud:") {
+                cloud_accounts.insert(acct_key.to_string(), bundle);
+            }
+        }
+        let mut session = Self::open_web_cache_struct(WebWorkspaceCache {
+            version: WEB_CACHE_VERSION,
+            global: state.global,
+            guest: None,
+            local_profiles,
+            cloud_accounts,
+        });
+        session.sync.web_tracker = tracker;
+        session
+    }
+
     /// Opens (or initializes) a browser workspace, restoring either the last active
     /// Offline-First server account cache or the active local profile.
     pub fn open_web_cache(raw_json: Option<&str>) -> Self {
-        if let Some(mut cache) = raw_json
+        if let Some(cache) = raw_json
             .and_then(|raw| serde_json::from_str::<WebWorkspaceCache>(raw).ok())
             .filter(|c| {
                 matches!(
@@ -154,72 +196,7 @@ impl Session {
                 )
             })
         {
-            sanitize_global_state(&mut cache.global);
-            migrate_web_cache_if_needed(&mut cache);
-
-            if let ActiveWorkspaceTarget::Cloud {
-                ref server_url,
-                ref user_id,
-            } = cache.global.active_workspace
-                && let Some(cached_acct) = cache
-                    .global
-                    .cached_server_session(server_url, user_id)
-                    .cloned()
-            {
-                let key =
-                    cloud_account_cache_key(&cached_acct.server_url, &cached_acct.user.user_id);
-                let bundle = cache.cloud_accounts.get(&key).cloned().unwrap_or_default();
-                let mut session = restore_web_bundle(&bundle);
-                session.sync.global = cache.global;
-                session.sync.web_cache_enabled = true;
-                session.sync.track_manifest = true;
-                session.sync.web_local_bundles = cache.local_profiles;
-                session.sync.web_cloud_bundles = cache.cloud_accounts;
-                session.sync.manifest.owner_id =
-                    Some(OwnerId::CloudUser(cached_acct.user.user_id.clone()));
-                session.sync.active_server_session = Some(cached_acct);
-                session.sync.connection = SyncConnectionState::Offline;
-                session.sync_reconcile_slots();
-                return session;
-            }
-
-            let has_saved =
-                !cache.global.needs_initial_nickname && !cache.global.local_profiles.is_empty();
-            let profile_id = ensure_default_profile_in_global(&mut cache.global);
-            if has_saved || cache.local_profiles.contains_key(&profile_id) {
-                let bundle = cache
-                    .local_profiles
-                    .get(&profile_id)
-                    .cloned()
-                    .unwrap_or_else(starter_web_bundle);
-                let mut session = restore_web_bundle(&bundle);
-                session.sync.global = cache.global;
-                session.sync.active_server_session = None;
-                session.sync.web_cache_enabled = true;
-                session.sync.track_manifest = true;
-                session.sync.web_local_bundles = cache.local_profiles;
-                session.sync.web_cloud_bundles = cache.cloud_accounts;
-                session.sync.connection = SyncConnectionState::SignedOut;
-                session.sync.manifest.owner_id = Some(OwnerId::LocalProfile(profile_id));
-                session.sync_reconcile_slots();
-                return session;
-            }
-
-            let mut session = Self::default();
-            session.replace_notebooks_for_library(starter_documents(), None);
-            seed_starter_library_prefs(&mut session.prefs);
-            cache.global.needs_initial_nickname = true;
-            session.sync.global = cache.global;
-            session.sync.active_server_session = None;
-            session.sync.web_cache_enabled = true;
-            session.sync.track_manifest = true;
-            session.sync.web_local_bundles = cache.local_profiles;
-            session.sync.web_cloud_bundles = cache.cloud_accounts;
-            session.sync.connection = SyncConnectionState::SignedOut;
-            let pid = ensure_default_profile_in_global(&mut session.sync.global);
-            session.sync.manifest.owner_id = Some(OwnerId::LocalProfile(pid));
-            session.sync_reconcile_slots();
-            return session;
+            return Self::open_web_cache_struct(cache);
         }
 
         let mut session = Self::default();
@@ -232,6 +209,74 @@ impl Session {
         session.sync.web_cache_enabled = true;
         session.sync.track_manifest = true;
         session.sync.connection = SyncConnectionState::SignedOut;
+        session.sync.manifest.owner_id = Some(OwnerId::LocalProfile(pid));
+        session.sync_reconcile_slots();
+        session
+    }
+
+    fn open_web_cache_struct(mut cache: WebWorkspaceCache) -> Self {
+        sanitize_global_state(&mut cache.global);
+        migrate_web_cache_if_needed(&mut cache);
+
+        if let ActiveWorkspaceTarget::Cloud {
+            ref server_url,
+            ref user_id,
+        } = cache.global.active_workspace
+            && let Some(cached_acct) = cache
+                .global
+                .cached_server_session(server_url, user_id)
+                .cloned()
+        {
+            let key = cloud_account_cache_key(&cached_acct.server_url, &cached_acct.user.user_id);
+            let bundle = cache.cloud_accounts.get(&key).cloned().unwrap_or_default();
+            let mut session = restore_web_bundle(&bundle);
+            session.sync.global = cache.global;
+            session.sync.web_cache_enabled = true;
+            session.sync.track_manifest = true;
+            session.sync.web_local_bundles = cache.local_profiles;
+            session.sync.web_cloud_bundles = cache.cloud_accounts;
+            session.sync.manifest.owner_id =
+                Some(OwnerId::CloudUser(cached_acct.user.user_id.clone()));
+            session.sync.active_server_session = Some(cached_acct);
+            session.sync.connection = SyncConnectionState::Offline;
+            session.sync_reconcile_slots();
+            return session;
+        }
+
+        let has_saved =
+            !cache.global.needs_initial_nickname && !cache.global.local_profiles.is_empty();
+        let profile_id = ensure_default_profile_in_global(&mut cache.global);
+        if has_saved || cache.local_profiles.contains_key(&profile_id) {
+            let bundle = cache
+                .local_profiles
+                .get(&profile_id)
+                .cloned()
+                .unwrap_or_else(starter_web_bundle);
+            let mut session = restore_web_bundle(&bundle);
+            session.sync.global = cache.global;
+            session.sync.active_server_session = None;
+            session.sync.web_cache_enabled = true;
+            session.sync.track_manifest = true;
+            session.sync.web_local_bundles = cache.local_profiles;
+            session.sync.web_cloud_bundles = cache.cloud_accounts;
+            session.sync.connection = SyncConnectionState::SignedOut;
+            session.sync.manifest.owner_id = Some(OwnerId::LocalProfile(profile_id));
+            session.sync_reconcile_slots();
+            return session;
+        }
+
+        let mut session = Self::default();
+        session.replace_notebooks_for_library(starter_documents(), None);
+        seed_starter_library_prefs(&mut session.prefs);
+        cache.global.needs_initial_nickname = true;
+        session.sync.global = cache.global;
+        session.sync.active_server_session = None;
+        session.sync.web_cache_enabled = true;
+        session.sync.track_manifest = true;
+        session.sync.web_local_bundles = cache.local_profiles;
+        session.sync.web_cloud_bundles = cache.cloud_accounts;
+        session.sync.connection = SyncConnectionState::SignedOut;
+        let pid = ensure_default_profile_in_global(&mut session.sync.global);
         session.sync.manifest.owner_id = Some(OwnerId::LocalProfile(pid));
         session.sync_reconcile_slots();
         session
@@ -280,10 +325,7 @@ impl Session {
         let trash = self
             .trashed_notebooks
             .iter()
-            .map(|entry| CachedTrashEntry {
-                doc: (*entry.doc).clone(),
-                deleted_at_ms: entry.deleted_at_ms,
-            })
+            .map(trashed_to_cached_entry)
             .collect();
         CachedLibraryBundle {
             notebooks,
@@ -765,6 +807,17 @@ impl Session {
         total
     }
 
+    /// Returns `true` when the active cloud session's token expired and needs password re-entry.
+    pub fn is_session_expired(&self) -> bool {
+        self.is_viewing_cloud() && self.sync.session_expired
+    }
+
+    /// Marks the active cloud session expired (`unauthorized`) while keeping all local work safe.
+    pub fn record_session_expired(&mut self, message: String) {
+        self.sync.session_expired = true;
+        self.record_sync_failure(false, message);
+    }
+
     pub fn record_sync_failure(&mut self, offline: bool, message: String) {
         self.sync.sync_in_flight = false;
         self.sync.in_flight_slot_gens.clear();
@@ -788,6 +841,7 @@ impl Session {
         {
             return;
         }
+        self.sync.session_expired = false;
         self.sync.global.server_url = updated.server_url.clone();
         self.sync.global.remember_server_account(&updated);
         self.sync
@@ -828,6 +882,16 @@ impl Session {
             .is_some_and(|root| account_library_dir(root, &clean_uid).exists());
         let web_key = cloud_account_cache_key(&norm_url, &clean_uid);
         let had_web_cache = self.sync.web_cloud_bundles.remove(&web_key).is_some();
+        if self.sync.web_cache_enabled {
+            let ws_key = cloud_workspace_key(&norm_url, &clean_uid);
+            self.sync.web_tracker.workspaces.remove(&ws_key);
+            let mut del = WebStorageDelta {
+                urgent: true,
+                ..Default::default()
+            };
+            del.delete_workspaces.insert(ws_key);
+            self.sync.pending_web_delta.merge(del);
+        }
 
         let removed_shortcut = self
             .sync
@@ -975,6 +1039,8 @@ impl Session {
         self.sync.last_error = None;
         self.sync.last_conflict_notice = None;
         self.sync.sync_in_flight = false;
+        self.sync.network_probed_offline = false;
+        self.sync.session_expired = false;
         self.sync.in_flight_slot_gens.clear();
         self.sync.last_dirty_at_ms = None;
         self.sync.global.active_workspace = ActiveWorkspaceTarget::Local;
@@ -1034,6 +1100,7 @@ impl Session {
         next.sync.connection = SyncConnectionState::Offline;
         next.sync.network_probed_offline = self.sync.network_probed_offline;
         next.sync.sync_in_flight = false;
+        next.sync.session_expired = false;
         next.sync.last_error = None;
         next.sync.last_conflict_notice = None;
         *self = next;
@@ -1098,6 +1165,7 @@ impl Session {
         next.sync.connection = SyncConnectionState::Synced;
         next.sync.network_probed_offline = false;
         next.sync.sync_in_flight = false;
+        next.sync.session_expired = false;
         next.sync.last_error = None;
         next.sync.last_conflict_notice = None;
 
@@ -1118,6 +1186,8 @@ impl Session {
         let keep_web_enabled = self.sync.web_cache_enabled;
         let keep_web_locals = self.sync.web_local_bundles.clone();
         let keep_web_clouds = self.sync.web_cloud_bundles.clone();
+        let keep_web_tracker = self.sync.web_tracker.clone();
+        let keep_web_delta = self.sync.pending_web_delta.clone();
         let keep_global = self.sync.global.clone();
         let uid = auth.user.user_id.clone();
         let owner = OwnerId::CloudUser(uid.clone());
@@ -1130,6 +1200,8 @@ impl Session {
             next.sync.web_cache_enabled = keep_web_enabled;
             next.sync.web_local_bundles = keep_web_locals;
             next.sync.web_cloud_bundles = keep_web_clouds;
+            next.sync.web_tracker = keep_web_tracker;
+            next.sync.pending_web_delta = keep_web_delta;
             next.sync.global = keep_global;
             next.sync.track_manifest = true;
             next.sync_init_from_disk(is_placeholder, owner);
@@ -1161,6 +1233,8 @@ impl Session {
             next.sync.web_cache_enabled = true;
             next.sync.web_local_bundles = keep_web_locals;
             next.sync.web_cloud_bundles = keep_web_clouds;
+            next.sync.web_tracker = keep_web_tracker;
+            next.sync.pending_web_delta = keep_web_delta;
             next.sync.global = keep_global;
             next.sync.track_manifest = true;
             next.sync.manifest.owner_id = Some(owner);
@@ -1204,6 +1278,7 @@ impl Session {
     fn exit_active_cloud_workspace_to_local(&mut self) -> bool {
         self.sync.active_server_session = None;
         self.sync.sync_in_flight = false;
+        self.sync.session_expired = false;
         self.sync.in_flight_slot_gens.clear();
         self.sync.last_error = None;
         self.sync.last_conflict_notice = None;
@@ -1216,6 +1291,8 @@ impl Session {
         let keep_web_enabled = self.sync.web_cache_enabled;
         let keep_web_bundles = self.sync.web_local_bundles.clone();
         let keep_web_clouds = self.sync.web_cloud_bundles.clone();
+        let keep_web_tracker = std::mem::take(&mut self.sync.web_tracker);
+        let keep_web_delta = std::mem::take(&mut self.sync.pending_web_delta);
         let mut keep_global = self.sync.global.clone();
         if keep_global.local_profiles.is_empty() {
             keep_global.needs_initial_nickname = true;
@@ -1232,6 +1309,8 @@ impl Session {
         next.sync.web_cache_enabled = keep_web_enabled;
         next.sync.web_local_bundles = keep_web_bundles;
         next.sync.web_cloud_bundles = keep_web_clouds;
+        next.sync.web_tracker = keep_web_tracker;
+        next.sync.pending_web_delta = keep_web_delta;
         next.sync.global = keep_global;
         next.sync.track_manifest = true;
         next.sync.slot_ids.clear();
@@ -1368,6 +1447,16 @@ impl Session {
             let key = cloud_account_cache_key(&auth.server_url, &auth.user.user_id);
             self.sync.web_cloud_bundles.insert(key, bundle);
         }
+        if self.sync.web_cache_enabled {
+            let old_ws_key = local_workspace_key(source_profile_id);
+            self.sync.web_tracker.workspaces.remove(&old_ws_key);
+            let mut del = WebStorageDelta {
+                urgent: true,
+                ..Default::default()
+            };
+            del.delete_workspaces.insert(old_ws_key);
+            self.sync.pending_web_delta.merge(del);
+        }
 
         if let Some(pos) = self
             .sync
@@ -1443,7 +1532,7 @@ impl Session {
         self.flush_active_workspace_to_storage();
     }
 
-    fn sync_flush_dirty_flags_to_manifest(&mut self) {
+    pub(crate) fn sync_flush_dirty_flags_to_manifest(&mut self) {
         self.sync_active_notebook_slot();
         if !self.sync.track_manifest {
             return;
@@ -1480,6 +1569,7 @@ impl Session {
         let _ = self.save_prefs();
         self.sync_persist_manifest();
         self.save_current_web_bundle();
+        self.capture_active_web_delta_into_pending(true);
     }
 
     fn load_local_profile_workspace(&mut self, profile_id: &str) {
@@ -1489,6 +1579,8 @@ impl Session {
             let keep_web_enabled = self.sync.web_cache_enabled;
             let keep_web_locals = self.sync.web_local_bundles.clone();
             let keep_web_clouds = self.sync.web_cloud_bundles.clone();
+            let keep_web_tracker = std::mem::take(&mut self.sync.web_tracker);
+            let keep_web_delta = std::mem::take(&mut self.sync.pending_web_delta);
             let prof_dir = profile_library_dir(&root, profile_id);
             let (next_session, is_placeholder) =
                 Self::open_library_mode(prof_dir, LibraryInitMode::EmptyClean);
@@ -1497,6 +1589,8 @@ impl Session {
             self.sync.web_cache_enabled = keep_web_enabled;
             self.sync.web_local_bundles = keep_web_locals;
             self.sync.web_cloud_bundles = keep_web_clouds;
+            self.sync.web_tracker = keep_web_tracker;
+            self.sync.pending_web_delta = keep_web_delta;
             self.sync.track_manifest = true;
             self.sync.global = keep_global;
             self.sync.active_server_session = None;
@@ -1519,6 +1613,8 @@ impl Session {
             next.sync.track_manifest = true;
             next.sync.web_local_bundles = self.sync.web_local_bundles.clone();
             next.sync.web_cloud_bundles = self.sync.web_cloud_bundles.clone();
+            next.sync.web_tracker = std::mem::take(&mut self.sync.web_tracker);
+            next.sync.pending_web_delta = std::mem::take(&mut self.sync.pending_web_delta);
             next.sync.connection = SyncConnectionState::SignedOut;
             next.sync.manifest.owner_id = Some(owner);
             *self = next;
@@ -1604,6 +1700,16 @@ impl Session {
 
     fn remove_local_profile_disk_and_web_data(&mut self, profile_id: &str) {
         self.sync.web_local_bundles.remove(profile_id);
+        if self.sync.web_cache_enabled {
+            let ws_key = local_workspace_key(profile_id);
+            self.sync.web_tracker.workspaces.remove(&ws_key);
+            let mut del = WebStorageDelta {
+                urgent: true,
+                ..Default::default()
+            };
+            del.delete_workspaces.insert(ws_key);
+            self.sync.pending_web_delta.merge(del);
+        }
         if let Some(ref root) = self.sync.desktop_root {
             let dir = profile_library_dir(root, profile_id);
             if dir.exists() {
@@ -1803,10 +1909,13 @@ impl Session {
         self.sync.manifest.last_sync_at_ms = Some(outcome.synced_at_ms);
         self.sync.network_probed_offline = false;
         self.sync.sync_in_flight = false;
+        self.sync.session_expired = false;
         self.sync.connection = SyncConnectionState::Synced;
         self.sync.last_error = None;
         if self.compute_pending_changes_fast() == 0 {
             self.sync.last_dirty_at_ms = None;
+        } else {
+            self.sync.last_dirty_at_ms.get_or_insert_with(now_unix_ms);
         }
 
         self.flush_active_workspace_to_storage();
@@ -2027,7 +2136,7 @@ impl Session {
         self.sync_persist_manifest();
     }
 
-    fn sync_reconcile_folders(&mut self) {
+    pub(crate) fn sync_reconcile_folders(&mut self) {
         if !self.sync.track_manifest {
             return;
         }
@@ -2382,6 +2491,23 @@ impl Session {
                     .is_some_and(|m| m.cloud_dirty && cur_hash != m.last_synced_hash);
 
             if local_changed && cur_hash != update.content_hash {
+                let server_unchanged =
+                    self.sync
+                        .manifest
+                        .meta(&update.notebook_id)
+                        .is_some_and(|m| {
+                            m.server_version > 0
+                                && m.server_version == update.version
+                                && m.last_synced_hash == update.content_hash
+                        });
+                if server_unchanged {
+                    self.sync
+                        .manifest
+                        .mark_notebook_dirty(&update.notebook_id, "");
+                    self.sync.slot_dirty_hash[idx] = true;
+                    self.sync.last_dirty_at_ms = Some(now_unix_ms());
+                    return false;
+                }
                 let local_body = canonical_document_body_hash(&self.notebooks[idx]);
                 let remote_body = canonical_document_body_hash(&doc);
                 if local_body == remote_body {
@@ -2733,7 +2859,7 @@ fn count_non_placeholder_slots(total: usize, placeholders: &[bool]) -> usize {
         .count()
 }
 
-fn ensure_default_profile_in_global(global: &mut GlobalSyncState) -> String {
+pub(crate) fn ensure_default_profile_in_global(global: &mut GlobalSyncState) -> String {
     if let Some(active) = global.active_local_profile() {
         let id = active.local_profile_id.clone();
         if global.active_local_profile_id != id {
@@ -2753,7 +2879,7 @@ fn ensure_default_profile_in_global(global: &mut GlobalSyncState) -> String {
     id
 }
 
-fn cloud_account_cache_key(server_url: &str, user_id: &str) -> String {
+pub(crate) fn cloud_account_cache_key(server_url: &str, user_id: &str) -> String {
     let norm = normalize_server_url(server_url).unwrap_or_else(|_| server_url.trim().to_string());
     format!("{norm}|{}", sanitize_account_dir_segment(user_id))
 }
@@ -3006,7 +3132,7 @@ fn migrate_legacy_root_library(root_dir: &Path, target_dir: &Path) {
     }
 }
 
-fn migrate_web_cache_if_needed(cache: &mut WebWorkspaceCache) {
+pub(crate) fn migrate_web_cache_if_needed(cache: &mut WebWorkspaceCache) {
     if cache.local_profiles.is_empty()
         && !cache.global.needs_initial_nickname
         && let Some(guest_bundle) = cache.guest.take()
@@ -3027,7 +3153,7 @@ fn sanitize_welcome_version(raw: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
-fn sanitize_global_state(global: &mut GlobalSyncState) {
+pub(crate) fn sanitize_global_state(global: &mut GlobalSyncState) {
     global.server_url =
         normalize_server_url(&global.server_url).unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string());
     global.device_name = sanitize_device_name(&global.device_name);
@@ -3110,6 +3236,11 @@ fn restore_web_bundle(bundle: &CachedLibraryBundle) -> Session {
             d.sync_active_to_pages();
             d.load_active_from_pages();
             TrashedNotebook {
+                trash_id: if entry.trash_id.trim().is_empty() {
+                    Uuid::new_v4().to_string()
+                } else {
+                    entry.trash_id.clone()
+                },
                 doc: Arc::new(d),
                 deleted_at_ms: entry.deleted_at_ms,
                 path: None,
@@ -4306,5 +4437,94 @@ mod tests {
         let web_reopened = Session::open_web_cache(Some(&exported));
         assert!(web_reopened.is_viewing_cloud());
         assert_eq!(web_reopened.cloud_pending_changes_count(), 1);
+    }
+
+    #[test]
+    fn reauthenticating_expired_session_keeps_offline_edits_without_false_conflicts() {
+        let mut session = Session::open_web_cache(None);
+        let acct = fake_account("u-exp", "expired@example.com", "expired");
+        let synced_doc = Document {
+            id: "nb-exp".to_string(),
+            title: "Lecture Notes".to_string(),
+            pages: vec![
+                papercraft_doc::NotebookPage::new(
+                    1000,
+                    1400,
+                    papercraft_doc::PaperTemplate::Blank,
+                    papercraft_doc::PaperColor::default(),
+                ),
+                papercraft_doc::NotebookPage::new(
+                    1000,
+                    1400,
+                    papercraft_doc::PaperTemplate::RuledNarrow,
+                    papercraft_doc::PaperColor::default(),
+                ),
+            ],
+            ..Default::default()
+        };
+        let remote_record = RemoteNotebookRecord {
+            notebook_id: "nb-exp".to_string(),
+            version: 1,
+            cursor: 1,
+            deleted: false,
+            updated_at_ms: 1000,
+            deleted_at_ms: None,
+            title: "Lecture Notes".to_string(),
+            content_hash: canonical_document_hash(&synced_doc),
+            body_hash: canonical_document_body_hash(&synced_doc),
+            meta_hash: canonical_document_meta_hash(&synced_doc),
+            meta_updated_at_ms: 1000,
+            document: Some(synced_doc),
+        };
+        let pull = SyncPullResponse {
+            server_cursor: 1,
+            user: acct.user.clone(),
+            notebooks: vec![remote_record.clone()],
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        session.enter_online_server_session(acct.clone(), pull);
+        assert_eq!(session.cloud_pending_changes_count(), 0);
+
+        // Token expires and user continues editing offline (including deleting a page & attaching a PDF).
+        session.record_session_expired("Session expired".to_string());
+        assert!(session.is_session_expired());
+
+        let mut edited = (*session.notebooks[0]).clone();
+        edited.title = "Edited Offline".to_string();
+        edited.pages.pop();
+        edited.pdf_documents.push(papercraft_doc::EmbeddedPdf {
+            name: "Slides.pdf".to_string(),
+            bytes: std::sync::Arc::new(b"%PDF-1.4\n".to_vec()),
+        });
+        edited.sync_active_to_pages();
+        session.notebooks[0] = std::sync::Arc::new(edited);
+        session.doc = std::sync::Arc::clone(&session.notebooks[0]);
+        session.sync_mark_slot_dirty(0);
+
+        // User enters password again: server returns the unchanged v1 record in initial_pull.
+        let reauth_pull = SyncPullResponse {
+            server_cursor: 1,
+            user: acct.user.clone(),
+            notebooks: vec![remote_record],
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        session.enter_online_server_session(acct, reauth_pull);
+
+        assert!(!session.is_session_expired());
+        assert_eq!(
+            session.notebooks.len(),
+            1,
+            "re-auth must NOT create a spurious Conflict Copy when the server version did not change"
+        );
+        assert_eq!(session.notebooks[0].title, "Edited Offline");
+        assert_eq!(session.notebooks[0].pages.len(), 1);
+        assert_eq!(session.notebooks[0].pdf_documents.len(), 1);
+        assert_eq!(session.cloud_pending_changes_count(), 1);
+        assert!(session.last_dirty_at_ms().is_some());
+        let batch = session.prepare_sync_batch().unwrap();
+        assert_eq!(batch.local_docs.len(), 1);
+        assert_eq!(batch.local_docs[0].base_version, 1);
     }
 }

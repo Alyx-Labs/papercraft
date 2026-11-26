@@ -625,6 +625,7 @@ pub(crate) fn editor_sync_status_indicator(
     summary: &papercraft_sync::SyncStatusSummary,
     pending: usize,
     in_flight: bool,
+    session_expired: bool,
     t: &Tokens,
 ) -> (&'static str, Color32, Color32, String) {
     if !summary.viewing_cloud {
@@ -637,6 +638,16 @@ pub(crate) fn editor_sync_status_indicator(
             t.tab_strip_fg_muted,
             t.tab_strip_fg_muted,
             format!("Local account '{prof}' — saved on this device. Click to open Accounts."),
+        );
+    }
+    if session_expired {
+        return (
+            "Session expired — sign in to sync",
+            t.danger_fg,
+            t.danger_fg,
+            format!(
+                "Session expired ({pending} queued locally). Click to enter your password and sync your offline changes."
+            ),
         );
     }
     match summary.connection {
@@ -705,8 +716,13 @@ fn draw_editor_status_indicator(
     let summary = app.session.sync_status_summary();
     let pending = app.session.cloud_pending_changes_count();
     let in_flight = app.session.is_sync_in_flight();
-    let (label, dot_color, text_color, tooltip) =
-        editor_sync_status_indicator(&summary, pending, in_flight, t);
+    let (label, dot_color, text_color, tooltip) = editor_sync_status_indicator(
+        &summary,
+        pending,
+        in_flight,
+        app.session.is_session_expired(),
+        t,
+    );
 
     let galley =
         ui.painter()
@@ -1080,6 +1096,14 @@ mod tests {
         assert!(
             offline_text.contains("Offline — changes saved locally"),
             "missing offline editor indicator in:\n{offline_text}"
+        );
+
+        app.session
+            .record_session_expired("Session expired".to_string());
+        let expired_text = collect_top_text(&mut app);
+        assert!(
+            expired_text.contains("Session expired — sign in to sync"),
+            "missing expired-session editor indicator in:\n{expired_text}"
         );
     }
 }
