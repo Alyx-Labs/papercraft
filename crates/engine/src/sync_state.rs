@@ -582,9 +582,10 @@ impl Session {
                 ))
     }
 
-    /// Returns `true` when the Initial Access / Account Picker modal should appear on startup.
+    /// Returns `true` when the startup account picker modal should appear on startup
+    /// (requires persistence enabled, at least one saved local/server account, and skip unchecked).
     pub fn should_show_startup_account_picker(&self) -> bool {
-        if !self.is_sync_persistence_enabled() {
+        if !self.is_sync_persistence_enabled() || !self.has_any_saved_accounts() {
             return false;
         }
         self.needs_initial_nickname() || !self.sync.global.skip_account_picker_on_startup
@@ -4827,7 +4828,11 @@ mod tests {
         let dir = temp_dir("startup_picker_pref");
         let mut session = Session::open_desktop_library(dir.0.clone());
         assert!(!session.skip_account_picker_on_startup());
-        assert!(session.should_show_startup_account_picker());
+        assert!(session.needs_initial_nickname());
+        assert!(
+            !session.has_any_saved_accounts() && !session.should_show_startup_account_picker(),
+            "clean first-time install with 0 saved accounts must use the simple nickname prompt, not the account picker"
+        );
 
         session
             .execute(
@@ -4835,6 +4840,7 @@ mod tests {
                 &json!({ "nickname": "Alex" }),
             )
             .unwrap();
+        assert!(session.has_any_saved_accounts());
         assert!(session.should_show_startup_account_picker());
 
         session

@@ -26,7 +26,7 @@ use crate::theme::Tokens;
 
 const HEADER_ROW_HEIGHT: f32 = TOOLBAR_CONTROL_HEIGHT;
 const HEADER_BADGE_SIZE: f32 = 28.0;
-const MAX_CONTENT_WIDTH: f32 = 940.0;
+const MAX_CONTENT_WIDTH: f32 = 1080.0;
 
 /// Renders the dedicated Profile & Cloud Sync screen.
 pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
@@ -1093,7 +1093,7 @@ mod tests {
         app.view.account.server_switch_form_open = true;
         let switch_form_text = render_profile_text(&ctx, &mut app);
         assert!(
-            switch_form_text.contains("Have a recovery code from the server?"),
+            switch_form_text.contains("Create Account") && switch_form_text.contains("Email"),
             "{switch_form_text}"
         );
 

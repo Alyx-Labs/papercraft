@@ -682,11 +682,16 @@ pub(crate) fn complete_forget_server_account(
         app.view.screen = crate::AppScreen::Home;
         app.view.profile_return_screen = crate::AppScreen::Home;
         finish_workspace_switch(app, ctx);
-        crate::modal::open(app, crate::modal::ActiveModal::SelectLocalAccount);
+        let next_modal = if app.session.has_any_saved_accounts() {
+            crate::modal::ActiveModal::SelectLocalAccount
+        } else {
+            crate::modal::ActiveModal::FirstAccessNickname
+        };
+        crate::modal::open(app, next_modal);
     } else {
         app.flush_web_storage(true);
         if app.session.needs_initial_nickname() && !app.session.has_any_saved_accounts() {
-            crate::modal::open(app, crate::modal::ActiveModal::SelectLocalAccount);
+            crate::modal::open(app, crate::modal::ActiveModal::FirstAccessNickname);
         }
     }
     app.view.account.error_message = None;
@@ -834,7 +839,12 @@ pub(crate) fn complete_sign_out(app: &mut PaperCraftApp, ctx: &egui::Context) {
     app.view.account.disconnect_notice = None;
     app.view.account.reset_after_sign_out(&prev_url);
     finish_workspace_switch(app, ctx);
-    crate::modal::open(app, crate::modal::ActiveModal::SelectLocalAccount);
+    let next_modal = if app.session.has_any_saved_accounts() {
+        crate::modal::ActiveModal::SelectLocalAccount
+    } else {
+        crate::modal::ActiveModal::FirstAccessNickname
+    };
+    crate::modal::open(app, next_modal);
 }
 
 fn handle_health_ok_reconnect(app: &mut PaperCraftApp, ctx: &egui::Context, server_url: &str) {
@@ -2234,7 +2244,7 @@ mod tests {
             Some(crate::modal::ActiveModal::SelectLocalAccount)
         );
 
-        // Forgetting that last server account drops saved accounts to 0 -> keeps unified SelectLocalAccount open.
+        // Forgetting that last server account drops saved accounts to 0 -> opens FirstAccessNickname.
         complete_forget_server_account(
             &mut app,
             &ctx,
@@ -2246,7 +2256,7 @@ mod tests {
         assert!(!app.session.has_any_saved_accounts());
         assert_eq!(
             app.view.active_modal,
-            Some(crate::modal::ActiveModal::SelectLocalAccount)
+            Some(crate::modal::ActiveModal::FirstAccessNickname)
         );
     }
 

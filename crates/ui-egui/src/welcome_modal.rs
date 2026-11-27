@@ -136,13 +136,15 @@ fn load_illustration_texture(
     Some(tex)
 }
 
-/// Marks the welcome banner as seen and advances to the startup account picker if configured.
+/// Marks the welcome banner as seen and advances to initial setup or the startup account picker.
 pub(crate) fn dismiss(app: &mut PaperCraftApp) {
     let _ = app
         .session
         .execute("profile.dismissWelcomeBanner", &serde_json::json!({}));
     app.flush_web_storage(true);
-    if app.session.should_show_startup_account_picker() {
+    if app.session.needs_initial_nickname() && !app.session.has_any_saved_accounts() {
+        crate::modal::open(app, ActiveModal::FirstAccessNickname);
+    } else if app.session.should_show_startup_account_picker() {
         app.view.account.profile_probe_pending = true;
         crate::modal::open(app, ActiveModal::SelectLocalAccount);
     } else {
@@ -726,7 +728,10 @@ mod tests {
 
         dismiss(&mut app);
         assert!(!app.session.should_show_welcome_banner());
-        assert_eq!(app.view.active_modal, Some(ActiveModal::SelectLocalAccount));
+        assert_eq!(
+            app.view.active_modal,
+            Some(ActiveModal::FirstAccessNickname)
+        );
 
         app.session
             .execute(
@@ -877,6 +882,9 @@ mod tests {
             out.drop_without_applying_deltas();
         }
         assert!(!app.session.should_show_welcome_banner());
-        assert_eq!(app.view.active_modal, Some(ActiveModal::SelectLocalAccount));
+        assert_eq!(
+            app.view.active_modal,
+            Some(ActiveModal::FirstAccessNickname)
+        );
     }
 }

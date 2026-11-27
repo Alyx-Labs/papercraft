@@ -1173,9 +1173,11 @@ impl PaperCraftApp {
         };
         let initial_modal = if session.should_show_welcome_banner() {
             Some(modal::ActiveModal::WelcomeBanner)
+        } else if session.needs_initial_nickname() && !session.has_any_saved_accounts() {
+            account.select_local_focus_pending = true;
+            Some(modal::ActiveModal::FirstAccessNickname)
         } else if session.should_show_startup_account_picker() {
             account.profile_probe_pending = true;
-            account.select_local_focus_pending = !session.has_any_saved_accounts();
             Some(modal::ActiveModal::SelectLocalAccount)
         } else {
             None
@@ -2395,7 +2397,8 @@ impl PaperCraftApp {
                 if matches!(
                     self.view.active_modal,
                     Some(
-                        modal::ActiveModal::WelcomeBanner
+                        modal::ActiveModal::FirstAccessNickname
+                            | modal::ActiveModal::WelcomeBanner
                             | modal::ActiveModal::FirstNotebookDataNotice
                     )
                 ) || (self.view.active_modal == Some(modal::ActiveModal::ConvertLocalAccount)
