@@ -18,6 +18,7 @@ use crate::icons::{Icon, SwitchLayout, SwitchOption, paint_icon, segmented_switc
 use crate::modal::{danger_action_button, primary_action_button, secondary_action_button};
 use crate::sync_worker::{
     SyncWorkerCommand, complete_forget_server_account, complete_sign_out,
+    create_local_account_and_switch, finish_workspace_switch, prepare_workspace_switch,
     switch_to_local_account_clean, trigger_manual_sync,
 };
 use crate::theme::Tokens;
@@ -37,9 +38,24 @@ pub enum AuthTab {
 pub enum ProfileSection {
     #[default]
     Accounts,
-    ServerLogin,
+    ServerSync,
     Profile,
-    Security,
+    Backup,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingUnsyncedSwitchTarget {
+    AuthForm,
+    QuickLogin { server_url: String, user_id: String },
+    PasswordReset,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingUnsyncedSwitch {
+    pub outgoing_label: String,
+    pub pending_count: usize,
+    pub target_label: String,
+    pub target: PendingUnsyncedSwitchTarget,
 }
 
 #[derive(Clone, Debug)]
@@ -83,7 +99,10 @@ pub enum ServerProbeState {
     Connected {
         server_url: String,
         version: String,
+        protocol_version: u32,
         registration_open: bool,
+        storage_engine: String,
+        max_notebook_bytes: usize,
     },
     Failed {
         server_url: String,
@@ -133,7 +152,11 @@ pub struct AccountDraftState {
     pub disconnect_notice: Option<String>,
     pub select_local_new_name: String,
     pub select_local_error: Option<String>,
+    pub select_local_focus_pending: bool,
     pub selector_other_server_open: bool,
+    pub server_switch_form_open: bool,
+    pub pending_unsynced_switch: Option<PendingUnsyncedSwitch>,
+    pub local_profile_rename_draft: String,
     pub convert_source_profile_id: String,
     pub convert_source_nickname: String,
     pub convert_source_notebook_count: usize,
@@ -201,7 +224,11 @@ impl Default for AccountDraftState {
             disconnect_notice: None,
             select_local_new_name: String::new(),
             select_local_error: None,
+            select_local_focus_pending: false,
             selector_other_server_open: false,
+            server_switch_form_open: false,
+            pending_unsynced_switch: None,
+            local_profile_rename_draft: String::new(),
             convert_source_profile_id: String::new(),
             convert_source_nickname: String::new(),
             convert_source_notebook_count: 0,
@@ -298,7 +325,10 @@ impl AccountDraftState {
         let state = ServerProbeState::Connected {
             server_url: norm.clone(),
             version: info.version,
+            protocol_version: info.protocol_version,
             registration_open: info.registration_open,
+            storage_engine: info.storage_engine,
+            max_notebook_bytes: info.max_notebook_bytes,
         };
         self.server_probes.insert(norm.clone(), state.clone());
         if urls_match(&self.server_url, &norm) {
@@ -396,6 +426,22 @@ impl AccountDraftState {
         self.convert_focus_pending = false;
     }
 
+    pub fn clear_pending_unsynced_switch(&mut self) {
+        self.pending_unsynced_switch = None;
+    }
+
+    pub fn clear_auth_form_credentials(&mut self) {
+        self.email_or_username.clear();
+        self.signup_username.clear();
+        self.display_name.clear();
+        self.password.clear();
+        self.show_password = false;
+        self.error_message = None;
+        self.status_message = None;
+        self.clear_pending_unsynced_switch();
+        self.exit_password_reset_flow();
+    }
+
     /// Applies successful login/registration feedback to the draft state.
     pub fn apply_auth_ok(&mut self, server_url: &str, label: &str) {
         let norm = norm_probe_url_key(server_url);
@@ -403,7 +449,10 @@ impl AccountDraftState {
             let connected = ServerProbeState::Connected {
                 server_url: norm.clone(),
                 version: String::new(),
+                protocol_version: 1,
                 registration_open: true,
+                storage_engine: String::new(),
+                max_notebook_bytes: 0,
             };
             self.server_probes.insert(norm.clone(), connected.clone());
             if urls_match(&self.server_url, &norm) {
@@ -411,7 +460,10 @@ impl AccountDraftState {
             }
         }
         self.auth_busy = false;
+        self.email_or_username.clear();
+        self.display_name.clear();
         self.password.clear();
+        self.show_password = false;
         self.signup_username.clear();
         self.password_reset = PasswordResetFlowState::default();
         self.clear_quick_login_draft();
@@ -419,7 +471,9 @@ impl AccountDraftState {
         self.clear_convert_draft();
         self.clear_pending_delete_profile();
         self.clear_pending_forget_server();
+        self.clear_pending_unsynced_switch();
         self.selector_other_server_open = false;
+        self.server_switch_form_open = false;
         self.profile_save_busy = false;
         self.change_password_busy = false;
         self.current_password_draft.clear();
@@ -485,7 +539,9 @@ impl AccountDraftState {
         self.clear_reauth_draft();
         self.error_message = None;
         self.status_message = None;
-        self.profile_section = ProfileSection::ServerLogin;
+        self.profile_section = ProfileSection::ServerSync;
+        self.server_switch_form_open = true;
+        self.clear_pending_unsynced_switch();
         self.password_reset.active = true;
         self.password_reset.identifier = identifier;
         self.password_reset.code_preverified = prefill_code.is_some();
@@ -588,8 +644,14 @@ impl AccountDraftState {
         self.clear_convert_draft();
         self.clear_pending_delete_profile();
         self.clear_pending_forget_server();
+        self.clear_pending_unsynced_switch();
         self.selector_other_server_open = false;
+        self.server_switch_form_open = false;
         self.password_reset = PasswordResetFlowState::default();
+        self.email_or_username.clear();
+        self.display_name.clear();
+        self.password.clear();
+        self.show_password = false;
         self.signup_username.clear();
         self.edit_display_name.clear();
         self.edit_username.clear();
@@ -607,13 +669,21 @@ impl AccountDraftState {
 }
 
 pub(crate) fn sync_draft_from_session(app: &mut PaperCraftApp) {
-    app.view.account.server_url = app.session.server_url().to_string();
+    app.view.account.server_url = app.session.preferred_server_url().to_string();
     app.view
         .account
         .sync_identity_from_session(app.session.active_account_session());
+    app.view.account.local_profile_rename_draft = app
+        .session
+        .active_local_profile()
+        .map(|p| p.nickname.clone())
+        .unwrap_or_default();
     app.view.account.error_message = None;
     app.view.account.status_message = None;
+    app.view.account.select_local_error = None;
     app.view.account.selector_other_server_open = false;
+    app.view.account.server_switch_form_open = false;
+    app.view.account.clear_pending_unsynced_switch();
     app.view.account.clear_quick_login_draft();
     app.view.account.clear_reauth_draft();
     app.view.account.clear_pending_delete_profile();
@@ -632,6 +702,7 @@ pub(crate) fn sync_draft_from_session(app: &mut PaperCraftApp) {
 pub(crate) fn probe_all_known_servers(app: &mut PaperCraftApp, ctx: &egui::Context) {
     let mut targets = BTreeSet::new();
     targets.insert(norm_probe_url_key(app.session.server_url()));
+    targets.insert(norm_probe_url_key(app.session.preferred_server_url()));
     if !app.view.account.server_url.trim().is_empty() {
         targets.insert(norm_probe_url_key(&app.view.account.server_url));
     }
@@ -702,108 +773,61 @@ pub(crate) fn render_footer(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Toke
     }
 }
 
-pub(crate) fn render_first_access_body(
+pub(crate) fn render_startup_picker_checkbox(
     app: &mut PaperCraftApp,
     ui: &mut egui::Ui,
     t: &Tokens,
-) -> bool {
-    let mut submitted = false;
-    ui.spacing_mut().item_spacing.y = 0.0;
-
-    if let Some(ref notice) = app.view.account.disconnect_notice {
-        draw_status_banner(ui, BannerTone::Error, notice, t);
-        ui.add_space(10.0);
+    show_settings_hint: bool,
+) {
+    if !app.session.is_sync_persistence_enabled() {
+        return;
     }
+    let mut skip = app.session.skip_account_picker_on_startup();
+    let changed = ui
+        .checkbox(
+            &mut skip,
+            egui::RichText::new("Remember last account and skip on startup")
+                .size(12.0)
+                .color(t.text),
+        )
+        .changed();
+    if changed {
+        let _ = app
+            .session
+            .execute("profile.setStartupPicker", &json!({ "skip": skip }));
+        app.flush_web_storage(true);
+    }
+    let hint = if show_settings_hint {
+        "When checked, PaperCraft opens your most recent account immediately on launch. Leave unchecked to choose between local and server accounts at startup."
+    } else {
+        "You can change this anytime in Profile & Cloud Sync → Accounts."
+    };
+    ui.add(egui::Label::new(egui::RichText::new(hint).size(10.5).color(t.text_muted)).wrap());
+}
 
-    draw_section_card(ui, t, |ui| {
-        draw_field_label_row(
+pub(crate) fn draw_account_type_badge(ui: &mut egui::Ui, connected_to_server: bool, t: &Tokens) {
+    if connected_to_server {
+        draw_pill_badge(
             ui,
-            "Nickname",
-            FieldHint::Muted("Used only to identify this local workspace"),
-            t,
-        );
-        ui.add_space(6.0);
-        let resp = draw_text_input(
-            ui,
-            InputFieldSpec {
-                id_salt: "first_access_nickname_input",
-                width: ui.available_width(),
-                hint: "e.g. Jordan or Alyx",
-                border_color: None,
-                trailing: InputTrailing::None,
+            PillStyle {
+                fill: t.accent_soft,
+                border: t.accent.gamma_multiply(0.5),
+                fg: t.accent,
+                icon: PillIcon::Vector(Icon::Server),
             },
-            &mut app.view.first_access_nickname,
-            t,
+            "Connected to Server",
         );
-        if app.view.first_access_focus_pending {
-            ui.memory_mut(|m| {
-                m.request_focus(ui.make_persistent_id("first_access_nickname_input"))
-            });
-            app.view.first_access_focus_pending = false;
-        }
-        if resp.changed {
-            app.view.first_access_error = None;
-        }
-        if resp.enter_pressed {
-            submitted = true;
-        }
-    });
-
-    if let Some(ref err) = app.view.first_access_error {
-        ui.add_space(8.0);
-        draw_status_banner(ui, BannerTone::Error, err, t);
-    }
-
-    if submitted {
-        return submit_first_access_nickname(app, ui.ctx());
-    }
-    false
-}
-
-pub(crate) fn render_first_access_footer(
-    app: &mut PaperCraftApp,
-    ui: &mut egui::Ui,
-    t: &Tokens,
-) -> bool {
-    let mut should_close = false;
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Required to begin a local session")
-                .size(11.0)
-                .color(t.text_muted),
+    } else {
+        draw_pill_badge(
+            ui,
+            PillStyle {
+                fill: t.toolbar_bg,
+                border: t.border,
+                fg: t.text_muted,
+                icon: PillIcon::Dot,
+            },
+            "Local",
         );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let valid = !app.view.first_access_nickname.trim().is_empty();
-            if primary_action_button(ui, "Start Session", valid, t).clicked() {
-                should_close = submit_first_access_nickname(app, ui.ctx());
-            }
-        });
-    });
-    should_close
-}
-
-fn submit_first_access_nickname(app: &mut PaperCraftApp, ctx: &egui::Context) -> bool {
-    let nickname = app.view.first_access_nickname.trim().to_string();
-    match app.session.execute(
-        "profile.completeFirstAccess",
-        &json!({ "nickname": nickname }),
-    ) {
-        Ok(_) => {
-            app.view.first_access_nickname.clear();
-            app.view.first_access_error = None;
-            app.view.account.disconnect_notice = None;
-            crate::sync_view_to_active_notebook(app);
-            crate::sync_worker::maybe_report_local_discovery(
-                app,
-                ctx,
-                ctx.input(|i| i.time * 1000.0),
-            );
-            true
-        }
-        Err(err) => {
-            app.view.first_access_error = Some(err.to_string());
-            false
-        }
     }
 }
 
@@ -818,11 +842,7 @@ pub(crate) fn render_select_local_account_body(
 
     let mut should_close = false;
     ui.spacing_mut().item_spacing.y = 0.0;
-    let subflow_id: u8 = if app.view.account.selector_other_server_open {
-        1
-    } else {
-        0
-    };
+    let subflow_id: u8 = u8::from(app.view.account.selector_other_server_open);
 
     crate::modal::apply_subflow_motion(
         app,
@@ -841,6 +861,7 @@ pub(crate) fn render_select_local_account_body(
                 draw_section_card(ui, t, |ui| {
                     submit_on_enter = render_auth_card_contents(app, ui, t, true);
                 });
+                render_unsynced_switch_confirmation(app, ui, t);
                 render_auth_banners(app, ui, t);
                 if test_on_enter && !app.view.account.is_testing() {
                     trigger_test_connection(app, ui.ctx());
@@ -859,197 +880,32 @@ pub(crate) fn render_select_local_account_body(
             let profiles = app.session.saved_local_profiles().to_vec();
             let remembered = app.session.remembered_server_accounts().to_vec();
 
-            if !remembered.is_empty() {
-                let any_checking = app
-                    .view
-                    .account
-                    .server_probes
-                    .values()
-                    .any(|p| matches!(p, ServerProbeState::Checking { .. }));
-                draw_section_card(ui, t, |ui| {
-                    ui.horizontal(|ui| {
-                        let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                        paint_icon(ui.painter(), ir, Icon::Server, t.accent);
-                        ui.label(
-                            egui::RichText::new("Server Accounts")
-                                .size(13.0)
-                                .strong()
-                                .color(t.text),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let check_lbl = if any_checking { "..." } else { "Check" };
-                            if fixed_secondary_button(ui, check_lbl, 62.0, !any_checking, t)
-                                .on_hover_text(
-                                    "Check whether your configured sync servers are online",
-                                )
-                                .clicked()
-                            {
-                                probe_all_known_servers(app, ui.ctx());
-                            }
-                        });
-                    });
-                    ui.add_space(2.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "Select a linked server account and enter your password to sign in.",
-                        )
-                        .size(11.0)
-                        .color(t.text_muted),
-                    );
-                    ui.add_space(8.0);
-                    for entry in &remembered {
-                        render_selector_server_account_block(app, ui, entry, t);
-                        ui.add_space(6.0);
-                    }
-                });
+            if !profiles.is_empty() || !remembered.is_empty() {
+                if render_selector_saved_accounts_card(app, ui, &profiles, &remembered, t) {
+                    should_close = true;
+                }
+                render_unsynced_switch_confirmation(app, ui, t);
                 ui.add_space(10.0);
             }
 
-            draw_section_card(ui, t, |ui| {
-                ui.horizontal(|ui| {
-                    let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                    paint_icon(ui.painter(), ir, Icon::Inbox, t.accent);
-                    ui.label(
-                        egui::RichText::new("Saved Local Accounts")
-                            .size(13.0)
-                            .strong()
-                            .color(t.text),
-                    );
-                });
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Stored exclusively on this device. Access any account immediately without internet.",
-                    )
-                    .size(11.0)
-                    .color(t.text_muted),
-                );
-                ui.add_space(8.0);
-
-                if profiles.is_empty() {
-                    let empty_msg = if remembered.is_empty() {
-                        "No saved accounts exist on this device yet."
-                    } else {
-                        "No local-only accounts on this device. You can create one below."
-                    };
-                    ui.label(
-                        egui::RichText::new(empty_msg)
-                            .size(11.5)
-                            .color(t.text_muted),
-                    );
-                } else {
-                    let mut open_id: Option<String> = None;
-                    for prof in &profiles {
-                        let nb_count = app
-                            .session
-                            .local_profile_notebook_count(&prof.local_profile_id);
-                        let count_label = format_notebook_count(nb_count);
-                        draw_account_block_frame(
-                            ui,
-                            ("select_local_prof", &prof.local_profile_id),
-                            false,
-                            false,
-                            t,
-                            |ui| {
-                                ui.horizontal(|ui| {
-                                    let (ir, _) =
-                                        ui.allocate_exact_size(Vec2::splat(15.0), Sense::hover());
-                                    paint_icon(ui.painter(), ir, Icon::Account, t.accent);
-                                    draw_truncated_block_title(
-                                        ui,
-                                        &prof.nickname,
-                                        (ui.available_width() - 120.0).max(80.0),
-                                        t,
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if primary_action_button(ui, "Open", true, t).clicked()
-                                            {
-                                                open_id = Some(prof.local_profile_id.clone());
-                                            }
-                                        },
-                                    );
-                                });
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{count_label} · Offline on this device"
-                                    ))
-                                    .size(11.0)
-                                    .color(t.text_muted),
-                                );
-                            },
-                        );
-                        ui.add_space(6.0);
-                    }
-                    if let Some(pid) = open_id {
-                        if let Err(err) = switch_to_local_account_clean(app, ui.ctx(), &pid) {
-                            app.view.account.select_local_error = Some(err);
-                        } else {
-                            should_close = true;
-                        }
-                    }
-                }
-            });
-
+            if render_selector_create_local_card(
+                app,
+                ui,
+                profiles.is_empty() && remembered.is_empty(),
+                t,
+            ) {
+                should_close = true;
+            }
             ui.add_space(10.0);
 
-            draw_section_card(ui, t, |ui| {
-                draw_field_label_row(
-                    ui,
-                    "Or Create a New Local Account",
-                    FieldHint::Muted("Start a clean workspace on this device"),
-                    t,
-                );
-                ui.add_space(6.0);
-                let btn_w = 112.0_f32;
-                let gap = 8.0_f32;
-                let input_w = (ui.available_width() - btn_w - gap).max(120.0);
-                let mut create_submitted = false;
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = gap;
-                    let resp = draw_text_input(
-                        ui,
-                        InputFieldSpec {
-                            id_salt: "select_local_new_nickname_input",
-                            width: input_w,
-                            hint: "New nickname...",
-                            border_color: None,
-                            trailing: InputTrailing::None,
-                        },
-                        &mut app.view.account.select_local_new_name,
-                        t,
-                    );
-                    if resp.changed {
-                        app.view.account.select_local_error = None;
-                    }
-                    if resp.enter_pressed {
-                        create_submitted = true;
-                    }
-                    let has_name = !app.view.account.select_local_new_name.trim().is_empty();
-                    if fixed_secondary_button(ui, "Create & Open", btn_w, has_name, t).clicked()
-                        || (create_submitted && has_name)
-                    {
-                        let nick = app.view.account.select_local_new_name.trim().to_string();
-                        match app.session.execute(
-                            "profile.create",
-                            &json!({ "nickname": nick, "switch_now": true }),
-                        ) {
-                            Ok(_) => {
-                                app.view.account.select_local_new_name.clear();
-                                app.view.account.select_local_error = None;
-                                app.view.account.disconnect_notice = None;
-                                crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
-                                crate::sync_view_to_active_notebook(app);
-                                should_close = true;
-                            }
-                            Err(err) => {
-                                app.view.account.select_local_error = Some(err.to_string());
-                            }
-                        }
-                    }
+            render_selector_server_signin_card(app, ui, t);
+
+            if app.session.is_sync_persistence_enabled() {
+                ui.add_space(10.0);
+                draw_section_card(ui, t, |ui| {
+                    render_startup_picker_checkbox(app, ui, t, false);
                 });
-            });
+            }
 
             if let Some(ref err) = app.view.account.select_local_error {
                 ui.add_space(8.0);
@@ -1063,21 +919,292 @@ pub(crate) fn render_select_local_account_body(
     should_close
 }
 
+fn render_selector_saved_accounts_card(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    profiles: &[papercraft_sync::LocalProfile],
+    remembered: &[RememberedServerAccount],
+    t: &Tokens,
+) -> bool {
+    let mut should_close = false;
+    let any_checking = app
+        .view
+        .account
+        .server_probes
+        .values()
+        .any(|p| matches!(p, ServerProbeState::Checking { .. }));
+    let viewing_cloud = app.session.is_viewing_cloud();
+    let active_local_id = app
+        .session
+        .active_local_profile()
+        .map(|p| p.local_profile_id.clone());
+    let active_cloud_key = app
+        .session
+        .active_account_session()
+        .map(|s| (norm_probe_url_key(&s.server_url), s.user.user_id.clone()));
+
+    draw_section_card(ui, t, |ui| {
+        ui.horizontal(|ui| {
+            let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+            paint_icon(ui.painter(), ir, Icon::Account, t.accent);
+            ui.label(
+                egui::RichText::new("Saved Accounts on This Device")
+                    .size(13.0)
+                    .strong()
+                    .color(t.text),
+            );
+            if !remembered.is_empty() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let check_lbl = if any_checking { "..." } else { "Check" };
+                    if fixed_secondary_button(ui, check_lbl, 62.0, !any_checking, t)
+                        .on_hover_text("Check whether your configured sync servers are reachable")
+                        .clicked()
+                    {
+                        probe_all_known_servers(app, ui.ctx());
+                    }
+                });
+            }
+        });
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(
+                "Pick any local account to open offline in one click, or sign in to a server account.",
+            )
+            .size(11.0)
+            .color(t.text_muted),
+        );
+        ui.add_space(8.0);
+
+        for entry in remembered {
+            let entry_key = (norm_probe_url_key(&entry.server_url), entry.user_id.clone());
+            let is_active = viewing_cloud && active_cloud_key.as_ref() == Some(&entry_key);
+            if render_selector_server_account_block(app, ui, entry, is_active, t) {
+                should_close = true;
+            }
+            ui.add_space(6.0);
+        }
+
+        let mut open_id: Option<String> = None;
+        for prof in profiles {
+            let is_active = !viewing_cloud
+                && active_local_id.as_deref() == Some(prof.local_profile_id.as_str());
+            if render_selector_local_account_row(app, ui, prof, is_active, t) {
+                if is_active {
+                    should_close = true;
+                } else {
+                    open_id = Some(prof.local_profile_id.clone());
+                }
+            }
+            ui.add_space(6.0);
+        }
+        if let Some(pid) = open_id {
+            if let Err(err) = switch_to_local_account_clean(app, ui.ctx(), &pid) {
+                app.view.account.select_local_error = Some(err);
+            } else {
+                should_close = true;
+            }
+        }
+    });
+    should_close
+}
+
+fn render_selector_local_account_row(
+    app: &PaperCraftApp,
+    ui: &mut egui::Ui,
+    prof: &papercraft_sync::LocalProfile,
+    is_active: bool,
+    t: &Tokens,
+) -> bool {
+    let mut clicked = false;
+    let nb_count = app
+        .session
+        .local_profile_notebook_count(&prof.local_profile_id);
+    let count_label = format_notebook_count(nb_count);
+    draw_account_block_frame(
+        ui,
+        ("select_local_prof", &prof.local_profile_id),
+        is_active,
+        false,
+        t,
+        |ui| {
+            ui.horizontal(|ui| {
+                let (ir, _) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::hover());
+                paint_icon(ui.painter(), ir, Icon::Inbox, t.accent);
+                draw_truncated_block_title(
+                    ui,
+                    &prof.nickname,
+                    (ui.available_width() - 210.0).max(60.0),
+                    t,
+                );
+                draw_account_type_badge(ui, false, t);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let cta = if is_active { "Continue" } else { "Open" };
+                    if primary_action_button(ui, cta, true, t).clicked() {
+                        clicked = true;
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if is_active {
+                    draw_active_pill(ui, t);
+                }
+                ui.label(
+                    egui::RichText::new(format!("{count_label} · Offline on this device"))
+                        .size(11.0)
+                        .color(t.text_muted),
+                );
+            });
+        },
+    );
+    clicked
+}
+
+fn render_selector_create_local_card(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    is_first_launch: bool,
+    t: &Tokens,
+) -> bool {
+    let mut should_close = false;
+    let heading = if is_first_launch {
+        "Start with a Local Account (Offline)"
+    } else {
+        "Create a New Local Account"
+    };
+    let cta_label = if is_first_launch {
+        "Start Local Session"
+    } else {
+        "Create & Open"
+    };
+
+    draw_section_card(ui, t, |ui| {
+        draw_field_label_row(
+            ui,
+            heading,
+            FieldHint::Muted("Always available offline — no server needed"),
+            t,
+        );
+        ui.add_space(6.0);
+        let btn_w = if is_first_launch {
+            136.0_f32
+        } else {
+            112.0_f32
+        };
+        let gap = 8.0_f32;
+        let input_w = (ui.available_width() - btn_w - gap).max(120.0);
+        let mut create_submitted = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            let resp = draw_text_input(
+                ui,
+                InputFieldSpec {
+                    id_salt: "select_local_new_nickname_input",
+                    width: input_w,
+                    hint: "Local nickname (e.g. Personal, Work)...",
+                    border_color: None,
+                    trailing: InputTrailing::None,
+                },
+                &mut app.view.account.select_local_new_name,
+                t,
+            );
+            if std::mem::take(&mut app.view.account.select_local_focus_pending) {
+                ui.memory_mut(|m| {
+                    m.request_focus(ui.make_persistent_id("select_local_new_nickname_input"));
+                });
+            }
+            if resp.changed {
+                app.view.account.select_local_error = None;
+            }
+            if resp.enter_pressed {
+                create_submitted = true;
+            }
+            let has_name = !app.view.account.select_local_new_name.trim().is_empty();
+            if primary_action_button(ui, cta_label, has_name, t).clicked()
+                || (create_submitted && has_name)
+            {
+                let nick = app.view.account.select_local_new_name.trim().to_string();
+                match create_local_account_and_switch(app, ui.ctx(), &nick) {
+                    Ok(()) => {
+                        app.view.account.select_local_new_name.clear();
+                        app.view.account.select_local_error = None;
+                        should_close = true;
+                    }
+                    Err(err) => {
+                        app.view.account.select_local_error = Some(err);
+                    }
+                }
+            }
+        });
+    });
+    should_close
+}
+
+fn render_selector_server_signin_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    let default_url = app.session.preferred_server_url().to_string();
+    draw_section_card(ui, t, |ui| {
+        ui.horizontal(|ui| {
+            let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+            paint_icon(ui.painter(), ir, Icon::Server, t.accent);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(
+                    egui::RichText::new("Sign In with a Server Account")
+                        .size(13.0)
+                        .strong()
+                        .color(t.text),
+                );
+                ui.label(
+                    egui::RichText::new(format!("Server: {default_url}"))
+                        .size(11.0)
+                        .monospace()
+                        .color(t.text_muted),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if fixed_secondary_button(ui, "Sign In / Register", 130.0, true, t)
+                    .on_hover_text("Configure server URL and sign in or create an account")
+                    .clicked()
+                {
+                    app.view.account.server_url = default_url.clone();
+                    app.view.account.invalidate_probe_if_url_changed();
+                    app.view.account.selector_other_server_open = true;
+                    app.view.account.tab = AuthTab::SignIn;
+                    app.view.account.clear_auth_form_credentials();
+                    app.view.account.clear_quick_login_draft();
+                    app.view.account.profile_probe_pending = true;
+                }
+            });
+        });
+    });
+}
+
 fn render_selector_server_account_block(
     app: &mut PaperCraftApp,
     ui: &mut egui::Ui,
     entry: &RememberedServerAccount,
+    is_active: bool,
     t: &Tokens,
-) {
+) -> bool {
+    let mut should_close = false;
     let norm_url = norm_probe_url_key(&entry.server_url);
     let probe = app.view.account.probe_for(&entry.server_url);
     let server_offline = matches!(probe, ServerProbeState::Failed { .. });
-    let is_cached = app
+    let cached_notebooks = app
         .session
-        .has_cached_server_account(&entry.server_url, &entry.user_id);
+        .server_account_notebook_count(&entry.server_url, &entry.user_id);
+    let is_cached = cached_notebooks > 0
+        || app
+            .session
+            .has_cached_server_account(&entry.server_url, &entry.user_id);
+    let pending = if is_active {
+        app.session.cloud_pending_changes_count()
+    } else {
+        app.session
+            .server_account_pending_changes_count(&entry.server_url, &entry.user_id)
+    };
     let entry_key = (norm_url, entry.user_id.clone());
-    let quick_open =
-        !server_offline && app.view.account.quick_login_key.as_ref() == Some(&entry_key);
+    let quick_open = !is_active && app.view.account.quick_login_key.as_ref() == Some(&entry_key);
     let primary = entry.primary_label();
     let subtitle_id = entry
         .login_email()
@@ -1087,63 +1214,82 @@ fn render_selector_server_account_block(
     draw_account_block_frame(
         ui,
         ("selector_srv_block", &entry.server_url, &entry.user_id),
-        quick_open,
+        is_active || quick_open,
         false,
         t,
         |ui| {
             ui.horizontal(|ui| {
                 let (ir, _) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::hover());
-                paint_icon(
-                    ui.painter(),
-                    ir,
-                    Icon::Server,
-                    if server_offline {
-                        t.text_muted
-                    } else {
-                        t.accent
-                    },
-                );
+                paint_icon(ui.painter(), ir, Icon::Server, t.accent);
                 draw_truncated_block_title(
                     ui,
                     &primary,
-                    (ui.available_width() - 210.0).max(56.0),
+                    (ui.available_width() - 320.0).max(48.0),
                     t,
                 );
-                draw_probe_status_pill(ui, &probe, t);
+                draw_account_type_badge(ui, true, t);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let can_open_login = !server_offline && !app.view.account.auth_busy;
-                    let tip = if server_offline {
-                        "Server is offline — signing in requires an online connection to verify your password"
+                    if is_active {
+                        if primary_action_button(ui, "Continue", true, t).clicked() {
+                            should_close = true;
+                        }
                     } else {
-                        "Enter your password to sign in to this account"
-                    };
-                    if fixed_secondary_button(ui, "Sign In", 68.0, can_open_login, t)
-                        .on_hover_text(tip)
-                        .clicked()
-                    {
-                        if quick_open {
-                            app.view.account.clear_quick_login_draft();
+                        let can_open_login = !app.view.account.auth_busy;
+                        let tip = if server_offline {
+                            "Last health check failed — click Sign In to retry authenticating with this server"
                         } else {
-                            app.view.account.quick_login_key = Some(entry_key.clone());
-                            app.view.account.quick_login_password.clear();
-                            app.view.account.quick_login_error = None;
-                            app.view.account.quick_login_focus_pending = true;
-                            app.view.account.server_url = entry.server_url.clone();
+                            "Enter your password to verify your identity and switch to this account"
+                        };
+                        if fixed_secondary_button(ui, "Sign In", 68.0, can_open_login, t)
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            if quick_open {
+                                app.view.account.clear_quick_login_draft();
+                            } else {
+                                app.view.account.quick_login_key = Some(entry_key.clone());
+                                app.view.account.quick_login_password.clear();
+                                app.view.account.quick_login_error = None;
+                                app.view.account.quick_login_focus_pending = true;
+                                app.view.account.server_url = entry.server_url.clone();
+                                app.view.account.clear_pending_unsynced_switch();
+                            }
                         }
                     }
                 });
             });
 
-            ui.label(
-                egui::RichText::new(format!("{subtitle_id} · {}", entry.server_url))
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if is_active {
+                    draw_active_pill(ui, t);
+                } else {
+                    draw_probe_status_pill(ui, &probe, t);
+                }
+                let cache_note = if is_cached {
+                    format!(" · {}", format_notebook_count(cached_notebooks))
+                } else {
+                    String::new()
+                };
+                let pending_note = if pending > 0 {
+                    format!(" · {pending} unsynced")
+                } else {
+                    String::new()
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{subtitle_id} · {}{cache_note}{pending_note}",
+                        entry.server_url
+                    ))
                     .size(11.0)
                     .color(t.text_muted),
-            );
-            if server_offline {
+                );
+            });
+            if !is_active && server_offline {
                 ui.label(
                     egui::RichText::new(
-                        "Server offline — signing in requires an online connection to verify your password.",
+                        "Last check could not reach server — click Sign In to retry or Check above.",
                     )
                     .size(10.5)
                     .color(t.warning_fg),
@@ -1167,6 +1313,7 @@ fn render_selector_server_account_block(
             );
         },
     );
+    should_close
 }
 
 fn render_quick_login_drawer(
@@ -1177,11 +1324,8 @@ fn render_quick_login_drawer(
     pw_prefix: &str,
     t: &Tokens,
 ) {
-    let probe = app.view.account.probe_for(&entry.server_url);
-    let server_offline = matches!(probe, ServerProbeState::Failed { .. });
     let entry_key = (norm_probe_url_key(&entry.server_url), entry.user_id.clone());
-    let quick_open =
-        !server_offline && app.view.account.quick_login_key.as_ref() == Some(&entry_key);
+    let quick_open = app.view.account.quick_login_key.as_ref() == Some(&entry_key);
 
     ui.add_space(6.0);
     let hint_text = if is_cached {
@@ -1239,6 +1383,7 @@ fn render_quick_login_drawer(
         }
         if fixed_secondary_button(ui, "Cancel", cancel_w, !busy, t).clicked() && ui.is_enabled() {
             app.view.account.clear_quick_login_draft();
+            app.view.account.clear_pending_unsynced_switch();
         }
     });
     if let Some(ref err) = app.view.account.quick_login_error {
@@ -1255,34 +1400,42 @@ pub(crate) fn render_select_local_account_footer(
     ui: &mut egui::Ui,
     t: &Tokens,
 ) -> bool {
+    let mut should_close = false;
+    let dismissible = crate::modal::is_account_picker_dismissible(app);
     ui.horizontal(|ui| {
         if app.view.account.selector_other_server_open {
             let busy = app.view.account.auth_busy || app.view.account.password_reset.busy;
             if secondary_action_button(ui, "Back to Accounts", !busy, t).clicked() {
                 app.view.account.selector_other_server_open = false;
                 app.view.account.exit_password_reset_flow();
+                app.view.account.clear_pending_unsynced_switch();
                 app.view.account.error_message = None;
                 app.view.account.status_message = None;
             }
+            if dismissible {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if secondary_action_button(ui, "Cancel", !busy, t).clicked() {
+                        should_close = true;
+                    }
+                });
+            }
         } else {
-            ui.label(
-                egui::RichText::new("Select an account above to continue.")
-                    .size(11.0)
-                    .color(t.text_muted),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if secondary_action_button(ui, "Sign In with Another Email", true, t).clicked() {
-                    app.view.account.selector_other_server_open = true;
-                    app.view.account.tab = AuthTab::SignIn;
-                    app.view.account.exit_password_reset_flow();
-                    app.view.account.clear_quick_login_draft();
-                    app.view.account.error_message = None;
-                    app.view.account.status_message = None;
-                }
-            });
+            let hint = if dismissible {
+                "Pick an account above, or cancel to stay on your current workspace."
+            } else {
+                "Pick a saved account, create a local one, or sign in to a server."
+            };
+            ui.label(egui::RichText::new(hint).size(11.0).color(t.text_muted));
+            if dismissible {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if secondary_action_button(ui, "Cancel", true, t).clicked() {
+                        should_close = true;
+                    }
+                });
+            }
         }
     });
-    false
+    should_close
 }
 
 pub(crate) fn render_convert_local_account_body(
@@ -1290,7 +1443,11 @@ pub(crate) fn render_convert_local_account_body(
     ui: &mut egui::Ui,
     t: &Tokens,
 ) -> bool {
+    if std::mem::take(&mut app.view.account.profile_probe_pending) {
+        probe_all_known_servers(app, ui.ctx());
+    }
     let mut submit_now = false;
+    let mut test_on_enter = false;
     let busy = app.view.account.convert_busy;
     let nick = if app.view.account.convert_source_nickname.trim().is_empty() {
         "Local Account".to_string()
@@ -1298,7 +1455,7 @@ pub(crate) fn render_convert_local_account_body(
         app.view.account.convert_source_nickname.clone()
     };
     let count_label = format_notebook_count(app.view.account.convert_source_notebook_count);
-    let server_url = app.session.server_url().to_string();
+    let target_url = app.view.account.server_url.trim().to_string();
 
     ui.spacing_mut().item_spacing.y = 0.0;
     draw_section_card(ui, t, |ui| {
@@ -1316,7 +1473,7 @@ pub(crate) fn render_convert_local_account_body(
         ui.add(
             egui::Label::new(
                 egui::RichText::new(format!(
-                    "All {count_label}, folders, and settings stored locally in '{nick}' will be uploaded to your new cloud account on {server_url}. Your local copy stays right here on this device as the active Offline-First cache so you can continue working offline anytime."
+                    "All {count_label}, folders, and settings stored locally in '{nick}' will be uploaded to your new cloud account on {target_url}. Your local copy stays right here on this device as the active Offline-First cache so you can continue working offline anytime."
                 ))
                 .size(11.0)
                 .color(t.text_muted),
@@ -1327,7 +1484,24 @@ pub(crate) fn render_convert_local_account_body(
 
     ui.add_space(10.0);
 
+    ui.add_enabled_ui(!busy, |ui| {
+        draw_section_card(ui, t, |ui| {
+            test_on_enter = render_server_probe_section(app, ui, t, false);
+        });
+    });
+
+    ui.add_space(10.0);
+
     draw_section_card(ui, t, |ui| {
+        if app.view.account.is_registration_closed() {
+            draw_status_banner(
+                ui,
+                BannerTone::Warning,
+                "Registration is closed on this server. Only an existing account or an open server can accept new registrations.",
+                t,
+            );
+            ui.add_space(8.0);
+        }
         draw_field_label_row(
             ui,
             "Email Address",
@@ -1390,7 +1564,10 @@ pub(crate) fn render_convert_local_account_body(
         render_convert_progress_card(app, ui, t);
     }
 
-    if submit_now && !busy {
+    if test_on_enter && !app.view.account.is_testing() && !busy {
+        trigger_test_connection(app, ui.ctx());
+    }
+    if submit_now && !busy && !app.view.account.is_registration_closed() {
         submit_convert_local_account(app, ui.ctx());
     }
     false
@@ -1443,6 +1620,7 @@ pub(crate) fn render_convert_local_account_footer(
 ) -> bool {
     let mut should_close = false;
     let busy = app.view.account.convert_busy;
+    let blocked_closed = app.view.account.is_registration_closed();
     ui.horizontal(|ui| {
         if secondary_action_button(ui, "Cancel", !busy, t).clicked() {
             app.view.account.convert_error = None;
@@ -1454,7 +1632,7 @@ pub(crate) fn render_convert_local_account_footer(
             } else {
                 "Create Cloud Account & Sync"
             };
-            if primary_action_button(ui, cta, !busy, t).clicked() {
+            if primary_action_button(ui, cta, !busy && !blocked_closed, t).clicked() {
                 submit_convert_local_account(app, ui.ctx());
             }
         });
@@ -1463,7 +1641,11 @@ pub(crate) fn render_convert_local_account_footer(
 }
 
 fn submit_convert_local_account(app: &mut PaperCraftApp, ctx: &egui::Context) {
-    let url = match normalize_server_url(app.session.server_url()) {
+    if app.view.account.is_registration_closed() {
+        app.view.account.convert_error = Some("Registration is closed on this server.".to_string());
+        return;
+    }
+    let url = match normalize_server_url(&app.view.account.server_url) {
         Ok(norm) => norm,
         Err(err) => {
             app.view.account.convert_error = Some(err.to_string());
@@ -1496,6 +1678,7 @@ fn submit_convert_local_account(app: &mut PaperCraftApp, ctx: &egui::Context) {
 
     let device_name = app.session.device_name().to_string();
     let password = app.view.account.convert_password.clone();
+    app.view.account.server_url = url.clone();
     app.view.account.convert_busy = true;
     app.view.account.convert_progress_stage = "Creating cloud account...".to_string();
     app.view.account.convert_progress_completed = 0;
@@ -1504,6 +1687,7 @@ fn submit_convert_local_account(app: &mut PaperCraftApp, ctx: &egui::Context) {
     let _ = app.session.set_server_url_preference(&url);
 
     let cmd = SyncWorkerCommand::ConvertLocalAccount {
+        session_generation: app.sync_worker.current_session_generation(),
         server_url: url,
         source_profile_id,
         source_nickname,
@@ -1522,7 +1706,7 @@ fn submit_convert_local_account(app: &mut PaperCraftApp, ctx: &egui::Context) {
     }
 }
 
-fn summary_account_label(summary: &SyncStatusSummary) -> String {
+pub(crate) fn summary_account_label(summary: &SyncStatusSummary) -> String {
     summary
         .email
         .clone()
@@ -1572,9 +1756,6 @@ fn is_active_server_known_offline(app: &PaperCraftApp) -> bool {
 }
 
 pub(crate) fn handle_auth_submit_on_enter(app: &mut PaperCraftApp, ctx: &egui::Context) {
-    if is_active_server_known_offline(app) {
-        return;
-    }
     if app.view.account.password_reset.active {
         if !app.view.account.password_reset.busy {
             submit_complete_password_reset(app, ctx);
@@ -1631,7 +1812,7 @@ pub(crate) fn render_auth_card_contents(
             draw_status_banner(
                 ui,
                 BannerTone::Warning,
-                "Server is offline — first sign-in or registration requires an online connection because no local backup of this account exists on this device.",
+                "Last check could not reach this server — you can still retry signing in or click Test.",
                 t,
             );
             ui.add_space(8.0);
@@ -1681,7 +1862,6 @@ pub(crate) fn render_auth_card_contents(
     if show_inline_submit {
         ui.add_space(10.0);
         let busy = app.view.account.auth_busy;
-        let offline_blocked = is_active_server_known_offline(app);
         let blocked_closed =
             tab == AuthTab::CreateAccount && app.view.account.is_registration_closed();
         let cta = match (tab, busy) {
@@ -1692,9 +1872,7 @@ pub(crate) fn render_auth_card_contents(
         };
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if primary_action_button(ui, cta, !busy && !blocked_closed && !offline_blocked, t)
-                    .clicked()
-                {
+                if primary_action_button(ui, cta, !busy && !blocked_closed, t).clicked() {
                     submit_auth_request(app, ui.ctx());
                 }
             });
@@ -1833,13 +2011,12 @@ fn render_password_reset_flow_card(
         submit_on_enter = true;
     }
 
-    let offline_blocked = is_active_server_known_offline(app);
-    if offline_blocked {
+    if is_active_server_known_offline(app) {
         ui.add_space(6.0);
         draw_status_banner(
             ui,
             BannerTone::Warning,
-            "Server is offline — completing password reset requires an online connection.",
+            "Last check could not reach this server — you can still retry resetting your password.",
             t,
         );
     }
@@ -1857,7 +2034,7 @@ fn render_password_reset_flow_card(
                 } else {
                     "Set New Password & Sign In"
                 };
-                if primary_action_button(ui, cta, !busy && !offline_blocked, t).clicked() {
+                if primary_action_button(ui, cta, !busy, t).clicked() {
                     submit_complete_password_reset(app, ui.ctx());
                 }
             });
@@ -2247,10 +2424,21 @@ fn render_probe_feedback_row(
         }
         ServerProbeState::Connected {
             version,
+            protocol_version,
             registration_open,
+            storage_engine,
+            max_notebook_bytes,
             ..
         } => {
-            draw_connected_server_banner(ui, version, *registration_open, t);
+            draw_connected_server_banner(
+                ui,
+                version,
+                *protocol_version,
+                *registration_open,
+                storage_engine,
+                *max_notebook_bytes,
+                t,
+            );
         }
         ServerProbeState::Failed { message, .. } => {
             draw_status_banner(ui, BannerTone::Error, message, t);
@@ -2261,9 +2449,23 @@ fn render_probe_feedback_row(
 fn draw_connected_server_banner(
     ui: &mut egui::Ui,
     version: &str,
+    protocol_version: u32,
     registration_open: bool,
+    storage_engine: &str,
+    max_notebook_bytes: usize,
     t: &Tokens,
 ) {
+    let mut capability_parts = vec![format!("Protocol v{protocol_version}")];
+    if !storage_engine.trim().is_empty() {
+        capability_parts.push(format!("Storage: {storage_engine}"));
+    }
+    if max_notebook_bytes > 0 {
+        capability_parts.push(format!(
+            "Max notebook: {}",
+            crate::inspector::format_storage_bytes(max_notebook_bytes as u64)
+        ));
+    }
+
     egui::Frame::new()
         .fill(t.success_bg)
         .stroke(Stroke::new(1.0, t.success_border))
@@ -2275,8 +2477,13 @@ fn draw_connected_server_banner(
                 ui.spacing_mut().item_spacing.x = 7.0;
                 let (badge_rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
                 paint_green_check_badge(ui.painter(), badge_rect, t);
+                let title = if version.trim().is_empty() {
+                    "Connected to PaperCraft Server".to_string()
+                } else {
+                    format!("Connected to PaperCraft Server v{version}")
+                };
                 ui.label(
-                    egui::RichText::new(format!("Connected to PaperCraft Server v{version}"))
+                    egui::RichText::new(title)
                         .size(11.5)
                         .strong()
                         .color(t.success_fg),
@@ -2295,6 +2502,12 @@ fn draw_connected_server_banner(
                     );
                 });
             });
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(capability_parts.join(" · "))
+                    .size(10.5)
+                    .color(t.text_muted),
+            );
         });
 }
 
@@ -2356,7 +2569,6 @@ fn render_signed_out_footer(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Toke
     ui.horizontal(|ui| {
         if app.view.account.password_reset.active {
             let busy = app.view.account.password_reset.busy;
-            let offline_blocked = is_active_server_known_offline(app);
             if secondary_action_button(ui, "Back to Sign In", !busy, t).clicked() {
                 app.view.account.exit_password_reset_flow();
             }
@@ -2366,7 +2578,7 @@ fn render_signed_out_footer(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Toke
                 } else {
                     "Set New Password & Sign In"
                 };
-                if primary_action_button(ui, cta, !busy && !offline_blocked, t).clicked() {
+                if primary_action_button(ui, cta, !busy, t).clicked() {
                     submit_complete_password_reset(app, ui.ctx());
                 }
             });
@@ -2378,7 +2590,6 @@ fn render_signed_out_footer(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Toke
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let busy = app.view.account.auth_busy;
-            let offline_blocked = is_active_server_known_offline(app);
             let blocked_closed = app.view.account.tab == AuthTab::CreateAccount
                 && app.view.account.is_registration_closed();
             let cta = match (app.view.account.tab, busy) {
@@ -2387,9 +2598,7 @@ fn render_signed_out_footer(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Toke
                 (AuthTab::CreateAccount, false) => "Create Account",
                 (AuthTab::CreateAccount, true) => "Creating...",
             };
-            if primary_action_button(ui, cta, !busy && !blocked_closed && !offline_blocked, t)
-                .clicked()
-            {
+            if primary_action_button(ui, cta, !busy && !blocked_closed, t).clicked() {
                 submit_auth_request(app, ui.ctx());
             }
         });
@@ -2411,9 +2620,9 @@ fn render_signed_in_body(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens)
     {
         ui.add_space(6.0);
         render_expired_session_reauth_box(app, ui, &acct, cloud_pending, "modal_reauth_pw", t);
-        ui.add_space(6.0);
     }
 
+    ui.add_space(8.0);
     let mut test_on_enter = false;
     draw_section_card(ui, t, |ui| {
         test_on_enter = render_signed_in_server_card(app, ui, &summary, t);
@@ -2435,7 +2644,7 @@ fn render_signed_in_body(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens)
 }
 
 pub(crate) fn render_signed_in_account_card(
-    app: &mut PaperCraftApp,
+    _app: &mut PaperCraftApp,
     ui: &mut egui::Ui,
     summary: &SyncStatusSummary,
     cloud_pending: usize,
@@ -2528,9 +2737,6 @@ pub(crate) fn render_signed_in_account_card(
         draw_metric_cell(&mut cols[1], "LAST SYNC", &last_sync_value, t);
         draw_metric_cell(&mut cols[2], "STORAGE", &mode_value, t);
     });
-
-    ui.add_space(8.0);
-    render_account_email_row(app, ui, summary, t);
 }
 
 fn render_account_email_row(
@@ -2624,6 +2830,137 @@ fn render_account_email_row(
             });
         },
     );
+}
+
+pub(crate) fn render_local_profile_identity_card(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    t: &Tokens,
+) {
+    let nb_count = app.session.notebooks.len();
+    let count_label = format_notebook_count(nb_count);
+    let active = app.session.active_local_profile().cloned();
+
+    ui.horizontal(|ui| {
+        let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+        paint_icon(ui.painter(), ir, Icon::Inbox, t.accent);
+        ui.label(
+            egui::RichText::new("Local Account Profile")
+                .size(13.5)
+                .strong()
+                .color(t.text),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            draw_account_type_badge(ui, false, t);
+        });
+    });
+    ui.add_space(3.0);
+
+    let Some(active) = active else {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!(
+                    "Active temporary local workspace ({count_label}). Open Accounts or Switch Account to create or select a named local account."
+                ))
+                .size(11.0)
+                .color(t.text_muted),
+            )
+            .wrap(),
+        );
+        return;
+    };
+
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(format!(
+                "'{nick}' is stored only on this device ({count_label}). Rename it here or upload it to a self-hosted server anytime.",
+                nick = active.nickname
+            ))
+            .size(11.0)
+            .color(t.text_muted),
+        )
+        .wrap(),
+    );
+    ui.add_space(10.0);
+
+    draw_field_label_row(
+        ui,
+        "Local Nickname",
+        FieldHint::Muted("Used to identify this offline workspace"),
+        t,
+    );
+    ui.add_space(4.0);
+    let mut submit_rename = false;
+    let resp = draw_text_input(
+        ui,
+        InputFieldSpec {
+            id_salt: "profile_local_nickname_edit",
+            width: ui.available_width(),
+            hint: "Local nickname...",
+            border_color: None,
+            trailing: InputTrailing::None,
+        },
+        &mut app.view.account.local_profile_rename_draft,
+        t,
+    );
+    if resp.enter_pressed {
+        submit_rename = true;
+    }
+
+    let clean_draft = app
+        .view
+        .account
+        .local_profile_rename_draft
+        .trim()
+        .to_string();
+    let dirty = !clean_draft.is_empty() && clean_draft != active.nickname;
+
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        if secondary_action_button(ui, "Reset", dirty, t).clicked() {
+            app.view.account.local_profile_rename_draft = active.nickname.clone();
+            app.view.account.error_message = None;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if primary_action_button(ui, "Save Nickname", dirty, t).clicked()
+                || (submit_rename && dirty)
+            {
+                match app.session.execute(
+                    "profile.rename",
+                    &json!({
+                        "profile_id": active.local_profile_id,
+                        "nickname": clean_draft,
+                    }),
+                ) {
+                    Ok(_) => {
+                        app.view.account.error_message = None;
+                        app.view.account.status_message =
+                            Some(format!("Local account renamed to '{clean_draft}'."));
+                        app.flush_web_storage(true);
+                    }
+                    Err(err) => {
+                        app.view.account.status_message = None;
+                        app.view.account.error_message = Some(err.to_string());
+                    }
+                }
+            }
+            if fixed_secondary_button(ui, "Upload to Server", 124.0, true, t)
+                .on_hover_text(
+                    "Convert this local account to a synced server account while keeping an Offline-First local copy",
+                )
+                .clicked()
+            {
+                app.view.account.convert_source_profile_id = active.local_profile_id.clone();
+                app.view.account.convert_source_nickname = active.nickname.clone();
+                app.view.account.convert_source_notebook_count = nb_count;
+                app.view.account.convert_email.clear();
+                app.view.account.convert_password.clear();
+                app.view.account.convert_show_password = false;
+                crate::modal::open(app, crate::modal::ActiveModal::ConvertLocalAccount);
+            }
+        });
+    });
 }
 
 pub(crate) fn render_profile_identity_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
@@ -2891,47 +3228,7 @@ pub(crate) fn render_change_password_card(app: &mut PaperCraftApp, ui: &mut egui
     });
 }
 
-pub(crate) fn render_session_sign_out_card(
-    app: &mut PaperCraftApp,
-    ui: &mut egui::Ui,
-    summary: &SyncStatusSummary,
-    t: &Tokens,
-) {
-    ui.horizontal(|ui| {
-        let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-        paint_icon(ui.painter(), ir, Icon::Server, t.accent);
-        ui.label(
-            egui::RichText::new("Session & Sign Out")
-                .size(13.5)
-                .strong()
-                .color(t.text),
-        );
-    });
-    ui.add_space(4.0);
-    let user_id = app
-        .session
-        .active_account_session()
-        .map_or_else(String::new, |s| s.user.user_id.clone());
-    ui.add(
-        egui::Label::new(
-            egui::RichText::new(format!(
-                "Signed in on `{}` · Server {} · Account ID {}",
-                summary.device_name, summary.server_url, user_id
-            ))
-            .size(11.0)
-            .color(t.text_muted),
-        )
-        .wrap(),
-    );
-    ui.add_space(10.0);
-    ui.horizontal(|ui| {
-        if danger_action_button(ui, "Sign Out", true, t).clicked() {
-            complete_sign_out(app, ui.ctx());
-        }
-    });
-}
-
-fn format_notebook_count(count: usize) -> String {
+pub(crate) fn format_notebook_count(count: usize) -> String {
     if count == 1 {
         "1 notebook".to_string()
     } else {
@@ -3119,8 +3416,6 @@ fn draw_manual_agree_confirmation_input(
     }
 }
 
-/// Unified Accounts switcher section inside Profile: renders independent Local Accounts (with Sync conversion)
-/// and Server Accounts (active session + remembered quick-access shortcuts with Forget Account).
 pub(crate) fn render_accounts_switcher_section(
     app: &mut PaperCraftApp,
     ui: &mut egui::Ui,
@@ -3144,7 +3439,7 @@ pub(crate) fn render_accounts_switcher_section(
         ui.add(
             egui::Label::new(
                 egui::RichText::new(
-                    "Stored exclusively on this device. Switch anytime without a password or internet connection, or click Sync when the server is online to move a local account to the cloud.",
+                    "Stored exclusively on this device. Switch anytime without a password or internet connection, or click Sync to upload a local account to a server.",
                 )
                 .size(11.0)
                 .color(t.text_muted),
@@ -3162,7 +3457,7 @@ pub(crate) fn render_accounts_switcher_section(
     let active_server_url = if summary.signed_in {
         summary.server_url.clone()
     } else {
-        app.session.server_url().to_string()
+        app.session.preferred_server_url().to_string()
     };
     let active_probe = app.view.account.probe_for(&active_server_url);
     let any_checking = matches!(active_probe, ServerProbeState::Checking { .. })
@@ -3185,17 +3480,28 @@ pub(crate) fn render_accounts_switcher_section(
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                if fixed_secondary_button(ui, "Sign In / Add", 98.0, true, t)
-                    .on_hover_text("Sign in with your email or create a new cloud account")
+                let sign_in_lbl = if summary.signed_in {
+                    "Sign In Another"
+                } else {
+                    "Sign In / Add"
+                };
+                if fixed_secondary_button(ui, sign_in_lbl, 118.0, true, t)
+                    .on_hover_text(
+                        "Open the Server Sync tab to sign in with another account or configure a server",
+                    )
                     .clicked()
                 {
-                    app.view.account.profile_section = ProfileSection::ServerLogin;
+                    app.view.account.profile_section = ProfileSection::ServerSync;
+                    app.view.account.server_switch_form_open = true;
                     app.view.account.tab = AuthTab::SignIn;
-                    app.view.account.error_message = None;
+                    app.view.account.server_url = app.session.preferred_server_url().to_string();
+                    app.view.account.invalidate_probe_if_url_changed();
+                    app.view.account.clear_auth_form_credentials();
+                    app.view.account.profile_probe_pending = true;
                 }
                 let check_lbl = if any_checking { "..." } else { "Check" };
                 if fixed_secondary_button(ui, check_lbl, 62.0, !any_checking, t)
-                    .on_hover_text("Check whether your configured sync servers are online")
+                    .on_hover_text("Check whether your configured sync servers are reachable")
                     .clicked()
                 {
                     probe_all_known_servers(app, ui.ctx());
@@ -3206,7 +3512,7 @@ pub(crate) fn render_accounts_switcher_section(
         ui.add(
             egui::Label::new(
                 egui::RichText::new(
-                    "Signed-in server accounts keep an Offline-First local copy on this device so you can keep editing offline and sync queued changes automatically when reconnected.",
+                    "Each signed-in server account keeps an isolated Offline-First cache on this device so switching accounts never mixes or discards local work.",
                 )
                 .size(11.0)
                 .color(t.text_muted),
@@ -3257,7 +3563,7 @@ pub(crate) fn render_accounts_switcher_section(
         if shortcuts.is_empty() && !summary.signed_in {
             ui.label(
                 egui::RichText::new(
-                    "No server accounts cached or remembered on this device. Click 'Sign In / Add' when online to sign in to a server account.",
+                    "No server accounts cached or remembered on this device yet. Click 'Sign In / Add' to connect to a server account.",
                 )
                 .size(11.5)
                 .color(t.text_muted),
@@ -3268,7 +3574,26 @@ pub(crate) fn render_accounts_switcher_section(
                 ui.add_space(8.0);
             }
         }
+        render_unsynced_switch_confirmation(app, ui, t);
     });
+
+    if app.session.is_sync_persistence_enabled() {
+        ui.add_space(10.0);
+        draw_section_card(ui, t, |ui| {
+            ui.horizontal(|ui| {
+                let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                paint_icon(ui.painter(), ir, Icon::Settings, t.accent);
+                ui.label(
+                    egui::RichText::new("Startup Account Chooser")
+                        .size(13.5)
+                        .strong()
+                        .color(t.text),
+                );
+            });
+            ui.add_space(6.0);
+            render_startup_picker_checkbox(app, ui, t, true);
+        });
+    }
 }
 
 fn render_active_cloud_account_block(
@@ -3294,6 +3619,7 @@ fn render_active_cloud_account_block(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&label)
         .to_string();
+    let cached_count = format_notebook_count(app.session.notebooks.len());
     let sync_note = if summary.connection == SyncConnectionState::Offline {
         match cloud_pending {
             0 => "Offline — local copy ready; will sync on reconnect".to_string(),
@@ -3321,15 +3647,12 @@ fn render_active_cloud_account_block(
                 draw_truncated_block_title(
                     ui,
                     &disp,
-                    (ui.available_width() - 340.0).max(52.0),
+                    (ui.available_width() - 360.0).max(52.0),
                     t,
                 );
-                draw_sync_connection_pill(ui, summary.connection, t);
+                draw_account_type_badge(ui, true, t);
+                draw_active_pill(ui, t);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    if danger_action_button(ui, "Sign Out", true, t).clicked() {
-                        complete_sign_out(app, ui.ctx());
-                    }
                     if !is_confirming_forget
                         && fixed_secondary_button(ui, "Forget Account", 104.0, true, t)
                             .on_hover_text(
@@ -3341,24 +3664,15 @@ fn render_active_cloud_account_block(
                         app.view.account.clear_quick_login_draft();
                         app.view.account.clear_pending_delete_profile();
                     }
-                    let busy = app.session.is_sync_in_flight();
-                    if fixed_secondary_button(
-                        ui,
-                        if busy { "Syncing..." } else { "Sync Now" },
-                        76.0,
-                        !busy,
-                        t,
-                    )
-                    .clicked()
-                    {
-                        trigger_manual_sync(app, ui.ctx());
-                    }
                 });
             });
             ui.label(
-                egui::RichText::new(format!("{label} · {} · {sync_note}", summary.server_url))
-                    .size(11.0)
-                    .color(t.text_muted),
+                egui::RichText::new(format!(
+                    "{label} · {} · {cached_count} · {sync_note}",
+                    summary.server_url
+                ))
+                .size(11.0)
+                .color(t.text_muted),
             );
             crate::motion::animated_collapse_with_duration(
                 ui,
@@ -3383,30 +3697,11 @@ fn render_active_cloud_account_block(
                     );
                 },
             );
-            let show_reauth = !is_confirming_forget && app.session.is_session_expired();
-            crate::motion::animated_collapse_with_duration(
-                ui,
-                ui.make_persistent_id(("active_reauth_box", &acct.server_url, &acct.user.user_id)),
-                show_reauth,
-                140.0,
-                crate::motion::MICRO_DURATION_S,
-                |ui| {
-                    ui.add_space(6.0);
-                    render_expired_session_reauth_box(
-                        app,
-                        ui,
-                        &acct,
-                        cloud_pending,
-                        "profile_reauth_pw",
-                        t,
-                    );
-                },
-            );
         },
     );
 }
 
-fn render_expired_session_reauth_box(
+pub(crate) fn render_expired_session_reauth_box(
     app: &mut PaperCraftApp,
     ui: &mut egui::Ui,
     acct: &papercraft_sync::ActiveAccountSession,
@@ -3455,7 +3750,7 @@ fn render_expired_session_reauth_box(
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(
-                        "Server is currently unreachable — reconnect to re-authenticate. Your edits stay safely saved locally.",
+                        "Last check could not reach server — click Sign In & Sync to retry. Your edits stay safely saved locally.",
                     )
                     .size(10.5)
                     .color(t.warning_fg),
@@ -3478,11 +3773,10 @@ fn render_expired_session_reauth_box(
                 if pw_resp.changed {
                     app.view.account.reauth_error = None;
                 }
-                if ui.is_enabled() && pw_resp.enter_pressed && !busy && !server_offline {
+                if ui.is_enabled() && pw_resp.enter_pressed && !busy {
                     submit_now = true;
                 }
-                let can_submit =
-                    !busy && !server_offline && !app.view.account.reauth_password.is_empty();
+                let can_submit = !busy && !app.view.account.reauth_password.is_empty();
                 let cta = if busy { "Signing In..." } else { "Sign In & Sync" };
                 if primary_action_button(ui, cta, can_submit, t).clicked() && ui.is_enabled() {
                     submit_now = true;
@@ -3533,6 +3827,7 @@ fn submit_active_session_reauth(
     ));
 
     let cmd = SyncWorkerCommand::Login {
+        session_generation: app.sync_worker.current_session_generation(),
         server_url: norm_url,
         identifier,
         password,
@@ -3653,15 +3948,18 @@ fn render_remembered_server_account_block(
     let norm_url = norm_probe_url_key(&entry.server_url);
     let probe = app.view.account.probe_for(&entry.server_url);
     let server_offline = matches!(probe, ServerProbeState::Failed { .. });
-    let is_cached = app
+    let cached_notebooks = app
         .session
-        .has_cached_server_account(&entry.server_url, &entry.user_id);
+        .server_account_notebook_count(&entry.server_url, &entry.user_id);
+    let is_cached = cached_notebooks > 0
+        || app
+            .session
+            .has_cached_server_account(&entry.server_url, &entry.user_id);
     let pending = app
         .session
         .server_account_pending_changes_count(&entry.server_url, &entry.user_id);
-    let entry_key = (norm_url.clone(), entry.user_id.clone());
-    let quick_open =
-        !server_offline && app.view.account.quick_login_key.as_ref() == Some(&entry_key);
+    let entry_key = (norm_url, entry.user_id.clone());
+    let quick_open = app.view.account.quick_login_key.as_ref() == Some(&entry_key);
     let confirming_forget = app.view.account.pending_forget_server_key.as_ref() == Some(&entry_key);
     let primary = entry.primary_label();
     let subtitle_id = entry
@@ -3684,22 +3982,14 @@ fn render_remembered_server_account_block(
         |ui| {
             ui.horizontal(|ui| {
                 let (ir, _) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::hover());
-                paint_icon(
-                    ui.painter(),
-                    ir,
-                    Icon::Server,
-                    if server_offline {
-                        t.text_muted
-                    } else {
-                        t.accent
-                    },
-                );
+                paint_icon(ui.painter(), ir, Icon::Server, t.accent);
                 draw_truncated_block_title(
                     ui,
                     &primary,
-                    (ui.available_width() - 310.0).max(56.0),
+                    (ui.available_width() - 360.0).max(48.0),
                     t,
                 );
+                draw_account_type_badge(ui, true, t);
                 draw_probe_status_pill(ui, &probe, t);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3718,19 +4008,19 @@ fn render_remembered_server_account_block(
 
                     let cta = if is_cached { "Switch" } else { "Sign In" };
                     let tip = if server_offline {
-                        "Server is offline — password verification requires an online connection to sign in or switch to this server account"
+                        "Last health check failed — enter your password to retry connecting and switching to this account"
                     } else if is_cached {
                         "Enter your password to verify your identity and switch to this server account"
                     } else {
                         "Enter password to sign in and download this server account"
                     };
-                    let can_open_login =
-                        !server_offline && !confirming_forget && !app.view.account.auth_busy;
+                    let can_open_login = !confirming_forget && !app.view.account.auth_busy;
                     if fixed_secondary_button(ui, cta, 68.0, can_open_login, t)
                         .on_hover_text(tip)
                         .clicked()
                     {
                         app.view.account.clear_pending_forget_server();
+                        app.view.account.clear_pending_unsynced_switch();
                         if quick_open {
                             app.view.account.clear_quick_login_draft();
                         } else {
@@ -3744,6 +4034,14 @@ fn render_remembered_server_account_block(
                 });
             });
 
+            let cache_suffix = if is_cached {
+                format!(
+                    " · {}",
+                    format_notebook_count(cached_count_val(cached_notebooks))
+                )
+            } else {
+                String::new()
+            };
             let queue_suffix = if is_cached && pending > 0 {
                 format!(" · {pending} pending sync")
             } else {
@@ -3751,7 +4049,7 @@ fn render_remembered_server_account_block(
             };
             ui.label(
                 egui::RichText::new(format!(
-                    "{subtitle_id} · {}{queue_suffix}",
+                    "{subtitle_id} · {}{cache_suffix}{queue_suffix}",
                     entry.server_url
                 ))
                 .size(11.0)
@@ -3761,7 +4059,7 @@ fn render_remembered_server_account_block(
             if server_offline {
                 ui.label(
                     egui::RichText::new(
-                        "Server offline — password verification requires an online connection before switching or signing in.",
+                        "Last check could not reach server — click Switch / Sign In to retry authenticating.",
                     )
                     .size(10.5)
                     .color(t.warning_fg),
@@ -3801,11 +4099,63 @@ fn render_remembered_server_account_block(
     );
 }
 
+const fn cached_count_val(n: usize) -> usize {
+    n
+}
+
 fn submit_quick_server_login(
     app: &mut PaperCraftApp,
     ctx: &egui::Context,
     entry: &RememberedServerAccount,
 ) {
+    if app.view.account.quick_login_password.is_empty() {
+        app.view.account.quick_login_error = Some("Enter your password.".to_string());
+        return;
+    }
+    if entry.login_email().is_none() {
+        app.view.account.quick_login_error = Some(
+            "Account shortcut is missing a sign-in email address. Use Sign In with Another Account instead."
+                .to_string(),
+        );
+        return;
+    }
+    if let Some((outgoing_label, pending_count)) = should_warn_unsynced_cloud_switch(
+        app,
+        &entry.server_url,
+        Some(&entry.user_id),
+        entry.login_email(),
+    ) {
+        app.view.account.pending_unsynced_switch = Some(PendingUnsyncedSwitch {
+            outgoing_label,
+            pending_count,
+            target_label: entry.primary_label(),
+            target: PendingUnsyncedSwitchTarget::QuickLogin {
+                server_url: entry.server_url.clone(),
+                user_id: entry.user_id.clone(),
+            },
+        });
+        return;
+    }
+    dispatch_quick_login_now(app, ctx, &entry.server_url, &entry.user_id);
+}
+
+fn dispatch_quick_login_now(
+    app: &mut PaperCraftApp,
+    ctx: &egui::Context,
+    server_url: &str,
+    user_id: &str,
+) {
+    let Some(entry) = app
+        .session
+        .remembered_server_accounts()
+        .iter()
+        .find(|e| e.user_id == user_id && urls_match(&e.server_url, server_url))
+        .cloned()
+    else {
+        app.view.account.quick_login_error =
+            Some("Saved server account shortcut was not found.".to_string());
+        return;
+    };
     let password = app.view.account.quick_login_password.clone();
     if password.is_empty() {
         app.view.account.quick_login_error = Some("Enter your password.".to_string());
@@ -3813,7 +4163,7 @@ fn submit_quick_server_login(
     }
     let Some(identifier) = entry.login_email().map(str::to_string) else {
         app.view.account.quick_login_error = Some(
-            "Account shortcut is missing a sign-in email address. Use Sign In with Another Email instead."
+            "Account shortcut is missing a sign-in email address. Use Sign In with Another Account instead."
                 .to_string(),
         );
         return;
@@ -3822,11 +4172,13 @@ fn submit_quick_server_login(
     app.view.account.server_url = norm_url.clone();
     let _ = app.session.set_server_url_preference(&norm_url);
     app.view.account.auth_busy = true;
+    app.view.account.clear_pending_unsynced_switch();
     app.view.account.quick_login_error = None;
     app.view.account.error_message = None;
     app.view.account.status_message = Some(format!("Signing in as {}...", entry.primary_label()));
 
     let cmd = SyncWorkerCommand::Login {
+        session_generation: app.sync_worker.current_session_generation(),
         server_url: norm_url,
         identifier,
         password,
@@ -3899,18 +4251,27 @@ pub(crate) fn render_local_profiles_manager(
         if fixed_secondary_button(ui, "Add Profile", create_w, has_name, t).clicked()
             || (create_submitted && has_name)
         {
-            crate::canvas::commit_pending_text(app);
             let name = app.view.account.new_profile_name.trim().to_string();
             let switch_now = !app.session.is_signed_in();
-            if let Err(err) = app.session.execute(
-                "profile.create",
-                &json!({ "nickname": name, "switch_now": switch_now }),
-            ) {
-                app.view.account.error_message = Some(err.to_string());
+            let res = if switch_now {
+                create_local_account_and_switch(app, ui.ctx(), &name)
+            } else {
+                crate::canvas::commit_pending_text(app);
+                app.session
+                    .execute(
+                        "profile.create",
+                        &json!({ "nickname": name, "switch_now": false }),
+                    )
+                    .map(|_| {
+                        app.flush_web_storage(true);
+                    })
+                    .map_err(|e| e.to_string())
+            };
+            if let Err(err) = res {
+                app.view.account.error_message = Some(err);
             } else {
                 app.view.account.new_profile_name.clear();
                 app.view.account.error_message = None;
-                crate::sync_view_to_active_notebook(app);
             }
         }
     });
@@ -3922,6 +4283,14 @@ fn execute_local_profile_delete(
     profile: &papercraft_sync::LocalProfile,
 ) {
     crate::canvas::commit_pending_text(app);
+    let was_active = !app.session.is_viewing_cloud()
+        && app
+            .session
+            .active_local_profile()
+            .is_some_and(|p| p.local_profile_id == profile.local_profile_id);
+    if was_active {
+        prepare_workspace_switch(app);
+    }
     let deleted_name = profile.nickname.clone();
     match app.session.execute(
         "profile.delete",
@@ -3933,7 +4302,11 @@ fn execute_local_profile_delete(
             app.view.account.status_message =
                 Some(format!("Deleted local profile '{deleted_name}'."));
             app.view.profile_return_screen = crate::AppScreen::Home;
-            crate::sync_view_to_active_notebook(app);
+            if was_active {
+                finish_workspace_switch(app, ui.ctx());
+            } else {
+                app.flush_web_storage(true);
+            }
             crate::sync_worker::maybe_report_local_discovery(
                 app,
                 ui.ctx(),
@@ -4056,7 +4429,7 @@ fn render_local_profile_block(
         .session
         .local_profile_notebook_count(&profile.local_profile_id);
     let count_label = format_notebook_count(nb_count);
-    let server_url = app.session.server_url().to_string();
+    let server_url = app.session.preferred_server_url().to_string();
     let server_online = app.view.account.probe_for(&server_url).is_connected();
 
     draw_account_block_frame(
@@ -4148,9 +4521,9 @@ fn render_local_profile_block(
                         let sync_tip = if server_online {
                             "Upload this local account to the server while keeping an Offline-First local copy on this device"
                         } else {
-                            "Server is offline — check connection above before syncing this account to the cloud"
+                            "Upload this local account to a self-hosted server (choose server URL and sign up inside the dialog)"
                         };
-                        if fixed_secondary_button(ui, "Sync", 58.0, server_online, t)
+                        if fixed_secondary_button(ui, "Sync", 58.0, true, t)
                             .on_hover_text(sync_tip)
                             .clicked()
                         {
@@ -4188,16 +4561,7 @@ fn render_local_profile_block(
             });
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                draw_pill_badge(
-                    ui,
-                    PillStyle {
-                        fill: t.panel_bg,
-                        border: t.border,
-                        fg: t.text_muted,
-                        icon: PillIcon::Dot,
-                    },
-                    "Local Only",
-                );
+                draw_account_type_badge(ui, false, t);
                 let suffix = if server_online {
                     "Offline on this device · Ready to Sync"
                 } else {
@@ -4234,8 +4598,10 @@ pub(crate) fn render_signed_in_server_card(
 ) -> bool {
     let mut test_on_enter = false;
     let probe = app.view.account.probe.clone();
-    let url_matches_saved = urls_match(&app.view.account.server_url, &summary.server_url);
-    let synced_active = url_matches_saved && summary.connection == SyncConnectionState::Synced;
+    let preferred_url = app.session.preferred_server_url().to_string();
+    let url_matches_saved = urls_match(&app.view.account.server_url, &preferred_url);
+    let url_matches_active = urls_match(&app.view.account.server_url, &summary.server_url);
+    let synced_active = url_matches_active && summary.connection == SyncConnectionState::Synced;
 
     ui.horizontal(|ui| {
         let icon_color = match probe {
@@ -4246,7 +4612,7 @@ pub(crate) fn render_signed_in_server_card(
         let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
         paint_icon(ui.painter(), ir, Icon::Server, icon_color);
         ui.label(
-            egui::RichText::new("Server Address")
+            egui::RichText::new("Server Address & Connection")
                 .size(13.0)
                 .strong()
                 .color(t.text),
@@ -4270,9 +4636,21 @@ pub(crate) fn render_signed_in_server_card(
     });
     ui.add_space(2.0);
     ui.label(
-        egui::RichText::new("Update the host or mesh VPN IP if your server moved.")
+        egui::RichText::new(format!("Active session server: {}", summary.server_url))
+            .size(11.0)
+            .monospace()
+            .color(t.text_muted),
+    );
+    ui.add_space(2.0);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                "Configure the default server URL used for tests or signing in to another account. Changing this does not disconnect your current session.",
+            )
             .size(11.0)
             .color(t.text_muted),
+        )
+        .wrap(),
     );
     ui.add_space(8.0);
 
@@ -4298,7 +4676,7 @@ pub(crate) fn render_signed_in_server_card(
 
     let testing = app.view.account.is_testing();
     let test_w = 72.0_f32;
-    let apply_w = 76.0_f32;
+    let apply_w = 104.0_f32;
     let gap = 6.0_f32;
     let input_w = (ui.available_width() - test_w - apply_w - gap * 2.0).max(120.0);
 
@@ -4333,8 +4711,8 @@ pub(crate) fn render_signed_in_server_card(
         }
 
         let can_apply = !app.view.account.server_url.trim().is_empty() && !url_matches_saved;
-        if fixed_secondary_button(ui, "Apply", apply_w, can_apply, t)
-            .on_hover_text("Save this server address for future syncs")
+        if fixed_secondary_button(ui, "Save Default", apply_w, can_apply, t)
+            .on_hover_text("Save this default server address for new logins")
             .clicked()
         {
             match app
@@ -4347,6 +4725,7 @@ pub(crate) fn render_signed_in_server_card(
                     app.view.account.error_message = None;
                     app.view.account.status_message =
                         Some(format!("Server URL updated to {norm}."));
+                    app.flush_web_storage(true);
                 }
                 Err(err) => {
                     app.view.account.status_message = None;
@@ -4369,6 +4748,9 @@ fn render_signed_in_footer(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Token
     ui.horizontal(|ui| {
         if danger_action_button(ui, "Sign Out", true, t).clicked() {
             complete_sign_out(app, ui.ctx());
+        }
+        if secondary_action_button(ui, "Switch Account", true, t).clicked() {
+            crate::modal::open(app, crate::modal::ActiveModal::SelectLocalAccount);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
@@ -4464,88 +4846,224 @@ pub(crate) fn trigger_test_connection(app: &mut PaperCraftApp, ctx: &egui::Conte
     }
 }
 
-fn submit_auth_request(app: &mut PaperCraftApp, ctx: &egui::Context) {
-    if is_active_server_known_offline(app) {
-        app.view.account.status_message = None;
-        app.view.account.error_message = Some(
-            "Server is offline — first sign-in or registration requires an online connection because no local backup exists on this device yet."
-                .to_string(),
-        );
-        return;
+fn should_warn_unsynced_cloud_switch(
+    app: &PaperCraftApp,
+    target_server_url: &str,
+    target_user_id: Option<&str>,
+    target_email: Option<&str>,
+) -> Option<(String, usize)> {
+    let active = app.session.active_account_session()?;
+    if !app.session.is_viewing_cloud() {
+        return None;
     }
-    let url = match normalize_server_url(&app.view.account.server_url) {
-        Ok(norm) => norm,
-        Err(err) => {
-            app.view.account.status_message = None;
-            app.view.account.error_message = Some(err.to_string());
-            return;
-        }
+    let pending = app.session.cloud_pending_changes_count();
+    if pending == 0 {
+        return None;
+    }
+    let same_server = urls_match(&active.server_url, target_server_url);
+    let same_user = target_user_id.is_some_and(|uid| uid == active.user.user_id)
+        || target_email.is_some_and(|email| {
+            active
+                .user
+                .email
+                .as_deref()
+                .is_some_and(|ae| ae.eq_ignore_ascii_case(email.trim()))
+        });
+    if same_server && same_user {
+        return None;
+    }
+    Some((active.user.primary_label(), pending))
+}
+
+pub(crate) fn render_unsynced_switch_confirmation(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    t: &Tokens,
+) {
+    let Some(pending) = app.view.account.pending_unsynced_switch.clone() else {
+        return;
     };
+    let busy = app.view.account.auth_busy || app.view.account.password_reset.busy;
+    ui.add_space(8.0);
+    egui::Frame::new()
+        .fill(t.field_bg)
+        .stroke(Stroke::new(1.0, t.danger_border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                paint_icon(ui.painter(), ir, Icon::AlertCircle, t.warning_fg);
+                ui.label(
+                    egui::RichText::new("Unsynced Changes on Current Account")
+                        .size(12.5)
+                        .strong()
+                        .color(t.text),
+                );
+            });
+            ui.add_space(4.0);
+            let change_word = if pending.pending_count == 1 {
+                "1 unsynced change"
+            } else {
+                "unsynced changes"
+            };
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "'{}' still has {} ({change_word}) not yet uploaded to the server. Switching directly to '{}' preserves '{}' safely in its own isolated offline cache on this device so you can finish syncing it later.",
+                        pending.outgoing_label,
+                        pending.pending_count,
+                        pending.target_label,
+                        pending.outgoing_label,
+                    ))
+                    .size(11.0)
+                    .color(t.text_muted),
+                )
+                .wrap(),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if secondary_action_button(ui, "Cancel", !busy, t).clicked() {
+                    app.view.account.clear_pending_unsynced_switch();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if primary_action_button(
+                        ui,
+                        "Switch Anyway (Keep Local Cache)",
+                        !busy,
+                        t,
+                    )
+                    .clicked()
+                    {
+                        let target = pending.target.clone();
+                        app.view.account.clear_pending_unsynced_switch();
+                        match target {
+                            PendingUnsyncedSwitchTarget::AuthForm => {
+                                dispatch_auth_form_now(app, ui.ctx());
+                            }
+                            PendingUnsyncedSwitchTarget::QuickLogin {
+                                server_url,
+                                user_id,
+                            } => {
+                                dispatch_quick_login_now(app, ui.ctx(), &server_url, &user_id);
+                            }
+                            PendingUnsyncedSwitchTarget::PasswordReset => {
+                                dispatch_password_reset_now(app, ui.ctx());
+                            }
+                        }
+                    }
+                    let sync_busy = app.session.is_sync_in_flight();
+                    if fixed_secondary_button(
+                        ui,
+                        if sync_busy { "Syncing..." } else { "Sync Now First" },
+                        116.0,
+                        !busy && !sync_busy,
+                        t,
+                    )
+                    .clicked()
+                    {
+                        app.view.account.clear_pending_unsynced_switch();
+                        trigger_manual_sync(app, ui.ctx());
+                    }
+                });
+            });
+        });
+}
+
+fn validate_and_build_auth_form_command(
+    app: &PaperCraftApp,
+) -> Result<(String, String, SyncWorkerCommand), String> {
+    let url = normalize_server_url(&app.view.account.server_url).map_err(|e| e.to_string())?;
     let device_name = app.session.device_name().to_string();
     let password = app.view.account.password.clone();
     let disp_raw = app.view.account.display_name.trim().to_string();
     let display_name = (!disp_raw.is_empty()).then_some(disp_raw);
+    let session_gen = app.sync_worker.current_session_generation();
 
-    let cmd = match app.view.account.tab {
+    match app.view.account.tab {
         AuthTab::SignIn => {
             if password.is_empty() {
-                app.view.account.status_message = None;
-                app.view.account.error_message =
-                    Some("Enter your password or recovery code.".to_string());
-                return;
+                return Err("Enter your password or recovery code.".to_string());
             }
-            match build_sign_in_command(
+            let cmd = build_sign_in_command(
+                session_gen,
                 &url,
                 &app.view.account.email_or_username,
                 password,
                 device_name,
-            ) {
-                Ok(cmd) => cmd,
-                Err(msg) => {
-                    app.view.account.status_message = None;
-                    app.view.account.error_message = Some(msg);
-                    return;
-                }
-            }
+            )?;
+            let target_email = normalize_email(&app.view.account.email_or_username)
+                .map(|(_, e)| e)
+                .unwrap_or_else(|_| app.view.account.email_or_username.trim().to_string());
+            Ok((url, target_email, cmd))
         }
         AuthTab::CreateAccount => {
-            if let Err(err) = validate_password(&app.view.account.password) {
-                app.view.account.status_message = None;
-                app.view.account.error_message = Some(err.to_string());
-                return;
+            if app.view.account.is_registration_closed() {
+                return Err("Registration is closed on this server.".to_string());
             }
-            let (email, _) = match normalize_email(&app.view.account.email_or_username) {
-                Ok(pair) => pair,
-                Err(err) => {
-                    app.view.account.status_message = None;
-                    app.view.account.error_message = Some(err.to_string());
-                    return;
-                }
+            validate_password(&app.view.account.password).map_err(|e| e.to_string())?;
+            let (email, _) =
+                normalize_email(&app.view.account.email_or_username).map_err(|e| e.to_string())?;
+            let username = if app.view.account.signup_username.trim().is_empty() {
+                None
+            } else {
+                let (clean, _) = normalize_username(&app.view.account.signup_username)
+                    .map_err(|e| e.to_string())?;
+                Some(clean)
             };
-            let username = match app.view.account.signup_username.trim().is_empty() {
-                true => None,
-                false => match normalize_username(&app.view.account.signup_username) {
-                    Ok((clean, _)) => Some(clean),
-                    Err(err) => {
-                        app.view.account.status_message = None;
-                        app.view.account.error_message = Some(err.to_string());
-                        return;
-                    }
-                },
-            };
-            SyncWorkerCommand::Register {
+            let cmd = SyncWorkerCommand::Register {
+                session_generation: session_gen,
                 server_url: url.clone(),
-                email,
+                email: email.clone(),
                 username,
                 password,
                 display_name,
                 device_name,
-            }
+            };
+            Ok((url, email, cmd))
+        }
+    }
+}
+
+fn submit_auth_request(app: &mut PaperCraftApp, ctx: &egui::Context) {
+    let (url, target_email, _) = match validate_and_build_auth_form_command(app) {
+        Ok(parts) => parts,
+        Err(msg) => {
+            app.view.account.status_message = None;
+            app.view.account.error_message = Some(msg);
+            return;
         }
     };
+    let compare_email = (app.view.account.tab == AuthTab::SignIn).then_some(target_email.as_str());
+    if let Some((outgoing_label, pending_count)) =
+        should_warn_unsynced_cloud_switch(app, &url, None, compare_email)
+    {
+        app.view.account.error_message = None;
+        app.view.account.pending_unsynced_switch = Some(PendingUnsyncedSwitch {
+            outgoing_label,
+            pending_count,
+            target_label: target_email,
+            target: PendingUnsyncedSwitchTarget::AuthForm,
+        });
+        return;
+    }
+    dispatch_auth_form_now(app, ctx);
+}
 
+fn dispatch_auth_form_now(app: &mut PaperCraftApp, ctx: &egui::Context) {
+    let (url, _, cmd) = match validate_and_build_auth_form_command(app) {
+        Ok(parts) => parts,
+        Err(msg) => {
+            app.view.account.status_message = None;
+            app.view.account.error_message = Some(msg);
+            return;
+        }
+    };
     app.view.account.server_url = url.clone();
     let _ = app.session.set_server_url_preference(&url);
+    app.view.account.clear_pending_unsynced_switch();
     app.view.account.auth_busy = true;
     app.view.account.error_message = None;
     app.view.account.status_message = Some("Contacting PaperCraft Server...".to_string());
@@ -4558,15 +5076,10 @@ fn submit_auth_request(app: &mut PaperCraftApp, ctx: &egui::Context) {
     }
 }
 
-fn submit_complete_password_reset(app: &mut PaperCraftApp, ctx: &egui::Context) {
-    let url = match normalize_server_url(&app.view.account.server_url) {
-        Ok(norm) => norm,
-        Err(err) => {
-            app.view.account.status_message = None;
-            app.view.account.error_message = Some(err.to_string());
-            return;
-        }
-    };
+fn validate_and_build_password_reset(
+    app: &PaperCraftApp,
+) -> Result<(String, String, SyncWorkerCommand), String> {
+    let url = normalize_server_url(&app.view.account.server_url).map_err(|e| e.to_string())?;
     let identifier = app
         .view
         .account
@@ -4574,15 +5087,8 @@ fn submit_complete_password_reset(app: &mut PaperCraftApp, ctx: &egui::Context) 
         .identifier
         .trim()
         .to_string();
-    let (clean_id, _) = match normalize_email(&identifier) {
-        Ok(pair) => pair,
-        Err(_) => {
-            app.view.account.status_message = None;
-            app.view.account.error_message =
-                Some("Enter a valid email address to recover your account.".to_string());
-            return;
-        }
-    };
+    let (clean_id, _) = normalize_email(&identifier)
+        .map_err(|_| "Enter a valid email address to recover your account.".to_string())?;
     let code = app
         .view
         .account
@@ -4591,47 +5097,69 @@ fn submit_complete_password_reset(app: &mut PaperCraftApp, ctx: &egui::Context) 
         .trim()
         .to_string();
     if code.is_empty() {
-        app.view.account.status_message = None;
-        app.view.account.error_message =
-            Some("Enter the temporary recovery code generated on the server.".to_string());
-        return;
+        return Err("Enter the temporary recovery code generated on the server.".to_string());
     }
-    if let Err(err) = validate_password(&app.view.account.password_reset.new_password) {
-        app.view.account.status_message = None;
-        app.view.account.error_message = Some(err.to_string());
-        return;
-    }
+    validate_password(&app.view.account.password_reset.new_password).map_err(|e| e.to_string())?;
     if app.view.account.password_reset.new_password
         != app.view.account.password_reset.confirm_password
     {
-        app.view.account.status_message = None;
-        app.view.account.error_message =
-            Some("New password and confirmation do not match.".to_string());
-        return;
+        return Err("New password and confirmation do not match.".to_string());
     }
     if app.view.account.password_reset.new_password == code {
-        app.view.account.status_message = None;
-        app.view.account.error_message =
-            Some("New password must be different from the temporary recovery code.".to_string());
+        return Err("New password must be different from the temporary recovery code.".to_string());
+    }
+    let cmd = SyncWorkerCommand::CompletePasswordReset {
+        session_generation: app.sync_worker.current_session_generation(),
+        server_url: url.clone(),
+        identifier: clean_id.clone(),
+        recovery_code: code,
+        new_password: app.view.account.password_reset.new_password.clone(),
+        device_name: app.session.device_name().to_string(),
+    };
+    Ok((url, clean_id, cmd))
+}
+
+fn submit_complete_password_reset(app: &mut PaperCraftApp, ctx: &egui::Context) {
+    let (url, clean_id, _) = match validate_and_build_password_reset(app) {
+        Ok(parts) => parts,
+        Err(msg) => {
+            app.view.account.status_message = None;
+            app.view.account.error_message = Some(msg);
+            return;
+        }
+    };
+    if let Some((outgoing_label, pending_count)) =
+        should_warn_unsynced_cloud_switch(app, &url, None, Some(&clean_id))
+    {
+        app.view.account.error_message = None;
+        app.view.account.pending_unsynced_switch = Some(PendingUnsyncedSwitch {
+            outgoing_label,
+            pending_count,
+            target_label: clean_id,
+            target: PendingUnsyncedSwitchTarget::PasswordReset,
+        });
         return;
     }
+    dispatch_password_reset_now(app, ctx);
+}
 
-    let device_name = app.session.device_name().to_string();
-    let new_password = app.view.account.password_reset.new_password.clone();
+fn dispatch_password_reset_now(app: &mut PaperCraftApp, ctx: &egui::Context) {
+    let (url, _, cmd) = match validate_and_build_password_reset(app) {
+        Ok(parts) => parts,
+        Err(msg) => {
+            app.view.account.status_message = None;
+            app.view.account.error_message = Some(msg);
+            return;
+        }
+    };
     app.view.account.server_url = url.clone();
     let _ = app.session.set_server_url_preference(&url);
+    app.view.account.clear_pending_unsynced_switch();
     app.view.account.password_reset.busy = true;
     app.view.account.error_message = None;
     app.view.account.status_message =
         Some("Verifying recovery code and saving your new password...".to_string());
 
-    let cmd = SyncWorkerCommand::CompletePasswordReset {
-        server_url: url,
-        identifier: clean_id,
-        recovery_code: code,
-        new_password,
-        device_name,
-    };
     if !crate::sync_worker::dispatch_command(app, Some(ctx), cmd) {
         app.view.account.password_reset.busy = false;
         app.view.account.status_message = None;
@@ -4664,6 +5192,7 @@ fn submit_update_profile(app: &mut PaperCraftApp, ctx: &egui::Context) {
     app.view.account.profile_save_busy = true;
     app.view.account.error_message = None;
     let cmd = SyncWorkerCommand::UpdateProfile {
+        session_generation: app.sync_worker.current_session_generation(),
         session,
         username,
         display_name,
@@ -4707,6 +5236,7 @@ fn submit_change_password(app: &mut PaperCraftApp, ctx: &egui::Context) {
     app.view.account.change_password_busy = true;
     app.view.account.error_message = None;
     let cmd = SyncWorkerCommand::ChangePassword {
+        session_generation: app.sync_worker.current_session_generation(),
         session,
         current_password: app.view.account.current_password_draft.clone(),
         new_password: app.view.account.new_password_draft.clone(),
@@ -4719,6 +5249,7 @@ fn submit_change_password(app: &mut PaperCraftApp, ctx: &egui::Context) {
 }
 
 fn build_sign_in_command(
+    session_generation: u64,
     server_url: &str,
     identifier_raw: &str,
     password: String,
@@ -4730,6 +5261,7 @@ fn build_sign_in_command(
     }
     let (_, email) = normalize_email(trimmed).map_err(|e| e.to_string())?;
     Ok(SyncWorkerCommand::Login {
+        session_generation,
         server_url: server_url.to_string(),
         identifier: email,
         password,
@@ -4758,6 +5290,7 @@ fn submit_change_email(app: &mut PaperCraftApp, ctx: &egui::Context) {
     app.view.account.change_email_busy = true;
     app.view.account.error_message = None;
     let cmd = SyncWorkerCommand::ChangeEmail {
+        session_generation: app.sync_worker.current_session_generation(),
         session,
         new_email,
         current_password: app.view.account.change_email_password.clone(),
@@ -5198,6 +5731,7 @@ pub(crate) fn render_auth_banners(app: &mut PaperCraftApp, ui: &mut egui::Ui, t:
         let tone = if msg.starts_with("Server URL updated")
             || msg.starts_with("Account email updated")
             || msg.starts_with("Profile updated")
+            || msg.starts_with("Local account renamed")
             || msg.starts_with("Account password updated")
             || msg.starts_with("Moved ")
             || msg.starts_with("Deleted local profile ")
@@ -5557,11 +6091,12 @@ mod tests {
 
         app.view.account.disconnect_notice =
             Some("Connection lost — automatically signed out.".to_string());
-        modal::open(&mut app, modal::ActiveModal::FirstAccessNickname);
+        modal::open(&mut app, modal::ActiveModal::SelectLocalAccount);
         let first_text = render_modal_settled(&ctx, &mut app);
         assert!(first_text.contains("Connection lost — automatically signed out."));
-        assert!(first_text.contains("Nickname"));
-        assert!(first_text.contains("Start Session"));
+        assert!(first_text.contains("Start with a Local Account (Offline)"));
+        assert!(first_text.contains("Start Local Session"));
+        assert!(first_text.contains("Sign In / Register"));
 
         app.session
             .execute(
@@ -5577,8 +6112,9 @@ mod tests {
             .clone();
         modal::open(&mut app, modal::ActiveModal::SelectLocalAccount);
         let select_text = render_modal_settled(&ctx, &mut app);
-        assert!(select_text.contains("Saved Local Accounts"));
+        assert!(select_text.contains("Saved Accounts on This Device"));
         assert!(select_text.contains("Bruno"));
+        assert!(select_text.contains("Local"));
         assert!(select_text.contains("Open"));
         assert!(select_text.contains("Create & Open"));
 
@@ -5588,6 +6124,7 @@ mod tests {
         modal::open(&mut app, modal::ActiveModal::ConvertLocalAccount);
         let convert_text = render_modal_settled(&ctx, &mut app);
         assert!(convert_text.contains("Convert 'Bruno' to Cloud Account?"));
+        assert!(convert_text.contains("Self-Hosted Server"));
         assert!(convert_text.contains("Offline-First cache"));
         assert!(convert_text.contains("Email Address"));
         assert!(convert_text.contains("Password"));
@@ -5701,7 +6238,7 @@ mod tests {
         assert!(app.session.sign_out_from_server_session());
         assert_eq!(app.session.remembered_server_accounts().len(), 1);
 
-        // When server is offline and shortcut has no cached session, sign-in is blocked and Forget Account asks confirmation.
+        // When server probe failed and shortcut has no cached session, warn softly without locking out retry and confirm Forget Account.
         crate::open_profile_screen(&mut app);
         app.view
             .account
@@ -5715,9 +6252,9 @@ mod tests {
         );
         assert!(
             text.contains(
-                "Server offline — password verification requires an online connection before switching or signing in."
+                "Last check could not reach server — click Switch / Sign In to retry authenticating."
             ),
-            "missing offline block notice:\n{text}"
+            "missing soft offline warning notice:\n{text}"
         );
         assert!(text.contains("Forget Account"));
         assert!(text.contains("Sync"));
@@ -5729,7 +6266,7 @@ mod tests {
         click_profile_button(&ctx, &mut app, &confirm_shapes, "Confirm Forget", 1.20);
         assert!(app.session.remembered_server_accounts().is_empty());
 
-        // Cached server accounts block passwordless access when offline and require password when online.
+        // Cached server accounts always require password verification instead of passwordless access.
         let cached_acct = test_account("u-cached", "cached@example.com");
         let cached_pull = SyncPullResponse {
             server_cursor: 1,
@@ -5764,17 +6301,22 @@ mod tests {
         );
         assert!(
             cached_text.contains(
-                "Server offline — password verification requires an online connection before switching or signing in."
+                "Last check could not reach server — click Switch / Sign In to retry authenticating."
             ),
-            "missing offline password-required notice for cached server account:\n{cached_text}"
+            "missing offline warning notice for cached server account:\n{cached_text}"
         );
         assert!(
             !cached_text.contains("Open Offline"),
             "must not allow passwordless Open Offline bypass:\n{cached_text}"
         );
+        // Clicking Switch when prior probe failed still opens the password verification drawer so user can retry!
         click_profile_button(&ctx, &mut app, &cached_shapes, "Switch", 2.15);
         assert!(!app.session.is_viewing_cloud());
-        assert!(app.view.account.quick_login_key.is_none());
+        assert!(
+            app.view.account.quick_login_key.is_some(),
+            "stale offline probe must never hard-disable retrying sign-in"
+        );
+        app.view.account.clear_quick_login_draft();
 
         // Clicking Forget Account on the cached account shows the pending local change warning.
         click_profile_button(&ctx, &mut app, &cached_shapes, "Forget Account", 2.25);
@@ -5901,11 +6443,12 @@ mod tests {
 
         let (text, shapes) = run_modal_frames(&ctx, &mut app, 0.0, 8);
         assert!(text.contains("Choose an Account"), "\n{text}");
-        assert!(text.contains("Server Accounts"), "\n{text}");
+        assert!(text.contains("Saved Accounts on This Device"), "\n{text}");
         assert!(text.contains("selector@example.com"), "\n{text}");
-        assert!(text.contains("Saved Local Accounts"), "\n{text}");
+        assert!(text.contains("Connected to Server"), "\n{text}");
         assert!(text.contains("Work"), "\n{text}");
-        assert!(text.contains("Sign In with Another Email"), "\n{text}");
+        assert!(text.contains("Local"), "\n{text}");
+        assert!(text.contains("Sign In / Register"), "\n{text}");
 
         // Clicking Sign In on the server card opens the password drawer instead of bypassing auth.
         let sign_in_pos = find_profile_button_center(&shapes, "Sign In");
@@ -5947,8 +6490,8 @@ mod tests {
             "missing drawer Cancel button:\n{pw_text}"
         );
 
-        // Clicking Sign In with Another Email transitions into the email-only login form.
-        let other_pos = find_profile_button_center(&pw_shapes, "Sign In with Another Email");
+        // Clicking Sign In / Register transitions into the server URL & email login form.
+        let other_pos = find_profile_button_center(&pw_shapes, "Sign In / Register");
         for (pressed, t) in [(true, 1.00), (false, 1.02)] {
             let out = ctx.run_ui(
                 egui::RawInput {
@@ -5990,6 +6533,7 @@ mod tests {
         use crate::sync_worker::SyncWorkerCommand;
 
         let Err(err) = super::build_sign_in_command(
+            0,
             "http://127.0.0.1:8787",
             "alex_nick",
             "SecretPass1!".to_string(),
@@ -6003,6 +6547,7 @@ mod tests {
         );
 
         let Ok(cmd) = super::build_sign_in_command(
+            0,
             "http://127.0.0.1:8787",
             "  Alex@Example.COM ",
             "SecretPass1!".to_string(),
@@ -6066,6 +6611,8 @@ mod tests {
         }
         assert!(text_out.contains("Connected to PaperCraft Server v0.1.0"));
         assert!(text_out.contains("Registration open"));
+        assert!(text_out.contains("Protocol v1"), "{text_out}");
+        assert!(text_out.contains("Storage: redb"), "{text_out}");
         assert!(
             green_badges >= 2,
             "expected green connection icons in header/input/banner, got {green_badges}"
@@ -6282,7 +6829,7 @@ mod tests {
             text.contains("Sign Out"),
             "missing Sign Out button:\n{text}"
         );
-        assert!(text.contains("Local Only"), "missing Local Only:\n{text}");
+        assert!(text.contains("Local"), "missing Local badge:\n{text}");
     }
 
     #[test]
@@ -6562,5 +7109,169 @@ mod tests {
             text.contains("Sign In & Sync"),
             "missing Sign In & Sync button:\n{text}"
         );
+    }
+
+    #[test]
+    fn startup_account_picker_respects_option_a_dismissibility_and_toggle() {
+        let ctx = egui::Context::default();
+        let mut session = papercraft_engine::Session::open_web_cache(None);
+        session.dismiss_welcome_banner();
+        let mut app = PaperCraftApp::new(session, crate::PlatformHooks::default());
+
+        assert_eq!(
+            app.view.active_modal,
+            Some(modal::ActiveModal::SelectLocalAccount)
+        );
+        assert!(app.session.needs_initial_nickname());
+        assert!(!modal::is_account_picker_dismissible(&app));
+
+        let initial_text = render_modal_settled(&ctx, &mut app);
+        assert!(
+            initial_text.contains("Welcome to PaperCraft"),
+            "{initial_text}"
+        );
+        assert!(
+            initial_text.contains("Remember last account and skip on startup"),
+            "{initial_text}"
+        );
+
+        // Create a local account -> Option A still shows picker on next startup until toggled.
+        crate::sync_worker::create_local_account_and_switch(&mut app, &ctx, "LocalOne").unwrap();
+        assert!(!app.session.needs_initial_nickname());
+        assert!(app.session.has_loaded_workspace());
+        assert!(app.session.should_show_startup_account_picker());
+
+        // Re-open picker as Switch Account -> now dismissible, shows Local badge + Active pill.
+        modal::open(&mut app, modal::ActiveModal::SelectLocalAccount);
+        assert!(modal::is_account_picker_dismissible(&app));
+        let switch_text = render_modal_settled(&ctx, &mut app);
+        assert!(switch_text.contains("Switch Account"), "{switch_text}");
+        assert!(switch_text.contains("LocalOne"), "{switch_text}");
+        assert!(switch_text.contains("Active"), "{switch_text}");
+        assert!(switch_text.contains("Continue"), "{switch_text}");
+        assert!(switch_text.contains("Cancel"), "{switch_text}");
+
+        // Toggling startup preference off updates the engine session immediately.
+        let mut shapes = Vec::new();
+        for step in 0..4 {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 800.0),
+                    )),
+                    time: Some(0.5 + f64::from(step) * 0.04),
+                    ..Default::default()
+                },
+                |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    modal::show(&mut app, ui);
+                },
+            );
+            shapes = out.shapes.clone();
+            out.drop_without_applying_deltas();
+        }
+        let check_pos =
+            find_profile_button_center(&shapes, "Remember last account and skip on startup");
+        for (pressed, t) in [(true, 0.7), (false, 0.74)] {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 800.0),
+                    )),
+                    time: Some(t),
+                    events: vec![
+                        egui::Event::PointerMoved(check_pos),
+                        egui::Event::PointerButton {
+                            pos: check_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    modal::show(&mut app, ui);
+                },
+            );
+            out.drop_without_applying_deltas();
+        }
+        assert!(app.session.skip_account_picker_on_startup());
+        assert!(!app.session.should_show_startup_account_picker());
+    }
+
+    #[test]
+    fn direct_cloud_switch_with_pending_edits_warns_and_preserves_cache() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let ctx = egui::Context::default();
+        let login_dispatches = Arc::new(AtomicUsize::new(0));
+        let login_clone = Arc::clone(&login_dispatches);
+        let hooks = crate::PlatformHooks {
+            web_sync_dispatch: Some(Box::new(move |cmd, _tx, _ctx| {
+                if matches!(cmd, crate::sync_worker::SyncWorkerCommand::Login { .. }) {
+                    login_clone.fetch_add(1, Ordering::Relaxed);
+                }
+            })),
+            ..crate::PlatformHooks::default()
+        };
+        let session = papercraft_engine::Session::open_web_cache(None);
+        let mut app = PaperCraftApp::new(session, hooks);
+        app.view.active_modal = None;
+
+        let acct_a = test_account("u-cloud-a", "alice@example.com");
+        let pull_a = SyncPullResponse {
+            server_cursor: 1,
+            user: acct_a.user.clone(),
+            notebooks: Vec::new(),
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        app.session.enter_online_server_session(acct_a, pull_a);
+        app.session
+            .execute(
+                "notebook.create",
+                &serde_json::json!({ "title": "Unsynced Sketch" }),
+            )
+            .unwrap();
+        assert_eq!(app.session.cloud_pending_changes_count(), 1);
+
+        crate::open_profile_screen(&mut app);
+        app.view.account.profile_section = ProfileSection::ServerSync;
+        app.view.account.server_switch_form_open = true;
+        app.view.account.email_or_username = "bob@example.com".to_string();
+        app.view.account.password = "SecretPass1!".to_string();
+
+        // Trying to switch to Bob sets pending_unsynced_switch instead of dispatching Login immediately.
+        super::submit_auth_request(&mut app, &ctx);
+        assert_eq!(login_dispatches.load(Ordering::Relaxed), 0);
+        assert!(app.view.account.pending_unsynced_switch.is_some());
+
+        let (warn_text, warn_shapes) = render_profile_frames(&ctx, &mut app, 0.0, 16);
+        assert!(
+            warn_text.contains("Unsynced Changes on Current Account"),
+            "{warn_text}"
+        );
+        assert!(warn_text.contains("Sync Now First"), "{warn_text}");
+        assert!(
+            warn_text.contains("Switch Anyway (Keep Local Cache)"),
+            "{warn_text}"
+        );
+
+        click_profile_button(
+            &ctx,
+            &mut app,
+            &warn_shapes,
+            "Switch Anyway (Keep Local Cache)",
+            0.40,
+        );
+        assert!(app.view.account.pending_unsynced_switch.is_none());
+        assert_eq!(login_dispatches.load(Ordering::Relaxed), 1);
     }
 }

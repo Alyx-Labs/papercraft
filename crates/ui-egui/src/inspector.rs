@@ -901,7 +901,9 @@ pub(crate) fn format_storage_bytes(bytes: u64) -> String {
     }
 }
 
-fn web_storage_info_from_status(status: &crate::WebStorageStatus) -> (String, Option<String>) {
+pub(crate) fn web_storage_info_from_status(
+    status: &crate::WebStorageStatus,
+) -> (String, Option<String>) {
     let mut tip = match status.backend {
         crate::WebStorageBackend::IndexedDb => {
             if status.persisted == Some(true) {
@@ -964,7 +966,9 @@ fn system_storage_info(app: &PaperCraftApp) -> (String, Option<String>) {
     }
 }
 
-fn web_storage_usage_row(status: &crate::WebStorageStatus) -> Option<(String, Option<String>)> {
+pub(crate) fn web_storage_usage_row(
+    status: &crate::WebStorageStatus,
+) -> Option<(String, Option<String>)> {
     match (status.usage_bytes, status.quota_bytes) {
         (Some(usage), Some(quota)) if quota > 0 => {
             let pct = (usage as f64 / quota as f64 * 100.0).clamp(0.0, 100.0);

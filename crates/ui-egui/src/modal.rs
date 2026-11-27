@@ -21,7 +21,6 @@ pub enum ActiveModal {
     ConfirmDeleteNotebook,
     ConfirmReorderPage,
     AccountSync,
-    FirstAccessNickname,
     SelectLocalAccount,
     ConvertLocalAccount,
     TransferPages,
@@ -74,7 +73,6 @@ impl ActiveModal {
             Self::NotebookSettings => 3,
             Self::ConfirmDeleteNotebook => 4,
             Self::AccountSync => 5,
-            Self::FirstAccessNickname => 14,
             Self::SelectLocalAccount => 15,
             Self::ConvertLocalAccount => 20,
             Self::TransferPages => 6,
@@ -177,18 +175,11 @@ impl ActiveModal {
                 width: 440.0,
                 min_body_height: 0.0,
             },
-            Self::FirstAccessNickname => DialogSpec {
-                icon: Icon::Account,
-                title: "Welcome to PaperCraft",
-                subtitle: "Enter a local nickname to identify this device session.",
-                width: 420.0,
-                min_body_height: 0.0,
-            },
             Self::SelectLocalAccount => DialogSpec {
                 icon: Icon::Account,
                 title: "Choose an Account",
-                subtitle: "Select a saved account to sign in, or create a new local workspace.",
-                width: 520.0,
+                subtitle: "Select a local or server account, create a new local workspace, or sign in to a server.",
+                width: 560.0,
                 min_body_height: 240.0,
             },
             Self::ConvertLocalAccount => DialogSpec {
@@ -349,15 +340,15 @@ pub(crate) fn open(app: &mut PaperCraftApp, target: ActiveModal) {
         | ActiveModal::KeyboardShortcuts
         | ActiveModal::WelcomeBanner
         | ActiveModal::FirstNotebookDataNotice => {}
-        ActiveModal::FirstAccessNickname => {
-            app.view.first_access_error = None;
-            app.view.first_access_focus_pending = true;
-        }
         ActiveModal::SelectLocalAccount => {
-            app.view.account.server_url = app.session.server_url().to_string();
+            app.view.account.server_url = app.session.preferred_server_url().to_string();
+            app.view.account.invalidate_probe_if_url_changed();
             app.view.account.select_local_new_name.clear();
             app.view.account.select_local_error = None;
+            app.view.account.select_local_focus_pending = !app.session.has_any_saved_accounts();
             app.view.account.clear_quick_login_draft();
+            app.view.account.clear_pending_unsynced_switch();
+            app.view.account.exit_password_reset_flow();
             app.view.account.selector_other_server_open = false;
             app.view.account.error_message = None;
             app.view.account.status_message = None;
@@ -366,6 +357,9 @@ pub(crate) fn open(app: &mut PaperCraftApp, target: ActiveModal) {
             app.view.motion.account_banner.reset();
         }
         ActiveModal::ConvertLocalAccount => {
+            app.view.account.server_url = app.session.preferred_server_url().to_string();
+            app.view.account.invalidate_probe_if_url_changed();
+            app.view.account.profile_probe_pending = true;
             app.view.account.convert_error = None;
             app.view.account.convert_busy = false;
             app.view.account.convert_focus_pending = true;
@@ -616,14 +610,6 @@ fn show_inner_with_motion(
             crate::account_modal::render_body,
             crate::account_modal::render_footer,
         ),
-        ActiveModal::FirstAccessNickname => show_dialog(
-            app,
-            ui,
-            active,
-            motion,
-            crate::account_modal::render_first_access_body,
-            crate::account_modal::render_first_access_footer,
-        ),
         ActiveModal::SelectLocalAccount => show_dialog(
             app,
             ui,
@@ -748,7 +734,6 @@ fn modal_steps(active: ActiveModal) -> Option<&'static [ModalStepSpec]> {
         | ActiveModal::ConfirmDeleteNotebook
         | ActiveModal::ConfirmReorderPage
         | ActiveModal::AccountSync
-        | ActiveModal::FirstAccessNickname
         | ActiveModal::SelectLocalAccount
         | ActiveModal::ConvertLocalAccount
         | ActiveModal::TransferPages
@@ -791,6 +776,12 @@ fn set_active_step_index(app: &mut PaperCraftApp, active: ActiveModal, step: usi
     }
 }
 
+pub(crate) fn is_account_picker_dismissible(app: &PaperCraftApp) -> bool {
+    app.session.has_loaded_workspace()
+        && !app.view.account.auth_busy
+        && !app.view.account.password_reset.busy
+}
+
 fn show_dialog(
     app: &mut PaperCraftApp,
     ui: &mut egui::Ui,
@@ -799,7 +790,20 @@ fn show_dialog(
     body: impl FnOnce(&mut PaperCraftApp, &mut egui::Ui, &Tokens) -> bool,
     footer: impl FnOnce(&mut PaperCraftApp, &mut egui::Ui, &Tokens) -> bool,
 ) -> ModalMetrics {
-    let spec = active.spec();
+    let mut spec = active.spec();
+    if active == ActiveModal::SelectLocalAccount {
+        if app.view.account.selector_other_server_open {
+            spec.title = "Sign In with a Server Account";
+            spec.subtitle =
+                "Enter your self-hosted server address and sign in or create an account.";
+        } else if app.session.needs_initial_nickname() && !app.session.has_any_saved_accounts() {
+            spec.title = "Welcome to PaperCraft";
+            spec.subtitle = "Start immediately with a local offline account, or sign in to a self-hosted server.";
+        } else if app.session.has_loaded_workspace() {
+            spec.title = "Switch Account";
+            spec.subtitle = "Switch between local and server accounts, create a local workspace, or sign in to a server.";
+        }
+    }
     let tag = active.id_tag();
     let steps = modal_steps(active);
     let current_step = active_step_index(app, active);
@@ -850,11 +854,9 @@ fn show_dialog(
         0.0,
         (1.0 - motion.eased) * crate::motion::MODAL_SETTLE_OFFSET_Y,
     );
-    let allow_close = !matches!(
-        active,
-        ActiveModal::FirstAccessNickname | ActiveModal::SelectLocalAccount
-    ) && !(active == ActiveModal::ConvertLocalAccount
-        && app.view.account.convert_busy)
+    let allow_close = !(active == ActiveModal::SelectLocalAccount
+        && !is_account_picker_dismissible(app))
+        && !(active == ActiveModal::ConvertLocalAccount && app.view.account.convert_busy)
         && !(active == ActiveModal::Export && app.is_pdf_export_active());
 
     let modal_resp = egui::Area::new(modal_id)

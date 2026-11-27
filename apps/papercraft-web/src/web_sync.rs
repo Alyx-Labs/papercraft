@@ -50,6 +50,7 @@ fn emit_web_progress(
 }
 
 fn web_convert_err_event(
+    session_generation: u64,
     source_profile_id: String,
     err: &SyncError,
     is_auth: bool,
@@ -63,6 +64,7 @@ fn web_convert_err_event(
         friendly_web_error(err)
     };
     SyncWorkerEvent::ConvertLocalErr {
+        session_generation,
         source_profile_id,
         offline,
         message,
@@ -100,6 +102,7 @@ async fn execute_async_command(
             None
         }
         SyncWorkerCommand::Register {
+            session_generation,
             server_url,
             email,
             username,
@@ -117,6 +120,7 @@ async fn execute_async_command(
                 Ok(req) => req,
                 Err(message) => {
                     return Some(SyncWorkerEvent::AuthErr {
+                        session_generation,
                         offline: false,
                         message,
                     });
@@ -127,6 +131,7 @@ async fn execute_async_command(
                     Ok(auth) => auth,
                     Err(err) => {
                         return Some(SyncWorkerEvent::AuthErr {
+                            session_generation,
                             offline: matches!(err, SyncError::Network(_)),
                             message: friendly_web_auth_error(&err),
                         });
@@ -134,22 +139,35 @@ async fn execute_async_command(
                 };
             match pull_with_refresh(&mut auth, 0).await {
                 Ok((pull_resp, _)) => Some(SyncWorkerEvent::AuthOk {
+                    session_generation,
                     auth,
                     initial_pull: Box::new(pull_resp),
                 }),
                 Err(err) => Some(SyncWorkerEvent::AuthErr {
+                    session_generation,
                     offline: matches!(err, SyncError::Network(_)),
                     message: friendly_web_error(&err),
                 }),
             }
         }
         SyncWorkerCommand::Login {
+            session_generation,
             server_url,
             identifier,
             password,
             device_name,
-        } => Some(exec_web_login(&server_url, identifier, password, &device_name).await),
+        } => Some(
+            exec_web_login(
+                session_generation,
+                &server_url,
+                identifier,
+                password,
+                &device_name,
+            )
+            .await,
+        ),
         SyncWorkerCommand::CompletePasswordReset {
+            session_generation,
             server_url,
             identifier,
             recovery_code,
@@ -157,6 +175,7 @@ async fn execute_async_command(
             device_name,
         } => Some(
             exec_web_complete_password_reset(
+                session_generation,
                 &server_url,
                 &identifier,
                 &recovery_code,
@@ -166,6 +185,7 @@ async fn execute_async_command(
             .await,
         ),
         SyncWorkerCommand::ConvertLocalAccount {
+            session_generation,
             server_url,
             source_profile_id,
             source_nickname,
@@ -175,6 +195,7 @@ async fn execute_async_command(
             upload_batch,
         } => Some(
             exec_web_convert_local_account(
+                session_generation,
                 &server_url,
                 source_profile_id,
                 source_nickname,
@@ -188,16 +209,24 @@ async fn execute_async_command(
             .await,
         ),
         SyncWorkerCommand::UpdateProfile {
+            session_generation,
             session,
             username,
             display_name,
-        } => Some(exec_web_update_profile(session, username, display_name).await),
+        } => {
+            Some(exec_web_update_profile(session_generation, session, username, display_name).await)
+        }
         SyncWorkerCommand::ChangePassword {
+            session_generation,
             session,
             current_password,
             new_password,
-        } => Some(exec_web_change_password(session, current_password, new_password).await),
+        } => Some(
+            exec_web_change_password(session_generation, session, current_password, new_password)
+                .await,
+        ),
         SyncWorkerCommand::ChangeEmail {
+            session_generation,
             mut session,
             new_email,
             current_password,
@@ -206,6 +235,7 @@ async fn execute_async_command(
                 Ok(req) => req,
                 Err(message) => {
                     return Some(SyncWorkerEvent::EmailChangeErr {
+                        session_generation,
                         offline: false,
                         unauthorized: false,
                         message,
@@ -216,24 +246,29 @@ async fn execute_async_command(
                 Ok(profile) => {
                     session.user = profile;
                     Some(SyncWorkerEvent::EmailChanged {
+                        session_generation,
                         updated_session: session,
                     })
                 }
                 Err(err) => Some(SyncWorkerEvent::EmailChangeErr {
+                    session_generation,
                     offline: matches!(err, SyncError::Network(_)),
                     unauthorized: matches!(err, SyncError::Unauthorized(_)),
                     message: friendly_web_error(&err),
                 }),
             }
         }
-        SyncWorkerCommand::SyncNow { mut session, batch } => {
-            match run_web_sync_cycle(&mut session, &batch).await {
-                Ok(outcome) => Some(SyncWorkerEvent::SyncOk {
-                    outcome: Box::new(outcome),
-                }),
-                Err(err) => Some(web_sync_err_event(&err)),
-            }
-        }
+        SyncWorkerCommand::SyncNow {
+            session_generation,
+            mut session,
+            batch,
+        } => match run_web_sync_cycle(&mut session, &batch).await {
+            Ok(outcome) => Some(SyncWorkerEvent::SyncOk {
+                session_generation,
+                outcome: Box::new(outcome),
+            }),
+            Err(err) => Some(web_sync_err_event(session_generation, &err)),
+        },
         SyncWorkerCommand::Logout { session } => {
             let url = format!("{}/api/v1/auth/logout", session.server_url);
             let body = LogoutRequest {
@@ -247,6 +282,7 @@ async fn execute_async_command(
 }
 
 async fn exec_web_login(
+    session_generation: u64,
     server_url: &str,
     identifier: String,
     password: String,
@@ -257,6 +293,7 @@ async fn exec_web_login(
         Ok(req) => req,
         Err(message) => {
             return SyncWorkerEvent::AuthErr {
+                session_generation,
                 offline: false,
                 message,
             };
@@ -268,6 +305,7 @@ async fn exec_web_login(
             if code == ERR_CODE_PASSWORD_CHANGE_REQUIRED =>
         {
             return SyncWorkerEvent::PasswordResetRequired {
+                session_generation,
                 identifier,
                 prefill_code: Some(submitted_password.trim().to_string()),
                 message,
@@ -277,6 +315,7 @@ async fn exec_web_login(
             if code == ERR_CODE_PASSWORD_RESET_REQUIRED =>
         {
             return SyncWorkerEvent::PasswordResetRequired {
+                session_generation,
                 identifier,
                 prefill_code: None,
                 message,
@@ -284,6 +323,7 @@ async fn exec_web_login(
         }
         Err(err) => {
             return SyncWorkerEvent::AuthErr {
+                session_generation,
                 offline: matches!(err, SyncError::Network(_)),
                 message: friendly_web_auth_error(&err),
             };
@@ -291,10 +331,12 @@ async fn exec_web_login(
     };
     match pull_with_refresh(&mut auth, 0).await {
         Ok((pull_resp, _)) => SyncWorkerEvent::AuthOk {
+            session_generation,
             auth,
             initial_pull: Box::new(pull_resp),
         },
         Err(err) => SyncWorkerEvent::AuthErr {
+            session_generation,
             offline: matches!(err, SyncError::Network(_)),
             message: friendly_web_error(&err),
         },
@@ -302,6 +344,7 @@ async fn exec_web_login(
 }
 
 async fn exec_web_complete_password_reset(
+    session_generation: u64,
     server_url: &str,
     identifier: &str,
     recovery_code: &str,
@@ -317,6 +360,7 @@ async fn exec_web_complete_password_reset(
         Ok(req) => req,
         Err(message) => {
             return SyncWorkerEvent::AuthErr {
+                session_generation,
                 offline: false,
                 message,
             };
@@ -333,6 +377,7 @@ async fn exec_web_complete_password_reset(
         Ok(auth) => auth,
         Err(err) => {
             return SyncWorkerEvent::AuthErr {
+                session_generation,
                 offline: matches!(err, SyncError::Network(_)),
                 message: friendly_web_auth_error(&err),
             };
@@ -340,10 +385,12 @@ async fn exec_web_complete_password_reset(
     };
     match pull_with_refresh(&mut auth, 0).await {
         Ok((pull_resp, _)) => SyncWorkerEvent::AuthOk {
+            session_generation,
             auth,
             initial_pull: Box::new(pull_resp),
         },
         Err(err) => SyncWorkerEvent::AuthErr {
+            session_generation,
             offline: matches!(err, SyncError::Network(_)),
             message: friendly_web_error(&err),
         },
@@ -352,6 +399,7 @@ async fn exec_web_complete_password_reset(
 
 #[allow(clippy::too_many_arguments)]
 async fn exec_web_convert_local_account(
+    session_generation: u64,
     server_url: &str,
     source_profile_id: String,
     source_nickname: String,
@@ -367,6 +415,7 @@ async fn exec_web_convert_local_account(
             Ok(req) => req,
             Err(message) => {
                 return SyncWorkerEvent::ConvertLocalErr {
+                    session_generation,
                     source_profile_id,
                     offline: false,
                     message,
@@ -379,6 +428,7 @@ async fn exec_web_convert_local_account(
         evt_tx,
         ctx,
         SyncWorkerEvent::ConvertLocalProgress {
+            session_generation,
             source_profile_id: source_profile_id.clone(),
             stage: "Creating cloud account...".to_string(),
             completed: 0,
@@ -388,13 +438,16 @@ async fn exec_web_convert_local_account(
 
     let mut auth = match web_auth("/api/v1/auth/register", server_url, &req, device_name).await {
         Ok(auth) => auth,
-        Err(err) => return web_convert_err_event(source_profile_id, &err, true),
+        Err(err) => {
+            return web_convert_err_event(session_generation, source_profile_id, &err, true);
+        }
     };
 
     emit_web_progress(
         evt_tx,
         ctx,
         SyncWorkerEvent::ConvertLocalProgress {
+            session_generation,
             source_profile_id: source_profile_id.clone(),
             stage: format!("Uploading notebooks (0/{total_docs})..."),
             completed: 1,
@@ -408,7 +461,9 @@ async fn exec_web_convert_local_account(
         let chunk_docs = push_req.changes.len();
         let resp = match push_with_refresh(&mut auth, &push_req).await {
             Ok(resp) => resp,
-            Err(err) => return web_convert_err_event(source_profile_id, &err, false),
+            Err(err) => {
+                return web_convert_err_event(session_generation, source_profile_id, &err, false);
+            }
         };
         driver.record_push_chunk_response(resp, upload_batch);
         uploaded_docs = uploaded_docs.saturating_add(chunk_docs).min(total_docs);
@@ -421,6 +476,7 @@ async fn exec_web_convert_local_account(
             evt_tx,
             ctx,
             SyncWorkerEvent::ConvertLocalProgress {
+                session_generation,
                 source_profile_id: source_profile_id.clone(),
                 stage: format!("Uploading notebooks ({uploaded_docs}/{total_docs})..."),
                 completed: done_step,
@@ -433,6 +489,7 @@ async fn exec_web_convert_local_account(
         evt_tx,
         ctx,
         SyncWorkerEvent::ConvertLocalProgress {
+            session_generation,
             source_profile_id: source_profile_id.clone(),
             stage: "Finalizing Offline-First cache...".to_string(),
             completed: total_steps.saturating_sub(1),
@@ -441,15 +498,17 @@ async fn exec_web_convert_local_account(
     );
     match pull_with_refresh(&mut auth, 0).await {
         Ok((pull_resp, _)) => SyncWorkerEvent::ConvertLocalOk {
+            session_generation,
             source_profile_id,
             auth,
             initial_pull: Box::new(pull_resp),
         },
-        Err(err) => web_convert_err_event(source_profile_id, &err, false),
+        Err(err) => web_convert_err_event(session_generation, source_profile_id, &err, false),
     }
 }
 
 async fn exec_web_update_profile(
+    session_generation: u64,
     mut session: ActiveAccountSession,
     username: Option<String>,
     display_name: Option<String>,
@@ -458,6 +517,7 @@ async fn exec_web_update_profile(
         Ok(req) => req,
         Err(message) => {
             return SyncWorkerEvent::ProfileUpdateErr {
+                session_generation,
                 offline: false,
                 unauthorized: false,
                 message,
@@ -468,10 +528,12 @@ async fn exec_web_update_profile(
         Ok(profile) => {
             session.user = profile;
             SyncWorkerEvent::ProfileUpdated {
+                session_generation,
                 updated_session: session,
             }
         }
         Err(err) => SyncWorkerEvent::ProfileUpdateErr {
+            session_generation,
             offline: matches!(err, SyncError::Network(_)),
             unauthorized: matches!(err, SyncError::Unauthorized(_)),
             message: friendly_web_error(&err),
@@ -480,6 +542,7 @@ async fn exec_web_update_profile(
 }
 
 async fn exec_web_change_password(
+    session_generation: u64,
     mut session: ActiveAccountSession,
     current_password: String,
     new_password: String,
@@ -488,6 +551,7 @@ async fn exec_web_change_password(
         Ok(req) => req,
         Err(message) => {
             return SyncWorkerEvent::PasswordChangeErr {
+                session_generation,
                 offline: false,
                 unauthorized: false,
                 message,
@@ -498,10 +562,12 @@ async fn exec_web_change_password(
         Ok(profile) => {
             session.user = profile;
             SyncWorkerEvent::PasswordChanged {
+                session_generation,
                 updated_session: session,
             }
         }
         Err(err) => SyncWorkerEvent::PasswordChangeErr {
+            session_generation,
             offline: matches!(err, SyncError::Network(_)),
             unauthorized: matches!(err, SyncError::Unauthorized(_)),
             message: friendly_web_error(&err),
@@ -514,8 +580,9 @@ async fn web_health(server_url: &str) -> Result<ServerInfoResponse, SyncError> {
     fetch_json::<(), ServerInfoResponse>(&format!("{base}/api/v1/health"), "GET", None, None).await
 }
 
-fn web_sync_err_event(err: &SyncError) -> SyncWorkerEvent {
+fn web_sync_err_event(session_generation: u64, err: &SyncError) -> SyncWorkerEvent {
     SyncWorkerEvent::SyncErr {
+        session_generation,
         offline: matches!(err, SyncError::Network(_)),
         unauthorized: matches!(err, SyncError::Unauthorized(_)),
         message: friendly_web_error(err),

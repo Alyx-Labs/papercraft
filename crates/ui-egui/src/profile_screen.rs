@@ -1,30 +1,32 @@
-//! Dedicated full-window Profile, Account Switching, Security & Server screen.
+//! Dedicated full-window Profile, Account Switching, Sync, Identity & Backup screen.
 
-use egui::{Color32, CornerRadius, Margin, Sense, Stroke, Vec2};
+use egui::{CornerRadius, Margin, Sense, Stroke, Vec2};
 use papercraft_sync::{SyncConnectionState, SyncStatusSummary};
 
 use crate::PaperCraftApp;
 use crate::account_modal::{
-    ProfileSection, draw_hairline, draw_section_card, draw_status_banner,
+    AuthTab, BannerTone, ProfileSection, draw_account_type_badge, draw_hairline, draw_section_card,
+    draw_status_banner, draw_sync_connection_pill, format_notebook_count,
     handle_auth_submit_on_enter, probe_all_known_servers, render_account_email_card,
     render_accounts_switcher_section, render_auth_banners, render_auth_card_contents,
-    render_change_password_card, render_profile_identity_card, render_server_probe_section,
-    render_session_sign_out_card, render_signed_in_account_card, render_signed_in_server_card,
-    status_badge_style, trigger_test_connection,
+    render_change_password_card, render_expired_session_reauth_box,
+    render_local_profile_identity_card, render_profile_identity_card, render_server_probe_section,
+    render_signed_in_account_card, render_signed_in_server_card,
+    render_unsynced_switch_confirmation, status_badge_style, summary_account_label,
+    trigger_test_connection,
 };
 use crate::icons::{
     Icon, SidebarEdge, SidebarEdgeButtonSpec, SidebarEdgeSize, SwitchLayout, SwitchOption,
     TOOLBAR_CONTROL_HEIGHT, paint_icon, segmented_switch, sidebar_edge_button_sized,
     toolbar_icon_button,
 };
-use crate::sync_worker::trigger_manual_sync;
+use crate::modal::{danger_action_button, primary_action_button, secondary_action_button};
+use crate::sync_worker::{complete_sign_out, trigger_manual_sync};
 use crate::theme::Tokens;
 
 const HEADER_ROW_HEIGHT: f32 = TOOLBAR_CONTROL_HEIGHT;
 const HEADER_BADGE_SIZE: f32 = 28.0;
 const MAX_CONTENT_WIDTH: f32 = 940.0;
-const RAIL_WIDTH: f32 = 228.0;
-const COMPACT_BREAKPOINT: f32 = 760.0;
 
 /// Renders the dedicated Profile & Cloud Sync screen.
 pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
@@ -35,15 +37,6 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
     let t = Tokens::for_theme(app.session.prefs.theme);
     let summary = app.session.sync_status_summary();
     let cloud_pending = app.session.cloud_pending_changes_count();
-
-    if !summary.signed_in
-        && matches!(
-            app.view.account.profile_section,
-            ProfileSection::Profile | ProfileSection::Security
-        )
-    {
-        app.view.account.profile_section = ProfileSection::Accounts;
-    }
 
     draw_profile_header(app, ui, &summary, cloud_pending, &t);
     crate::inspector::show(app, ui);
@@ -58,7 +51,7 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
                 .min(avail.width().max(1.0));
             let left = avail.left() + ((avail.width() - content_w) * 0.5).max(side_pad);
             let inner_rect = egui::Rect::from_min_max(
-                egui::pos2(left, avail.top() + 20.0),
+                egui::pos2(left, avail.top() + 18.0),
                 egui::pos2(
                     left + content_w,
                     (avail.bottom() - 16.0).max(avail.top() + 60.0),
@@ -67,12 +60,32 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
 
             ui.scope_builder(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
                 ui.set_width(content_w);
-                if content_w >= COMPACT_BREAKPOINT {
-                    draw_two_column_layout(app, ui, &summary, cloud_pending, content_w, &t);
-                } else {
-                    draw_compact_layout(app, ui, &summary, cloud_pending, &t);
-                }
+                draw_profile_workspace(app, ui, &summary, cloud_pending, content_w, &t);
             });
+        });
+}
+
+fn draw_profile_workspace(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    summary: &SyncStatusSummary,
+    cloud_pending: usize,
+    content_w: f32,
+    t: &Tokens,
+) {
+    ui.spacing_mut().item_spacing.y = 0.0;
+    draw_active_account_summary_card(app, ui, summary, cloud_pending, t);
+    ui.add_space(12.0);
+    draw_profile_tab_bar(app, ui, t);
+    ui.add_space(12.0);
+
+    egui::ScrollArea::vertical()
+        .id_salt("papercraft_profile_body_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width().min(content_w));
+            draw_active_section_content(app, ui, summary, cloud_pending, t);
+            ui.add_space(16.0);
         });
 }
 
@@ -153,7 +166,7 @@ fn draw_profile_header(
                     } else if app
                         .view
                         .account
-                        .probe_for(app.session.server_url())
+                        .probe_for(app.session.preferred_server_url())
                         .is_connected()
                     {
                         t.success_fg
@@ -177,7 +190,7 @@ fn draw_profile_header(
                     } else {
                         format!(
                             "Local Account Active (Saved on this device)\nClick to check sync server status ({}).",
-                            app.session.server_url()
+                            app.session.preferred_server_url()
                         )
                     };
                     let sync_resp =
@@ -202,228 +215,11 @@ fn draw_profile_header(
         });
 }
 
-fn draw_two_column_layout(
+fn draw_active_account_summary_card(
     app: &mut PaperCraftApp,
     ui: &mut egui::Ui,
     summary: &SyncStatusSummary,
     cloud_pending: usize,
-    content_w: f32,
-    t: &Tokens,
-) {
-    let gap = 18.0_f32;
-    let body_w = (content_w - RAIL_WIDTH - gap).max(280.0);
-    let max_h = ui.available_height().max(180.0);
-
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        ui.allocate_ui_with_layout(
-            Vec2::new(RAIL_WIDTH, max_h),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                ui.set_width(RAIL_WIDTH);
-                draw_sidebar_rail(app, ui, summary, t);
-            },
-        );
-
-        ui.allocate_ui_with_layout(
-            Vec2::new(body_w, max_h),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                ui.set_width(body_w);
-                egui::ScrollArea::vertical()
-                    .id_salt("papercraft_profile_body_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width().min(body_w));
-                        draw_active_section_content(app, ui, summary, cloud_pending, t);
-                        ui.add_space(16.0);
-                    });
-            },
-        );
-    });
-}
-
-fn draw_compact_layout(
-    app: &mut PaperCraftApp,
-    ui: &mut egui::Ui,
-    summary: &SyncStatusSummary,
-    cloud_pending: usize,
-    t: &Tokens,
-) {
-    if summary.signed_in {
-        let options = [
-            SwitchOption::new(
-                Some(Icon::Inbox),
-                Some("Accounts"),
-                "Switch local & server accounts",
-                true,
-            ),
-            SwitchOption::new(
-                Some(Icon::Server),
-                Some("Server"),
-                "Server address & login",
-                true,
-            ),
-            SwitchOption::new(
-                Some(Icon::Account),
-                Some("Profile"),
-                "Profile & email",
-                true,
-            ),
-            SwitchOption::new(
-                Some(Icon::Reset),
-                Some("Security"),
-                "Password & sign-out",
-                true,
-            ),
-        ];
-        let active = match app.view.account.profile_section {
-            ProfileSection::Accounts => 0,
-            ProfileSection::ServerLogin => 1,
-            ProfileSection::Profile => 2,
-            ProfileSection::Security => 3,
-        };
-        let (clicked, _) = segmented_switch(
-            ui,
-            "profile_compact_tabs_signed_in",
-            &options,
-            Some(active),
-            SwitchLayout::EqualWidth,
-            t,
-        );
-        if let Some(idx) = clicked {
-            app.view.account.profile_section = match idx {
-                0 => ProfileSection::Accounts,
-                1 => ProfileSection::ServerLogin,
-                2 => ProfileSection::Profile,
-                _ => ProfileSection::Security,
-            };
-        }
-    } else {
-        let options = [
-            SwitchOption::new(
-                Some(Icon::Inbox),
-                Some("Accounts"),
-                "Local accounts & server shortcuts",
-                true,
-            ),
-            SwitchOption::new(
-                Some(Icon::Server),
-                Some("Server Sign-In"),
-                "Sign in, create account, or reset password",
-                true,
-            ),
-        ];
-        let active = match app.view.account.profile_section {
-            ProfileSection::Accounts => 0,
-            _ => 1,
-        };
-        let (clicked, _) = segmented_switch(
-            ui,
-            "profile_compact_tabs_signed_out",
-            &options,
-            Some(active),
-            SwitchLayout::EqualWidth,
-            t,
-        );
-        if let Some(idx) = clicked {
-            app.view.account.profile_section = if idx == 0 {
-                ProfileSection::Accounts
-            } else {
-                ProfileSection::ServerLogin
-            };
-        }
-    }
-
-    ui.add_space(12.0);
-    egui::ScrollArea::vertical()
-        .id_salt("papercraft_profile_compact_scroll")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            draw_active_section_content(app, ui, summary, cloud_pending, t);
-            ui.add_space(16.0);
-        });
-}
-
-fn draw_sidebar_rail(
-    app: &mut PaperCraftApp,
-    ui: &mut egui::Ui,
-    summary: &SyncStatusSummary,
-    t: &Tokens,
-) {
-    draw_identity_summary_card(app, ui, summary, t);
-    ui.add_space(10.0);
-
-    egui::Frame::new()
-        .fill(t.toolbar_bg)
-        .stroke(Stroke::new(1.0, t.border))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::same(8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 4.0;
-            if summary.signed_in {
-                let items = [
-                    (
-                        ProfileSection::Accounts,
-                        Icon::Inbox,
-                        "Accounts",
-                        "Local & server shortcuts",
-                    ),
-                    (
-                        ProfileSection::ServerLogin,
-                        Icon::Server,
-                        "Server Sign-In",
-                        "Server URL or switch account",
-                    ),
-                    (
-                        ProfileSection::Profile,
-                        Icon::Account,
-                        "Profile",
-                        "Display name, @username & email",
-                    ),
-                    (
-                        ProfileSection::Security,
-                        Icon::Reset,
-                        "Security",
-                        "Password & active session",
-                    ),
-                ];
-                for (sec, icon, title, subtitle) in items {
-                    let active = app.view.account.profile_section == sec;
-                    if draw_rail_nav_button(ui, icon, title, subtitle, active, t) {
-                        app.view.account.profile_section = sec;
-                    }
-                }
-            } else {
-                let items = [
-                    (
-                        ProfileSection::Accounts,
-                        Icon::Inbox,
-                        "Accounts",
-                        "Local accounts & server shortcuts",
-                    ),
-                    (
-                        ProfileSection::ServerLogin,
-                        Icon::Server,
-                        "Server Sign-In",
-                        "Sign in, sign up, or reset password",
-                    ),
-                ];
-                for (sec, icon, title, subtitle) in items {
-                    let active = app.view.account.profile_section == sec;
-                    if draw_rail_nav_button(ui, icon, title, subtitle, active, t) {
-                        app.view.account.profile_section = sec;
-                    }
-                }
-            }
-        });
-}
-
-fn draw_identity_summary_card(
-    app: &mut PaperCraftApp,
-    ui: &mut egui::Ui,
-    summary: &SyncStatusSummary,
     t: &Tokens,
 ) {
     let identity_key = if summary.signed_in {
@@ -446,178 +242,231 @@ fn draw_identity_summary_card(
         ui.ctx().request_repaint();
     }
     let identity_opacity = app.view.motion.profile_identity.opacity();
+    let (primary, handle_or_mode, monogram) = resolve_summary_identity(summary);
 
     egui::Frame::new()
         .fill(t.toolbar_bg)
         .stroke(Stroke::new(1.0, t.border))
         .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::same(12))
+        .inner_margin(Margin::symmetric(14, 12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 6.0;
             ui.multiply_opacity(identity_opacity);
 
-            let (primary, secondary, monogram) = if summary.signed_in {
-                let disp = summary
-                    .display_name
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .or(summary.username.as_deref())
-                    .unwrap_or("Account")
-                    .to_string();
-                let handle = summary
-                    .username
-                    .as_deref()
-                    .map_or_else(String::new, |u| format!("@{u}"));
-                let mono = disp
-                    .chars()
-                    .find(|c| c.is_alphanumeric())
-                    .map_or_else(|| "U".to_string(), |c| c.to_uppercase().collect());
-                (disp, handle, mono)
-            } else {
-                let nick = summary
-                    .active_local_profile_name
-                    .clone()
-                    .unwrap_or_else(|| "Personal".to_string());
-                let mono = nick
-                    .chars()
-                    .find(|c| c.is_alphanumeric())
-                    .map_or_else(|| "L".to_string(), |c| c.to_uppercase().collect());
-                (nick, "Local Only Workspace".to_string(), mono)
-            };
+            draw_summary_card_header_row(
+                app,
+                ui,
+                summary,
+                (&primary, &handle_or_mode, &monogram),
+                t,
+            );
+            draw_summary_card_meta_row(app, ui, summary, cloud_pending, t);
 
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                let (avatar_rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
-                ui.painter()
-                    .circle_filled(avatar_rect.center(), 20.0, t.accent_soft);
-                ui.painter().circle_stroke(
-                    avatar_rect.center(),
-                    20.0,
-                    Stroke::new(1.2, t.accent.gamma_multiply(0.45)),
-                );
-                ui.painter().text(
-                    avatar_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    monogram,
-                    egui::FontId::proportional(16.0),
-                    t.accent,
-                );
-
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(primary)
-                                .size(13.5)
-                                .strong()
-                                .color(t.text),
-                        )
-                        .wrap(),
-                    );
-                    if !secondary.is_empty() {
-                        ui.label(
-                            egui::RichText::new(secondary)
-                                .size(11.5)
-                                .monospace()
-                                .color(t.text_muted),
-                        );
-                    }
-                });
-            });
-
-            if let Some(email) = summary.email.as_deref().filter(|s| !s.trim().is_empty()) {
-                draw_hairline(ui, t);
-                ui.add(
-                    egui::Label::new(egui::RichText::new(email).size(11.0).color(t.text_muted))
-                        .wrap(),
+            if summary.signed_in
+                && app.session.is_session_expired()
+                && let Some(acct) = app.session.active_account_session().cloned()
+            {
+                ui.add_space(4.0);
+                render_expired_session_reauth_box(
+                    app,
+                    ui,
+                    &acct,
+                    cloud_pending,
+                    "summary_reauth_pw",
+                    t,
                 );
             }
         });
 }
 
-fn draw_rail_nav_button(
-    ui: &mut egui::Ui,
-    icon: Icon,
-    title: &str,
-    subtitle: &str,
-    selected: bool,
-    t: &Tokens,
-) -> bool {
-    let id = ui.make_persistent_id(("profile_rail_nav", title));
-    let hov_state_id = id.with("hov_state");
-    let prev_hovered = ui
-        .ctx()
-        .data(|d| d.get_temp::<bool>(hov_state_id).unwrap_or(false));
-    let hover_t = crate::motion::hover_factor(ui.ctx(), id.with("hov"), prev_hovered && !selected);
-    let select_t = crate::motion::hover_factor(ui.ctx(), id.with("sel"), selected);
-
-    let base_fill = crate::motion::lerp_color(Color32::TRANSPARENT, t.panel_bg, hover_t);
-    let fill = crate::motion::lerp_color(base_fill, t.accent_soft, select_t);
-    let base_border = crate::motion::lerp_color(Color32::TRANSPARENT, t.border, hover_t);
-    let border_color = crate::motion::lerp_color(base_border, t.accent, select_t);
-    let border = if select_t > 0.01 || hover_t > 0.01 {
-        Stroke::new(1.0, border_color)
+fn resolve_summary_identity(summary: &SyncStatusSummary) -> (String, String, String) {
+    if summary.signed_in {
+        let disp = summary
+            .display_name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or(summary.username.as_deref())
+            .unwrap_or("Account")
+            .to_string();
+        let email_or_handle = match (
+            summary.email.as_deref().filter(|s| !s.trim().is_empty()),
+            summary.username.as_deref().filter(|s| !s.trim().is_empty()),
+        ) {
+            (Some(e), Some(u)) => format!("{e} (@{u})"),
+            (Some(e), None) => e.to_string(),
+            (None, Some(u)) => format!("@{u}"),
+            (None, None) => "Server Account".to_string(),
+        };
+        let mono = disp
+            .chars()
+            .find(|c| c.is_alphanumeric())
+            .map_or_else(|| "U".to_string(), |c| c.to_uppercase().collect());
+        (disp, email_or_handle, mono)
     } else {
-        Stroke::NONE
-    };
-    let title_color = crate::motion::lerp_color(t.text, t.accent, select_t);
-    let icon_color = crate::motion::lerp_color(t.text_muted, t.accent, select_t.max(hover_t * 0.4));
-
-    let resp = egui::Frame::new()
-        .fill(fill)
-        .stroke(border)
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                paint_icon(ui.painter(), ir, icon, icon_color);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(title)
-                                .size(12.5)
-                                .strong()
-                                .color(title_color),
-                        )
-                        .selectable(false),
-                    );
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(subtitle).size(10.5).color(t.text_muted),
-                        )
-                        .selectable(false)
-                        .wrap(),
-                    );
-                });
-            });
-        })
-        .response
-        .interact(Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-
-    if select_t > 0.02 && ui.is_rect_visible(resp.rect) {
-        let half_h = (resp.rect.height() - 16.0).max(4.0) * 0.5 * select_t;
-        let center_y = resp.rect.center().y;
-        let bar_rect = egui::Rect::from_min_max(
-            egui::pos2(resp.rect.left() + 3.0, center_y - half_h),
-            egui::pos2(resp.rect.left() + 5.5, center_y + half_h),
-        );
-        ui.painter().rect_filled(
-            bar_rect,
-            CornerRadius::same(2),
-            t.accent.gamma_multiply(select_t),
-        );
+        let nick = summary
+            .active_local_profile_name
+            .clone()
+            .unwrap_or_else(|| "Personal".to_string());
+        let mono = nick
+            .chars()
+            .find(|c| c.is_alphanumeric())
+            .map_or_else(|| "L".to_string(), |c| c.to_uppercase().collect());
+        (nick, "Offline workspace on this device".to_string(), mono)
     }
+}
 
-    let hovered_now = resp.hovered();
-    ui.ctx()
-        .data_mut(|d| d.insert_temp(hov_state_id, hovered_now));
-    resp.clicked()
+fn draw_summary_card_header_row(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    summary: &SyncStatusSummary,
+    identity: (&str, &str, &str),
+    t: &Tokens,
+) {
+    let (primary, subtitle, monogram) = identity;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(10.0, 6.0);
+        let (avatar_rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+        ui.painter()
+            .circle_filled(avatar_rect.center(), 20.0, t.accent_soft);
+        ui.painter().circle_stroke(
+            avatar_rect.center(),
+            20.0,
+            Stroke::new(1.2, t.accent.gamma_multiply(0.45)),
+        );
+        ui.painter().text(
+            avatar_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            monogram,
+            egui::FontId::proportional(16.0),
+            t.accent,
+        );
+
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(
+                    egui::RichText::new(primary)
+                        .size(14.5)
+                        .strong()
+                        .color(t.text),
+                );
+                draw_account_type_badge(ui, summary.signed_in, t);
+                if summary.signed_in {
+                    draw_sync_connection_pill(ui, summary.connection, t);
+                }
+            });
+            ui.label(egui::RichText::new(subtitle).size(11.5).color(t.text_muted));
+        });
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if summary.signed_in {
+                if danger_action_button(ui, "Sign Out", true, t).clicked() {
+                    complete_sign_out(app, ui.ctx());
+                }
+                if secondary_action_button(ui, "Switch Account", true, t).clicked() {
+                    crate::modal::open(app, crate::modal::ActiveModal::SelectLocalAccount);
+                }
+                let in_flight = app.session.is_sync_in_flight();
+                let can_sync = !in_flight && app.session.is_viewing_cloud();
+                let sync_lbl = if in_flight { "Syncing..." } else { "Sync Now" };
+                if primary_action_button(ui, sync_lbl, can_sync, t).clicked() {
+                    app.view.account.error_message = None;
+                    app.view.account.status_message = None;
+                    trigger_manual_sync(app, ui.ctx());
+                }
+            } else {
+                if secondary_action_button(ui, "Switch Account", true, t).clicked() {
+                    crate::modal::open(app, crate::modal::ActiveModal::SelectLocalAccount);
+                }
+                if primary_action_button(ui, "Connect to Server", true, t).clicked() {
+                    app.view.account.profile_section = ProfileSection::ServerSync;
+                    app.view.account.tab = AuthTab::SignIn;
+                    app.view.account.profile_probe_pending = true;
+                    app.view.account.error_message = None;
+                }
+            }
+        });
+    });
+}
+
+fn draw_summary_card_meta_row(
+    app: &PaperCraftApp,
+    ui: &mut egui::Ui,
+    summary: &SyncStatusSummary,
+    cloud_pending: usize,
+    t: &Tokens,
+) {
+    let nb_label = format_notebook_count(app.session.notebooks.len());
+    let detail = if summary.signed_in {
+        let queue_txt = match cloud_pending {
+            0 => "all changes synced".to_string(),
+            1 => "1 pending sync".to_string(),
+            n => format!("{n} pending syncs"),
+        };
+        format!(
+            "Server: {} · Device: {} · {nb_label} · {queue_txt}",
+            summary.server_url, summary.device_name
+        )
+    } else {
+        format!(
+            "{nb_label} in this local workspace · Stored only on this device unless synced via Server Sync"
+        )
+    };
+    ui.add(egui::Label::new(egui::RichText::new(detail).size(11.0).color(t.text_muted)).wrap());
+}
+
+fn draw_profile_tab_bar(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    let options = [
+        SwitchOption::new(
+            Some(Icon::Inbox),
+            Some("Accounts"),
+            "Switch, create, rename, delete, or forget accounts",
+            true,
+        ),
+        SwitchOption::new(
+            Some(Icon::Server),
+            Some("Server Sync"),
+            "Configure server URL, inspect capabilities, and sign in or switch accounts",
+            true,
+        ),
+        SwitchOption::new(
+            Some(Icon::Account),
+            Some("Profile"),
+            "Edit account name, username, email, and password",
+            true,
+        ),
+        SwitchOption::new(
+            Some(Icon::Export),
+            Some("Backup"),
+            "Export or import .pcraftpkg archives and inspect device storage",
+            true,
+        ),
+    ];
+    let active = match app.view.account.profile_section {
+        ProfileSection::Accounts => 0,
+        ProfileSection::ServerSync => 1,
+        ProfileSection::Profile => 2,
+        ProfileSection::Backup => 3,
+    };
+    let (clicked, _) = segmented_switch(
+        ui,
+        "profile_main_tabs",
+        &options,
+        Some(active),
+        SwitchLayout::EqualWidth,
+        t,
+    );
+    if let Some(idx) = clicked {
+        app.view.account.profile_section = match idx {
+            0 => ProfileSection::Accounts,
+            1 => ProfileSection::ServerSync,
+            2 => ProfileSection::Profile,
+            _ => ProfileSection::Backup,
+        };
+    }
 }
 
 fn draw_active_section_content(
@@ -631,9 +480,9 @@ fn draw_active_section_content(
 
     let section_order: isize = match app.view.account.profile_section {
         ProfileSection::Accounts => 0,
-        ProfileSection::ServerLogin => 1,
+        ProfileSection::ServerSync => 1,
         ProfileSection::Profile => 2,
-        ProfileSection::Security => 3,
+        ProfileSection::Backup => 3,
     };
     let section_key = (summary.signed_in, section_order as u8);
     let dt = ui.ctx().input(|i| i.stable_dt);
@@ -649,69 +498,18 @@ fn draw_active_section_content(
     let flow_offset_x = app.view.motion.profile_section.offset_x();
 
     crate::motion::show_flow_content(ui, flow_opacity, flow_offset_x, |ui| {
-        if summary.signed_in {
-            match app.view.account.profile_section {
-                ProfileSection::Accounts => {
-                    render_accounts_switcher_section(app, ui, summary, cloud_pending, t);
-                }
-                ProfileSection::ServerLogin => {
-                    draw_section_card(ui, t, |ui| {
-                        render_signed_in_account_card(app, ui, summary, cloud_pending, t);
-                    });
-                    ui.add_space(10.0);
-                    let mut test_on_enter = false;
-                    draw_section_card(ui, t, |ui| {
-                        test_on_enter = render_signed_in_server_card(app, ui, summary, t);
-                    });
-                    if test_on_enter && !app.view.account.is_testing() {
-                        trigger_test_connection(app, ui.ctx());
-                    }
-                    ui.add_space(10.0);
-                    draw_self_hosted_download_disclaimer(app, ui, t);
-                }
-                ProfileSection::Profile => {
-                    draw_section_card(ui, t, |ui| {
-                        render_profile_identity_card(app, ui, t);
-                    });
-                    ui.add_space(10.0);
-                    draw_section_card(ui, t, |ui| {
-                        render_account_email_card(app, ui, summary, t);
-                    });
-                }
-                ProfileSection::Security => {
-                    draw_section_card(ui, t, |ui| {
-                        render_change_password_card(app, ui, t);
-                    });
-                    ui.add_space(10.0);
-                    draw_section_card(ui, t, |ui| {
-                        render_session_sign_out_card(app, ui, summary, t);
-                    });
-                }
+        match app.view.account.profile_section {
+            ProfileSection::Accounts => {
+                render_accounts_switcher_section(app, ui, summary, cloud_pending, t);
             }
-        } else {
-            match app.view.account.profile_section {
-                ProfileSection::Accounts => {
-                    render_accounts_switcher_section(app, ui, summary, cloud_pending, t);
-                }
-                _ => {
-                    let mut test_on_enter = false;
-                    draw_section_card(ui, t, |ui| {
-                        test_on_enter = render_server_probe_section(app, ui, t, true);
-                    });
-                    ui.add_space(10.0);
-                    let mut submit_on_enter = false;
-                    draw_section_card(ui, t, |ui| {
-                        submit_on_enter = render_auth_card_contents(app, ui, t, true);
-                    });
-                    ui.add_space(10.0);
-                    draw_self_hosted_download_disclaimer(app, ui, t);
-                    if test_on_enter && !app.view.account.is_testing() {
-                        trigger_test_connection(app, ui.ctx());
-                    }
-                    if submit_on_enter {
-                        handle_auth_submit_on_enter(app, ui.ctx());
-                    }
-                }
+            ProfileSection::ServerSync => {
+                draw_server_sync_tab(app, ui, summary, cloud_pending, t);
+            }
+            ProfileSection::Profile => {
+                draw_profile_tab(app, ui, summary, t);
+            }
+            ProfileSection::Backup => {
+                draw_backup_tab(app, ui, t);
             }
         }
     });
@@ -721,9 +519,336 @@ fn draw_active_section_content(
         && summary.connection == SyncConnectionState::Error
     {
         ui.add_space(8.0);
-        draw_status_banner(ui, crate::account_modal::BannerTone::Error, err, t);
+        draw_status_banner(ui, BannerTone::Error, err, t);
     }
     render_auth_banners(app, ui, t);
+}
+
+fn draw_server_sync_tab(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    summary: &SyncStatusSummary,
+    cloud_pending: usize,
+    t: &Tokens,
+) {
+    if summary.signed_in {
+        let mut test_on_enter = false;
+        draw_section_card(ui, t, |ui| {
+            test_on_enter = render_signed_in_server_card(app, ui, summary, t);
+        });
+        if test_on_enter && !app.view.account.is_testing() {
+            trigger_test_connection(app, ui.ctx());
+        }
+
+        ui.add_space(10.0);
+        draw_section_card(ui, t, |ui| {
+            render_signed_in_account_card(app, ui, summary, cloud_pending, t);
+        });
+
+        ui.add_space(10.0);
+        draw_sign_in_another_account_card(app, ui, summary, t);
+
+        ui.add_space(10.0);
+        draw_self_hosted_download_disclaimer(app, ui, t);
+    } else {
+        let mut test_on_enter = false;
+        draw_section_card(ui, t, |ui| {
+            test_on_enter = render_server_probe_section(app, ui, t, true);
+        });
+        ui.add_space(10.0);
+        let mut submit_on_enter = false;
+        draw_section_card(ui, t, |ui| {
+            submit_on_enter = render_auth_card_contents(app, ui, t, true);
+        });
+        render_unsynced_switch_confirmation(app, ui, t);
+        ui.add_space(10.0);
+        draw_self_hosted_download_disclaimer(app, ui, t);
+        if test_on_enter && !app.view.account.is_testing() {
+            trigger_test_connection(app, ui.ctx());
+        }
+        if submit_on_enter {
+            handle_auth_submit_on_enter(app, ui.ctx());
+        }
+    }
+}
+
+fn draw_sign_in_another_account_card(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    summary: &SyncStatusSummary,
+    t: &Tokens,
+) {
+    let open = app.view.account.server_switch_form_open || app.view.account.password_reset.active;
+    let mut submit_on_enter = false;
+    draw_section_card(ui, t, |ui| {
+        ui.horizontal(|ui| {
+            let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+            paint_icon(ui.painter(), ir, Icon::Account, t.accent);
+            ui.label(
+                egui::RichText::new("Sign In with Another Server Account")
+                    .size(13.5)
+                    .strong()
+                    .color(t.text),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let lbl = if open {
+                    "Hide Form"
+                } else {
+                    "Switch / Sign In Another"
+                };
+                if crate::account_modal::fixed_secondary_button(ui, lbl, 160.0, true, t).clicked() {
+                    if open {
+                        app.view.account.server_switch_form_open = false;
+                        app.view.account.clear_pending_unsynced_switch();
+                        app.view.account.exit_password_reset_flow();
+                    } else {
+                        app.view.account.server_switch_form_open = true;
+                        app.view.account.tab = AuthTab::SignIn;
+                        app.view.account.clear_auth_form_credentials();
+                    }
+                }
+            });
+        });
+        ui.add_space(3.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!(
+                    "Currently signed in as {}. Enter credentials for a different account on {} (or test another server URL above) to switch safely while preserving this account's isolated local cache.",
+                    summary_account_label(summary),
+                    app.view.account.server_url
+                ))
+                .size(11.0)
+                .color(t.text_muted),
+            )
+            .wrap(),
+        );
+
+        if open {
+            ui.add_space(10.0);
+            draw_hairline(ui, t);
+            ui.add_space(6.0);
+            render_unsynced_switch_confirmation(app, ui, t);
+            ui.add_space(6.0);
+            if render_auth_card_contents(app, ui, t, true) {
+                submit_on_enter = true;
+            }
+        }
+    });
+
+    if submit_on_enter {
+        handle_auth_submit_on_enter(app, ui.ctx());
+    }
+}
+
+fn draw_profile_tab(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    summary: &SyncStatusSummary,
+    t: &Tokens,
+) {
+    if summary.signed_in {
+        draw_section_card(ui, t, |ui| {
+            render_profile_identity_card(app, ui, t);
+        });
+        ui.add_space(10.0);
+        draw_section_card(ui, t, |ui| {
+            render_account_email_card(app, ui, summary, t);
+        });
+        ui.add_space(10.0);
+        draw_section_card(ui, t, |ui| {
+            render_change_password_card(app, ui, t);
+        });
+    } else {
+        draw_section_card(ui, t, |ui| {
+            render_local_profile_identity_card(app, ui, t);
+        });
+        ui.add_space(10.0);
+        draw_section_card(ui, t, |ui| {
+            ui.horizontal(|ui| {
+                let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                paint_icon(ui.painter(), ir, Icon::Reset, t.accent);
+                ui.label(
+                    egui::RichText::new("Server Email & Password")
+                        .size(13.5)
+                        .strong()
+                        .color(t.text),
+                );
+            });
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "Local offline accounts do not require an email or password. Sign in on the Server Sync tab or upload this local account to manage cloud credentials.",
+                    )
+                    .size(11.0)
+                    .color(t.text_muted),
+                )
+                .wrap(),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if secondary_action_button(ui, "Open Server Sync", true, t).clicked() {
+                    app.view.account.profile_section = ProfileSection::ServerSync;
+                    app.view.account.tab = AuthTab::SignIn;
+                    app.view.account.profile_probe_pending = true;
+                }
+            });
+        });
+    }
+}
+
+fn draw_backup_tab(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    draw_section_card(ui, t, |ui| {
+        ui.horizontal(|ui| {
+            let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+            paint_icon(ui.painter(), ir, Icon::Export, t.accent);
+            ui.label(
+                egui::RichText::new("Workspace Backup (.pcraftpkg)")
+                    .size(13.5)
+                    .strong()
+                    .color(t.text),
+            );
+        });
+        ui.add_space(3.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "Create a single portable backup archive containing all notebooks, Trash items, folders, and preferences from the active account, or restore a .pcraftpkg archive.",
+                )
+                .size(11.0)
+                .color(t.text_muted),
+            )
+            .wrap(),
+        );
+        ui.add_space(10.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+            if primary_action_button(ui, "Export Backup (.pcraftpkg)", true, t).clicked() {
+                app.trigger_export_package_dialog();
+            }
+            if secondary_action_button(ui, "Import Backup (.pcraftpkg)", true, t).clicked() {
+                app.trigger_import_package_dialog();
+            }
+        });
+        if let Some(ref status) = app.session.last_export_status {
+            ui.add_space(8.0);
+            draw_status_banner(ui, BannerTone::Info, status, t);
+        }
+    });
+
+    ui.add_space(10.0);
+    draw_storage_overview_card(app, ui, t);
+}
+
+fn draw_storage_overview_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    let active_notebooks = format_notebook_count(app.session.notebooks.len());
+    let trash_count = format_notebook_count(app.session.trashed_notebooks.len());
+    let local_count = app.session.saved_local_profiles().len();
+    let server_count = app.session.remembered_server_accounts().len();
+    let desktop_dir = app.session.library_dir().map(|p| p.display().to_string());
+    let web_status = app.web_storage_status.clone();
+
+    draw_section_card(ui, t, |ui| {
+        ui.horizontal(|ui| {
+            let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+            paint_icon(ui.painter(), ir, Icon::Library, t.accent);
+            ui.label(
+                egui::RichText::new("Device & Browser Storage")
+                    .size(13.5)
+                    .strong()
+                    .color(t.text),
+            );
+        });
+        ui.add_space(3.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "Each account on this device keeps its own isolated workspace storage so switching accounts never mixes notebooks.",
+                )
+                .size(11.0)
+                .color(t.text_muted),
+            )
+            .wrap(),
+        );
+        ui.add_space(8.0);
+        draw_hairline(ui, t);
+        ui.add_space(8.0);
+
+        ui.label(
+            egui::RichText::new(format!(
+                "Active workspace: {active_notebooks} · Trash: {trash_count} · Saved accounts: {local_count} local, {server_count} server"
+            ))
+            .size(11.5)
+            .color(t.text),
+        );
+        ui.add_space(6.0);
+
+        if let Some(status) = web_status {
+            let (info_text, tip) = crate::inspector::web_storage_info_from_status(&status);
+            let resp = ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("Browser storage: {info_text}"))
+                        .size(11.5)
+                        .color(t.text_muted),
+                )
+                .wrap(),
+            );
+            if let Some(tip) = tip {
+                let _ = resp.on_hover_text(tip);
+            }
+            if let Some((usage_text, _)) = crate::inspector::web_storage_usage_row(&status) {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("Usage & Quota: {usage_text}"))
+                        .size(11.0)
+                        .color(t.text_muted),
+                );
+                if let (Some(used), Some(quota)) = (status.usage_bytes, status.quota_bytes)
+                    && quota > 0
+                {
+                    ui.add_space(4.0);
+                    let frac = (used as f32 / quota as f32).clamp(0.02, 1.0);
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .desired_width(ui.available_width())
+                            .desired_height(6.0)
+                            .fill(t.accent),
+                    );
+                }
+            }
+            if status.has_unsaved_error {
+                ui.add_space(8.0);
+                if let Some(ref err) = status.last_error {
+                    draw_status_banner(ui, BannerTone::Error, err, t);
+                    ui.add_space(6.0);
+                }
+                if app.hooks.retry_web_storage_write.is_some()
+                    && primary_action_button(ui, "Retry Save Now", true, t).clicked()
+                    && let Some(retry) = app.hooks.retry_web_storage_write.as_mut()
+                {
+                    retry();
+                }
+            }
+        } else if let Some(dir) = desktop_dir {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("Library directory: {dir}"))
+                        .size(11.0)
+                        .monospace()
+                        .color(t.text_muted),
+                )
+                .wrap(),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(
+                    "Storage mode: In-memory session (changes are kept until the app closes unless exported).",
+                )
+                .size(11.0)
+                .color(t.text_muted),
+            );
+        }
+    });
 }
 
 fn draw_self_hosted_download_disclaimer(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
@@ -878,7 +1003,7 @@ mod tests {
         assert_eq!(app.view.screen, AppScreen::Profile);
         assert_eq!(app.view.account.profile_section, ProfileSection::Accounts);
 
-        app.view.account.profile_section = ProfileSection::ServerLogin;
+        app.view.account.profile_section = ProfileSection::ServerSync;
         app.view.account.tab = AuthTab::CreateAccount;
         let signup_text = render_profile_text(&ctx, &mut app);
         assert!(signup_text.contains("Profile & Cloud Sync"));
@@ -886,10 +1011,12 @@ mod tests {
         assert!(signup_text.contains("Display Name"));
 
         app.view.account.tab = AuthTab::SignIn;
+        let session_gen = app.sync_worker.current_session_generation();
         apply_worker_event(
             &mut app,
             &ctx,
             SyncWorkerEvent::PasswordResetRequired {
+                session_generation: session_gen,
                 identifier: "maria@example.com".to_string(),
                 prefill_code: Some("ABCD-EFGH-JKLM".to_string()),
                 message: "Temporary password verified. Choose a new password.".to_string(),
@@ -942,6 +1069,8 @@ mod tests {
         assert_eq!(app.view.account.profile_section, ProfileSection::Accounts);
 
         let accts_text = render_profile_text(&ctx, &mut app);
+        assert!(accts_text.contains("Switch Account"), "{accts_text}");
+        assert!(accts_text.contains("Connected to Server"), "{accts_text}");
         assert!(accts_text.contains("Local Accounts (1)"), "{accts_text}");
         assert!(
             accts_text.contains("Server Accounts (Offline-First)"),
@@ -949,31 +1078,99 @@ mod tests {
         );
         assert!(accts_text.contains("Ana"));
         assert!(accts_text.contains("0 notebooks"));
-        assert!(accts_text.contains("Local Only"));
+
+        app.view.account.profile_section = ProfileSection::ServerSync;
+        let sync_text = render_profile_text(&ctx, &mut app);
+        assert!(
+            sync_text.contains("Server Address & Connection"),
+            "{sync_text}"
+        );
+        assert!(sync_text.contains("SYNC QUEUE"), "{sync_text}");
+        assert!(
+            sync_text.contains("Sign In with Another Server Account"),
+            "{sync_text}"
+        );
+        app.view.account.server_switch_form_open = true;
+        let switch_form_text = render_profile_text(&ctx, &mut app);
+        assert!(
+            switch_form_text.contains("Have a recovery code from the server?"),
+            "{switch_form_text}"
+        );
 
         app.view.account.profile_section = ProfileSection::Profile;
         let profile_text = render_profile_text(&ctx, &mut app);
         assert!(profile_text.contains("Profile Details"));
         assert!(profile_text.contains("Save Profile"));
         assert!(profile_text.contains("Email Address"));
+        assert!(profile_text.contains("Change Password"));
         assert!(profile_text.contains("@alex_notes"));
 
-        app.view.account.profile_section = ProfileSection::Security;
+        app.view.account.profile_section = ProfileSection::Backup;
         let _ = app
             .session
             .execute("theme.set", &serde_json::json!({ "theme": "Dark" }));
-        let sec_text = render_profile_text(&ctx, &mut app);
-        assert!(sec_text.contains("Change Password"));
-        assert!(sec_text.contains("Update Password"));
-        assert!(sec_text.contains("Session & Sign Out"));
-
-        app.view.account.profile_section = ProfileSection::ServerLogin;
-        let sync_text = render_profile_text(&ctx, &mut app);
-        assert!(sync_text.contains("Server Address"));
-        assert!(sync_text.contains("SYNC QUEUE"));
+        let backup_text = render_profile_text(&ctx, &mut app);
+        assert!(
+            backup_text.contains("Workspace Backup (.pcraftpkg)"),
+            "{backup_text}"
+        );
+        assert!(
+            backup_text.contains("Export Backup (.pcraftpkg)"),
+            "{backup_text}"
+        );
+        assert!(
+            backup_text.contains("Device & Browser Storage"),
+            "{backup_text}"
+        );
 
         crate::close_profile_screen(&mut app);
         assert_eq!(app.view.screen, AppScreen::Home);
+    }
+
+    #[test]
+    fn signed_out_profile_exposes_all_four_tabs_in_light_and_dark() {
+        let ctx = egui::Context::default();
+        let mut session = papercraft_engine::Session::open_web_cache(None);
+        session
+            .execute(
+                "profile.completeFirstAccess",
+                &serde_json::json!({ "nickname": "Mia" }),
+            )
+            .unwrap();
+        let mut app = PaperCraftApp::new(session, crate::PlatformHooks::default());
+        app.view.active_modal = None;
+        app.web_storage_status = Some(crate::WebStorageStatus {
+            backend: crate::WebStorageBackend::IndexedDb,
+            persisted: Some(true),
+            usage_bytes: Some(2 * 1024 * 1024),
+            quota_bytes: Some(128 * 1024 * 1024),
+            in_flight: false,
+            has_unsaved_error: false,
+            quota_exceeded: false,
+            last_error: None,
+            other_tab_active: false,
+            other_tab_wrote: false,
+        });
+        crate::open_profile_screen(&mut app);
+        let acct_text = render_profile_text(&ctx, &mut app);
+        assert!(acct_text.contains("Switch Account"), "{acct_text}");
+        assert!(acct_text.contains("Connect to Server"), "{acct_text}");
+        assert!(acct_text.contains("Mia"), "{acct_text}");
+        assert!(acct_text.contains("Backup"), "{acct_text}");
+
+        app.view.account.profile_section = ProfileSection::Profile;
+        let prof_text = render_profile_text(&ctx, &mut app);
+        assert!(prof_text.contains("Local Account Profile"), "{prof_text}");
+        assert!(prof_text.contains("Upload to Server"), "{prof_text}");
+        assert!(prof_text.contains("Server Email & Password"), "{prof_text}");
+
+        app.view.account.profile_section = ProfileSection::Backup;
+        let _ = app
+            .session
+            .execute("theme.set", &serde_json::json!({ "theme": "Dark" }));
+        let backup_text = render_profile_text(&ctx, &mut app);
+        assert!(backup_text.contains("IndexedDB"), "{backup_text}");
+        assert!(backup_text.contains("Usage & Quota"), "{backup_text}");
     }
 
     #[test]
@@ -992,7 +1189,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = PaperCraftApp::new(papercraft_engine::Session::default(), hooks);
         crate::open_profile_screen(&mut app);
-        app.view.account.profile_section = ProfileSection::ServerLogin;
+        app.view.account.profile_section = ProfileSection::ServerSync;
 
         let find_text_center = |shapes: &[ClippedShape], needle: &str| -> Option<egui::Pos2> {
             fn visit(shape: &Shape, needle: &str) -> Option<egui::Pos2> {
@@ -1266,7 +1463,7 @@ mod tests {
         );
 
         // Switching ProfileSection starts a directional FlowTransition that settles smoothly.
-        app.view.account.profile_section = crate::account_modal::ProfileSection::ServerLogin;
+        app.view.account.profile_section = ProfileSection::ServerSync;
         time += 0.02;
         let out = ctx.run_ui(
             egui::RawInput {
@@ -1295,7 +1492,7 @@ mod tests {
             "expected settled profile_section after animation"
         );
 
-        // Switching AuthTab on ServerLogin starts auth_flow FlowTransition that settles smoothly.
+        // Switching AuthTab on ServerSync starts auth_flow FlowTransition that settles smoothly.
         app.view.account.tab = crate::account_modal::AuthTab::CreateAccount;
         time += 0.02;
         let out = ctx.run_ui(

@@ -136,21 +136,15 @@ fn load_illustration_texture(
     Some(tex)
 }
 
-/// Marks the welcome banner as seen and advances to initial nickname setup if required.
+/// Marks the welcome banner as seen and advances to the startup account picker if configured.
 pub(crate) fn dismiss(app: &mut PaperCraftApp) {
     let _ = app
         .session
         .execute("profile.dismissWelcomeBanner", &serde_json::json!({}));
-    if app.session.needs_initial_nickname() {
-        if app.session.has_any_saved_accounts() {
-            app.view.account.profile_probe_pending = true;
-            crate::modal::open(app, ActiveModal::SelectLocalAccount);
-        } else {
-            app.view.first_access_nickname.clear();
-            app.view.first_access_error = None;
-            app.view.first_access_focus_pending = true;
-            crate::modal::open(app, ActiveModal::FirstAccessNickname);
-        }
+    app.flush_web_storage(true);
+    if app.session.should_show_startup_account_picker() {
+        app.view.account.profile_probe_pending = true;
+        crate::modal::open(app, ActiveModal::SelectLocalAccount);
     } else {
         crate::modal::close(app);
     }
@@ -732,15 +726,26 @@ mod tests {
 
         dismiss(&mut app);
         assert!(!app.session.should_show_welcome_banner());
-        assert_eq!(
-            app.view.active_modal,
-            Some(ActiveModal::FirstAccessNickname)
-        );
+        assert_eq!(app.view.active_modal, Some(ActiveModal::SelectLocalAccount));
 
         app.session
             .execute(
                 "profile.completeFirstAccess",
                 &serde_json::json!({ "nickname": "Alyx" }),
+            )
+            .unwrap();
+        crate::modal::open(&mut app, ActiveModal::WelcomeBanner);
+        dismiss(&mut app);
+        assert_eq!(
+            app.view.active_modal,
+            Some(ActiveModal::SelectLocalAccount),
+            "Option A shows the account picker by default until skip preference is enabled"
+        );
+
+        app.session
+            .execute(
+                "profile.setStartupPicker",
+                &serde_json::json!({ "skip": true }),
             )
             .unwrap();
         crate::modal::open(&mut app, ActiveModal::WelcomeBanner);
@@ -872,9 +877,6 @@ mod tests {
             out.drop_without_applying_deltas();
         }
         assert!(!app.session.should_show_welcome_banner());
-        assert_eq!(
-            app.view.active_modal,
-            Some(ActiveModal::FirstAccessNickname)
-        );
+        assert_eq!(app.view.active_modal, Some(ActiveModal::SelectLocalAccount));
     }
 }

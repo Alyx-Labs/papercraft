@@ -461,9 +461,6 @@ pub struct ViewState {
     pub rich_fonts_installed: bool,
     pub last_canvas_rect: Option<egui::Rect>,
     pub last_home_rect: Option<egui::Rect>,
-    pub first_access_nickname: String,
-    pub first_access_error: Option<String>,
-    pub first_access_focus_pending: bool,
     pub desktop_shortcut_feedback: Option<(bool, String)>,
 }
 
@@ -649,9 +646,6 @@ impl Default for ViewState {
             rich_fonts_installed: false,
             last_canvas_rect: None,
             last_home_rect: None,
-            first_access_nickname: String::new(),
-            first_access_error: None,
-            first_access_focus_pending: false,
             desktop_shortcut_feedback: None,
         }
     }
@@ -1174,18 +1168,15 @@ pub(crate) const BRAND_DISPLAY_BOLD_TTF: &[u8] =
 impl PaperCraftApp {
     pub fn new(session: Session, mut hooks: PlatformHooks) -> Self {
         let mut account = account_modal::AccountDraftState {
-            server_url: session.server_url().to_string(),
+            server_url: session.preferred_server_url().to_string(),
             ..Default::default()
         };
         let initial_modal = if session.should_show_welcome_banner() {
             Some(modal::ActiveModal::WelcomeBanner)
-        } else if session.needs_initial_nickname() {
-            if session.has_any_saved_accounts() {
-                account.profile_probe_pending = true;
-                Some(modal::ActiveModal::SelectLocalAccount)
-            } else {
-                Some(modal::ActiveModal::FirstAccessNickname)
-            }
+        } else if session.should_show_startup_account_picker() {
+            account.profile_probe_pending = true;
+            account.select_local_focus_pending = !session.has_any_saved_accounts();
+            Some(modal::ActiveModal::SelectLocalAccount)
         } else {
             None
         };
@@ -1195,8 +1186,6 @@ impl PaperCraftApp {
             export_path_stem: inspector::title_to_export_stem(&session.doc.title),
             account,
             active_modal: initial_modal,
-            first_access_focus_pending: initial_modal
-                == Some(modal::ActiveModal::FirstAccessNickname),
             ..Default::default()
         };
         let mut stylus = stylus::Stylus::default();
@@ -2388,12 +2377,25 @@ impl PaperCraftApp {
                 return;
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if self.view.active_modal == Some(modal::ActiveModal::SelectLocalAccount) {
+                    if self.view.account.pending_unsynced_switch.is_some() {
+                        self.view.account.clear_pending_unsynced_switch();
+                    } else if self.view.account.selector_other_server_open {
+                        if !self.view.account.auth_busy && !self.view.account.password_reset.busy {
+                            self.view.account.selector_other_server_open = false;
+                            self.view.account.exit_password_reset_flow();
+                            self.view.account.error_message = None;
+                            self.view.account.status_message = None;
+                        }
+                    } else if modal::is_account_picker_dismissible(self) {
+                        modal::close(self);
+                    }
+                    return;
+                }
                 if matches!(
                     self.view.active_modal,
                     Some(
-                        modal::ActiveModal::FirstAccessNickname
-                            | modal::ActiveModal::SelectLocalAccount
-                            | modal::ActiveModal::WelcomeBanner
+                        modal::ActiveModal::WelcomeBanner
                             | modal::ActiveModal::FirstNotebookDataNotice
                     )
                 ) || (self.view.active_modal == Some(modal::ActiveModal::ConvertLocalAccount)

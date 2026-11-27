@@ -546,6 +546,11 @@ const COMMANDS: &[CommandSpec] = &[
         label: "Forget Server Account Shortcut",
         description: "Remove a remembered server account shortcut from this device without deleting server data",
     },
+    CommandSpec {
+        id: "profile.setStartupPicker",
+        label: "Set Startup Account Picker",
+        description: "Choose whether to show the account picker modal automatically on startup",
+    },
 ];
 
 pub fn specs() -> &'static [CommandSpec] {
@@ -1359,6 +1364,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
         "profile.switch" => cmd_profile_switch(session, id, params),
         "profile.delete" => cmd_profile_delete(session, id, params),
         "profile.forgetServerAccount" => cmd_profile_forget_server_account(session, id, params),
+        "profile.setStartupPicker" => cmd_profile_set_startup_picker(session, id, params),
         _ => return Err(EngineError::UnknownCommand(id.to_string())),
     };
     if result.is_ok() {
@@ -1401,6 +1407,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
                     | "profile.switch"
                     | "profile.delete"
                     | "profile.forgetServerAccount"
+                    | "profile.setStartupPicker"
                     | "sync.signOut"
                     | "package.export"
                     | "package.import"
@@ -6584,6 +6591,24 @@ fn cmd_profile_delete(
         .delete_local_profile(&p.profile_id)
         .map_err(|reason| invalid(id, reason))?;
     Ok(json!({ "deletedProfileId": p.profile_id }))
+}
+
+#[derive(Deserialize)]
+struct SetStartupPickerParams {
+    #[serde(alias = "skipOnStartup", alias = "skip_account_picker_on_startup")]
+    skip: bool,
+}
+
+fn cmd_profile_set_startup_picker(
+    session: &mut Session,
+    id: &str,
+    params: &Value,
+) -> Result<Value, EngineError> {
+    let p: SetStartupPickerParams = parse_params(id, params)?;
+    session.set_skip_account_picker_on_startup(p.skip);
+    Ok(json!({
+        "skipAccountPickerOnStartup": session.skip_account_picker_on_startup(),
+    }))
 }
 
 #[derive(Deserialize)]

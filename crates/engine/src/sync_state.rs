@@ -302,13 +302,26 @@ impl Session {
         if !self.sync.web_cache_enabled {
             return;
         }
-        let current = self.capture_web_bundle();
         if let Some(ref acct) = self.sync.active_server_session {
+            let current = self.capture_web_bundle();
             let key = cloud_account_cache_key(&acct.server_url, &acct.user.user_id);
             self.sync.web_cloud_bundles.insert(key, current);
             return;
         }
-        let pid = ensure_default_profile_in_global(&mut self.sync.global);
+        let Some(OwnerId::LocalProfile(pid)) = self.sync.manifest.owner_id.clone() else {
+            return;
+        };
+        if pid.is_empty()
+            || !self
+                .sync
+                .global
+                .local_profiles
+                .iter()
+                .any(|p| p.local_profile_id == pid)
+        {
+            return;
+        }
+        let current = self.capture_web_bundle();
         self.sync.web_local_bundles.insert(pid, current);
     }
 
@@ -535,6 +548,80 @@ impl Session {
             })
     }
 
+    /// Returns the user's configured default/preferred server URL independent of any active session.
+    pub fn preferred_server_url(&self) -> &str {
+        &self.sync.global.server_url
+    }
+
+    /// Returns `true` when the user opted to skip the startup account picker modal.
+    pub fn skip_account_picker_on_startup(&self) -> bool {
+        self.sync.global.skip_account_picker_on_startup
+    }
+
+    /// Updates whether the startup account picker modal should be skipped on next launch.
+    pub fn set_skip_account_picker_on_startup(&mut self, skip: bool) {
+        if self.sync.global.skip_account_picker_on_startup == skip {
+            return;
+        }
+        self.sync.global.skip_account_picker_on_startup = skip;
+        self.sync_persist_global_state();
+        self.capture_active_web_delta_into_pending(true);
+        self.bump_revision();
+    }
+
+    /// Returns `true` when either a cloud account or a confirmed local profile workspace is loaded.
+    pub fn has_loaded_workspace(&self) -> bool {
+        if !self.is_sync_persistence_enabled() {
+            return true;
+        }
+        self.is_viewing_cloud()
+            || (!self.sync.global.needs_initial_nickname
+                && matches!(
+                    self.sync.manifest.owner_id,
+                    Some(OwnerId::LocalProfile(ref id)) if !id.is_empty()
+                ))
+    }
+
+    /// Returns `true` when the Initial Access / Account Picker modal should appear on startup.
+    pub fn should_show_startup_account_picker(&self) -> bool {
+        if !self.is_sync_persistence_enabled() {
+            return false;
+        }
+        self.needs_initial_nickname() || !self.sync.global.skip_account_picker_on_startup
+    }
+
+    /// Returns the number of cached/offline notebooks belonging to `(server_url, user_id)`.
+    pub fn server_account_notebook_count(&self, server_url: &str, user_id: &str) -> usize {
+        if self.sync.active_server_session.as_ref().is_some_and(|s| {
+            s.user.user_id == user_id
+                && (s.server_url.eq_ignore_ascii_case(server_url)
+                    || normalize_server_url(server_url)
+                        .is_ok_and(|u| u.eq_ignore_ascii_case(&s.server_url)))
+        }) {
+            return count_non_placeholder_slots(
+                self.notebooks.len(),
+                &self.sync.slot_placeholder_blank,
+            );
+        }
+        if let Some(ref root) = self.sync.desktop_root {
+            let dir = account_library_dir(root, user_id);
+            if dir.exists() {
+                return count_ncraft_files_in_dir(&dir);
+            }
+            return 0;
+        }
+        if self.sync.web_cache_enabled {
+            let key = cloud_account_cache_key(server_url, user_id);
+            if let Some(bundle) = self.sync.web_cloud_bundles.get(&key) {
+                return count_non_placeholder_slots(
+                    bundle.notebooks.len(),
+                    &bundle.slot_placeholder_blank,
+                );
+            }
+        }
+        0
+    }
+
     pub fn device_name(&self) -> &str {
         &self.sync.global.device_name
     }
@@ -584,6 +671,7 @@ impl Session {
         self.sync.global.welcome_banner_seen_version = Some(target);
         self.sync_persist_global_state();
         self.save_current_web_bundle();
+        self.capture_active_web_delta_into_pending(true);
         self.bump_revision();
     }
 
@@ -609,6 +697,7 @@ impl Session {
         self.sync.global.first_notebook_data_notice_seen = true;
         self.sync_persist_global_state();
         self.save_current_web_bundle();
+        self.capture_active_web_delta_into_pending(true);
         self.bump_revision();
     }
 
@@ -862,6 +951,7 @@ impl Session {
         let normalized = normalize_server_url(raw_url).map_err(|e| e.to_string())?;
         self.sync.global.server_url = normalized.clone();
         self.sync_persist_global_state();
+        self.capture_active_web_delta_into_pending(true);
         Ok(normalized)
     }
 
@@ -1327,6 +1417,7 @@ impl Session {
 
         *self = next;
         self.sync_persist_global_state();
+        self.capture_active_web_delta_into_pending(true);
         self.bump_revision();
         has_locals
     }
@@ -1568,13 +1659,15 @@ impl Session {
     }
 
     fn flush_active_workspace_to_storage(&mut self) {
-        self.library.promote_view_dirty_to_dirty();
-        self.sync_flush_dirty_flags_to_manifest();
-        self.sync_reconcile_folders();
-        let _ = self.save_library();
-        let _ = self.save_prefs();
-        self.sync_persist_manifest();
-        self.save_current_web_bundle();
+        if self.has_loaded_workspace() {
+            self.library.promote_view_dirty_to_dirty();
+            self.sync_flush_dirty_flags_to_manifest();
+            self.sync_reconcile_folders();
+            let _ = self.save_library();
+            let _ = self.save_prefs();
+            self.sync_persist_manifest();
+            self.save_current_web_bundle();
+        }
         self.capture_active_web_delta_into_pending(true);
     }
 
@@ -1841,6 +1934,25 @@ impl Session {
         }
         if !self.is_viewing_cloud() {
             return Err("cannot apply server sync outcome while using a local profile".to_string());
+        }
+        let Some(active) = self.sync.active_server_session.as_ref() else {
+            return Err("no active server session".to_string());
+        };
+        if active.user.user_id != outcome.server_user.user_id {
+            return Err("ignored stale sync outcome for a different server account".to_string());
+        }
+        if let Some(ref refreshed) = outcome.refreshed_session {
+            let norm_refreshed = normalize_server_url(&refreshed.server_url)
+                .unwrap_or_else(|_| refreshed.server_url.clone());
+            let norm_active = normalize_server_url(&active.server_url)
+                .unwrap_or_else(|_| active.server_url.clone());
+            if refreshed.user.user_id != active.user.user_id
+                || !norm_refreshed.eq_ignore_ascii_case(&norm_active)
+            {
+                return Err(
+                    "ignored stale refreshed session for a different server account".to_string(),
+                );
+            }
         }
         self.sync_active_notebook_slot();
 
@@ -3399,11 +3511,15 @@ mod tests {
                 )
             })
             .collect();
+        let server_user = session
+            .active_account_session()
+            .map(|s| s.user.clone())
+            .unwrap_or_else(|| fake_account("user-a", "alice@example.com", "alice").user);
         session
             .apply_sync_outcome(SyncCycleOutcome {
                 new_cursor: count as u64,
                 refreshed_session: None,
-                server_user: fake_account("user-a", "alice@example.com", "alice").user,
+                server_user,
                 accepted_uploads: accepted,
                 accepted_page_hashes,
                 accepted_folders: Vec::new(),
@@ -4532,5 +4648,203 @@ mod tests {
         let batch = session.prepare_sync_batch().unwrap();
         assert_eq!(batch.local_docs.len(), 1);
         assert_eq!(batch.local_docs[0].base_version, 1);
+    }
+
+    #[test]
+    fn web_sign_out_then_switch_to_local_preserves_local_notebooks() {
+        let mut session = Session::open_web_cache(None);
+        session
+            .execute(
+                "profile.completeFirstAccess",
+                &json!({ "nickname": "OfflineNote" }),
+            )
+            .unwrap();
+        session
+            .execute("notebook.create", &json!({ "title": "My Local Journal" }))
+            .unwrap();
+        let local_id = session
+            .active_local_profile()
+            .unwrap()
+            .local_profile_id
+            .clone();
+
+        let acct = fake_account("u-signout", "cloud@example.com", "clouduser");
+        let cloud_doc = Document {
+            id: "nb-cloud-only".to_string(),
+            title: "Cloud Only Doc".to_string(),
+            ..Default::default()
+        };
+        let pull = SyncPullResponse {
+            server_cursor: 1,
+            user: acct.user.clone(),
+            notebooks: vec![RemoteNotebookRecord {
+                notebook_id: "nb-cloud-only".to_string(),
+                version: 1,
+                cursor: 1,
+                deleted: false,
+                updated_at_ms: 1000,
+                deleted_at_ms: None,
+                title: "Cloud Only Doc".to_string(),
+                content_hash: canonical_document_hash(&cloud_doc),
+                body_hash: canonical_document_body_hash(&cloud_doc),
+                meta_hash: canonical_document_meta_hash(&cloud_doc),
+                meta_updated_at_ms: 1000,
+                document: Some(cloud_doc),
+            }],
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        session.enter_online_server_session(acct, pull);
+        assert!(has_notebook_title(&session, "Cloud Only Doc"));
+        assert!(!has_notebook_title(&session, "My Local Journal"));
+
+        assert!(session.sign_out_from_server_session());
+        assert!(!session.has_loaded_workspace());
+
+        // Switching back into the existing local account must still have My Local Journal intact.
+        session.switch_to_local_profile(&local_id).unwrap();
+        assert!(session.has_loaded_workspace());
+        assert!(has_notebook_title(&session, "My Local Journal"));
+        assert!(!has_notebook_title(&session, "Cloud Only Doc"));
+    }
+
+    #[test]
+    fn direct_cloud_to_cloud_switch_preserves_account_a_pending_and_isolates_web_deltas() {
+        let mut session = Session::open_web_cache(None);
+        let acct_a = fake_account("u-a", "alice@example.com", "alice");
+        session.enter_online_server_session(acct_a.clone(), empty_pull_for(&acct_a, 0));
+        session
+            .execute("notebook.create", &json!({ "title": "Alice Unsynced" }))
+            .unwrap();
+        assert_eq!(session.cloud_pending_changes_count(), 1);
+
+        let acct_b = fake_account("u-b", "bob@example.com", "bob");
+        let bob_doc = Document {
+            id: "nb-bob".to_string(),
+            title: "Bob Synced".to_string(),
+            ..Default::default()
+        };
+        let pull_b = SyncPullResponse {
+            server_cursor: 2,
+            user: acct_b.user.clone(),
+            notebooks: vec![RemoteNotebookRecord {
+                notebook_id: "nb-bob".to_string(),
+                version: 1,
+                cursor: 2,
+                deleted: false,
+                updated_at_ms: 1000,
+                deleted_at_ms: None,
+                title: "Bob Synced".to_string(),
+                content_hash: canonical_document_hash(&bob_doc),
+                body_hash: canonical_document_body_hash(&bob_doc),
+                meta_hash: canonical_document_meta_hash(&bob_doc),
+                meta_updated_at_ms: 1000,
+                document: Some(bob_doc),
+            }],
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        session.enter_online_server_session(acct_b, pull_b);
+
+        assert_eq!(session.notebooks.len(), 1);
+        assert_eq!(session.notebooks[0].title, "Bob Synced");
+        assert_eq!(
+            session.server_account_notebook_count(&acct_a.server_url, "u-a"),
+            1
+        );
+        assert_eq!(
+            session.server_account_pending_changes_count(&acct_a.server_url, "u-a"),
+            1
+        );
+
+        let exported = session.export_web_cache_json().unwrap();
+        let reopened = Session::open_web_cache(Some(&exported));
+        assert_eq!(
+            reopened.server_account_notebook_count(&acct_a.server_url, "u-a"),
+            1
+        );
+        assert_eq!(
+            reopened.server_account_pending_changes_count(&acct_a.server_url, "u-a"),
+            1
+        );
+        assert_eq!(
+            reopened
+                .active_account_session()
+                .map(|s| s.user.user_id.as_str()),
+            Some("u-b")
+        );
+    }
+
+    #[test]
+    fn apply_sync_outcome_rejects_mismatched_user_id() {
+        let mut session = Session::open_web_cache(None);
+        let acct_b = fake_account("u-b", "bob@example.com", "bob");
+        let pull_b = empty_pull_for(&acct_b, 0);
+        session.enter_online_server_session(acct_b, pull_b);
+
+        let alice_doc = Document {
+            id: "nb-alice".to_string(),
+            title: "Stale Alice Doc".to_string(),
+            ..Default::default()
+        };
+        let stale_outcome = SyncCycleOutcome {
+            new_cursor: 10,
+            refreshed_session: None,
+            server_user: fake_account("u-a", "alice@example.com", "alice").user,
+            accepted_uploads: Vec::new(),
+            accepted_page_hashes: std::collections::HashMap::new(),
+            accepted_folders: Vec::new(),
+            cleared_tombstones: Vec::new(),
+            downloaded_updates: vec![papercraft_sync::RemoteNotebookUpdate {
+                notebook_id: "nb-alice".to_string(),
+                version: 1,
+                cursor: 10,
+                deleted: false,
+                updated_at_ms: 1000,
+                deleted_at_ms: None,
+                content_hash: canonical_document_hash(&alice_doc),
+                body_hash: canonical_document_body_hash(&alice_doc),
+                meta_hash: canonical_document_meta_hash(&alice_doc),
+                meta_updated_at_ms: 1000,
+                document: Some(alice_doc),
+                page_hashes: Vec::new(),
+            }],
+            conflict_updates: Vec::new(),
+            downloaded_folders: Vec::new(),
+            updated_prefs: None,
+            ack_prefs: None,
+            pushed_count: 0,
+            pulled_count: 1,
+            synced_at_ms: 2000,
+        };
+        let err = session.apply_sync_outcome(stale_outcome).unwrap_err();
+        assert!(err.contains("different server account"), "{err}");
+        assert!(!has_notebook_title(&session, "Stale Alice Doc"));
+    }
+
+    #[test]
+    fn startup_picker_preference_command_persists_across_reopen() {
+        let dir = temp_dir("startup_picker_pref");
+        let mut session = Session::open_desktop_library(dir.0.clone());
+        assert!(!session.skip_account_picker_on_startup());
+        assert!(session.should_show_startup_account_picker());
+
+        session
+            .execute(
+                "profile.completeFirstAccess",
+                &json!({ "nickname": "Alex" }),
+            )
+            .unwrap();
+        assert!(session.should_show_startup_account_picker());
+
+        session
+            .execute("profile.setStartupPicker", &json!({ "skip": true }))
+            .unwrap();
+        assert!(session.skip_account_picker_on_startup());
+        assert!(!session.should_show_startup_account_picker());
+
+        let reopened = Session::open_desktop_library(dir.0.clone());
+        assert!(reopened.skip_account_picker_on_startup());
+        assert!(!reopened.should_show_startup_account_picker());
     }
 }

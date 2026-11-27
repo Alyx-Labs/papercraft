@@ -2,7 +2,7 @@
 //! zero-loss `localStorage` migration, StorageManager integration, and multi-tab protection.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -154,6 +154,7 @@ struct WebStorageInner {
     has_unsaved_error: bool,
     quota_exceeded: bool,
     last_error: Option<String>,
+    urgent_queue: VecDeque<WebStorageDelta>,
     pending_delta: WebStorageDelta,
     failed_delta: Option<WebStorageDelta>,
     first_pending_at_ms: Option<f64>,
@@ -201,7 +202,10 @@ impl WebStorageInner {
     }
 
     fn has_unflushed_work(&self) -> bool {
-        self.in_flight || !self.pending_delta.is_empty() || self.failed_delta.is_some()
+        self.in_flight
+            || !self.urgent_queue.is_empty()
+            || !self.pending_delta.is_empty()
+            || self.failed_delta.is_some()
     }
 
     fn can_run_gc(&mut self) -> bool {
@@ -210,6 +214,7 @@ impl WebStorageInner {
             && self.db.is_some()
             && self.peer_tabs.is_empty()
             && !self.in_flight
+            && self.urgent_queue.is_empty()
             && self.pending_delta.is_empty()
             && self.failed_delta.is_none()
     }
@@ -260,6 +265,7 @@ impl WebStorageController {
             has_unsaved_error: false,
             quota_exceeded: false,
             last_error: None,
+            urgent_queue: VecDeque::new(),
             pending_delta: WebStorageDelta::default(),
             failed_delta: None,
             first_pending_at_ms: None,
@@ -410,21 +416,35 @@ impl WebStorageController {
         let (backend, urgent, should_flush_now) = {
             let mut st = self.inner.borrow_mut();
             let urgent = delta.urgent;
-            let now = Date::now();
-            if st.pending_delta.is_empty() {
-                st.first_pending_at_ms = Some(now);
-            }
-            st.pending_delta.merge(delta);
+            if urgent {
+                if let Some(timer_id) = st.debounce_timer_id.take() {
+                    clear_window_timeout(timer_id);
+                }
+                let mut sealed = std::mem::take(&mut st.pending_delta);
+                sealed.merge(delta);
+                sealed.urgent = true;
+                st.first_pending_at_ms = None;
+                st.urgent_queue.push_back(sealed);
+                let flush_now = !st.in_flight;
+                (st.backend, true, flush_now)
+            } else {
+                let now = Date::now();
+                if st.pending_delta.is_empty() {
+                    st.first_pending_at_ms = Some(now);
+                }
+                st.pending_delta.merge(delta);
 
-            let exceeded_max_wait = st
-                .first_pending_at_ms
-                .is_some_and(|start| (now - start) >= DEBOUNCE_MAX_WAIT_MS);
-            let is_writing = st.writing_active.load(Ordering::Relaxed);
-            let flush_now = !st.in_flight && (urgent || (exceeded_max_wait && !is_writing));
-            if flush_now && let Some(timer_id) = st.debounce_timer_id.take() {
-                clear_window_timeout(timer_id);
+                let exceeded_max_wait = st
+                    .first_pending_at_ms
+                    .is_some_and(|start| (now - start) >= DEBOUNCE_MAX_WAIT_MS);
+                let is_writing = st.writing_active.load(Ordering::Relaxed);
+                let flush_now =
+                    !st.in_flight && st.urgent_queue.is_empty() && exceeded_max_wait && !is_writing;
+                if flush_now && let Some(timer_id) = st.debounce_timer_id.take() {
+                    clear_window_timeout(timer_id);
+                }
+                (st.backend, false, flush_now)
             }
-            (st.backend, urgent, flush_now)
         };
 
         if backend != WebStorageBackend::IndexedDb {
@@ -443,17 +463,13 @@ impl WebStorageController {
     pub fn retry_failed(&self) {
         let should_flush = {
             let mut st = self.inner.borrow_mut();
-            if let Some(failed) = st.failed_delta.take() {
-                let pending = std::mem::take(&mut st.pending_delta);
-                let mut combined = failed;
-                combined.merge(pending);
-                combined.urgent = true;
-                st.pending_delta = combined;
-                st.has_unsaved_error = false;
-                st.quota_exceeded = false;
-                st.last_error = None;
-            }
-            !st.in_flight && !st.pending_delta.is_empty()
+            st.has_unsaved_error = false;
+            st.quota_exceeded = false;
+            st.last_error = None;
+            !st.in_flight
+                && (st.failed_delta.is_some()
+                    || !st.urgent_queue.is_empty()
+                    || !st.pending_delta.is_empty())
         };
         if should_flush {
             let backend = self.inner.borrow().backend;
@@ -499,6 +515,7 @@ impl WebStorageController {
                 let mut st = ctrl.inner.borrow_mut();
                 st.debounce_timer_id = None;
                 st.writing_active.load(Ordering::Relaxed)
+                    && st.urgent_queue.is_empty()
                     && !st.pending_delta.is_empty()
                     && !st.pending_delta.urgent
             };
@@ -572,26 +589,27 @@ impl WebStorageController {
         if st.in_flight {
             return None;
         }
-        if let Some(timer_id) = st.debounce_timer_id.take() {
-            clear_window_timeout(timer_id);
-        }
         let db = st.db.clone()?;
-        let mut delta = std::mem::take(&mut st.pending_delta);
-        if let Some(failed) = st.failed_delta.take() {
-            let mut combined = failed;
-            combined.merge(delta);
-            delta = combined;
-        }
-        st.first_pending_at_ms = None;
+        // Drain strictly in FIFO order: failed head batch first, then sealed urgent
+        // account-switch barriers, then coalesced non-urgent background changes.
+        let delta = if let Some(failed) = st.failed_delta.take() {
+            failed
+        } else if let Some(urgent) = st.urgent_queue.pop_front() {
+            urgent
+        } else {
+            if let Some(timer_id) = st.debounce_timer_id.take() {
+                clear_window_timeout(timer_id);
+            }
+            st.first_pending_at_ms = None;
+            std::mem::take(&mut st.pending_delta)
+        };
         if delta.is_empty() {
             return None;
         }
         let encoded = match encode_delta_for_idb(&mut st, &delta, false) {
             Ok(enc) => enc,
             Err(err) => {
-                st.has_unsaved_error = true;
-                st.last_error = Some(err);
-                st.failed_delta = Some(delta);
+                requeue_failed_delta(&mut st, delta, IdbOpError::plain(err));
                 st.emit_status();
                 return None;
             }
@@ -639,7 +657,7 @@ impl WebStorageController {
                     if try_persist {
                         st.tried_persist_after_write = true;
                     }
-                    let more = !st.pending_delta.is_empty();
+                    let more = !st.urgent_queue.is_empty() || !st.pending_delta.is_empty();
                     let can_gc = had_deletions && !more && st.peer_tabs.is_empty();
                     (more, est_due, try_persist, can_gc)
                 }
@@ -667,18 +685,21 @@ impl WebStorageController {
         if let Some(timer_id) = st.debounce_timer_id.take() {
             clear_window_timeout(timer_id);
         }
-        let mut delta = std::mem::take(&mut st.pending_delta);
+        let mut combined = WebStorageDelta::default();
         if let Some(failed) = st.failed_delta.take() {
-            let mut combined = failed;
-            combined.merge(delta);
-            delta = combined;
+            combined.merge(failed);
         }
+        while let Some(urgent) = st.urgent_queue.pop_front() {
+            combined.merge(urgent);
+        }
+        let pending = std::mem::take(&mut st.pending_delta);
+        combined.merge(pending);
         st.first_pending_at_ms = None;
-        if delta.is_empty() {
+        if combined.is_empty() {
             return;
         }
         if let Some(ref mut mirror) = st.fallback_mirror {
-            apply_delta_to_fallback_mirror(mirror, &delta);
+            apply_delta_to_fallback_mirror(mirror, &combined);
         }
         if st.backend == WebStorageBackend::MemoryOnly {
             st.has_unsaved_error = true;
@@ -701,7 +722,7 @@ impl WebStorageController {
                 st.has_unsaved_error = true;
                 st.quota_exceeded = is_quota;
                 st.last_error = Some(err);
-                st.failed_delta = Some(delta);
+                st.failed_delta = Some(combined);
             }
         }
         st.emit_status();
@@ -755,7 +776,10 @@ impl WebStorageController {
                 }
                 _ => 0,
             };
-            (deleted, !st.pending_delta.is_empty())
+            (
+                deleted,
+                !st.urgent_queue.is_empty() || !st.pending_delta.is_empty(),
+            )
         };
         if deleted_count > 0 {
             self.refresh_storage_manager_state(false).await;
@@ -1660,7 +1684,11 @@ fn finalize_gc_deletes_in_active_tx(
     {
         let mut st = inner.borrow_mut();
         st.prune_stale_peers();
-        if !st.peer_tabs.is_empty() || !st.pending_delta.is_empty() || st.failed_delta.is_some() {
+        if !st.peer_tabs.is_empty()
+            || !st.urgent_queue.is_empty()
+            || !st.pending_delta.is_empty()
+            || st.failed_delta.is_some()
+        {
             return;
         }
     }

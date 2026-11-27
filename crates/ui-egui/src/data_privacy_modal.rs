@@ -312,6 +312,12 @@ mod tests {
                 &serde_json::json!({ "nickname": "Alyx" }),
             )
             .unwrap();
+        session
+            .execute(
+                "profile.setStartupPicker",
+                &serde_json::json!({ "skip": true }),
+            )
+            .unwrap();
 
         let mut app = PaperCraftApp::new(session, crate::PlatformHooks::default());
         assert_eq!(app.view.active_modal, None);
