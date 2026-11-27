@@ -2425,6 +2425,7 @@ impl PaperCraftApp {
         ctx: &egui::Context,
     ) {
         let prev_theme = self.session.prefs.theme;
+        let prev_infinite = self.session.prefs.infinite_theme;
         let prev_active_title = self.session.doc.title.clone();
         let prev_active_cover = self.session.doc.cover;
         let prev_rev = self.session.revision;
@@ -2440,8 +2441,10 @@ impl PaperCraftApp {
         if self.session.revision != prev_rev {
             self.mesh_cache.clear();
         }
-        if self.session.prefs.theme != prev_theme {
-            theme::apply_visuals(ctx, self.session.prefs.theme);
+        if self.session.prefs.theme != prev_theme
+            || self.session.prefs.infinite_theme != prev_infinite
+        {
+            theme::apply_prefs_visuals(ctx, &self.session.prefs);
         }
         if self.session.doc.title != prev_active_title
             || self.session.doc.cover != prev_active_cover
@@ -3049,12 +3052,12 @@ impl PaperCraftApp {
             ctx.request_repaint();
         }
 
-        theme::apply_visuals(ui.ctx(), self.session.prefs.theme);
+        theme::apply_prefs_visuals(ui.ctx(), &self.session.prefs);
         if self.view.motion.screen.tick(self.view.screen, dt) {
             ctx.request_repaint();
         }
 
-        let tokens = theme::Tokens::for_theme(self.session.prefs.theme);
+        let tokens = theme::Tokens::for_prefs(&self.session.prefs);
         let exiting_screen = self.view.motion.screen.is_exiting();
         let tab_out = tab_strip::show(self, ui);
         match self.view.motion.screen.rendered {

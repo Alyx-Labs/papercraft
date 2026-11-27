@@ -5,10 +5,10 @@ use papercraft_sync::{SyncConnectionState, SyncStatusSummary};
 
 use crate::PaperCraftApp;
 use crate::account_modal::{
-    AddAccountMode, BannerTone, ProfileSection, ServerProbeState, account_icon_and_colors,
+    AddAccountMode, BannerTone, ProfileSection, ServerProbeState, account_avatar_icon_and_colors,
     draw_account_type_badge, draw_active_pill, draw_hairline, draw_section_card,
-    draw_status_banner, draw_sync_connection_pill, fixed_secondary_button, format_notebook_count,
-    header_status_dot_color, norm_probe_url_key, probe_all_known_servers,
+    draw_status_banner, fixed_secondary_button, format_notebook_count, header_status_dot_color,
+    hollow_secondary_button, norm_probe_url_key, probe_all_known_servers,
     render_account_email_card, render_accounts_switcher_section, render_auth_banners,
     render_change_password_card, render_expired_session_reauth_box,
     render_forget_server_account_confirmation, render_local_profile_identity_card,
@@ -411,7 +411,6 @@ fn draw_active_account_summary_card(
                 summary,
                 server_online,
                 app.session.notebooks.len(),
-                cloud_pending,
                 t,
             );
 
@@ -455,7 +454,7 @@ fn draw_active_account_header(
     t: &Tokens,
 ) {
     let (acct_icon, icon_fg, icon_bg, icon_border) =
-        account_icon_and_colors(summary.signed_in, server_online, t);
+        account_avatar_icon_and_colors(summary.signed_in, server_online, t);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         let (badge_rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
@@ -505,32 +504,17 @@ fn draw_active_account_meta_row(
     summary: &SyncStatusSummary,
     server_online: bool,
     notebook_count: usize,
-    cloud_pending: usize,
     t: &Tokens,
 ) {
     let nb_label = format_notebook_count(notebook_count);
     let meta = if summary.signed_in {
-        match cloud_pending {
-            0 => nb_label,
-            1 => format!("{nb_label} · 1 pending"),
-            n => format!("{nb_label} · {n} pending"),
-        }
+        nb_label
     } else {
         format!("{nb_label} · Saved on this device")
     };
 
-    let pills_reserve_w = if summary.signed_in {
-        if summary.connection == SyncConnectionState::Error {
-            178.0
-        } else {
-            162.0
-        }
-    } else {
-        74.0
-    };
-
     ui.horizontal(|ui| {
-        let left_max_w = (ui.available_width() - pills_reserve_w).max(48.0);
+        let left_max_w = (ui.available_width() - 74.0).max(48.0);
         ui.scope(|ui| {
             ui.set_max_width(left_max_w);
             ui.add(
@@ -538,13 +522,51 @@ fn draw_active_account_meta_row(
             );
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
             draw_account_type_badge(ui, summary.signed_in, server_online, t);
-            if summary.signed_in {
-                draw_sync_connection_pill(ui, summary.connection, t);
-            }
         });
     });
+}
+
+fn draw_active_account_edit_button(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    tip: &str,
+    t: &Tokens,
+) {
+    if fixed_secondary_button(ui, "Edit", 56.0, true, t)
+        .on_hover_text(tip)
+        .clicked()
+    {
+        sync_draft_from_session(app);
+        app.view.account.profile_section = ProfileSection::Profile;
+    }
+}
+
+fn draw_active_server_left_actions(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    active_acct: Option<&papercraft_sync::ActiveAccountSession>,
+    is_confirming_forget: bool,
+    t: &Tokens,
+) {
+    if danger_action_button(ui, "Sign Out", true, t).clicked() {
+        complete_sign_out(app, ui.ctx());
+    }
+    if !is_confirming_forget
+        && let Some(acct) = active_acct
+        && hollow_secondary_button(ui, "Forget", true, t)
+            .on_hover_text(
+                "Remove this account shortcut and delete ONLY its local cache on this device",
+            )
+            .clicked()
+    {
+        app.view.account.pending_forget_server_key = Some((
+            norm_probe_url_key(&acct.server_url),
+            acct.user.user_id.clone(),
+        ));
+        app.view.account.clear_quick_login_draft();
+        app.view.account.clear_pending_delete_profile();
+    }
 }
 
 fn draw_active_account_actions(
@@ -558,51 +580,30 @@ fn draw_active_account_actions(
     if !summary.signed_in && app.session.active_local_profile().is_none() {
         return;
     }
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-        if summary.signed_in {
-            let in_flight = app.session.is_sync_in_flight();
-            let can_sync = !in_flight && app.session.is_viewing_cloud();
-            let sync_lbl = if in_flight { "Syncing..." } else { "Sync Now" };
-            if primary_action_button(ui, sync_lbl, can_sync, t).clicked() {
-                app.view.account.error_message = None;
-                app.view.account.status_message = None;
-                trigger_manual_sync(app, ui.ctx());
-            }
-            if fixed_secondary_button(ui, "Edit", 56.0, true, t)
-                .on_hover_text("Edit display name, @username, email, or password")
-                .clicked()
-            {
-                sync_draft_from_session(app);
-                app.view.account.profile_section = ProfileSection::Profile;
-            }
-            if danger_action_button(ui, "Sign Out", true, t).clicked() {
-                complete_sign_out(app, ui.ctx());
-            }
-            if !is_confirming_forget
-                && let Some(acct) = active_acct
-                && fixed_secondary_button(ui, "Forget Account", 104.0, true, t)
-                    .on_hover_text(
-                        "Remove this account shortcut and delete ONLY its local cache on this device",
-                    )
-                    .clicked()
-            {
-                app.view.account.pending_forget_server_key = Some((
-                    norm_probe_url_key(&acct.server_url),
-                    acct.user.user_id.clone(),
-                ));
-                app.view.account.clear_quick_login_draft();
-                app.view.account.clear_pending_delete_profile();
-            }
-        } else if app.session.active_local_profile().is_some()
-            && fixed_secondary_button(ui, "Edit", 56.0, true, t)
-                .on_hover_text("Edit this local account nickname")
-                .clicked()
-        {
-            sync_draft_from_session(app);
-            app.view.account.profile_section = ProfileSection::Profile;
+    if summary.signed_in {
+        let edit_tip = "Edit display name, @username, email, or password";
+        if ui.available_width() >= 210.0 {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                draw_active_server_left_actions(app, ui, active_acct, is_confirming_forget, t);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    draw_active_account_edit_button(app, ui, edit_tip, t);
+                });
+            });
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                draw_active_server_left_actions(app, ui, active_acct, is_confirming_forget, t);
+                draw_active_account_edit_button(app, ui, edit_tip, t);
+            });
         }
-    });
+    } else {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                draw_active_account_edit_button(app, ui, "Edit this local account nickname", t);
+            });
+        });
+    }
 }
 
 fn draw_active_account_alerts(
@@ -764,13 +765,17 @@ fn draw_storage_overview_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &To
             if let Some(tip) = tip {
                 let _ = resp.on_hover_text(tip);
             }
-            if let Some((usage_text, _)) = crate::inspector::web_storage_usage_row(&status) {
+            if let Some((usage_text, usage_tip)) = crate::inspector::web_storage_usage_row(&status)
+            {
                 ui.add_space(4.0);
-                ui.label(
+                let usage_resp = ui.label(
                     egui::RichText::new(usage_text)
                         .size(11.0)
                         .color(t.text_muted),
                 );
+                if let Some(usage_tip) = usage_tip {
+                    let _ = usage_resp.on_hover_text(usage_tip);
+                }
                 if let (Some(used), Some(quota)) = (status.usage_bytes, status.quota_bytes)
                     && quota > 0
                 {
@@ -783,6 +788,17 @@ fn draw_storage_overview_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &To
                             .fill(t.accent),
                     );
                 }
+            }
+            if let Some(quota_note) = crate::inspector::web_storage_quota_explanation(&status) {
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(quota_note)
+                            .size(10.5)
+                            .color(t.text_muted),
+                    )
+                    .wrap(),
+                );
             }
             if status.has_unsaved_error {
                 ui.add_space(8.0);
@@ -1048,7 +1064,8 @@ mod tests {
                 "Alex Silva",
                 "@alex_notes",
                 "Edit",
-                "Forget Account",
+                "Sign Out",
+                "Forget",
                 "Local Accounts (1)",
                 "Server Accounts (0)",
                 "No other server accounts saved on this device.",
@@ -1148,6 +1165,12 @@ mod tests {
         let sync_text = render_drawer_text(&ctx, &mut app);
         assert!(sync_text.contains("IndexedDB"), "{sync_text}");
         assert!(sync_text.contains("2.0 MB / 128.0 MB"), "{sync_text}");
+        assert!(
+            sync_text.contains(
+                "The 128.0 MB limit is the maximum space your browser allows for local notebooks when running locally in the browser."
+            ),
+            "{sync_text}"
+        );
     }
 
     #[test]
@@ -1670,13 +1693,21 @@ mod tests {
         app.session.enter_online_server_session(acct, empty_pull);
 
         let server_rects = collect_text_rects(&ctx, &mut app, 1.0);
+        assert!(
+            !server_rects
+                .iter()
+                .any(|(text, _)| text == "Synced" || text == "Sync Now"),
+            "Active server card must omit Synced pill and Sync Now button: {server_rects:?}"
+        );
         let s_name_r = find_rect(&server_rects, "Alex Silva");
         let s_sub_r = find_rect(&server_rects, "alex@example.com (@alex_notes)");
         let s_active_r = find_rect(&server_rects, "Active");
         let s_server_r = find_rect(&server_rects, "Server");
-        let s_synced_r = find_rect(&server_rects, "Synced");
         let s_meta_r = find_rect(&server_rects, "0 notebooks");
         let s_url_r = find_rect(&server_rects, DEFAULT_SERVER_URL);
+        let s_sign_out_r = find_rect(&server_rects, "Sign Out");
+        let s_forget_r = find_rect(&server_rects, "Forget");
+        let s_edit_r = find_rect(&server_rects, "Edit");
 
         assert!(
             s_sub_r.top() > s_name_r.bottom(),
@@ -1691,16 +1722,20 @@ mod tests {
             "Server badge ({s_server_r:?}) should align on right edge under Active ({s_active_r:?})"
         );
         assert!(
-            s_synced_r.right() < s_server_r.left(),
-            "Synced pill ({s_synced_r:?}) should sit left of Server badge ({s_server_r:?})"
-        );
-        assert!(
-            s_meta_r.right() < s_synced_r.left(),
-            "Server meta ({s_meta_r:?}) must stay left of Synced pill ({s_synced_r:?})"
+            s_meta_r.right() < s_server_r.left(),
+            "Server meta ({s_meta_r:?}) must stay left of Server badge ({s_server_r:?})"
         );
         assert!(
             s_url_r.top() > s_server_r.bottom(),
             "Server URL ({s_url_r:?}) should sit cleanly below meta/badges ({s_server_r:?})"
+        );
+        assert!(
+            s_sign_out_r.top() > s_url_r.bottom(),
+            "Action row ({s_sign_out_r:?}) should sit below server URL ({s_url_r:?})"
+        );
+        assert!(
+            s_sign_out_r.right() < s_forget_r.left() && s_forget_r.right() < s_edit_r.left(),
+            "Expected Sign Out -> Forget on left and Edit on right: sign_out={s_sign_out_r:?}, forget={s_forget_r:?}, edit={s_edit_r:?}"
         );
     }
 

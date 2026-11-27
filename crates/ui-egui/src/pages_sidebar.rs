@@ -90,7 +90,7 @@ struct TileFooterResult {
 }
 
 pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> SidebarMetrics {
-    let t = Tokens::for_theme(app.session.prefs.theme);
+    let t = Tokens::for_prefs(&app.session.prefs);
     let mut metrics = SidebarMetrics::default();
 
     let prev_open = app.view.pages_sidebar_open;

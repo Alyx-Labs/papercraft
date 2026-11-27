@@ -72,7 +72,7 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
 
 pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> HomeMetrics {
     app.install_rich_fonts_if_needed(ui.ctx());
-    let t = Tokens::for_theme(app.session.prefs.theme);
+    let t = Tokens::for_prefs(&app.session.prefs);
     let header_rect = draw_home_header(app, ui, &t);
     let min_viewport_for_sidebar = if app.view.inspector_open {
         SIDEBAR_MIN_VIEWPORT
@@ -443,10 +443,10 @@ fn draw_home_profile_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Toke
     let (state_label, _) = crate::account_modal::status_badge_style(summary.connection, t);
     let dot_color = if summary.viewing_cloud {
         crate::account_modal::header_status_dot_color(summary.connection, t)
-    } else if app.view.inspector_open && !t.is_dark {
+    } else if !t.is_dark {
         t.header_active_fg
     } else {
-        Color32::from_rgb(0x82, 0xCA, 0xF2)
+        t.accent
     };
     let tip = if summary.viewing_cloud {
         let handle = summary
@@ -484,7 +484,7 @@ fn draw_home_profile_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Toke
         let ring_bg = if app.view.inspector_open {
             t.header_active_bg
         } else {
-            t.header_bg
+            t.header_track_bg
         };
         let dot_c = pos2(resp.rect.right() - 8.5, resp.rect.bottom() - 7.5);
         ui.painter().circle_filled(dot_c, 4.2, ring_bg);
@@ -643,7 +643,7 @@ fn draw_search_input(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     let focus_stroke = if t.is_dark {
         t.accent
     } else {
-        t.header_active_bg
+        t.header_active_fg
     };
     let stroke = Stroke::new(
         crate::motion::lerp_f32(1.0, 1.5, focus_t),
@@ -4265,9 +4265,10 @@ mod tests {
     #[test]
     fn brand_wordmark_uses_display_font_and_blue_craft_in_light_and_dark_themes() {
         let brand_cyan = Color32::from_rgb(0x82, 0xCA, 0xF2);
+        let light_brand_blue = Color32::from_rgb(0x0A, 0x46, 0x6B);
         for (theme, expected_craft_color) in [
             (papercraft_doc::UiTheme::Dark, brand_cyan),
-            (papercraft_doc::UiTheme::Light, brand_cyan),
+            (papercraft_doc::UiTheme::Light, light_brand_blue),
         ] {
             let mut app = PaperCraftApp::default();
             app.session

@@ -3284,6 +3284,7 @@ pub(crate) fn merge_studio_prefs(
     }
     if overwrite_appearance {
         target.theme = incoming.theme;
+        target.infinite_theme = incoming.infinite_theme;
         target.auto_contrast_with_theme = incoming.auto_contrast_with_theme;
         target.ui_scale = incoming.ui_scale;
         target.pen_sizes = incoming.pen_sizes;

@@ -11,7 +11,7 @@ use crate::PaperCraftApp;
 use crate::color_picker::{paint_hue_bar_picker, paint_sv_square_picker};
 use crate::icons::{
     Icon, SwitchLayout, SwitchOption, chip_close_button, compact_icon_button, icon_button,
-    paint_icon, segmented_switch,
+    paint_icon, segmented_switch, toggle_switch_row,
 };
 use crate::library_folders::{
     FolderPickerDrafts, commit_pending_picker_folder, draw_folder_picker, known_library_folders,
@@ -1486,9 +1486,13 @@ pub(crate) fn render_transfer_pages_body(
         }
         draw_destination_notebook_picker(app, ui, Some(source_idx), t);
         ui.add_space(8.0);
-        ui.checkbox(
-            &mut app.view.transfer_merge_delete_source,
+        toggle_switch_row(
+            ui,
+            "transfer_merge_delete_source_switch",
             "Move merged source notebook to Trash after merging",
+            "After appending all pages into the destination notebook, move the original source notebook to Trash.",
+            &mut app.view.transfer_merge_delete_source,
+            t,
         );
         return false;
     }
@@ -3828,5 +3832,55 @@ mod tests {
                 base.1
             );
         }
+    }
+
+    #[test]
+    fn merge_notebooks_modal_delete_source_switch_toggles_flag() {
+        let ctx = egui::Context::default();
+        let mut app = PaperCraftApp::default();
+        app.session
+            .execute("notebook.create", &json!({ "title": "Target Book" }))
+            .unwrap();
+        app.view.transfer_merge_whole_notebook = Some(0);
+        app.view.transfer_merge_delete_source = false;
+        modal::open(&mut app, modal::ActiveModal::TransferPages);
+
+        let mut shapes = Vec::new();
+        for frame in 0..4 {
+            shapes =
+                run_page_setup_modal_frame(&ctx, &mut app, Vec::new(), f64::from(frame) * 0.05);
+        }
+        let label_pos = find_modal_label_center(
+            &shapes,
+            "Move merged source notebook to Trash after merging",
+        )
+        .expect("merge delete-source switch label should render");
+
+        let _ = run_page_setup_modal_frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(label_pos),
+                egui::Event::PointerButton {
+                    pos: label_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            0.25,
+        );
+        let _ = run_page_setup_modal_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: label_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            0.29,
+        );
+        assert!(app.view.transfer_merge_delete_source);
     }
 }

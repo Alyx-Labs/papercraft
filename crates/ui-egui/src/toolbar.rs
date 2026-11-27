@@ -4099,9 +4099,14 @@ fn draw_settings_edge_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tok
         let badge_dot = if t.is_dark {
             t.accent
         } else {
-            t.header_active_bg
+            t.header_active_fg
         };
-        ui.painter().circle_filled(dot_c, 4.2, t.header_bg);
+        let ring_bg = if app.view.inspector_open {
+            t.header_active_bg
+        } else {
+            t.header_track_bg
+        };
+        ui.painter().circle_filled(dot_c, 4.2, ring_bg);
         ui.painter().circle_filled(dot_c, 3.0, badge_dot);
     }
     if settings_resp.clicked() {
@@ -4670,7 +4675,7 @@ fn show_top_context_tray_in_rect(
         return None;
     }
 
-    let t = Tokens::for_theme(app.session.prefs.theme);
+    let t = Tokens::for_prefs(&app.session.prefs);
     let viewport = ui.ctx().content_rect();
     let bounds = tray_workspace_bounds(viewport, header_rect, workspace_rect);
     let bounds_left = bounds.left() + CONTEXT_TRAY_OUTER_MARGIN;
@@ -4816,7 +4821,7 @@ fn show_color_dock_in_rect(
         None => (LASER_COLOR_COUNT, false, false, false),
     };
 
-    let t = Tokens::for_theme(app.session.prefs.theme);
+    let t = Tokens::for_prefs(&app.session.prefs);
     let viewport = ui.ctx().content_rect();
     let bounds = tray_workspace_bounds(viewport, header_rect, workspace_rect);
     let max_frame_h = (bounds.height() - COLOR_DOCK_OUTER_MARGIN * 2.0).max(96.0);
@@ -5072,7 +5077,7 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
 }
 
 pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> egui::Rect {
-    let t = Tokens::for_theme(app.session.prefs.theme);
+    let t = Tokens::for_prefs(&app.session.prefs);
     let frame = egui::Frame::new()
         .fill(t.header_bg)
         .inner_margin(egui::Margin {
@@ -5174,7 +5179,7 @@ pub(crate) fn show_elements_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui) 
         return;
     }
 
-    let t = Tokens::for_theme(app.session.prefs.theme);
+    let t = Tokens::for_prefs(&app.session.prefs);
     let theme = app.session.prefs.theme;
     let (auto_contrast, paper_color) = crate::effective_doc_ink_context(app);
     let built_ins = SavedElement::built_ins();
@@ -5747,7 +5752,7 @@ pub(crate) fn show_smoothing_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui)
         return;
     }
 
-    let t = Tokens::for_theme(app.session.prefs.theme);
+    let t = Tokens::for_prefs(&app.session.prefs);
     let sm = app.session.pen(kind).smoothing.clone();
     let eff_strength = sm.effective_strength();
     let is_off = sm.is_smoothing_disabled();
@@ -6925,7 +6930,7 @@ mod tests {
             let ctx = egui::Context::default();
             let mut shapes = Vec::new();
             let mut tray_rect_opt = None;
-            let t = Tokens::for_theme(app.session.prefs.theme);
+            let t = Tokens::for_prefs(&app.session.prefs);
             for frame in 0..4 {
                 let raw = egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
@@ -7029,7 +7034,7 @@ mod tests {
         app.view.inspector_open = false;
 
         let ctx = egui::Context::default();
-        let t = Tokens::for_theme(app.session.prefs.theme);
+        let t = Tokens::for_prefs(&app.session.prefs);
         let mut tray_rect_opt = None;
         for frame in 0..3 {
             let raw = egui::RawInput {
@@ -7069,7 +7074,7 @@ mod tests {
         app.view.shape_insert_mode = true;
 
         let ctx = egui::Context::default();
-        let t = Tokens::for_theme(app.session.prefs.theme);
+        let t = Tokens::for_prefs(&app.session.prefs);
         let viewport_w = 1040.0_f32; // canvas = 1040 - 280 - 372 = 388px (wraps compactly with open sidebars)
         let mut tray_rect_opt = None;
         for frame in 0..4 {
@@ -7246,7 +7251,7 @@ mod tests {
         assert!(!app.view.freeform_lasso_mode);
 
         let ctx = egui::Context::default();
-        let t = Tokens::for_theme(app.session.prefs.theme);
+        let t = Tokens::for_prefs(&app.session.prefs);
         let mut tray_rect = egui::Rect::NOTHING;
         for frame in 0..3 {
             let raw = egui::RawInput {
@@ -7417,7 +7422,7 @@ mod tests {
         assert!(crate::copy_selection(&mut app, Some(&ctx), false));
         assert!(app.session.clipboard.is_some());
 
-        let t = Tokens::for_theme(app.session.prefs.theme);
+        let t = Tokens::for_prefs(&app.session.prefs);
         let mut tray_rect = egui::Rect::NOTHING;
         let mut tray_boxes = Vec::new();
         for frame in 0..3 {
@@ -7551,7 +7556,7 @@ mod tests {
         }
 
         // 1. Pen mode: top tray keeps thickness dots; color dock opens vertically on left edge.
-        let t = Tokens::for_theme(app.session.prefs.theme);
+        let t = Tokens::for_prefs(&app.session.prefs);
         let (shapes, _) =
             step_editor_frame(&ctx, &mut app, viewport, time + 0.08, 0.08, Vec::new());
         time += 0.08;
@@ -7943,7 +7948,7 @@ mod tests {
             time += 0.05;
             shapes = step_editor_frame(&ctx, &mut app, viewport, time, 0.05, Vec::new()).0;
         }
-        let t = Tokens::for_theme(app.session.prefs.theme);
+        let t = Tokens::for_prefs(&app.session.prefs);
         let mut picker_rect = None;
         fn find_picker(shape: &egui::Shape, fill: Color32, out: &mut Option<egui::Rect>) {
             match shape {
@@ -8388,7 +8393,7 @@ mod tests {
         app.view.motion.screen = crate::motion::ScreenTransition::new(crate::AppScreen::Editor);
         let ctx = egui::Context::default();
         let viewport = Vec2::new(1280.0, 800.0);
-        let t = Tokens::for_theme(app.session.prefs.theme);
+        let t = Tokens::for_prefs(&app.session.prefs);
         let mut time = 0.0_f64;
 
         let settle_tray = |ctx: &egui::Context,
@@ -8817,7 +8822,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         let viewport = Vec2::new(1280.0, 800.0);
-        let t = Tokens::for_theme(app.session.prefs.theme);
+        let t = Tokens::for_prefs(&app.session.prefs);
         let mut time = 0.0_f64;
 
         let assert_no_fill_controls =

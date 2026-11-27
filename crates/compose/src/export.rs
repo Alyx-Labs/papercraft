@@ -2197,11 +2197,12 @@ pub(crate) struct PaperTemplateKey {
 pub(crate) struct PdfWriterCheckpoint {
     pdf_len: usize,
     offsets_len: usize,
-    page_ids_len: usize,
     template_objs_len: usize,
     shared_q_stream_id: Option<usize>,
     remapped_log_len: usize,
     copied_counts: Vec<usize>,
+    catalog_extra_len: usize,
+    info_obj_id: Option<usize>,
 }
 
 pub(crate) struct PdfWriterState {
@@ -2213,6 +2214,8 @@ pub(crate) struct PdfWriterState {
     remapped_objs: std::collections::HashMap<(usize, u32, i32), usize>,
     remapped_log: Vec<(usize, u32, i32)>,
     copied_count_per_pdf: Vec<usize>,
+    pub(crate) info_obj_id: Option<usize>,
+    pub(crate) catalog_extra: Vec<u8>,
 }
 
 impl PdfWriterState {
@@ -2220,15 +2223,18 @@ impl PdfWriterState {
         let mut pdf = Vec::with_capacity(expected_pages.clamp(1, 512).saturating_mul(2048));
         let _ = writeln!(pdf, "%PDF-{}.{}", version.0, version.1);
         pdf.extend_from_slice(b"%\xE2\xE3\xCF\xD3\n%PaperCraft\n");
+        let page_obj_ids: Vec<usize> = (3..3 + expected_pages).collect();
         Self {
             pdf,
-            offsets: vec![0usize; 3],
-            page_obj_ids: Vec::with_capacity(expected_pages),
+            offsets: vec![0usize; 3 + expected_pages],
+            page_obj_ids,
             template_obj_ids: Vec::new(),
             shared_q_stream_id: None,
             remapped_objs: std::collections::HashMap::new(),
             remapped_log: Vec::new(),
             copied_count_per_pdf: Vec::new(),
+            info_obj_id: None,
+            catalog_extra: Vec::new(),
         }
     }
 
@@ -2236,24 +2242,44 @@ impl PdfWriterState {
         PdfWriterCheckpoint {
             pdf_len: self.pdf.len(),
             offsets_len: self.offsets.len(),
-            page_ids_len: self.page_obj_ids.len(),
             template_objs_len: self.template_obj_ids.len(),
             shared_q_stream_id: self.shared_q_stream_id,
             remapped_log_len: self.remapped_log.len(),
             copied_counts: self.copied_count_per_pdf.clone(),
+            catalog_extra_len: self.catalog_extra.len(),
+            info_obj_id: self.info_obj_id,
         }
     }
 
     pub(crate) fn rollback(&mut self, cp: PdfWriterCheckpoint) {
         self.pdf.truncate(cp.pdf_len);
         self.offsets.truncate(cp.offsets_len);
-        self.page_obj_ids.truncate(cp.page_ids_len);
         self.template_obj_ids.truncate(cp.template_objs_len);
         self.shared_q_stream_id = cp.shared_q_stream_id;
         for key in self.remapped_log.drain(cp.remapped_log_len..) {
             self.remapped_objs.remove(&key);
         }
         self.copied_count_per_pdf = cp.copied_counts;
+        self.catalog_extra.truncate(cp.catalog_extra_len);
+        self.info_obj_id = cp.info_obj_id;
+    }
+
+    pub(crate) fn page_obj_id_for_slot(&self, out_idx: usize) -> Option<usize> {
+        self.page_obj_ids.get(out_idx).copied()
+    }
+
+    pub(crate) fn clear_offset(&mut self, obj_id: usize) {
+        if let Some(slot) = self.offsets.get_mut(obj_id) {
+            *slot = 0;
+        }
+    }
+
+    pub(crate) fn set_info_obj_id(&mut self, id: usize) {
+        self.info_obj_id = Some(id);
+    }
+
+    pub(crate) fn append_catalog_extra(&mut self, bytes: &[u8]) {
+        self.catalog_extra.extend_from_slice(bytes);
     }
 
     pub(crate) fn alloc_obj_id(&mut self) -> usize {
@@ -2263,7 +2289,9 @@ impl PdfWriterState {
     }
 
     pub(crate) fn emit_raw_object(&mut self, obj_id: usize, body: &[u8]) {
-        self.offsets[obj_id] = self.pdf.len();
+        if let Some(slot) = self.offsets.get_mut(obj_id) {
+            *slot = self.pdf.len();
+        }
         let head = format!("{obj_id} 0 obj\n");
         self.pdf.extend_from_slice(head.as_bytes());
         self.pdf.extend_from_slice(body);
@@ -2276,7 +2304,9 @@ impl PdfWriterState {
         dict_extra: &str,
         raw_stream: &[u8],
     ) {
-        self.offsets[obj_id] = self.pdf.len();
+        if let Some(slot) = self.offsets.get_mut(obj_id) {
+            *slot = self.pdf.len();
+        }
         append_pdf_stream_object(&mut self.pdf, obj_id, dict_extra, raw_stream);
     }
 
@@ -2314,10 +2344,13 @@ impl PdfWriterState {
         pdf_idx: usize,
         id: hayro::hayro_syntax::object::ObjectIdentifier,
         dest_id: usize,
-    ) {
+    ) -> bool {
         let key = (pdf_idx, id.obj_number, id.gen_number);
         if self.remapped_objs.insert(key, dest_id).is_none() {
             self.remapped_log.push(key);
+            true
+        } else {
+            false
         }
     }
 
@@ -2357,20 +2390,24 @@ impl PdfWriterState {
     fn finish(mut self) -> Vec<u8> {
         self.offsets[1] = self.pdf.len();
         self.pdf
-            .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+            .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R");
+        self.pdf.extend_from_slice(&self.catalog_extra);
+        self.pdf.extend_from_slice(b" >>\nendobj\n");
 
         let mut kids = String::new();
-        for (i, &page_obj_id) in self.page_obj_ids.iter().enumerate() {
-            if i > 0 {
-                kids.push(' ');
+        let mut valid_count = 0usize;
+        for &page_obj_id in &self.page_obj_ids {
+            if self.offsets.get(page_obj_id).copied().unwrap_or(0) > 0 {
+                if valid_count > 0 {
+                    kids.push(' ');
+                }
+                let _ = write!(kids, "{page_obj_id} 0 R");
+                valid_count += 1;
             }
-            let _ = write!(kids, "{page_obj_id} 0 R");
         }
         self.offsets[2] = self.pdf.len();
-        let pages_obj = format!(
-            "2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {} >>\nendobj\n",
-            self.page_obj_ids.len()
-        );
+        let pages_obj =
+            format!("2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {valid_count} >>\nendobj\n");
         self.pdf.extend_from_slice(pages_obj.as_bytes());
 
         let total_objs = self.offsets.len().saturating_sub(1);
@@ -2378,11 +2415,18 @@ impl PdfWriterState {
         let xref_head = format!("xref\n0 {}\n0000000000 65535 f \n", total_objs + 1);
         self.pdf.extend_from_slice(xref_head.as_bytes());
         for &off in self.offsets.iter().skip(1) {
-            let entry = format!("{off:010} 00000 n \n");
-            self.pdf.extend_from_slice(entry.as_bytes());
+            if off > 0 {
+                let entry = format!("{off:010} 00000 n \n");
+                self.pdf.extend_from_slice(entry.as_bytes());
+            } else {
+                self.pdf.extend_from_slice(b"0000000000 65535 f \n");
+            }
         }
+        let info_entry = self
+            .info_obj_id
+            .map_or(String::new(), |id| format!("/Info {id} 0 R "));
         let trailer = format!(
-            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            "trailer\n<< /Size {} /Root 1 0 R {info_entry}>>\nstartxref\n{xref_offset}\n%%EOF\n",
             total_objs + 1
         );
         self.pdf.extend_from_slice(trailer.as_bytes());
@@ -2402,8 +2446,12 @@ pub enum PdfExportStep {
 pub struct PdfExportSession {
     doc: Arc<Document>,
     selected_pages: Vec<usize>,
+    selected_backdrops: Vec<Option<papercraft_doc::PdfPageBackdrop>>,
+    ordered_used_pdfs: Vec<usize>,
+    primary_pdf_index: Option<usize>,
     next_page: usize,
     parsed_pdfs: Vec<Option<Option<hayro::hayro_syntax::Pdf>>>,
+    source_contexts: Vec<Option<crate::pdf_passthrough::SourcePdfContext>>,
     writer: Option<PdfWriterState>,
     finished_bytes: Option<Vec<u8>>,
 }
@@ -2426,6 +2474,42 @@ impl PdfExportSession {
             selected = (0..total_doc_pages).collect();
         }
 
+        let active_page_idx = doc.active_page_index();
+        let pdf_doc_count = doc.pdf_documents.len();
+        let selected_backdrops: Vec<Option<papercraft_doc::PdfPageBackdrop>> = selected
+            .iter()
+            .map(|&page_idx| {
+                let raw = if doc.pages.is_empty() {
+                    (page_idx == 0).then_some(doc.pdf_backdrop).flatten()
+                } else if page_idx == active_page_idx {
+                    doc.pdf_backdrop
+                } else {
+                    doc.pages.get(page_idx).and_then(|p| p.pdf_backdrop)
+                };
+                raw.filter(|b| b.pdf_index < pdf_doc_count)
+            })
+            .collect();
+
+        let mut ordered_used_pdfs = Vec::new();
+        let mut counts = vec![0usize; pdf_doc_count];
+        for backdrop in selected_backdrops.iter().flatten() {
+            if let Some(slot) = counts.get_mut(backdrop.pdf_index) {
+                if *slot == 0 {
+                    ordered_used_pdfs.push(backdrop.pdf_index);
+                }
+                *slot += 1;
+            }
+        }
+        let mut primary_pdf_index = None;
+        let mut best_count = 0usize;
+        for &idx in &ordered_used_pdfs {
+            let c = counts.get(idx).copied().unwrap_or(0);
+            if c > best_count {
+                best_count = c;
+                primary_pdf_index = Some(idx);
+            }
+        }
+
         let mut max_ver = (1u8, 4u8);
         for pdf_src in &doc.pdf_documents {
             let ver = crate::pdf_passthrough::detect_pdf_header_version(&pdf_src.bytes);
@@ -2436,14 +2520,21 @@ impl PdfExportSession {
         max_ver = max_ver.min((2, 0));
 
         let parsed_pdfs = std::iter::repeat_with(|| None)
-            .take(doc.pdf_documents.len())
+            .take(pdf_doc_count)
+            .collect();
+        let source_contexts = std::iter::repeat_with(|| None)
+            .take(pdf_doc_count)
             .collect();
         let writer = PdfWriterState::new(max_ver, selected.len());
         Self {
             doc,
             selected_pages: selected,
+            selected_backdrops,
+            ordered_used_pdfs,
+            primary_pdf_index,
             next_page: 0,
             parsed_pdfs,
+            source_contexts,
             writer: Some(writer),
             finished_bytes: None,
         }
@@ -2490,14 +2581,25 @@ impl PdfExportSession {
         let total = self.selected_pages.len();
         if self.next_page < total {
             let page_idx = self.selected_pages[self.next_page];
+            let out_idx = self.next_page;
             let doc_ref = Arc::clone(&self.doc);
             let _ = doc_ref.with_resolved_page(page_idx, |page| {
-                self.emit_single_resolved_page(&doc_ref, page);
+                self.emit_single_resolved_page(out_idx, &doc_ref, page);
             });
             self.next_page += 1;
         }
         if self.next_page >= total {
-            let bytes = if let Some(writer) = self.writer.take() {
+            self.ensure_used_pdfs_parsed();
+            let bytes = if let Some(mut writer) = self.writer.take() {
+                let meta_ctx = crate::pdf_metadata::MetadataExportContext {
+                    doc: &self.doc,
+                    selected_backdrops: &self.selected_backdrops,
+                    ordered_used_pdfs: &self.ordered_used_pdfs,
+                    primary_pdf_index: self.primary_pdf_index,
+                    parsed_pdfs: &self.parsed_pdfs,
+                    source_contexts: &self.source_contexts,
+                };
+                crate::pdf_metadata::emit_document_metadata_and_catalog(&mut writer, &meta_ctx);
                 writer.finish()
             } else {
                 Vec::new()
@@ -2511,27 +2613,76 @@ impl PdfExportSession {
         }
     }
 
-    fn emit_single_resolved_page(&mut self, doc: &Document, page: &NotebookPage) {
+    fn ensure_pdf_ready(&mut self, pdf_index: usize) {
+        let Some(slot) = self.parsed_pdfs.get_mut(pdf_index) else {
+            return;
+        };
+        let parsed_opt = slot.get_or_insert_with(|| {
+            self.doc
+                .pdf_documents
+                .get(pdf_index)
+                .filter(|src| papercraft_doc::looks_like_pdf_bytes(&src.bytes))
+                .and_then(|src| hayro::hayro_syntax::Pdf::new(Arc::clone(&src.bytes)).ok())
+        });
+        if let Some(parsed_pdf) = parsed_opt.as_ref()
+            && self
+                .source_contexts
+                .get(pdf_index)
+                .is_some_and(Option::is_none)
+        {
+            let multi_pdf = self.ordered_used_pdfs.len() > 1;
+            let ctx = crate::pdf_passthrough::build_source_pdf_context(
+                pdf_index,
+                parsed_pdf,
+                &self.selected_backdrops,
+                self.primary_pdf_index,
+                multi_pdf,
+            );
+            if let Some(ctx_slot) = self.source_contexts.get_mut(pdf_index) {
+                *ctx_slot = Some(ctx);
+            }
+        }
+    }
+
+    fn ensure_used_pdfs_parsed(&mut self) {
+        for idx in 0..self.ordered_used_pdfs.len() {
+            let pdf_index = self.ordered_used_pdfs[idx];
+            self.ensure_pdf_ready(pdf_index);
+        }
+    }
+
+    fn emit_single_resolved_page(&mut self, out_idx: usize, doc: &Document, page: &NotebookPage) {
+        if let Some(backdrop) = page.pdf_backdrop {
+            self.ensure_pdf_ready(backdrop.pdf_index);
+        }
         let Some(writer) = self.writer.as_mut() else {
             return;
         };
+        let page_obj_id = if let Some(id) = writer.page_obj_id_for_slot(out_idx) {
+            id
+        } else {
+            let id = writer.alloc_obj_id();
+            writer.page_obj_ids.push(id);
+            id
+        };
+
         if let Some(backdrop) = page.pdf_backdrop
-            && let Some(slot) = self.parsed_pdfs.get_mut(backdrop.pdf_index)
+            && let Some(Some(Some(parsed_pdf))) = self.parsed_pdfs.get(backdrop.pdf_index)
+            && let Some(Some(src_ctx)) = self.source_contexts.get_mut(backdrop.pdf_index)
         {
-            let parsed_opt = slot.get_or_insert_with(|| {
-                doc.pdf_documents
-                    .get(backdrop.pdf_index)
-                    .filter(|src| papercraft_doc::looks_like_pdf_bytes(&src.bytes))
-                    .and_then(|src| hayro::hayro_syntax::Pdf::new(Arc::clone(&src.bytes)).ok())
-            });
-            if let Some(parsed_pdf) = parsed_opt.as_ref()
-                && crate::pdf_passthrough::try_emit_pdf_backdrop_page(
-                    writer, parsed_pdf, page, backdrop, doc,
-                )
-                .is_ok()
+            if crate::pdf_passthrough::try_emit_pdf_backdrop_page(
+                writer,
+                parsed_pdf,
+                src_ctx,
+                page_obj_id,
+                page,
+                backdrop,
+            )
+            .is_ok()
             {
                 return;
             }
+            src_ctx.all_exported_pages_passthrough = false;
         }
 
         // Streaming 1-page fallback for custom image backdrops, native pages, or malformed PDFs.
@@ -2572,7 +2723,6 @@ impl PdfExportSession {
         let paper_ref_borrowed = paper_ref.as_ref().map(|(n, id)| (n.as_str(), *id));
         let resources = format_pdf_overlay_resources(&states, paper_ref_borrowed, &page_images);
 
-        let page_obj_id = writer.alloc_obj_id();
         let content_obj_id = writer.alloc_obj_id();
         let pt_w = f64::from(page.width.clamp(64, 8192)) * 0.5;
         let pt_h = f64::from(page.height.clamp(64, 8192)) * 0.5;
@@ -2583,7 +2733,6 @@ impl PdfExportSession {
         writer.emit_raw_object(page_obj_id, page_dict.as_bytes());
         writer.emit_stream_object(content_obj_id, "", &stream);
         writer.emit_image_entries(&page_images);
-        writer.page_obj_ids.push(page_obj_id);
         drop(page_images);
     }
 }
@@ -3416,9 +3565,12 @@ mod tests {
     }
 
     #[test]
-    fn pdf_passthrough_handles_contents_array_deduplicates_and_strips_annots() {
+    fn pdf_passthrough_handles_contents_array_deduplicates_and_remaps_annots() {
+        use hayro::hayro_syntax::object::dict::keys::{ANNOTS, DEST, SUBTYPE};
+        use hayro::hayro_syntax::object::{Array, Dict, MaybeRef, Name, Object, ObjectIdentifier};
+
         // Object graph:
-        // 1 Catalog, 2 Pages, 3 Page0 (indirect /Contents array + /Annots + /Group + shared Form /Fm0),
+        // 1 Catalog, 2 Pages, 3 Page0 (indirect /Contents array + /Annots + shared Form /Fm0),
         // 4 Page1 (shares /Fm0 + extra exclusive marker if page 1 omitted),
         // 5 Indirect Contents array [6 0 R 7 0 R], 6 StreamA, 7 StreamB, 8 Shared Form XObject,
         // 9 Exclusive Page1 stream with unique token `UNIQUE_PAGE_ONE_STREAM`.
@@ -3451,9 +3603,10 @@ mod tests {
             pdf_index: 0,
             page_index: 1,
         });
+        doc.load_active_from_pages();
         stamp_top_left_red_annotation(&mut doc, 0);
 
-        // 1. Export only page 0 -> strips `/Annots`, skips page 1's stream, parses and renders cleanly.
+        // 1. Export only page 0 -> strips dangling `/Annots`, skips page 1's stream, parses and renders cleanly.
         let subset = Arc::new(export_notebook_pdf_pages(&doc, &[0]));
         let subset_text = String::from_utf8_lossy(&subset);
         assert!(!subset_text.contains("/Annots"));
@@ -3470,14 +3623,713 @@ mod tests {
             "second stream of indirect /Contents array should paint green center"
         );
 
-        // 2. Export both pages -> shared Form XObject (`8 0 obj`) should be copied once (1 `/Subtype /Form` excluding PCOv overlap check).
-        let both = export_notebook_pdf(&doc);
+        // 2. Export both pages -> preserves `/Annots`, remaps `/Dest` to output Page 1, and deduplicates `/Fm0`.
+        let both = Arc::new(export_notebook_pdf(&doc));
         let both_text = String::from_utf8_lossy(&both);
-        assert!(!both_text.contains("/Annots"));
+        assert!(both_text.contains("/Annots"));
         assert_eq!(
             both_text.matches("/BBox [0 0 10 10]").count(),
             1,
             "shared XObject resource must be deduplicated across pages"
+        );
+        let parsed_both = hayro::hayro_syntax::Pdf::new(both)
+            .expect("full two-page export with /Annots should parse");
+        assert_eq!(parsed_both.pages().len(), 2);
+        let p0 = &parsed_both.pages()[0];
+        let p1_id = parsed_both.pages()[1].raw().obj_id().expect("page 1 id");
+        let annots = p0.raw().get::<Array<'_>>(ANNOTS).expect("page 0 annots");
+        let link = annots
+            .iter::<Dict<'_>>()
+            .next()
+            .expect("remapped link annotation");
+        assert_eq!(link.get::<Name<'_>>(SUBTYPE).as_deref(), Some(&b"Link"[..]));
+        let dest = link.get::<Array<'_>>(DEST).expect("link dest");
+        let Some(MaybeRef::Ref(dest_page_ref)) = dest.raw_iter().next() else {
+            panic!("expected page reference in link /Dest");
+        };
+        let target_id: ObjectIdentifier = dest_page_ref.into();
+        assert_eq!(target_id, p1_id);
+        assert!(
+            !matches!(
+                dest.raw_iter().next(),
+                Some(MaybeRef::NotRef(Object::Null(_)))
+            ),
+            "link /Dest target must not be null"
+        );
+    }
+
+    fn build_numbered_pdf(entries: &[(usize, Vec<u8>)]) -> Vec<u8> {
+        let max_id = entries.iter().map(|(id, _)| *id).max().unwrap_or(1);
+        let mut by_id: Vec<Option<&[u8]>> = vec![None; max_id + 1];
+        for (id, body) in entries {
+            by_id[*id] = Some(body.as_slice());
+        }
+        let mut raw = b"%PDF-1.6\n".to_vec();
+        let mut offsets = vec![0usize; max_id + 1];
+        for id in 1..=max_id {
+            if let Some(body) = by_id[id] {
+                offsets[id] = raw.len();
+                raw.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+                raw.extend_from_slice(body);
+                raw.extend_from_slice(b"\nendobj\n");
+            }
+        }
+        let xref = raw.len();
+        raw.extend_from_slice(format!("xref\n0 {}\n", max_id + 1).as_bytes());
+        raw.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets[1..] {
+            if *off > 0 {
+                raw.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            } else {
+                raw.extend_from_slice(b"0000000000 65535 f \n");
+            }
+        }
+        let info_ref = if by_id.get(99).is_some_and(Option::is_some) {
+            " /Info 99 0 R"
+        } else {
+            ""
+        };
+        raw.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R{info_ref} >>\nstartxref\n{xref}\n%%EOF\n",
+                max_id + 1
+            )
+            .as_bytes(),
+        );
+        raw
+    }
+
+    fn utf16be_pdf_literal(text: &str) -> String {
+        let mut bytes = vec![0xFE, 0xFF];
+        for u in text.encode_utf16() {
+            bytes.extend_from_slice(&u.to_be_bytes());
+        }
+        let mut out = String::from("(");
+        for b in bytes {
+            if (0x20..=0x7E).contains(&b) && !matches!(b, b'(' | b')' | b'\\') {
+                out.push(char::from(b));
+            } else {
+                let _ = write!(out, "\\{b:03o}");
+            }
+        }
+        out.push(')');
+        out
+    }
+
+    fn doc_from_pdf_pages(name: &str, bytes: Arc<Vec<u8>>, indices: &[usize]) -> Document {
+        let mut doc = Document::new(400, 600);
+        doc.pdf_documents.push(papercraft_doc::EmbeddedPdf {
+            name: name.to_string(),
+            bytes,
+        });
+        for (out_idx, &src_idx) in indices.iter().enumerate() {
+            if out_idx > 0 {
+                doc.add_page(None, None);
+            }
+            doc.pages[out_idx].pdf_backdrop = Some(papercraft_doc::PdfPageBackdrop {
+                pdf_index: 0,
+                page_index: src_idx,
+            });
+            doc.load_active_from_pages();
+        }
+        doc.select_page(0);
+        doc
+    }
+
+    fn build_rich_metadata_source_pdf() -> Vec<u8> {
+        let pt_title = utf16be_pdf_literal("Relatório Técnico — Capítulo 1");
+        let pt_outline = utf16be_pdf_literal("Índice Geral");
+        let pt_sec2 = utf16be_pdf_literal("Seção 2");
+        let xmp = b"<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?><x:xmpmeta/>".to_vec();
+        let entries: Vec<(usize, Vec<u8>)> = vec![
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /Version /1.6 /Metadata 10 0 R /Lang (pt-BR) /PageLayout /TwoPageLeft /PageMode /UseOutlines /ViewerPreferences << /DisplayDocTitle true >> /OpenAction [4 0 R /Fit] /URI << /Base (https://example.org/) >> /OutputIntents [11 0 R] /PageLabels 12 0 R /Dests 13 0 R /Names << /Dests 14 0 R >> /Outlines 20 0 R /OCProperties << /OCGs [30 0 R] /D << /BaseState /ON /Order [30 0 R] /ON [30 0 R] >> >> >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] /Count 4 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /BleedBox [5 5 195 295] /Trans << /S /Dissolve >> /Dur 2.5 /Tabs /R /Annots [40 0 R 41 0 R 42 0 R 43 0 R 44 0 R 45 0 R] /Contents 7 0 R /Resources << /Properties << /OC0 30 0 R >> >> >>".to_vec(),
+            ),
+            (4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Contents 7 0 R /Resources << >> >>".to_vec()),
+            (5, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Contents 7 0 R /Resources << >> >>".to_vec()),
+            (6, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Contents 7 0 R /Resources << >> >>".to_vec()),
+            (7, b"<< /Length 28 >>\nstream\n0 1 0 rg 0 0 200 300 re f\nendstream".to_vec()),
+            (
+                10,
+                format!(
+                    "<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n{}\nendstream",
+                    xmp.len(),
+                    String::from_utf8_lossy(&xmp)
+                )
+                .into_bytes(),
+            ),
+            (
+                11,
+                b"<< /Type /OutputIntent /S /GTS_PDFA1 /OutputConditionIdentifier (sRGB) >>".to_vec(),
+            ),
+            (
+                12,
+                b"<< /Nums [0 << /S /r >> 2 << /S /D /P (Ch-) /St 1 >>] >>".to_vec(),
+            ),
+            (13, b"<< /Preface [3 0 R /Fit] >>".to_vec()),
+            (
+                14,
+                b"<< /Names [(sec1) [5 0 R /XYZ 0 700 0] (sec2) << /D [6 0 R /FitH 400] >>] >>".to_vec(),
+            ),
+            (20, b"<< /Type /Outlines /First 21 0 R /Last 22 0 R /Count 4 >>".to_vec()),
+            (
+                21,
+                format!(
+                    "<< /Title {pt_outline} /Parent 20 0 R /Next 22 0 R /First 23 0 R /Last 24 0 R /Count 2 /C [0.1 0.2 0.8] /F 2 /Dest [3 0 R /Fit] >>"
+                )
+                .into_bytes(),
+            ),
+            (
+                22,
+                format!(
+                    "<< /Title {pt_sec2} /Parent 20 0 R /Prev 21 0 R /First 25 0 R /Last 25 0 R /Count -1 /A << /S /GoTo /D (sec2) >> >>"
+                )
+                .into_bytes(),
+            ),
+            (
+                23,
+                b"<< /Title (Preface) /Parent 21 0 R /Next 24 0 R /Dest /Preface >>".to_vec(),
+            ),
+            (
+                24,
+                b"<< /Title (Section 1) /Parent 21 0 R /Prev 23 0 R /A << /S /GoTo /D (sec1) >> >>".to_vec(),
+            ),
+            (
+                25,
+                b"<< /Title (Website) /Parent 22 0 R /A << /S /URI /URI (https://papercraft.ink) >> >>".to_vec(),
+            ),
+            (30, b"<< /Type /OCG /Name (LayerOne) >>".to_vec()),
+            (40, b"<< /Type /Annot /Subtype /Link /Rect [0 0 20 20] /Dest [6 0 R /Fit] >>".to_vec()),
+            (41, b"<< /Type /Annot /Subtype /Link /Rect [20 0 40 20] /A << /S /GoTo /D (sec1) >> >>".to_vec()),
+            (42, b"<< /Type /Annot /Subtype /Link /Rect [40 0 60 20] /A << /S /URI /URI (https://example.org) >> >>".to_vec()),
+            (43, b"<< /Type /Annot /Subtype /Text /Rect [60 0 80 20] /Contents (Sticky note) /Popup 44 0 R /P 3 0 R >>".to_vec()),
+            (44, b"<< /Type /Annot /Subtype /Popup /Rect [80 0 120 40] /Parent 43 0 R /P 3 0 R >>".to_vec()),
+            (45, b"<< /Type /Annot /Subtype /Widget /FT /Sig /Rect [0 50 50 70] /T (Sig1) /P 3 0 R >>".to_vec()),
+            (
+                99,
+                format!(
+                    "<< /Title {pt_title} /Author (Alice) /Subject (Math) /Keywords (notes,pdf) /Creator (SpecSuite) /Producer (OrigProd) /CreationDate (D:20250102030405Z) /ModDate (D:20250607080910-03'00') /Trapped /False /DOI (10.1234/papercraft) >>"
+                )
+                .into_bytes(),
+            ),
+        ];
+        build_numbered_pdf(&entries)
+    }
+
+    fn first_dest_page_id(
+        dest: &hayro::hayro_syntax::object::Array<'_>,
+    ) -> Option<hayro::hayro_syntax::object::ObjectIdentifier> {
+        match dest.raw_iter().next()? {
+            hayro::hayro_syntax::object::MaybeRef::Ref(r) => Some(r.into()),
+            _ => None,
+        }
+    }
+
+    fn assert_rich_catalog_and_info(exported: &Arc<Vec<u8>>) -> hayro::hayro_syntax::Pdf {
+        use hayro::hayro_syntax::object::dict::keys::{
+            LANG, METADATA, OPEN_ACTION, OUTPUT_INTENTS, PAGE_LAYOUT, PAGE_MODE, URI, VERSION,
+            VIEWER_PREFERENCES,
+        };
+        use hayro::hayro_syntax::object::{self, Array, Dict, Name, Stream};
+
+        let exported_text = String::from_utf8_lossy(exported);
+        assert!(exported_text.contains("/DOI (10.1234/papercraft)"));
+        assert!(exported_text.contains("/Trapped /False"));
+        assert!(!exported_text.contains("(Sig1)"));
+
+        let parsed = hayro::hayro_syntax::Pdf::new(Arc::clone(exported))
+            .expect("exported rich PDF must parse");
+        assert_eq!(parsed.pages().len(), 5);
+        let meta = parsed.metadata();
+        assert_eq!(meta.author.as_deref(), Some(&b"Alice"[..]));
+        assert_eq!(meta.producer.as_deref(), Some(&b"OrigProd"[..]));
+        let summary = crate::pdf::inspect_pdf(Arc::clone(exported), 20).unwrap();
+        assert_eq!(
+            summary.title.as_deref(),
+            Some("Relatório Técnico — Capítulo 1")
+        );
+
+        let cat = parsed
+            .xref()
+            .get::<Dict<'_>>(parsed.xref().root_id())
+            .expect("catalog");
+        assert_eq!(cat.get::<Name<'_>>(VERSION).as_deref(), Some(&b"1.6"[..]));
+        assert_eq!(
+            cat.get::<object::String<'_>>(LANG).as_deref(),
+            Some(&b"pt-BR"[..])
+        );
+        assert_eq!(
+            cat.get::<Name<'_>>(PAGE_LAYOUT).as_deref(),
+            Some(&b"TwoPageLeft"[..])
+        );
+        assert_eq!(
+            cat.get::<Name<'_>>(PAGE_MODE).as_deref(),
+            Some(&b"UseOutlines"[..])
+        );
+        assert!(cat.get::<Dict<'_>>(VIEWER_PREFERENCES).is_some());
+        assert!(cat.get::<Dict<'_>>(URI).is_some());
+        assert!(cat.get::<Array<'_>>(OUTPUT_INTENTS).is_some());
+        let xmp_stream = cat.get::<Stream<'_>>(METADATA).expect("XMP stream");
+        assert!(String::from_utf8_lossy(&xmp_stream.decoded().unwrap()).contains("<x:xmpmeta/>"));
+
+        let page1_id = parsed.pages()[1].raw().obj_id().expect("page 1 id");
+        let open_act = cat.get::<Array<'_>>(OPEN_ACTION).expect("OpenAction");
+        assert_eq!(first_dest_page_id(&open_act), Some(page1_id));
+        parsed
+    }
+
+    fn assert_rich_navigation_and_annots(parsed: &hayro::hayro_syntax::Pdf) {
+        use hayro::hayro_syntax::object::dict::keys::{
+            A, ANNOTS, C, COUNT, DEST, DESTS, DUR, F, FIRST, NAMES, NEXT, NUMS, OCGS, OCPROPERTIES,
+            OUTLINES, P, PAGE_LABELS, POPUP, PROPERTIES, RESOURCES, S, ST,
+        };
+        use hayro::hayro_syntax::object::{self, Array, Dict, MaybeRef, Name, Object};
+
+        let cat = parsed
+            .xref()
+            .get::<Dict<'_>>(parsed.xref().root_id())
+            .expect("catalog");
+        let page_ids: Vec<_> = parsed
+            .pages()
+            .iter()
+            .map(|p| p.raw().obj_id().expect("page obj id"))
+            .collect();
+
+        // PageLabels: 0 -> r, 2 -> blank << >>, 3 -> Ch-1
+        let labels = cat.get::<Dict<'_>>(PAGE_LABELS).expect("PageLabels");
+        let nums = labels.get::<Array<'_>>(NUMS).expect("Nums");
+        let num_items: Vec<_> = nums.raw_iter().collect();
+        assert!(num_items.len() >= 6);
+        assert!(matches!(
+            num_items[4],
+            MaybeRef::NotRef(Object::Number(n)) if n.as_i64() == 3
+        ));
+        let MaybeRef::NotRef(Object::Dict(rule3)) = &num_items[5] else {
+            panic!("expected dict for label 3");
+        };
+        assert_eq!(rule3.get::<Name<'_>>(S).as_deref(), Some(&b"D"[..]));
+        assert_eq!(
+            rule3.get::<object::String<'_>>(P).as_deref(),
+            Some(&b"Ch-"[..])
+        );
+        assert!(rule3.get::<i32>(ST).is_none());
+
+        // Outlines tree & Named destinations
+        let outlines = cat.get::<Dict<'_>>(OUTLINES).expect("Outlines");
+        assert_eq!(outlines.get::<i32>(COUNT), Some(4));
+        let top1 = outlines.get::<Dict<'_>>(FIRST).expect("Top1");
+        assert_eq!(top1.get::<i32>(COUNT), Some(2));
+        assert_eq!(top1.get::<i32>(F), Some(2));
+        assert!(top1.get::<Array<'_>>(C).is_some());
+        assert_eq!(
+            first_dest_page_id(&top1.get::<Array<'_>>(DEST).unwrap()),
+            Some(page_ids[0])
+        );
+        assert_eq!(
+            top1.get::<Dict<'_>>(NEXT).unwrap().get::<i32>(COUNT),
+            Some(-1)
+        );
+        let pdf11_dests = cat.get::<Dict<'_>>(DESTS).expect("PDF 1.1 /Dests");
+        assert_eq!(
+            first_dest_page_id(&pdf11_dests.get::<Array<'_>>(b"Preface").unwrap()),
+            Some(page_ids[0])
+        );
+        let nd_str = format!(
+            "{}",
+            cat.get::<Dict<'_>>(NAMES)
+                .unwrap()
+                .get::<Dict<'_>>(DESTS)
+                .unwrap()
+                .get::<Array<'_>>(NAMES)
+                .unwrap()
+        );
+        assert!(nd_str.contains("sec1") && nd_str.contains("sec2"));
+
+        // OCG object ID matches between Catalog /OCProperties and Page 0 /Resources /Properties
+        let ocg_arr = cat
+            .get::<Dict<'_>>(OCPROPERTIES)
+            .unwrap()
+            .get::<Array<'_>>(OCGS)
+            .unwrap();
+        let MaybeRef::Ref(ocp_ocg_ref) = ocg_arr.raw_iter().next().unwrap() else {
+            panic!("expected indirect OCG");
+        };
+        let p0_props = parsed.pages()[0]
+            .raw()
+            .get::<Dict<'_>>(RESOURCES)
+            .unwrap()
+            .get::<Dict<'_>>(PROPERTIES)
+            .unwrap();
+        assert_eq!(p0_props.get_ref(b"OC0"), Some(ocp_ocg_ref));
+
+        // Page 0 extras & 5 surviving annotations (Sig widget dropped)
+        let p0 = parsed.pages()[0].raw();
+        assert_eq!(p0.get::<Name<'_>>(b"Tabs").as_deref(), Some(&b"R"[..]));
+        assert_eq!(p0.get::<f64>(DUR), Some(2.5));
+        let annot_dicts: Vec<_> = p0
+            .get::<Array<'_>>(ANNOTS)
+            .unwrap()
+            .iter::<Dict<'_>>()
+            .collect();
+        assert_eq!(annot_dicts.len(), 5);
+        assert_eq!(
+            first_dest_page_id(&annot_dicts[0].get::<Array<'_>>(DEST).unwrap()),
+            Some(page_ids[4])
+        );
+        assert_eq!(
+            annot_dicts[2]
+                .get::<Dict<'_>>(A)
+                .unwrap()
+                .get::<Name<'_>>(S)
+                .as_deref(),
+            Some(&b"URI"[..])
+        );
+        assert!(annot_dicts[3].get_ref(POPUP).is_some());
+    }
+
+    fn assert_rich_subset_pruning(raw_pdf: Arc<Vec<u8>>) {
+        use hayro::hayro_syntax::object::dict::keys::{
+            COUNT, DEST, DESTS, FIRST, NUMS, OPEN_ACTION, OUTLINES, P, PAGE_LABELS,
+            VIEWER_PREFERENCES,
+        };
+        use hayro::hayro_syntax::object::{self, Array, Dict, MaybeRef, Object};
+
+        let sub_doc = doc_from_pdf_pages("rich.pdf", raw_pdf, &[2, 3]);
+        let sub_bytes = Arc::new(export_notebook_pdf(&sub_doc));
+        let sub_parsed = hayro::hayro_syntax::Pdf::new(sub_bytes).expect("subset PDF must parse");
+        assert_eq!(sub_parsed.pages().len(), 2);
+        let sub_cat = sub_parsed
+            .xref()
+            .get::<Dict<'_>>(sub_parsed.xref().root_id())
+            .unwrap();
+        assert!(sub_cat.get::<Object<'_>>(OPEN_ACTION).is_none());
+        assert!(sub_cat.get::<Dict<'_>>(DESTS).is_none());
+        assert!(sub_cat.get::<Dict<'_>>(VIEWER_PREFERENCES).is_some());
+        let sub_outlines = sub_cat.get::<Dict<'_>>(OUTLINES).expect("subset outlines");
+        let sub_top1 = sub_outlines.get::<Dict<'_>>(FIRST).unwrap();
+        assert!(sub_top1.get::<Object<'_>>(DEST).is_none());
+        assert_eq!(sub_top1.get::<i32>(COUNT), Some(1));
+        let sub_labels = sub_cat.get::<Dict<'_>>(PAGE_LABELS).unwrap();
+        let sub_nums: Vec<_> = sub_labels
+            .get::<Array<'_>>(NUMS)
+            .unwrap()
+            .raw_iter()
+            .collect();
+        let MaybeRef::NotRef(Object::Dict(sub_l0)) = &sub_nums[1] else {
+            panic!("expected label dict");
+        };
+        assert_eq!(
+            sub_l0.get::<object::String<'_>>(P).as_deref(),
+            Some(&b"Ch-"[..])
+        );
+    }
+
+    #[test]
+    fn pdf_export_preserves_rich_metadata_outlines_dests_labels_layers_and_annots_round_trip() {
+        use hayro::hayro_syntax::object::Dict;
+        use hayro::hayro_syntax::object::dict::keys::{COUNT, OCPROPERTIES, OUTLINES, PAGE_LABELS};
+
+        let raw_pdf = Arc::new(build_rich_metadata_source_pdf());
+
+        // 1. Export all 4 PDF pages with an inserted blank note page at index 2 -> [PDF0, PDF1, Blank, PDF2, PDF3].
+        let mut doc = doc_from_pdf_pages("rich.pdf", Arc::clone(&raw_pdf), &[0, 1, 2, 3]);
+        doc.select_page(1);
+        doc.add_page(Some(PaperTemplate::Grid), None);
+        doc.sync_active_to_pages();
+
+        let exported = Arc::new(export_notebook_pdf(&doc));
+        let parsed = assert_rich_catalog_and_info(&exported);
+        assert_rich_navigation_and_annots(&parsed);
+
+        // Round-trip: re-import `exported` into a fresh Document and re-export!
+        let rt_doc = doc_from_pdf_pages("rt.pdf", Arc::clone(&exported), &[0, 1, 2, 3, 4]);
+        let rt_bytes = Arc::new(export_notebook_pdf(&rt_doc));
+        assert!(String::from_utf8_lossy(&rt_bytes).contains("/DOI (10.1234/papercraft)"));
+        let rt_parsed = hayro::hayro_syntax::Pdf::new(rt_bytes).expect("round-trip PDF must parse");
+        let rt_cat = rt_parsed
+            .xref()
+            .get::<Dict<'_>>(rt_parsed.xref().root_id())
+            .unwrap();
+        assert_eq!(
+            rt_cat.get::<Dict<'_>>(OUTLINES).unwrap().get::<i32>(COUNT),
+            Some(4)
+        );
+        assert!(rt_cat.get::<Dict<'_>>(PAGE_LABELS).is_some());
+        assert!(rt_cat.get::<Dict<'_>>(OCPROPERTIES).is_some());
+
+        // 2. Subset export &[2, 3]
+        assert_rich_subset_pruning(raw_pdf);
+    }
+
+    #[test]
+    fn pdf_export_merges_multiple_pdfs_outlines_page_labels_and_disambiguates_dests() {
+        use hayro::hayro_syntax::object::dict::keys::{
+            COUNT, DESTS, FIRST, NAMES, NEXT, NUMS, OCGS, OCPROPERTIES, OUTLINES, P, PAGE_LABELS,
+            TITLE,
+        };
+        use hayro::hayro_syntax::object::{self, Array, Dict, MaybeRef, Object};
+
+        let pdf_a = build_numbered_pdf(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R /PageLabels 10 0 R /Dests 11 0 R /Names << /Dests 12 0 R >> /Outlines 20 0 R /OCProperties << /OCGs [30 0 R] /D << /Order [30 0 R] /ON [30 0 R] >> >> >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec()),
+            (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 5 0 R /Resources << /Properties << /LA 30 0 R >> >> >>".to_vec()),
+            (4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 5 0 R /Resources << >> >>".to_vec()),
+            (5, b"<< /Length 22 >>\nstream\n0 0 1 rg 0 0 50 50 re f\nendstream".to_vec()),
+            (10, b"<< /Nums [0 << /S /r >>] >>".to_vec()),
+            (11, b"<< /Intro [3 0 R /Fit] >>".to_vec()),
+            (12, b"<< /Names [(chap1) [4 0 R /Fit]] >>".to_vec()),
+            (20, b"<< /Type /Outlines /First 21 0 R /Last 21 0 R /Count 1 >>".to_vec()),
+            (21, b"<< /Title (A Chapter 1) /Parent 20 0 R /A << /S /GoTo /D (chap1) >> >>".to_vec()),
+            (30, b"<< /Type /OCG /Name (LayerA) >>".to_vec()),
+        ]);
+        let pdf_b = build_numbered_pdf(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R /PageLabels 10 0 R /Dests 11 0 R /Names << /Dests 12 0 R >> /Outlines 20 0 R /OCProperties << /OCGs [30 0 R] /D << /Order [30 0 R] /ON [30 0 R] >> >> >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec()),
+            (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 5 0 R /Resources << /Properties << /LB 30 0 R >> >> >>".to_vec()),
+            (4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 5 0 R /Resources << >> >>".to_vec()),
+            (5, b"<< /Length 22 >>\nstream\n1 0 0 rg 0 0 50 50 re f\nendstream".to_vec()),
+            (10, b"<< /Nums [0 << /S /D /P (A-) >>] >>".to_vec()),
+            (11, b"<< /Intro [3 0 R /Fit] >>".to_vec()),
+            (12, b"<< /Names [(chap1) [4 0 R /Fit]] >>".to_vec()),
+            (20, b"<< /Type /Outlines /First 21 0 R /Last 21 0 R /Count 1 >>".to_vec()),
+            (21, b"<< /Title (B Chapter 1) /Parent 20 0 R /A << /S /GoTo /D (chap1) >> >>".to_vec()),
+            (30, b"<< /Type /OCG /Name (LayerB) >>".to_vec()),
+        ]);
+
+        let mut doc = Document::new(400, 400);
+        doc.pdf_documents.push(papercraft_doc::EmbeddedPdf {
+            name: "DocA.pdf".to_string(),
+            bytes: Arc::new(pdf_a),
+        });
+        doc.pdf_documents.push(papercraft_doc::EmbeddedPdf {
+            name: "DocB.pdf".to_string(),
+            bytes: Arc::new(pdf_b),
+        });
+        let map = [(0, 0), (0, 1), (1, 0), (1, 1)];
+        for (out_idx, &(pdf_idx, page_idx)) in map.iter().enumerate() {
+            if out_idx > 0 {
+                doc.add_page(None, None);
+            }
+            doc.pages[out_idx].pdf_backdrop = Some(papercraft_doc::PdfPageBackdrop {
+                pdf_index: pdf_idx,
+                page_index: page_idx,
+            });
+            doc.load_active_from_pages();
+        }
+        doc.select_page(0);
+
+        let exported = Arc::new(export_notebook_pdf(&doc));
+        let text = String::from_utf8_lossy(&exported);
+        assert!(text.contains("(chap1)"));
+        assert!(text.contains("(pc1_chap1)"));
+        assert!(text.contains("/Intro "));
+        assert!(text.contains("/pc1_Intro "));
+
+        let parsed = hayro::hayro_syntax::Pdf::new(exported).expect("merged PDF must parse");
+        assert_eq!(parsed.pages().len(), 4);
+        let cat = parsed
+            .xref()
+            .get::<Dict<'_>>(parsed.xref().root_id())
+            .unwrap();
+        let outlines = cat.get::<Dict<'_>>(OUTLINES).expect("merged outlines");
+        assert_eq!(outlines.get::<i32>(COUNT), Some(4));
+        let wrap_a = outlines.get::<Dict<'_>>(FIRST).unwrap();
+        assert_eq!(
+            wrap_a.get::<object::String<'_>>(TITLE).as_deref(),
+            Some(&b"DocA"[..])
+        );
+        let wrap_b = wrap_a.get::<Dict<'_>>(NEXT).unwrap();
+        assert_eq!(
+            wrap_b.get::<object::String<'_>>(TITLE).as_deref(),
+            Some(&b"DocB"[..])
+        );
+        let child_b = wrap_b.get::<Dict<'_>>(FIRST).unwrap();
+        assert!(format!("{child_b}").contains("pc1_chap1"));
+
+        let ocp = cat.get::<Dict<'_>>(OCPROPERTIES).unwrap();
+        assert_eq!(ocp.get::<Array<'_>>(OCGS).unwrap().raw_iter().count(), 2);
+        let labels = cat.get::<Dict<'_>>(PAGE_LABELS).unwrap();
+        let nums: Vec<_> = labels.get::<Array<'_>>(NUMS).unwrap().raw_iter().collect();
+        assert_eq!(nums.len(), 4);
+        assert!(matches!(
+            nums[2],
+            MaybeRef::NotRef(Object::Number(n)) if n.as_i64() == 2
+        ));
+        let MaybeRef::NotRef(Object::Dict(b_lbl)) = &nums[3] else {
+            panic!("expected label dict for B");
+        };
+        assert_eq!(
+            b_lbl.get::<object::String<'_>>(P).as_deref(),
+            Some(&b"A-"[..])
+        );
+        let _ = (DESTS, NAMES);
+    }
+
+    #[test]
+    fn pdf_export_survives_cyclic_outlines_and_malformed_annots() {
+        use hayro::hayro_syntax::object::dict::keys::{ANNOTS, COUNT, OUTLINES};
+        use hayro::hayro_syntax::object::{Array, Dict};
+
+        // Cyclic outlines (21 -> Next 22 -> Next 21; 21 -> First 21) + malformed annot (31 refs 2 0 R /Pages)
+        let raw = build_numbered_pdf(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R /Outlines 20 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [30 0 R 31 0 R] /Contents 4 0 R /Resources << >> >>".to_vec()),
+            (4, b"<< /Length 22 >>\nstream\n0 1 0 rg 0 0 50 50 re f\nendstream".to_vec()),
+            (20, b"<< /Type /Outlines /First 21 0 R /Last 22 0 R /Count 2 >>".to_vec()),
+            (21, b"<< /Title (LoopA) /Parent 20 0 R /Next 22 0 R /First 21 0 R /Last 21 0 R /Dest [3 0 R /Fit] >>".to_vec()),
+            (22, b"<< /Title (LoopB) /Parent 20 0 R /Next 21 0 R /Dest [3 0 R /Fit] >>".to_vec()),
+            (30, b"<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A << /S /URI /URI (https://example.org) >> >>".to_vec()),
+            (31, b"<< /Type /Annot /Subtype /Text /Rect [10 10 20 20] /BadRef 2 0 R >>".to_vec()),
+        ]);
+
+        let doc = doc_from_pdf_pages("hostile.pdf", Arc::new(raw), &[0]);
+        let exported = Arc::new(export_notebook_pdf(&doc));
+        let parsed = hayro::hayro_syntax::Pdf::new(exported).expect("hostile PDF export parses");
+        let cat = parsed
+            .xref()
+            .get::<Dict<'_>>(parsed.xref().root_id())
+            .unwrap();
+        assert_eq!(
+            cat.get::<Dict<'_>>(OUTLINES).unwrap().get::<i32>(COUNT),
+            Some(2)
+        );
+        let annots = parsed.pages()[0].raw().get::<Array<'_>>(ANNOTS).unwrap();
+        assert_eq!(annots.iter::<Dict<'_>>().count(), 1);
+    }
+
+    #[test]
+    fn pdf_export_preserves_struct_tree_on_full_export_and_omits_on_subset() {
+        use hayro::hayro_syntax::object::dict::keys::{
+            MARK_INFO, PG, STRUCT_PARENTS, STRUCT_TREE_ROOT,
+        };
+        use hayro::hayro_syntax::object::{Dict, MaybeRef};
+
+        let raw = Arc::new(build_numbered_pdf(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R /MarkInfo << /Marked true >> /StructTreeRoot 10 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec()),
+            (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /StructParents 0 /Contents 5 0 R /Resources << >> >>".to_vec()),
+            (4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /StructParents 1 /Contents 5 0 R /Resources << >> >>".to_vec()),
+            (5, b"<< /Length 22 >>\nstream\n0 1 0 rg 0 0 50 50 re f\nendstream".to_vec()),
+            (10, b"<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>".to_vec()),
+            (11, b"<< /Type /StructElem /S /P /P 10 0 R /Pg 3 0 R /K 0 >>".to_vec()),
+            (12, b"<< /Nums [0 [11 0 R] 1 []] >>".to_vec()),
+        ]));
+
+        let full_doc = doc_from_pdf_pages("tagged.pdf", Arc::clone(&raw), &[0, 1]);
+        let full_bytes = Arc::new(export_notebook_pdf(&full_doc));
+        let full_parsed = hayro::hayro_syntax::Pdf::new(full_bytes).expect("full tagged PDF");
+        let full_cat = full_parsed
+            .xref()
+            .get::<Dict<'_>>(full_parsed.xref().root_id())
+            .unwrap();
+        assert!(full_cat.get::<Dict<'_>>(MARK_INFO).is_some());
+        let st = full_cat
+            .get::<Dict<'_>>(STRUCT_TREE_ROOT)
+            .expect("StructTreeRoot");
+        let elem = st
+            .get::<hayro::hayro_syntax::object::Array<'_>>(
+                hayro::hayro_syntax::object::dict::keys::K,
+            )
+            .unwrap()
+            .iter::<Dict<'_>>()
+            .next()
+            .unwrap();
+        let MaybeRef::Ref(pg_ref) = elem
+            .get_raw::<hayro::hayro_syntax::object::Object<'_>>(PG)
+            .unwrap()
+        else {
+            panic!("expected /Pg ref");
+        };
+        assert_eq!(
+            hayro::hayro_syntax::object::ObjectIdentifier::from(pg_ref),
+            full_parsed.pages()[0].raw().obj_id().unwrap()
+        );
+        assert_eq!(
+            full_parsed.pages()[0].raw().get::<i32>(STRUCT_PARENTS),
+            Some(0)
+        );
+
+        let sub_doc = doc_from_pdf_pages("tagged.pdf", raw, &[0]);
+        let sub_bytes = Arc::new(export_notebook_pdf(&sub_doc));
+        let sub_parsed = hayro::hayro_syntax::Pdf::new(sub_bytes).expect("subset PDF");
+        let sub_cat = sub_parsed
+            .xref()
+            .get::<Dict<'_>>(sub_parsed.xref().root_id())
+            .unwrap();
+        assert!(sub_cat.get::<Dict<'_>>(STRUCT_TREE_ROOT).is_none());
+        assert!(sub_cat.get::<Dict<'_>>(MARK_INFO).is_none());
+        assert!(
+            sub_parsed.pages()[0]
+                .raw()
+                .get::<i32>(STRUCT_PARENTS)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pdf_export_filters_acroform_fields_and_strips_signature_flags() {
+        use hayro::hayro_syntax::object::dict::keys::{ACRO_FORM, ANNOTS, CO, FIELDS, SIG_FLAGS};
+        use hayro::hayro_syntax::object::{Array, Dict};
+
+        let raw = Arc::new(build_numbered_pdf(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [10 0 R 11 0 R 12 0 R] /CO [10 0 R 12 0 R] /SigFlags 3 /NeedAppearances true /DA (/Helv 12 Tf 0 g) >> >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec()),
+            (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [10 0 R 11 0 R] /Contents 5 0 R /Resources << >> >>".to_vec()),
+            (4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [12 0 R] /Contents 5 0 R /Resources << >> >>".to_vec()),
+            (5, b"<< /Length 22 >>\nstream\n0 1 0 rg 0 0 50 50 re f\nendstream".to_vec()),
+            (10, b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (NameP0) /Rect [10 10 100 30] /P 3 0 R >>".to_vec()),
+            (11, b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (SigP0) /Rect [10 40 100 60] /P 3 0 R >>".to_vec()),
+            (12, b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (NameP1) /Rect [10 10 100 30] /P 4 0 R >>".to_vec()),
+        ]));
+
+        let doc = doc_from_pdf_pages("forms.pdf", raw, &[0]);
+        let exported = Arc::new(export_notebook_pdf(&doc));
+        let text = String::from_utf8_lossy(&exported);
+        assert!(!text.contains("(SigP0)"));
+        assert!(!text.contains("(NameP1)"));
+
+        let parsed = hayro::hayro_syntax::Pdf::new(exported).expect("form PDF parses");
+        let cat = parsed
+            .xref()
+            .get::<Dict<'_>>(parsed.xref().root_id())
+            .unwrap();
+        let acro = cat.get::<Dict<'_>>(ACRO_FORM).expect("AcroForm");
+        assert!(acro.get::<i32>(SIG_FLAGS).is_none());
+        let fields = acro.get::<Array<'_>>(FIELDS).unwrap();
+        assert_eq!(fields.raw_iter().count(), 1);
+        let co = acro.get::<Array<'_>>(CO).unwrap();
+        assert_eq!(co.raw_iter().count(), 1);
+        assert_eq!(
+            fields.raw_iter().next().unwrap().as_obj_ref(),
+            parsed.pages()[0]
+                .raw()
+                .get::<Array<'_>>(ANNOTS)
+                .unwrap()
+                .raw_iter()
+                .next()
+                .unwrap()
+                .as_obj_ref()
+        );
+    }
+
+    #[test]
+    fn pdf_export_emits_unicode_title_and_producer_for_native_notebook() {
+        let mut doc = Document::new(400, 600);
+        doc.title = "Caderno de Física — Anotações".to_string();
+        let bytes = Arc::new(export_notebook_pdf(&doc));
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("/Producer (PaperCraft)"));
+        let summary = crate::pdf::inspect_pdf(bytes, 10).expect("inspect native pdf");
+        assert_eq!(
+            summary.title.as_deref(),
+            Some("Caderno de Física — Anotações")
         );
     }
 

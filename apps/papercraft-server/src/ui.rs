@@ -1558,8 +1558,8 @@ mod tests {
     }
 
     #[test]
-    fn autostart_window_checkbox_renders_below_autostart_and_persists_when_enabled() {
-        let dir = temp_dir("autostart-window-checkbox");
+    fn autostart_window_switch_renders_below_autostart_and_persists_when_enabled() {
+        let dir = temp_dir("autostart-window-switch");
         let cfg_path = dir.0.join(CONFIG_FILE_NAME);
         let settings = ServerControlSettings {
             data_dir: dir.0.join("vault").to_string_lossy().into_owned(),

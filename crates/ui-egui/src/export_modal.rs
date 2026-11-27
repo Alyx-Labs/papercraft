@@ -3,7 +3,7 @@
 use egui::{CornerRadius, Margin, RichText, Sense, Stroke, StrokeKind, Vec2, pos2};
 use serde_json::json;
 
-use crate::icons::{Icon, paint_icon};
+use crate::icons::{Icon, paint_icon, toggle_switch_row_enabled};
 use crate::inspector::{export_target_with_ext, title_to_default_filename};
 use crate::modal::{ActiveModal, primary_action_button, secondary_action_button};
 use crate::motion::{hover_factor, lerp_color};
@@ -1037,20 +1037,17 @@ fn draw_page_scope_options(
             } else {
                 app.view.export_separate_files
             };
-            let check_resp = ui
-                .add_enabled(
-                    can_split && !force_separate_image,
-                    egui::Checkbox::new(
-                        &mut checked,
-                        RichText::new("Export pages as separate files")
-                            .size(12.5)
-                            .color(if can_split { t.text } else { t.text_muted }),
-                    ),
-                )
-                .on_hover_text(
-                    "Export each page as its own numbered file or combine them together in selection order",
-                );
-            if can_split && !force_separate_image && check_resp.changed() {
+            let can_toggle_separate = can_split && !force_separate_image;
+            let switch_resp = toggle_switch_row_enabled(
+                ui,
+                "export_separate_files_switch",
+                "Export pages as separate files",
+                "Export each page as its own numbered file or combine them together in selection order",
+                &mut checked,
+                can_toggle_separate,
+                t,
+            );
+            if can_toggle_separate && switch_resp.changed() {
                 app.view.export_separate_files = checked;
             }
 
@@ -1547,7 +1544,7 @@ mod tests {
         }
         captured.borrow_mut().clear();
 
-        // 3. Toggle "Export pages as separate files" checkbox -> saves 2 files in order Page 3 then Page 1.
+        // 3. Toggle "Export pages as separate files" switch -> saves 2 files in order Page 3 then Page 1.
         app.view.export_format = FileDialogKind::Pdf;
         open_for_pages(&mut app, vec![2, 0]);
         for _ in 0..5 {

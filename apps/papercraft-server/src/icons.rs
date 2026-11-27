@@ -528,17 +528,18 @@ pub fn toggle_switch(
     enabled: bool,
     t: &Tokens,
 ) -> egui::Response {
-    let sense = if enabled {
+    let interactive = enabled && ui.is_enabled();
+    let sense = if interactive {
         Sense::click()
     } else {
         Sense::hover()
     };
     let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(36.0, 20.0), sense);
-    if enabled && resp.clicked() {
+    if interactive && resp.clicked() {
         *on = !*on;
         resp.mark_changed();
     }
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, *on, ""));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, interactive, *on, ""));
 
     if ui.is_rect_visible(rect) {
         let anim_t = ui.ctx().animate_value_with_time(
@@ -546,7 +547,12 @@ pub fn toggle_switch(
             if *on { 1.0 } else { 0.0 },
             MICRO_DURATION_S,
         );
-        let alpha = if enabled { 1.0 } else { 0.55 };
+        // When `!ui.is_enabled()`, an outer `add_enabled_ui(false, ...)` already fades painter opacity.
+        let alpha = if !ui.is_enabled() || enabled {
+            1.0
+        } else {
+            0.55
+        };
         let track_fill = lerp_color(t.field_bg, t.accent, anim_t).gamma_multiply(alpha);
         let track_stroke = lerp_color(t.border, t.accent, anim_t).gamma_multiply(alpha);
         let knob_fill = lerp_color(t.text_muted, t.on_accent, anim_t).gamma_multiply(alpha);
@@ -563,50 +569,62 @@ pub fn toggle_switch(
         p.circle_filled(pos2(knob_x, rect.center().y), 7.0, knob_fill);
     }
 
-    if enabled {
+    if interactive {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {
         resp
     }
 }
 
-/// Renders a labeled settings row with a clickable label on the left and a right-aligned pill switch.
-pub fn toggle_switch_row(
+/// Renders a labeled settings row with a clickable label on the left and a right-aligned pill
+/// switch, with explicit `enabled` state control.
+pub fn toggle_switch_row_enabled(
     ui: &mut egui::Ui,
     id_salt: impl egui::AsIdSalt,
     label: &str,
     tooltip: &str,
     on: &mut bool,
+    enabled: bool,
     t: &Tokens,
 ) -> egui::Response {
     let was_on = *on;
+    let interactive = enabled && ui.is_enabled();
     let switch_w = 36.0_f32;
     let gap = 8.0_f32;
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
         let label_w = (ui.available_width() - switch_w - gap).max(80.0);
+        let label_color = if interactive { t.text } else { t.text_muted };
+        let label_sense = if interactive {
+            Sense::click()
+        } else {
+            Sense::hover()
+        };
         let mut label_resp = ui
             .allocate_ui_with_layout(
                 Vec2::new(label_w, 20.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.add(
-                        egui::Label::new(egui::RichText::new(label).size(12.0).color(t.text))
+                        egui::Label::new(egui::RichText::new(label).size(12.0).color(label_color))
                             .wrap()
-                            .sense(Sense::click()),
+                            .sense(label_sense),
                     )
                 },
             )
-            .inner
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
+            .inner;
+        if interactive {
+            label_resp = label_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        }
         if !tooltip.is_empty() {
             label_resp = label_resp.on_hover_text(tooltip);
         }
-        if label_resp.clicked() {
+        if interactive && label_resp.clicked() {
             *on = !*on;
         }
 
         ui.add_space(gap);
-        let mut switch_resp = toggle_switch(ui, id_salt, on, true, t);
+        let mut switch_resp = toggle_switch(ui, id_salt, on, enabled, t);
         if !tooltip.is_empty() {
             switch_resp = switch_resp.on_hover_text(tooltip);
         }
@@ -618,6 +636,18 @@ pub fn toggle_switch_row(
         combined
     })
     .inner
+}
+
+/// Renders a labeled settings row with a clickable label on the left and a right-aligned pill switch.
+pub fn toggle_switch_row(
+    ui: &mut egui::Ui,
+    id_salt: impl egui::AsIdSalt,
+    label: &str,
+    tooltip: &str,
+    on: &mut bool,
+    t: &Tokens,
+) -> egui::Response {
+    toggle_switch_row_enabled(ui, id_salt, label, tooltip, on, true, t)
 }
 
 #[cfg(test)]
@@ -676,6 +706,105 @@ mod tests {
                 })
                 .sum();
             assert!(vertices > 0, "icon {icon:?} produced zero vertices");
+        }
+    }
+
+    #[test]
+    fn toggle_switch_row_enabled_toggles_and_respects_disabled_state() {
+        for theme in [
+            papercraft_doc::UiTheme::Light,
+            papercraft_doc::UiTheme::Dark,
+        ] {
+            let ctx = egui::Context::default();
+            let t = crate::theme::Tokens::for_theme(theme);
+            let mut value = false;
+            let mut row_rect = Rect::NOTHING;
+
+            let warm = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 120.0))),
+                    time: Some(0.05),
+                    ..Default::default()
+                },
+                |ui| {
+                    row_rect = toggle_switch_row_enabled(
+                        ui,
+                        ("srv_ts_row_test", theme),
+                        "Open control window at system startup",
+                        "Tooltip",
+                        &mut value,
+                        true,
+                        &t,
+                    )
+                    .rect;
+                },
+            );
+            warm.drop_without_applying_deltas();
+
+            let pt = Pos2::new(row_rect.right() - 10.0, row_rect.center().y);
+            for (pressed, time) in [(true, 0.08), (false, 0.12)] {
+                let out = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 120.0))),
+                        time: Some(time),
+                        events: vec![
+                            egui::Event::PointerMoved(pt),
+                            egui::Event::PointerButton {
+                                pos: pt,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let _ = toggle_switch_row_enabled(
+                            ui,
+                            ("srv_ts_row_test", theme),
+                            "Open control window at system startup",
+                            "Tooltip",
+                            &mut value,
+                            true,
+                            &t,
+                        );
+                    },
+                );
+                out.drop_without_applying_deltas();
+            }
+            assert!(value);
+
+            for (pressed, time) in [(true, 0.16), (false, 0.20)] {
+                let out = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 120.0))),
+                        time: Some(time),
+                        events: vec![
+                            egui::Event::PointerMoved(pt),
+                            egui::Event::PointerButton {
+                                pos: pt,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let _ = toggle_switch_row_enabled(
+                            ui,
+                            ("srv_ts_row_test", theme),
+                            "Open control window at system startup",
+                            "Tooltip",
+                            &mut value,
+                            false,
+                            &t,
+                        );
+                    },
+                );
+                out.drop_without_applying_deltas();
+            }
+            assert!(value, "disabled switch must ignore clicks");
         }
     }
 }

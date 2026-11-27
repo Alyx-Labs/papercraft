@@ -303,7 +303,7 @@ pub fn show_popover(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
     }
 
     let ctx = ui.ctx().clone();
-    let t = Tokens::for_theme(app.session.prefs.theme);
+    let t = Tokens::for_prefs(&app.session.prefs);
     let viewport = ctx.content_rect();
     let just_opened = app.view.color_picker.opened_this_frame;
     app.view.color_picker.opened_this_frame = false;

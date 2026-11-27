@@ -7224,6 +7224,102 @@ impl UiTheme {
     }
 }
 
+fn default_infinite_hue_degrees() -> f32 {
+    InfiniteThemeConfig::DEFAULT_HUE_DEGREES
+}
+
+fn default_infinite_saturation_percent() -> f32 {
+    InfiniteThemeConfig::DEFAULT_SATURATION_PERCENT
+}
+
+/// Continuous hue-rotation and saturation modifier layered atop [`UiTheme::Light`] or
+/// [`UiTheme::Dark`] for studio UI surfaces only (never affecting document paper, ink, or exports).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InfiniteThemeConfig {
+    pub enabled: bool,
+    /// Hue rotation angle in degrees (`0.0..=360.0`, default `0.0`).
+    #[serde(default = "default_infinite_hue_degrees")]
+    pub hue_degrees: f32,
+    /// Color saturation percentage (`0.0..=250.0`, default `100.0`).
+    #[serde(default = "default_infinite_saturation_percent")]
+    pub saturation_percent: f32,
+}
+
+impl Default for InfiniteThemeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hue_degrees: Self::DEFAULT_HUE_DEGREES,
+            saturation_percent: Self::DEFAULT_SATURATION_PERCENT,
+        }
+    }
+}
+
+impl InfiniteThemeConfig {
+    pub const MIN_HUE_DEGREES: f32 = 0.0;
+    pub const MAX_HUE_DEGREES: f32 = 360.0;
+    pub const DEFAULT_HUE_DEGREES: f32 = 0.0;
+    pub const MIN_SATURATION_PERCENT: f32 = 0.0;
+    pub const MAX_SATURATION_PERCENT: f32 = 250.0;
+    pub const DEFAULT_SATURATION_PERCENT: f32 = 100.0;
+
+    /// Clamps and rounds `hue` to deterministic whole degrees (`0.0..=360.0`).
+    #[must_use]
+    pub fn sanitize_hue_degrees(hue: f32) -> f32 {
+        if hue.is_finite() {
+            hue.round()
+                .clamp(Self::MIN_HUE_DEGREES, Self::MAX_HUE_DEGREES)
+        } else {
+            Self::DEFAULT_HUE_DEGREES
+        }
+    }
+
+    /// Clamps and rounds `saturation` to deterministic whole percentages (`0.0..=250.0`).
+    #[must_use]
+    pub fn sanitize_saturation_percent(saturation: f32) -> f32 {
+        if saturation.is_finite() {
+            saturation
+                .round()
+                .clamp(Self::MIN_SATURATION_PERCENT, Self::MAX_SATURATION_PERCENT)
+        } else {
+            Self::DEFAULT_SATURATION_PERCENT
+        }
+    }
+
+    /// Returns a sanitized copy with finite, bounded hue and saturation values.
+    #[must_use]
+    pub fn sanitized(self) -> Self {
+        Self {
+            enabled: self.enabled,
+            hue_degrees: Self::sanitize_hue_degrees(self.hue_degrees),
+            saturation_percent: Self::sanitize_saturation_percent(self.saturation_percent),
+        }
+    }
+
+    /// True when the modifier leaves base Light/Dark UI colors visually unchanged.
+    #[must_use]
+    pub fn is_identity(self) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        let clean = self.sanitized();
+        let hue_is_zero = (clean.hue_degrees - Self::DEFAULT_HUE_DEGREES).abs() < 0.5
+            || (clean.hue_degrees - Self::MAX_HUE_DEGREES).abs() < 0.5;
+        let sat_is_default =
+            (clean.saturation_percent - Self::DEFAULT_SATURATION_PERCENT).abs() < 0.5;
+        hue_is_zero && sat_is_default
+    }
+
+    /// True when either hue or saturation differs from the `0° / 100%` baseline.
+    #[must_use]
+    pub fn is_customized(self) -> bool {
+        let clean = self.sanitized();
+        (clean.hue_degrees - Self::DEFAULT_HUE_DEGREES).abs() >= 0.5
+            || (clean.saturation_percent - Self::DEFAULT_SATURATION_PERCENT).abs() >= 0.5
+    }
+}
+
 /// Concrete canvas paper background, ruling line, and margin colors for rendering.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ResolvedPaperColors {
@@ -7839,6 +7935,8 @@ impl StylusButtonConfig {
 #[serde(default)]
 pub struct UserStudioConfig {
     pub theme: UiTheme,
+    #[serde(default)]
+    pub infinite_theme: InfiniteThemeConfig,
     pub auto_contrast_with_theme: bool,
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
@@ -7897,6 +7995,7 @@ impl Default for UserStudioConfig {
     fn default() -> Self {
         Self {
             theme: UiTheme::default(),
+            infinite_theme: InfiniteThemeConfig::default(),
             auto_contrast_with_theme: false,
             ui_scale: Self::DEFAULT_UI_SCALE,
             pen_sizes: Self::DEFAULT_PEN_SIZES,
@@ -8333,6 +8432,7 @@ impl UserStudioConfig {
 
         Self {
             theme: self.theme,
+            infinite_theme: self.infinite_theme.sanitized(),
             auto_contrast_with_theme: self.auto_contrast_with_theme,
             ui_scale: Self::sanitize_ui_scale(self.ui_scale),
             pen_sizes,
@@ -9625,6 +9725,55 @@ mod tests {
             serde_json::from_str(&encoded).expect("deserialize studio config");
         assert!(!decoded.auto_create_desktop_shortcut);
         assert!(!decoded.sanitized().auto_create_desktop_shortcut);
+    }
+
+    #[test]
+    fn infinite_theme_defaults_sanitizes_hostile_values_and_roundtrips() {
+        let def = UserStudioConfig::default();
+        assert!(!def.infinite_theme.enabled);
+        assert!((def.infinite_theme.hue_degrees - 0.0).abs() < 1e-6);
+        assert!((def.infinite_theme.saturation_percent - 100.0).abs() < 1e-6);
+        assert!(def.infinite_theme.is_identity());
+        assert!(!def.infinite_theme.is_customized());
+
+        let legacy: UserStudioConfig = serde_json::from_str("{}").expect("legacy studio config");
+        assert_eq!(legacy.infinite_theme, InfiniteThemeConfig::default());
+
+        let hostile = InfiniteThemeConfig {
+            enabled: true,
+            hue_degrees: f32::NAN,
+            saturation_percent: f32::INFINITY,
+        };
+        let cleaned = hostile.sanitized();
+        assert!(cleaned.enabled);
+        assert!((cleaned.hue_degrees - 0.0).abs() < 1e-6);
+        assert!((cleaned.saturation_percent - 100.0).abs() < 1e-6);
+
+        let clamped = InfiniteThemeConfig {
+            enabled: true,
+            hue_degrees: 999.0,
+            saturation_percent: -50.0,
+        }
+        .sanitized();
+        assert!((clamped.hue_degrees - 360.0).abs() < 1e-6);
+        assert!((clamped.saturation_percent - 0.0).abs() < 1e-6);
+        assert!(clamped.is_customized());
+
+        let custom = UserStudioConfig {
+            theme: UiTheme::Light,
+            infinite_theme: InfiniteThemeConfig {
+                enabled: true,
+                hue_degrees: 145.0,
+                saturation_percent: 185.0,
+            },
+            ..UserStudioConfig::default()
+        };
+        let encoded = serde_json::to_string(&custom).expect("serialize infinite config");
+        let decoded: UserStudioConfig =
+            serde_json::from_str(&encoded).expect("deserialize infinite config");
+        assert_eq!(decoded.infinite_theme, custom.infinite_theme);
+        assert_eq!(decoded.sanitized().infinite_theme, custom.infinite_theme);
+        assert!(!decoded.infinite_theme.is_identity());
     }
 
     #[test]

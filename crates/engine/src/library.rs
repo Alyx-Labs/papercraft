@@ -1189,6 +1189,53 @@ mod tests {
     }
 
     #[test]
+    fn infinite_theme_persists_clamps_and_skips_disk_during_live_preview() {
+        let guard = temp_lib_dir("infinite_theme");
+        let dir = guard.0.clone();
+
+        {
+            let mut session = Session::open_library(dir.clone());
+            session
+                .execute(
+                    "theme.set",
+                    &json!({
+                        "infinite_enabled": true,
+                        "infinite_hue": 215.0,
+                        "infinite_saturation": 165.0
+                    }),
+                )
+                .unwrap();
+            assert!(session.prefs.infinite_theme.enabled);
+            assert!((session.prefs.infinite_theme.hue_degrees - 215.0).abs() < 1e-6);
+            assert!((session.prefs.infinite_theme.saturation_percent - 165.0).abs() < 1e-6);
+
+            // Live preview (persist: false) mutates active session without overwriting saved disk prefs.
+            session
+                .execute(
+                    "theme.set",
+                    &json!({
+                        "infinite_hue": 500.0,
+                        "infinite_saturation": -10.0,
+                        "persist": false
+                    }),
+                )
+                .unwrap();
+            assert!((session.prefs.infinite_theme.hue_degrees - 360.0).abs() < 1e-6);
+            assert!((session.prefs.infinite_theme.saturation_percent - 0.0).abs() < 1e-6);
+        }
+
+        let mut reopened = Session::open_library(dir);
+        assert!(reopened.prefs.infinite_theme.enabled);
+        assert!((reopened.prefs.infinite_theme.hue_degrees - 215.0).abs() < 1e-6);
+        assert!((reopened.prefs.infinite_theme.saturation_percent - 165.0).abs() < 1e-6);
+        assert!(
+            reopened
+                .execute("theme.set", &json!({ "infinite_hue": f64::NAN }))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn palette_presets_lifecycle_protection_and_persistence() {
         let guard = temp_lib_dir("palette_presets");
         let dir = guard.0.clone();

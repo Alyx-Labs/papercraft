@@ -626,11 +626,7 @@ fn draw_styled_icon_button(
                 } else {
                     Color32::TRANSPARENT
                 };
-                let act_s = if t.is_dark {
-                    t.accent
-                } else {
-                    t.header_active_bg
-                };
+                let act_s = t.accent;
                 (
                     t.header_control_hover,
                     t.header_active_bg,
@@ -873,11 +869,7 @@ fn paint_sidebar_edge_chrome(
     let m = chrome.m;
     let (closed_fill, active_fill, closed_stroke, open_stroke, rest_rail, active_rail) =
         if chrome.on_header {
-            let act_accent = if t.is_dark {
-                t.accent
-            } else {
-                t.header_active_bg
-            };
+            let act_accent = t.accent;
             (
                 crate::motion::lerp_color(t.header_track_bg, t.header_control_hover, hover_t),
                 t.header_active_bg,
@@ -1423,11 +1415,7 @@ pub fn segmented_switch(
         let on_header = matches!(layout, SwitchLayout::Toolbar);
         let (track_bg, track_border, active_fill, active_border, fg_muted, fg_rest, active_fg) =
             if on_header {
-                let act_border = if t.is_dark {
-                    t.accent
-                } else {
-                    t.header_active_bg
-                };
+                let act_border = t.accent;
                 (
                     t.header_track_bg,
                     t.header_border,
@@ -1557,17 +1545,18 @@ pub fn toggle_switch(
     enabled: bool,
     t: &Tokens,
 ) -> Response {
-    let sense = if enabled {
+    let interactive = enabled && ui.is_enabled();
+    let sense = if interactive {
         Sense::click()
     } else {
         Sense::hover()
     };
     let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(36.0, 20.0), sense);
-    if enabled && resp.clicked() {
+    if interactive && resp.clicked() {
         *on = !*on;
         resp.mark_changed();
     }
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, *on, ""));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, interactive, *on, ""));
 
     if ui.is_rect_visible(rect) {
         let anim_t = ui.ctx().animate_value_with_time(
@@ -1575,7 +1564,12 @@ pub fn toggle_switch(
             if *on { 1.0 } else { 0.0 },
             crate::motion::MICRO_DURATION_S,
         );
-        let alpha = if enabled { 1.0 } else { 0.55 };
+        // When `!ui.is_enabled()`, an outer `add_enabled_ui(false, ...)` already fades painter opacity.
+        let alpha = if !ui.is_enabled() || enabled {
+            1.0
+        } else {
+            0.55
+        };
         let track_fill =
             crate::motion::lerp_color(t.field_bg, t.accent, anim_t).gamma_multiply(alpha);
         let track_stroke =
@@ -1595,50 +1589,62 @@ pub fn toggle_switch(
         p.circle_filled(pos2(knob_x, rect.center().y), 7.0, knob_fill);
     }
 
-    if enabled {
+    if interactive {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {
         resp
     }
 }
 
-/// Renders a labeled settings row with a clickable label on the left and a right-aligned pill switch.
-pub fn toggle_switch_row(
+/// Renders a labeled settings row with a clickable label on the left and a right-aligned pill
+/// switch, with explicit `enabled` state control.
+pub fn toggle_switch_row_enabled(
     ui: &mut egui::Ui,
     id_salt: impl egui::AsIdSalt,
     label: &str,
     tooltip: &str,
     on: &mut bool,
+    enabled: bool,
     t: &Tokens,
 ) -> Response {
     let was_on = *on;
+    let interactive = enabled && ui.is_enabled();
     let switch_w = 36.0_f32;
     let gap = 8.0_f32;
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
         let label_w = (ui.available_width() - switch_w - gap).max(80.0);
+        let label_color = if interactive { t.text } else { t.text_muted };
+        let label_sense = if interactive {
+            Sense::click()
+        } else {
+            Sense::hover()
+        };
         let mut label_resp = ui
             .allocate_ui_with_layout(
                 Vec2::new(label_w, 20.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.add(
-                        egui::Label::new(egui::RichText::new(label).size(12.0).color(t.text))
+                        egui::Label::new(egui::RichText::new(label).size(12.0).color(label_color))
                             .wrap()
-                            .sense(Sense::click()),
+                            .sense(label_sense),
                     )
                 },
             )
-            .inner
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
+            .inner;
+        if interactive {
+            label_resp = label_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        }
         if !tooltip.is_empty() {
             label_resp = label_resp.on_hover_text(tooltip);
         }
-        if label_resp.clicked() {
+        if interactive && label_resp.clicked() {
             *on = !*on;
         }
 
         ui.add_space(gap);
-        let mut switch_resp = toggle_switch(ui, id_salt, on, true, t);
+        let mut switch_resp = toggle_switch(ui, id_salt, on, enabled, t);
         if !tooltip.is_empty() {
             switch_resp = switch_resp.on_hover_text(tooltip);
         }
@@ -1650,6 +1656,18 @@ pub fn toggle_switch_row(
         combined
     })
     .inner
+}
+
+/// Renders a labeled settings row with a clickable label on the left and a right-aligned pill switch.
+pub fn toggle_switch_row(
+    ui: &mut egui::Ui,
+    id_salt: impl egui::AsIdSalt,
+    label: &str,
+    tooltip: &str,
+    on: &mut bool,
+    t: &Tokens,
+) -> Response {
+    toggle_switch_row_enabled(ui, id_salt, label, tooltip, on, true, t)
 }
 
 /// Renders a section heading with an icon and muted plain-English subtitle.
@@ -1672,7 +1690,7 @@ mod tests {
         TOOLBAR_CONTROL_HEIGHT, max_width_icon_button, max_width_icon_button_width, paint_icon,
         segmented_switch, sidebar_edge_button, sidebar_edge_button_sized,
         sidebar_edge_button_sized_width, sidebar_edge_button_width, toggle_switch,
-        toggle_switch_row, toolbar_icon_button,
+        toggle_switch_row, toggle_switch_row_enabled, toolbar_icon_button,
     };
     use crate::theme::Tokens;
     use egui::{Color32, Pos2, RawInput, Rect, Vec2, epaint::Primitive};
@@ -2268,6 +2286,72 @@ mod tests {
             assert!(
                 value,
                 "expected toggle_switch_row click to turn switch back on"
+            );
+
+            // Disabled state ignores clicks on both the label and the pill switch.
+            let mut disabled_rect = Rect::NOTHING;
+            let warm_disabled = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 120.0))),
+                    time: Some(0.28),
+                    ..Default::default()
+                },
+                |ui| {
+                    disabled_rect = toggle_switch_row_enabled(
+                        ui,
+                        ("ts_row_disabled_test", theme),
+                        "Disabled toggle switch",
+                        "Tooltip",
+                        &mut value,
+                        false,
+                        &t,
+                    )
+                    .rect;
+                },
+            );
+            warm_disabled.drop_without_applying_deltas();
+
+            for pt in [
+                Pos2::new(disabled_rect.left() + 24.0, disabled_rect.center().y),
+                Pos2::new(disabled_rect.right() - 10.0, disabled_rect.center().y),
+            ] {
+                for (pressed, time) in [(true, 0.32), (false, 0.36)] {
+                    let click_out = ctx.run_ui(
+                        RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(360.0, 120.0),
+                            )),
+                            time: Some(time),
+                            events: vec![
+                                egui::Event::PointerMoved(pt),
+                                egui::Event::PointerButton {
+                                    pos: pt,
+                                    button: egui::PointerButton::Primary,
+                                    pressed,
+                                    modifiers: egui::Modifiers::NONE,
+                                },
+                            ],
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let _ = toggle_switch_row_enabled(
+                                ui,
+                                ("ts_row_disabled_test", theme),
+                                "Disabled toggle switch",
+                                "Tooltip",
+                                &mut value,
+                                false,
+                                &t,
+                            );
+                        },
+                    );
+                    click_out.drop_without_applying_deltas();
+                }
+            }
+            assert!(
+                value,
+                "expected disabled toggle_switch_row_enabled click to leave value unchanged"
             );
         }
     }

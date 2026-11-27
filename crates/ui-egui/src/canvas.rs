@@ -9322,11 +9322,13 @@ fn paint_ruler(
         frame.corner_pos2(half_length, half_width),
         frame.corner_pos2(-half_length, half_width),
     ];
-    let fill = if t.is_dark {
-        Color32::from_rgba_unmultiplied(42, 52, 68, 210)
-    } else {
-        Color32::from_rgba_unmultiplied(220, 230, 242, 215)
-    };
+    let base_fill = crate::motion::lerp_color(t.toolbar_bg, t.accent_soft, 0.45);
+    let fill = Color32::from_rgba_unmultiplied(
+        base_fill.r(),
+        base_fill.g(),
+        base_fill.b(),
+        if t.is_dark { 210 } else { 215 },
+    );
     p.add(Shape::convex_polygon(
         corners.to_vec(),
         fill,
@@ -10061,7 +10063,7 @@ fn paint_laser_pointer(
 
 pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
     app.install_rich_fonts_if_needed(ui.ctx());
-    let t = Tokens::for_theme(app.session.prefs.theme);
+    let t = Tokens::for_prefs(&app.session.prefs);
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(t.canvas_bg))
         .show(ui, |ui| {

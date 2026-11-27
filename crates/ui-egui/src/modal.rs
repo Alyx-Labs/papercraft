@@ -863,7 +863,7 @@ fn show_dialog(
     let steps = modal_steps(active);
     let current_step = active_step_index(app, active);
     let ctx = ui.ctx().clone();
-    let t = Tokens::for_theme(app.session.prefs.theme);
+    let t = Tokens::for_prefs(&app.session.prefs);
     let viewport = ctx.content_rect();
     let margin = 18_i8;
     let margin_f = f32::from(margin);

@@ -1,14 +1,18 @@
 //! Dedicated minimalist Settings drawer: Pen stylus shortcuts, studio appearance, and system info.
 
-use egui::{CornerRadius, Frame, Margin, Rect, RichText, Sense, Stroke, Vec2};
+use egui::{
+    CornerRadius, FontId, Frame, Margin, Mesh, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
+    Vec2, pos2,
+};
 use papercraft_doc::{
-    PenKind, PenSettings, StylusButtonAction, StylusButtonConfig, UserStudioConfig,
+    InfiniteThemeConfig, PenKind, PenSettings, StylusButtonAction, StylusButtonConfig,
+    UserStudioConfig,
 };
 use serde_json::json;
 
 use crate::icons::{
     Icon, SwitchLayout, SwitchOption, compact_icon_button, icon_button, paint_icon,
-    section_card_header, segmented_switch,
+    section_card_header, segmented_switch, toggle_switch_row,
 };
 use crate::theme::Tokens;
 use crate::{PaperCraftApp, SettingsTab};
@@ -152,12 +156,15 @@ fn draw_touch_and_palm_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Toke
         );
 
         let mut stylus_only = app.session.prefs.stylus_only_drawing;
-        let check_resp = ui
-            .checkbox(&mut stylus_only, "Draw with stylus only")
-            .on_hover_text(
-                "Ignore finger and resting palm touches when drawing, erasing, or placing shapes. Drag with one finger to pan the page and pinch with two fingers to zoom; mouse input still draws normally.",
-            );
-        if check_resp.changed() {
+        let switch_resp = toggle_switch_row(
+            ui,
+            "settings_stylus_only_switch",
+            "Draw with stylus only",
+            "Ignore finger and resting palm touches when drawing, erasing, or placing shapes. Drag with one finger to pan the page and pinch with two fingers to zoom; mouse input still draws normally.",
+            &mut stylus_only,
+            t,
+        );
+        if switch_resp.changed() {
             let _ = app.session.execute(
                 "stylus.setInputMode",
                 &json!({ "stylus_only_drawing": stylus_only }),
@@ -357,6 +364,331 @@ fn draw_stylus_shortcuts_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &To
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct InfiniteSliderDragState {
+    active: bool,
+    needs_persist: bool,
+}
+
+#[derive(Clone, Copy)]
+enum InfiniteSliderKind {
+    Hue {
+        base_theme: papercraft_doc::UiTheme,
+        saturation_percent: f32,
+    },
+    Saturation {
+        base_theme: papercraft_doc::UiTheme,
+        hue_degrees: f32,
+    },
+}
+
+struct InfiniteSliderSpec<'a> {
+    id_salt: &'a str,
+    label: &'a str,
+    min: f32,
+    max: f32,
+    default_value: f32,
+    current: f32,
+    unit_suffix: &'a str,
+    baseline_mark: Option<f32>,
+    tooltip_prefix: &'a str,
+    kind: InfiniteSliderKind,
+}
+
+impl InfiniteSliderSpec<'_> {
+    fn sample_color(&self, value: f32) -> egui::Color32 {
+        let (base_theme, hue, sat) = match self.kind {
+            InfiniteSliderKind::Hue {
+                base_theme,
+                saturation_percent,
+            } => (base_theme, value, saturation_percent),
+            InfiniteSliderKind::Saturation {
+                base_theme,
+                hue_degrees,
+            } => (base_theme, hue_degrees, value),
+        };
+        let base = Tokens::for_theme(base_theme);
+        let seed = if base.is_dark {
+            base.accent
+        } else {
+            base.header_bg
+        };
+        crate::theme::apply_hue_saturation(seed, hue, sat)
+    }
+}
+
+fn update_infinite_slider_drag(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    drag_id: egui::Id,
+    clean_cur: f32,
+    spec: &InfiniteSliderSpec<'_>,
+    travel_x: (f32, f32),
+) -> Option<(f32, bool)> {
+    let (travel_min_x, travel_w) = travel_x;
+    let span = (spec.max - spec.min).max(1.0);
+    let pos_to_val = |pos: Pos2| -> f32 {
+        let frac = ((pos.x - travel_min_x) / travel_w).clamp(0.0, 1.0);
+        (spec.min + frac * span).round().clamp(spec.min, spec.max)
+    };
+    let mut state = ui
+        .ctx()
+        .data(|d| d.get_temp::<InfiniteSliderDragState>(drag_id))
+        .unwrap_or_default();
+    let pointer_pos = resp
+        .interact_pointer_pos()
+        .or_else(|| ui.input(|i| i.pointer.interact_pos()));
+    let mut emission = None;
+
+    if resp.dragged_by(egui::PointerButton::Primary) {
+        state.active = true;
+        if let Some(pos) = pointer_pos {
+            let next = pos_to_val(pos);
+            if (next - clean_cur).abs() >= 0.5 {
+                state.needs_persist = true;
+                emission = Some((next, false));
+            }
+        }
+    } else if state.active {
+        let final_val = pointer_pos.map(pos_to_val).unwrap_or(clean_cur);
+        if state.needs_persist || (final_val - clean_cur).abs() >= 0.5 {
+            emission = Some((final_val, true));
+        }
+        state = InfiniteSliderDragState::default();
+    } else if resp.clicked_by(egui::PointerButton::Primary)
+        && let Some(pos) = pointer_pos
+    {
+        let next = pos_to_val(pos);
+        if (next - clean_cur).abs() >= 0.5 {
+            emission = Some((next, true));
+        }
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(drag_id, state));
+    emission
+}
+
+fn paint_infinite_slider_readout(
+    ctx: &egui::Context,
+    id: egui::Id,
+    thumb_center: Pos2,
+    label: &str,
+    t: &Tokens,
+) {
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, id));
+    let galley = painter.layout_no_wrap(label.to_string(), FontId::proportional(11.0), t.text);
+    let pill_size = galley.size() + Vec2::new(12.0, 6.0);
+    let screen = ctx.content_rect().shrink(4.0);
+    let left = (thumb_center.x - pill_size.x * 0.5).clamp(
+        screen.left(),
+        (screen.right() - pill_size.x).max(screen.left()),
+    );
+    let top = (thumb_center.y + 14.0).clamp(
+        screen.top(),
+        (screen.bottom() - pill_size.y).max(screen.top()),
+    );
+    let pill_rect = Rect::from_min_size(pos2(left, top), pill_size);
+    painter.rect(
+        pill_rect,
+        CornerRadius::same(6),
+        t.field_bg,
+        Stroke::new(1.0, t.border),
+        StrokeKind::Inside,
+    );
+    painter.galley(
+        pos2(
+            pill_rect.center().x - galley.size().x * 0.5,
+            pill_rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        t.text,
+    );
+}
+
+fn draw_infinite_slider(
+    ui: &mut egui::Ui,
+    spec: &InfiniteSliderSpec<'_>,
+    t: &Tokens,
+) -> Option<(f32, bool)> {
+    const TRACK_H: f32 = 10.0;
+    const THUMB_R: f32 = 7.0;
+    const THUMB_HOVER_R: f32 = 8.0;
+    const GRADIENT_STEPS: usize = 24;
+
+    let span = (spec.max - spec.min).max(1.0);
+    let clean_cur = if spec.current.is_finite() {
+        spec.current.round().clamp(spec.min, spec.max)
+    } else {
+        spec.default_value
+    };
+    let is_default = (clean_cur - spec.default_value).abs() < 0.5;
+    let value_text = format!("{clean_cur:.0}{}", spec.unit_suffix);
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(spec.label).size(12.0).color(t.text));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            Frame::new()
+                .fill(if is_default {
+                    t.toolbar_bg
+                } else {
+                    t.accent_soft
+                })
+                .stroke(Stroke::new(
+                    1.0,
+                    if is_default { t.border } else { t.accent },
+                ))
+                .corner_radius(CornerRadius::same(5))
+                .inner_margin(Margin::symmetric(7, 2))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(&value_text)
+                            .size(11.0)
+                            .strong()
+                            .monospace()
+                            .color(if is_default { t.text_muted } else { t.accent }),
+                    );
+                });
+        });
+    });
+
+    let slider_w = ui.available_width().max(80.0);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(slider_w, 24.0), Sense::click_and_drag());
+    let track_rect = Rect::from_min_max(
+        pos2(rect.left() + 4.0, rect.center().y - TRACK_H * 0.5),
+        pos2(rect.right() - 4.0, rect.center().y + TRACK_H * 0.5),
+    );
+    let cap_pad = TRACK_H * 0.5;
+    let travel_min_x = track_rect.left() + cap_pad;
+    let travel_max_x = (track_rect.right() - cap_pad).max(travel_min_x + 1.0);
+    let travel_w = (travel_max_x - travel_min_x).max(1.0);
+
+    let drag_id = ui.make_persistent_id(spec.id_salt);
+    let emission = update_infinite_slider_drag(
+        ui,
+        &resp,
+        drag_id,
+        clean_cur,
+        spec,
+        (travel_min_x, travel_w),
+    );
+    let display_val = emission.map_or(clean_cur, |(v, _)| v);
+    let is_dragging = resp.dragged_by(egui::PointerButton::Primary);
+    let target_frac = ((display_val - spec.min) / span).clamp(0.0, 1.0);
+    let anim_frac = ui
+        .ctx()
+        .animate_value_with_time(
+            drag_id.with("frac"),
+            target_frac,
+            if is_dragging {
+                0.0
+            } else {
+                crate::motion::MICRO_DURATION_S
+            },
+        )
+        .clamp(0.0, 1.0);
+    let hover_t = crate::motion::hover_factor(
+        ui.ctx(),
+        drag_id.with("hov"),
+        resp.hovered() && !is_dragging,
+    );
+    let drag_t = crate::motion::hover_factor(ui.ctx(), drag_id.with("act"), is_dragging);
+    let active_t = hover_t.max(drag_t);
+
+    let thumb_cx = travel_min_x + anim_frac * travel_w;
+    let thumb_center = pos2(thumb_cx, track_rect.center().y);
+    if ui.is_rect_visible(track_rect) {
+        let p = ui.painter();
+        let left_cap_col = spec.sample_color(spec.min);
+        let right_cap_col = spec.sample_color(spec.max);
+        p.circle_filled(
+            pos2(travel_min_x, track_rect.center().y),
+            cap_pad,
+            left_cap_col,
+        );
+        p.circle_filled(
+            pos2(travel_max_x, track_rect.center().y),
+            cap_pad,
+            right_cap_col,
+        );
+
+        let mut mesh = Mesh::default();
+        for idx in 0..=GRADIENT_STEPS {
+            let frac = idx as f32 / GRADIENT_STEPS as f32;
+            let x = travel_min_x + frac * travel_w;
+            let col = spec.sample_color(spec.min + frac * span);
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: pos2(x, track_rect.top()),
+                uv: egui::epaint::WHITE_UV,
+                color: col,
+            });
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: pos2(x, track_rect.bottom()),
+                uv: egui::epaint::WHITE_UV,
+                color: col,
+            });
+            if idx > 0 {
+                let base = (idx as u32 - 1) * 2;
+                mesh.add_triangle(base, base + 2, base + 3);
+                mesh.add_triangle(base, base + 3, base + 1);
+            }
+        }
+        p.add(egui::Shape::mesh(mesh));
+
+        if let Some(mark_val) = spec.baseline_mark {
+            let mark_frac = ((mark_val - spec.min) / span).clamp(0.0, 1.0);
+            let mark_x = travel_min_x + mark_frac * travel_w;
+            p.line_segment(
+                [
+                    pos2(mark_x, track_rect.top() + 1.5),
+                    pos2(mark_x, track_rect.bottom() - 1.5),
+                ],
+                Stroke::new(1.5, t.field_bg.gamma_multiply(0.85)),
+            );
+        }
+
+        let track_border =
+            crate::motion::lerp_color(t.border, t.accent.gamma_multiply(0.7), active_t);
+        p.rect_stroke(
+            track_rect,
+            CornerRadius::same(5),
+            Stroke::new(1.0, track_border),
+            StrokeKind::Inside,
+        );
+
+        let thumb_r = crate::motion::lerp_f32(THUMB_R, THUMB_HOVER_R, active_t);
+        if active_t > 0.01 {
+            p.circle_filled(
+                thumb_center,
+                thumb_r + 2.5 * active_t,
+                t.accent.gamma_multiply(0.20 * active_t),
+            );
+        }
+        let preview_col = spec.sample_color(display_val);
+        p.circle(
+            thumb_center,
+            thumb_r,
+            t.field_bg,
+            Stroke::new(2.2, t.accent),
+        );
+        p.circle_filled(thumb_center, 3.0, preview_col);
+    }
+
+    let resp = resp.on_hover_cursor(if is_dragging {
+        egui::CursorIcon::Grabbing
+    } else {
+        egui::CursorIcon::PointingHand
+    });
+    let readout = format!("{display_val:.0}{}", spec.unit_suffix);
+    if is_dragging {
+        paint_infinite_slider_readout(ui.ctx(), drag_id.with("readout"), thumb_center, &readout, t);
+    } else {
+        resp.on_hover_text(format!(
+            "{} ({readout}) — drag or click to adjust",
+            spec.tooltip_prefix
+        ));
+    }
+    emission
+}
+
 fn draw_appearance_controls(
     app: &mut PaperCraftApp,
     ui: &mut egui::Ui,
@@ -392,13 +724,148 @@ fn draw_appearance_controls(
     }
 
     ui.add_space(10.0);
-    let mut auto_contrast = app.session.prefs.auto_contrast_with_theme;
-    let check_resp = ui
-        .checkbox(&mut auto_contrast, "Auto-adapt canvas colors to theme")
-        .on_hover_text(
-            "Invert paper polarity and rebalance ink contrast along its hue when switching themes. Saved files and exports keep their original colors.",
+    let infinite = app.session.prefs.infinite_theme.sanitized();
+    let mut infinite_enabled = infinite.enabled;
+    let infinite_resp = toggle_switch_row(
+        ui,
+        "inspector_infinite_theme_switch",
+        "Infinite theme",
+        "Customize the app interface with any hue and saturation across Light or Dark mode. Document paper, ink, and exports stay unchanged.",
+        &mut infinite_enabled,
+        t,
+    );
+    if infinite_resp.changed() {
+        let _ = app.session.execute(
+            "theme.set",
+            &json!({ "infinite_enabled": infinite_enabled }),
         );
-    if check_resp.changed() {
+    }
+    ui.add(
+        egui::Label::new(
+            RichText::new(
+                "Shift interface hue and saturation across Light or Dark mode. Document paper, ink, and exports stay unchanged.",
+            )
+            .size(11.0)
+            .color(t.text_muted),
+        )
+        .wrap(),
+    );
+
+    if infinite_enabled {
+        ui.add_space(8.0);
+        let is_customized = infinite.is_customized();
+        let mut next_hue: Option<(f32, bool)> = None;
+        let mut next_sat: Option<(f32, bool)> = None;
+        let mut reset_requested = false;
+
+        Frame::new()
+            .fill(t.panel_bg)
+            .stroke(Stroke::new(1.0, t.border))
+            .corner_radius(CornerRadius::same(7))
+            .inner_margin(Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                next_hue = draw_infinite_slider(
+                    ui,
+                    &InfiniteSliderSpec {
+                        id_salt: "inspector_infinite_hue_slider",
+                        label: "Hue",
+                        min: InfiniteThemeConfig::MIN_HUE_DEGREES,
+                        max: InfiniteThemeConfig::MAX_HUE_DEGREES,
+                        default_value: InfiniteThemeConfig::DEFAULT_HUE_DEGREES,
+                        current: infinite.hue_degrees,
+                        unit_suffix: "°",
+                        baseline_mark: None,
+                        tooltip_prefix: "Shift interface hue",
+                        kind: InfiniteSliderKind::Hue {
+                            base_theme: current,
+                            saturation_percent: infinite.saturation_percent,
+                        },
+                    },
+                    t,
+                );
+
+                ui.add_space(6.0);
+                next_sat = draw_infinite_slider(
+                    ui,
+                    &InfiniteSliderSpec {
+                        id_salt: "inspector_infinite_saturation_slider",
+                        label: "Saturation",
+                        min: InfiniteThemeConfig::MIN_SATURATION_PERCENT,
+                        max: InfiniteThemeConfig::MAX_SATURATION_PERCENT,
+                        default_value: InfiniteThemeConfig::DEFAULT_SATURATION_PERCENT,
+                        current: infinite.saturation_percent,
+                        unit_suffix: "%",
+                        baseline_mark: Some(InfiniteThemeConfig::DEFAULT_SATURATION_PERCENT),
+                        tooltip_prefix: "Adjust interface saturation",
+                        kind: InfiniteSliderKind::Saturation {
+                            base_theme: current,
+                            hue_degrees: infinite.hue_degrees,
+                        },
+                    },
+                    t,
+                );
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("UI only · documents unchanged")
+                            .size(10.5)
+                            .color(t.text_muted),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if compact_icon_button(
+                            ui,
+                            Icon::Reset,
+                            Some("Reset"),
+                            false,
+                            is_customized,
+                            t,
+                        )
+                        .on_hover_text("Restore default hue (0°) and saturation (100%)")
+                        .clicked()
+                        {
+                            reset_requested = true;
+                        }
+                    });
+                });
+            });
+
+        if reset_requested {
+            let _ = app.session.execute(
+                "theme.set",
+                &json!({
+                    "infinite_hue": InfiniteThemeConfig::DEFAULT_HUE_DEGREES,
+                    "infinite_saturation": InfiniteThemeConfig::DEFAULT_SATURATION_PERCENT,
+                }),
+            );
+        } else {
+            if let Some((hue, persist)) = next_hue {
+                let _ = app.session.execute(
+                    "theme.set",
+                    &json!({ "infinite_hue": hue, "persist": persist }),
+                );
+            }
+            if let Some((sat, persist)) = next_sat {
+                let _ = app.session.execute(
+                    "theme.set",
+                    &json!({ "infinite_saturation": sat, "persist": persist }),
+                );
+            }
+        }
+    }
+
+    ui.add_space(10.0);
+    let mut auto_contrast = app.session.prefs.auto_contrast_with_theme;
+    let switch_resp = toggle_switch_row(
+        ui,
+        "settings_auto_contrast_switch",
+        "Auto-adapt canvas colors to theme",
+        "Invert paper polarity and rebalance ink contrast along its hue when switching themes. Saved files and exports keep their original colors.",
+        &mut auto_contrast,
+        t,
+    );
+    if switch_resp.changed() {
         let _ = app.session.execute(
             "theme.set",
             &json!({ "auto_contrast_with_theme": auto_contrast }),
@@ -695,11 +1162,14 @@ fn draw_app_updates_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens)
 
         ui.add_space(8.0);
         let mut auto_check = app.session.prefs.auto_check_updates;
-        let toggle_resp = ui
-            .checkbox(&mut auto_check, "Check for updates automatically on startup")
-            .on_hover_text(
-                "Quietly check GitHub Releases for new versions when PaperCraft opens.",
-            );
+        let toggle_resp = toggle_switch_row(
+            ui,
+            "settings_auto_check_updates_switch",
+            "Check for updates automatically on startup",
+            "Quietly check GitHub Releases for new versions when PaperCraft opens.",
+            &mut auto_check,
+            t,
+        );
         if toggle_resp.changed() {
             let _ = app
                 .session
@@ -718,7 +1188,7 @@ fn draw_app_updates_card(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens)
 
         ui.add_space(8.0);
         let mut desktop_shortcut = app.session.prefs.auto_create_desktop_shortcut;
-        let shortcut_resp = crate::icons::toggle_switch_row(
+        let shortcut_resp = toggle_switch_row(
             ui,
             "settings_desktop_shortcut_switch",
             "Create Desktop shortcut automatically",
@@ -968,6 +1438,23 @@ fn system_storage_info(app: &PaperCraftApp) -> (String, Option<String>) {
     }
 }
 
+/// Returns a plain-English explanation of the browser-enforced local storage limit, if known.
+pub(crate) fn web_storage_quota_explanation(status: &crate::WebStorageStatus) -> Option<String> {
+    if let Some(quota) = status.quota_bytes.filter(|&q| q > 0) {
+        let quota_str = format_storage_bytes(quota);
+        return Some(format!(
+            "The {quota_str} limit is the maximum space your browser allows for local notebooks when running locally in the browser."
+        ));
+    }
+    if status.backend == crate::WebStorageBackend::LocalStorageFallback {
+        return Some(
+            "This fallback limit (~5 MB) is the maximum space your browser allows for local notebooks when running locally in the browser."
+                .to_string(),
+        );
+    }
+    None
+}
+
 pub(crate) fn web_storage_usage_row(
     status: &crate::WebStorageStatus,
 ) -> Option<(String, Option<String>)> {
@@ -979,12 +1466,17 @@ pub(crate) fn web_storage_usage_row(
                 format_storage_bytes(usage),
                 format_storage_bytes(quota)
             );
-            let tip = status.remaining_bytes().map(|rem| {
-                format!(
+            let mut tip_parts = Vec::new();
+            if let Some(rem) = status.remaining_bytes() {
+                tip_parts.push(format!(
                     "{} estimated free space remaining.",
                     format_storage_bytes(rem)
-                )
-            });
+                ));
+            }
+            if let Some(expl) = web_storage_quota_explanation(status) {
+                tip_parts.push(expl);
+            }
+            let tip = (!tip_parts.is_empty()).then(|| tip_parts.join(" "));
             Some((value, tip))
         }
         (Some(usage), _) => Some((format_storage_bytes(usage), None)),
@@ -1077,6 +1569,16 @@ fn draw_system_info_card(app: &PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
                     );
                 }
             });
+        if let Some(quota_note) = app
+            .web_storage_status
+            .as_ref()
+            .and_then(web_storage_quota_explanation)
+        {
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(RichText::new(quota_note).size(10.5).color(t.text_muted)).wrap(),
+            );
+        }
         if let Some(err) = app
             .web_storage_status
             .as_ref()
@@ -1234,7 +1736,7 @@ pub fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) {
 }
 
 pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
-    let t = Tokens::for_theme(app.session.prefs.theme);
+    let t = Tokens::for_prefs(&app.session.prefs);
     let prev_open = app.view.inspector_open;
     let mut panel_open = prev_open;
     let reveal_id = ui.make_persistent_id("papercraft_inspector_reveal");
@@ -1405,7 +1907,7 @@ mod auto_contrast_ui_tests {
     }
 
     #[test]
-    fn appearance_checkbox_toggles_auto_contrast_and_recolors_green_ink_in_dark_theme() {
+    fn appearance_switch_toggles_auto_contrast_and_recolors_green_ink_in_dark_theme() {
         let ctx = egui::Context::default();
         let mut app = PaperCraftApp::default();
         app.view.screen = AppScreen::Editor;
@@ -1446,22 +1948,22 @@ mod auto_contrast_ui_tests {
             .unwrap();
         assert!(!app.session.prefs.auto_contrast_with_theme);
 
-        // With checkbox default OFF, Dark theme leaves green ink canonical (#1D7A46).
+        // With switch default OFF, Dark theme leaves green ink canonical (#1D7A46).
         let mut time_s = 1.0_f64;
         let _ = run_editor_frame(&ctx, &mut app, base_input(), &mut time_s);
         let shapes = run_editor_frame(&ctx, &mut app, base_input(), &mut time_s);
         let check_rect = find_text_rect_in_shapes(&shapes, "Auto-adapt canvas colors to theme")
-            .expect("Appearance checkbox label should be rendered on Appearance settings tab");
+            .expect("Appearance switch label should be rendered on Appearance settings tab");
         let off_color = sample_opaque_stroke_color(&app, stroke_id);
         assert!(
             (off_color.r - green.r).abs() < 0.02
                 && (off_color.g - green.g).abs() < 0.02
                 && (off_color.b - green.b).abs() < 0.02,
-            "when checkbox is OFF, ink must remain canonical green, got {:?}",
+            "when switch is OFF, ink must remain canonical green, got {:?}",
             off_color
         );
 
-        // Click checkbox ON -> adapts paper to dark and lifts green ink for high contrast.
+        // Click switch ON -> adapts paper to dark and lifts green ink for high contrast.
         let shapes_on = click_at(&ctx, &mut app, check_rect.center(), &mut time_s);
         assert!(app.session.prefs.auto_contrast_with_theme);
         assert_eq!(app.session.prefs.theme, UiTheme::Dark);
@@ -1481,10 +1983,10 @@ mod auto_contrast_ui_tests {
             papercraft_color::contrast_ratio(on_color, dark_bg)
         );
 
-        // Click checkbox OFF again -> immediately invalidates cache and restores canonical ink.
+        // Click switch OFF again -> immediately invalidates cache and restores canonical ink.
         let check_rect_on =
             find_text_rect_in_shapes(&shapes_on, "Auto-adapt canvas colors to theme")
-                .expect("Appearance checkbox label should remain visible after toggle");
+                .expect("Appearance switch label should remain visible after toggle");
         let _ = click_at(&ctx, &mut app, check_rect_on.center(), &mut time_s);
         assert!(!app.session.prefs.auto_contrast_with_theme);
         let restored = sample_opaque_stroke_color(&app, stroke_id);
@@ -1532,6 +2034,181 @@ mod auto_contrast_ui_tests {
         let shapes_back = click_at(&ctx, &mut app, pen_tab.center(), &mut time_s);
         assert_eq!(app.view.settings_tab, SettingsTab::Pen);
         assert!(find_text_rect_in_shapes(&shapes_back, "Stylus detection").is_some());
+    }
+
+    fn find_infinite_slider_tracks(shapes: &[egui::epaint::ClippedShape]) -> Vec<Rect> {
+        fn visit(shape: &Shape, out: &mut Vec<Rect>) {
+            match shape {
+                Shape::Mesh(mesh) if mesh.vertices.len() >= 20 => {
+                    let rect = mesh.calc_bounds();
+                    if (rect.height() - 10.0).abs() <= 1.5 && rect.width() >= 100.0 {
+                        out.push(rect);
+                    }
+                }
+                Shape::Vec(items) => {
+                    for s in items {
+                        visit(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for cs in shapes {
+            visit(&cs.shape, &mut out);
+        }
+        out.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        out
+    }
+
+    #[test]
+    fn infinite_theme_switch_and_sliders_tint_light_and_dark_ui_without_altering_document_colors() {
+        let ctx = egui::Context::default();
+        let mut app = PaperCraftApp::default();
+        app.view.screen = AppScreen::Editor;
+        app.view.motion.screen = motion::ScreenTransition::new(AppScreen::Editor);
+        app.view.inspector_open = true;
+        app.view.settings_tab = SettingsTab::Appearance;
+
+        let green_hex = "#1D7A46";
+        let green = Color::from_hex(green_hex).unwrap();
+        app.session
+            .execute("tool.select", &json!({ "tool": "FountainPen" }))
+            .unwrap();
+        app.session
+            .execute(
+                "pen.setSettings",
+                &json!({ "kind": "FountainPen", "color_hex": green_hex }),
+            )
+            .unwrap();
+        let draw_res = app
+            .session
+            .execute(
+                "stroke.draw",
+                &json!({
+                    "kind": "FountainPen",
+                    "points": [
+                        { "x": 120.0, "y": 140.0, "pressure": 1.0, "time_ms": 0.0 },
+                        { "x": 200.0, "y": 150.0, "pressure": 1.0, "time_ms": 16.0 },
+                        { "x": 280.0, "y": 160.0, "pressure": 1.0, "time_ms": 32.0 }
+                    ]
+                }),
+            )
+            .unwrap();
+        let stroke_id = papercraft_doc::StrokeId(draw_res["strokeId"].as_u64().unwrap());
+
+        let mut time_s = 1.0_f64;
+        let _ = run_editor_frame(&ctx, &mut app, base_input(), &mut time_s);
+        let shapes_off = run_editor_frame(&ctx, &mut app, base_input(), &mut time_s);
+
+        let dark_switch_r = find_text_rect_in_shapes(&shapes_off, "Dark")
+            .expect("Light/Dark switch should render Dark label");
+        let infinite_r = find_text_rect_in_shapes(&shapes_off, "Infinite theme")
+            .expect("Infinite theme switch should render on Appearance tab");
+        let auto_contrast_r =
+            find_text_rect_in_shapes(&shapes_off, "Auto-adapt canvas colors to theme")
+                .expect("Auto-adapt switch should render on Appearance tab");
+
+        assert!(
+            infinite_r.top() > dark_switch_r.bottom()
+                && infinite_r.bottom() < auto_contrast_r.top(),
+            "Infinite theme must appear below Light/Dark switch and above Auto-adapt switch"
+        );
+        assert!(find_text_rect_in_shapes(&shapes_off, "Hue").is_none());
+        assert!(find_text_rect_in_shapes(&shapes_off, "Saturation").is_none());
+        assert!(find_infinite_slider_tracks(&shapes_off).is_empty());
+
+        // Turn Infinite theme ON -> Hue and Saturation sliders appear above Auto-adapt.
+        let shapes_on = click_at(&ctx, &mut app, infinite_r.center(), &mut time_s);
+        assert!(app.session.prefs.infinite_theme.enabled);
+        let hue_r = find_text_rect_in_shapes(&shapes_on, "Hue").expect("Hue label visible");
+        let sat_r =
+            find_text_rect_in_shapes(&shapes_on, "Saturation").expect("Saturation label visible");
+        let auto_after_r =
+            find_text_rect_in_shapes(&shapes_on, "Auto-adapt canvas colors to theme")
+                .expect("Auto-adapt switch still visible");
+        assert!(hue_r.top() > infinite_r.bottom() && sat_r.bottom() < auto_after_r.top());
+
+        let tracks = find_infinite_slider_tracks(&shapes_on);
+        assert_eq!(tracks.len(), 2, "expected Hue and Saturation slider tracks");
+        let hue_track = tracks[0];
+        let sat_track = tracks[1];
+        assert!(sat_track.top() > hue_track.bottom());
+
+        // Click Hue at ~65% (~234°) and Saturation at ~80% (~200%).
+        let hue_click = Pos2::new(
+            hue_track.left() + hue_track.width() * 0.65,
+            hue_track.center().y,
+        );
+        let shapes_hue = click_at(&ctx, &mut app, hue_click, &mut time_s);
+        assert!(app.session.prefs.infinite_theme.hue_degrees > 180.0);
+
+        let sat_track_after = find_infinite_slider_tracks(&shapes_hue)[1];
+        let sat_click = Pos2::new(
+            sat_track_after.left() + sat_track_after.width() * 0.80,
+            sat_track_after.center().y,
+        );
+        let shapes_sat = click_at(&ctx, &mut app, sat_click, &mut time_s);
+        assert!(app.session.prefs.infinite_theme.saturation_percent > 150.0);
+
+        let dark_tokens = Tokens::for_prefs(&app.session.prefs);
+        assert_ne!(dark_tokens.accent, Tokens::dark().accent);
+        assert_eq!(
+            ctx.style_of(egui::Theme::Dark)
+                .visuals
+                .selection
+                .stroke
+                .color,
+            dark_tokens.accent
+        );
+
+        // Switch to Light theme -> Infinite tint remains active and shifts Light UI too.
+        let light_btn = find_text_rect_in_shapes(&shapes_sat, "Light").expect("Light theme button");
+        let shapes_light = click_at(&ctx, &mut app, light_btn.center(), &mut time_s);
+        assert_eq!(app.session.prefs.theme, UiTheme::Light);
+        assert!(app.session.prefs.infinite_theme.enabled);
+        let light_tokens = Tokens::for_prefs(&app.session.prefs);
+        assert_ne!(light_tokens.header_bg, Tokens::light().header_bg);
+        assert_ne!(light_tokens.accent, Tokens::light().accent);
+
+        // Document stroke and paper remain 100% untouched by Infinite theme!
+        let stroke_col = sample_opaque_stroke_color(&app, stroke_id);
+        assert!(
+            (stroke_col.r - green.r).abs() < 0.02
+                && (stroke_col.g - green.g).abs() < 0.02
+                && (stroke_col.b - green.b).abs() < 0.02,
+            "document ink must stay canonical green with Infinite theme active, got {stroke_col:?}"
+        );
+        assert_eq!(
+            app.session
+                .doc
+                .paper_color
+                .resolved_colors(
+                    app.session.prefs.theme,
+                    app.session.prefs.auto_contrast_with_theme
+                )
+                .background,
+            app.session.doc.paper_color.background_color()
+        );
+
+        // Click Reset -> restores 0° and 100%.
+        let reset_r = find_text_rect_in_shapes(&shapes_light, "Reset")
+            .expect("Reset button inside Infinite panel");
+        let shapes_reset = click_at(&ctx, &mut app, reset_r.center(), &mut time_s);
+        assert!((app.session.prefs.infinite_theme.hue_degrees - 0.0).abs() < 0.5);
+        assert!((app.session.prefs.infinite_theme.saturation_percent - 100.0).abs() < 0.5);
+        assert_eq!(
+            Tokens::for_prefs(&app.session.prefs).header_bg,
+            Tokens::light().header_bg
+        );
+
+        // Toggle Infinite theme OFF -> hides sliders cleanly.
+        let inf_off_r = find_text_rect_in_shapes(&shapes_reset, "Infinite theme")
+            .expect("Infinite theme switch");
+        let shapes_closed = click_at(&ctx, &mut app, inf_off_r.center(), &mut time_s);
+        assert!(!app.session.prefs.infinite_theme.enabled);
+        assert!(find_text_rect_in_shapes(&shapes_closed, "Hue").is_none());
+        assert!(find_text_rect_in_shapes(&shapes_closed, "Saturation").is_none());
     }
 }
 
@@ -1649,6 +2326,9 @@ mod tests {
         assert!(sys_texts.contains("IndexedDB (Best-effort)"));
         assert!(sys_texts.contains("Storage Used"));
         assert!(sys_texts.contains("12.0 MB / 4.0 GB"));
+        assert!(sys_texts.contains(
+            "The 4.0 GB limit is the maximum space your browser allows for local notebooks when running locally in the browser."
+        ));
 
         app.web_storage_status = Some(crate::WebStorageStatus {
             backend: crate::WebStorageBackend::IndexedDb,
@@ -1666,7 +2346,51 @@ mod tests {
         let (_, persisted_texts) = render_inspector_tab(&mut app, SettingsTab::System);
         assert!(persisted_texts.contains("IndexedDB (Persistent)"));
         assert!(persisted_texts.contains("250.0 KB / 2.0 GB"));
+        assert!(persisted_texts.contains(
+            "The 2.0 GB limit is the maximum space your browser allows for local notebooks when running locally in the browser."
+        ));
         assert!(persisted_texts.contains("Storage error: QuotaExceededError"));
+    }
+
+    #[test]
+    fn web_storage_quota_explanation_and_tooltip_describe_browser_limit() {
+        let idb = crate::WebStorageStatus {
+            backend: crate::WebStorageBackend::IndexedDb,
+            persisted: Some(false),
+            usage_bytes: Some(30 * 1024 * 1024),
+            quota_bytes: Some(10 * 1024 * 1024 * 1024),
+            in_flight: false,
+            has_unsaved_error: false,
+            quota_exceeded: false,
+            last_error: None,
+            other_tab_active: false,
+            cross_tab_syncing: false,
+            cross_tab_error: None,
+        };
+        let (usage, tip) = web_storage_usage_row(&idb).expect("usage row");
+        assert!(usage.contains("10.0 GB"));
+        let tip = tip.expect("usage tooltip");
+        assert!(tip.contains("estimated free space remaining."));
+        assert!(tip.contains("The 10.0 GB limit is the maximum space your browser allows"));
+
+        let fallback = crate::WebStorageStatus {
+            backend: crate::WebStorageBackend::LocalStorageFallback,
+            quota_bytes: None,
+            ..idb.clone()
+        };
+        assert!(
+            web_storage_quota_explanation(&fallback)
+                .expect("fallback explanation")
+                .contains("~5 MB")
+        );
+
+        let memory = crate::WebStorageStatus {
+            backend: crate::WebStorageBackend::MemoryOnly,
+            usage_bytes: None,
+            quota_bytes: None,
+            ..idb
+        };
+        assert!(web_storage_quota_explanation(&memory).is_none());
     }
 
     #[test]
@@ -1676,6 +2400,9 @@ mod tests {
         assert!(app_texts.contains("Appearance"));
         assert!(app_texts.contains("Light"));
         assert!(app_texts.contains("Dark"));
+        assert!(app_texts.contains("Infinite theme"));
+        assert!(!app_texts.contains("Hue"));
+        assert!(!app_texts.contains("Saturation"));
         assert!(app_texts.contains("Auto-adapt canvas colors to theme"));
         assert!(app_texts.contains("App Scale"));
         assert!(app_texts.contains("100%"));
@@ -1691,7 +2418,7 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn app_updates_checkbox_persists_auto_check_preference() {
+    fn app_updates_switch_persists_auto_check_preference() {
         let ctx = egui::Context::default();
         let mut app = PaperCraftApp::default();
         app.view.screen = crate::AppScreen::Editor;
@@ -1717,7 +2444,7 @@ mod tests {
             &shapes,
             "Check for updates automatically on startup",
         )
-        .expect("Auto-check updates checkbox should render");
+        .expect("Auto-check updates switch should render");
         let _ = auto_contrast_ui_tests::click_at(&ctx, &mut app, check_rect.center(), &mut time_s);
         assert!(!app.session.prefs.auto_check_updates);
     }
@@ -2017,7 +2744,7 @@ mod tests {
         );
         let check_rect =
             auto_contrast_ui_tests::find_text_rect_in_shapes(&shapes, "Draw with stylus only")
-                .expect("Draw with stylus only checkbox should render on Pen tab");
+                .expect("Draw with stylus only switch should render on Pen tab");
 
         let shapes_on =
             auto_contrast_ui_tests::click_at(&ctx, &mut app, check_rect.center(), &mut time_s);
@@ -2025,7 +2752,7 @@ mod tests {
 
         let check_rect_on =
             auto_contrast_ui_tests::find_text_rect_in_shapes(&shapes_on, "Draw with stylus only")
-                .expect("Draw with stylus only checkbox should remain visible when enabled");
+                .expect("Draw with stylus only switch should remain visible when enabled");
         let _ =
             auto_contrast_ui_tests::click_at(&ctx, &mut app, check_rect_on.center(), &mut time_s);
         assert!(!app.session.prefs.stylus_only_drawing);

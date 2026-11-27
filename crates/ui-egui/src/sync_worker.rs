@@ -559,7 +559,7 @@ pub(crate) fn finish_workspace_switch(app: &mut PaperCraftApp, ctx: &egui::Conte
     app.view.library_tag_filter = None;
     app.mesh_cache.clear();
     app.image_textures.clear();
-    crate::theme::apply_visuals(ctx, app.session.prefs.theme);
+    crate::theme::apply_prefs_visuals(ctx, &app.session.prefs);
     crate::sync_view_to_active_notebook(app);
     app.flush_web_storage(true);
 }
@@ -753,6 +753,7 @@ pub(crate) fn poll_and_tick(app: &mut PaperCraftApp, ctx: &egui::Context, now_ui
     }
     if can_mutate_docs && let Some(outcome) = app.sync_worker.pending_outcome.take() {
         let prev_theme = app.session.prefs.theme;
+        let prev_infinite = app.session.prefs.infinite_theme;
         let prev_active_title = app.session.doc.title.clone();
         let prev_active_cover = app.session.doc.cover;
         let prev_rev = app.session.revision;
@@ -772,8 +773,10 @@ pub(crate) fn poll_and_tick(app: &mut PaperCraftApp, ctx: &egui::Context, now_ui
                 app.flush_web_storage(true);
             }
             crate::tab_strip::sync_open_tabs(app);
-            if app.session.prefs.theme != prev_theme {
-                crate::theme::apply_visuals(ctx, app.session.prefs.theme);
+            if app.session.prefs.theme != prev_theme
+                || app.session.prefs.infinite_theme != prev_infinite
+            {
+                crate::theme::apply_prefs_visuals(ctx, &app.session.prefs);
             }
             if app.session.doc.title != prev_active_title
                 || app.session.doc.cover != prev_active_cover

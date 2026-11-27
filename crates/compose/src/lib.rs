@@ -12,6 +12,7 @@
 
 pub mod export;
 pub mod pdf;
+mod pdf_metadata;
 mod pdf_passthrough;
 
 pub use export::{

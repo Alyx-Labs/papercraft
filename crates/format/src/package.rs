@@ -135,6 +135,7 @@ pub fn load_package_bytes(bytes: &[u8]) -> Result<WorkspacePackage, FormatError>
     let prefs_bytes = reader.read_len_bytes(MAX_PREFS_JSON_BYTES)?;
     let mut prefs: UserStudioConfig = serde_json::from_slice(prefs_bytes)?;
     prefs.ui_scale = UserStudioConfig::sanitize_ui_scale(prefs.ui_scale);
+    prefs.infinite_theme = prefs.infinite_theme.sanitized();
 
     let nb_count = reader.read_count(MAX_PACKAGE_NOTEBOOKS, "notebooks")?;
     let mut notebooks = Vec::with_capacity(nb_count.min(256));

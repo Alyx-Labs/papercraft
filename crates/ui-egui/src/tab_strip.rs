@@ -179,7 +179,7 @@ fn apply_action(app: &mut PaperCraftApp, action: TabAction) {
 /// Renders the tab strip as a top panel and applies any tab interaction.
 pub(crate) fn show(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> TabStripOutput {
     sync_open_tabs(app);
-    let t = Tokens::for_theme(app.session.prefs.theme);
+    let t = Tokens::for_prefs(&app.session.prefs);
     let frame = egui::Frame::new()
         .fill(t.tab_strip_bg)
         .inner_margin(egui::Margin {
@@ -309,11 +309,7 @@ fn draw_home_tab(
     );
     paint_tab_chrome(ui.painter(), home_rect, on_home, home_hover_t, t);
     let home_fg = if on_home {
-        if t.is_dark {
-            t.accent
-        } else {
-            t.header_active_bg
-        }
+        if t.is_dark { t.accent } else { t.header_fg }
     } else {
         crate::motion::lerp_color(t.tab_strip_fg_muted, t.tab_strip_fg, home_hover_t)
     };

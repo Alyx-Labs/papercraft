@@ -6,7 +6,9 @@ use papercraft_updater::{
 };
 
 use crate::controller::ServerController;
-use crate::icons::{Icon, icon_button, icon_button_width, paint_icon, toggle_switch_row};
+use crate::icons::{
+    Icon, icon_button, icon_button_width, paint_icon, toggle_switch_row, toggle_switch_row_enabled,
+};
 use crate::settings::{
     MAX_ACCESS_TTL_HOURS, MAX_MAX_NOTEBOOK_MB, MAX_REFRESH_TTL_DAYS, MIN_ACCESS_TTL_HOURS,
     MIN_MAX_NOTEBOOK_MB, MIN_REFRESH_TTL_DAYS,
@@ -265,7 +267,7 @@ fn render_startup_panel(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &Toke
         ui.add(
             egui::Label::new(
                 egui::RichText::new(
-                    "Hides this window on manual launches too; sign-in launches use the checkbox below.",
+                    "Hides this window on manual launches too; sign-in launches use the switch below.",
                 )
                 .size(11.0)
                 .color(t.text_muted),
@@ -350,30 +352,27 @@ fn render_autostart_section(ctrl: &mut ServerController, ui: &mut egui::Ui, t: &
 
     ui.add_space(8.0);
     let autostart_enabled = ctrl.draft_settings.launch_at_login;
-    let title_color = if autostart_enabled {
-        t.text
-    } else {
-        t.text_muted
-    };
     ui.indent("srv_autostart_window_indent", |ui| {
-        ui.add_enabled_ui(autostart_enabled, |ui| {
-            ui.checkbox(
-                &mut ctrl.draft_settings.open_window_at_login,
-                egui::RichText::new("Open control window at system startup")
-                    .size(12.0)
-                    .color(title_color),
-            );
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(
-                        "Leave unchecked to keep PaperCraft Server hidden in the system tray when your computer starts. Open it anytime from the tray icon.",
-                    )
-                    .size(11.0)
-                    .color(t.text_muted),
+        toggle_switch_row_enabled(
+            ui,
+            "srv_autostart_window_switch",
+            "Open control window at system startup",
+            "Open the PaperCraft Server control window automatically when you sign in instead of keeping it hidden in the system tray.",
+            &mut ctrl.draft_settings.open_window_at_login,
+            autostart_enabled,
+            t,
+        );
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "Leave off to keep PaperCraft Server hidden in the system tray when your computer starts. Open it anytime from the tray icon.",
                 )
-                .wrap(),
-            );
-        });
+                .size(11.0)
+                .color(t.text_muted),
+            )
+            .wrap(),
+        );
     });
 }
 
@@ -441,12 +440,15 @@ fn render_updates_panel(
         draw_hairline(ui, t);
         ui.add_space(10.0);
 
-        ui.checkbox(
+        toggle_switch_row(
+            ui,
+            "srv_auto_check_updates_switch",
+            "Check for updates automatically on startup",
+            "Quietly check GitHub Releases for new versions when PaperCraft Server starts.",
             &mut ctrl.draft_settings.auto_check_updates,
-            egui::RichText::new("Check for updates automatically on startup")
-                .size(12.0)
-                .color(t.text),
+            t,
         );
+        ui.add_space(2.0);
         ui.add(
             egui::Label::new(
                 egui::RichText::new(

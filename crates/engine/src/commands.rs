@@ -468,8 +468,8 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "theme.set",
-        label: "Set UI Theme, Scale & Contrast",
-        description: "Switch between Light and Dark studio themes, adjust interface scale, or toggle automatic canvas color contrast",
+        label: "Set UI Theme, Infinite Tint, Scale & Contrast",
+        description: "Switch between Light and Dark studio themes, configure Infinite theme hue/saturation, adjust interface scale, or toggle automatic canvas color contrast",
     },
     CommandSpec {
         id: "stylus.setButtons",
@@ -943,6 +943,10 @@ struct SetThemeParams {
     theme: Option<UiTheme>,
     auto_contrast_with_theme: Option<bool>,
     ui_scale: Option<f32>,
+    infinite_enabled: Option<bool>,
+    infinite_hue: Option<f32>,
+    infinite_saturation: Option<f32>,
+    persist: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]
@@ -1368,19 +1372,28 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
         _ => return Err(EngineError::UnknownCommand(id.to_string())),
     };
     if result.is_ok() {
-        if id.starts_with("palette.")
-            || id.starts_with("preset.")
-            || id == "element.save"
-            || id == "element.delete"
-            || id == "styleFavorite.save"
-            || id == "styleFavorite.delete"
-            || id == "theme.set"
-            || id == "stylus.setButtons"
-            || id == "stylus.setInputMode"
-            || id == "updates.setAutoCheck"
-            || id == "updates.setDesktopShortcut"
-            || id.starts_with("library.")
-            || id.starts_with("template.")
+        let mark_dirty = if id == "theme.set" {
+            params
+                .get("persist")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        } else {
+            true
+        };
+        if mark_dirty
+            && (id.starts_with("palette.")
+                || id.starts_with("preset.")
+                || id == "element.save"
+                || id == "element.delete"
+                || id == "styleFavorite.save"
+                || id == "styleFavorite.delete"
+                || id == "theme.set"
+                || id == "stylus.setButtons"
+                || id == "stylus.setInputMode"
+                || id == "updates.setAutoCheck"
+                || id == "updates.setDesktopShortcut"
+                || id.starts_with("library.")
+                || id.starts_with("template."))
         {
             session.sync_mark_prefs_dirty();
         }
@@ -6204,16 +6217,32 @@ fn cmd_preset_delete(
 
 fn cmd_theme_set(session: &mut Session, id: &str, params: &Value) -> Result<Value, EngineError> {
     let p: SetThemeParams = parse_params(id, params)?;
-    if p.theme.is_none() && p.auto_contrast_with_theme.is_none() && p.ui_scale.is_none() {
+    if p.theme.is_none()
+        && p.auto_contrast_with_theme.is_none()
+        && p.ui_scale.is_none()
+        && p.infinite_enabled.is_none()
+        && p.infinite_hue.is_none()
+        && p.infinite_saturation.is_none()
+    {
         return Err(invalid(
             id,
-            "requires at least one of `theme`, `auto_contrast_with_theme`, or `ui_scale`",
+            "requires at least one of `theme`, `auto_contrast_with_theme`, `ui_scale`, `infinite_enabled`, `infinite_hue`, or `infinite_saturation`",
         ));
     }
     if let Some(raw_scale) = p.ui_scale
         && !raw_scale.is_finite()
     {
         return Err(invalid(id, "ui_scale must be a finite number"));
+    }
+    if let Some(raw_hue) = p.infinite_hue
+        && !raw_hue.is_finite()
+    {
+        return Err(invalid(id, "infinite_hue must be a finite number"));
+    }
+    if let Some(raw_sat) = p.infinite_saturation
+        && !raw_sat.is_finite()
+    {
+        return Err(invalid(id, "infinite_saturation must be a finite number"));
     }
     if let Some(theme) = p.theme {
         session.prefs.theme = theme;
@@ -6224,12 +6253,26 @@ fn cmd_theme_set(session: &mut Session, id: &str, params: &Value) -> Result<Valu
     if let Some(raw_scale) = p.ui_scale {
         session.prefs.ui_scale = papercraft_doc::UserStudioConfig::sanitize_ui_scale(raw_scale);
     }
-    let _ = session.save_prefs();
-    session.bump_revision();
+    if let Some(enabled) = p.infinite_enabled {
+        session.prefs.infinite_theme.enabled = enabled;
+    }
+    if let Some(raw_hue) = p.infinite_hue {
+        session.prefs.infinite_theme.hue_degrees =
+            papercraft_doc::InfiniteThemeConfig::sanitize_hue_degrees(raw_hue);
+    }
+    if let Some(raw_sat) = p.infinite_saturation {
+        session.prefs.infinite_theme.saturation_percent =
+            papercraft_doc::InfiniteThemeConfig::sanitize_saturation_percent(raw_sat);
+    }
+    if p.persist.unwrap_or(true) {
+        let _ = session.save_prefs();
+        session.bump_revision();
+    }
     Ok(json!({
         "theme": session.prefs.theme,
         "auto_contrast_with_theme": session.prefs.auto_contrast_with_theme,
         "ui_scale": session.prefs.ui_scale,
+        "infinite_theme": session.prefs.infinite_theme,
     }))
 }
 
