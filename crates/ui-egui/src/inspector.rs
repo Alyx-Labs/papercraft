@@ -1095,59 +1095,7 @@ fn draw_system_info_card(app: &PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     });
 }
 
-pub(crate) fn draw_home_drawer_mode_switch(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
-    let options = [
-        SwitchOption::new(
-            Some(Icon::Account),
-            Some("Profile"),
-            "Accounts, server sign-in, profile details, and backups",
-            true,
-        ),
-        SwitchOption::new(
-            Some(Icon::Settings),
-            Some("Settings"),
-            "Studio appearance, app scale, system info, and stylus settings",
-            true,
-        ),
-    ];
-    let active = match app.view.right_drawer_mode {
-        crate::RightDrawerMode::Profile => 0,
-        crate::RightDrawerMode::Settings => 1,
-    };
-    let (clicked, _) = segmented_switch(
-        ui,
-        "inspector_home_drawer_mode_switch",
-        &options,
-        Some(active),
-        SwitchLayout::EqualWidth,
-        t,
-    );
-    if let Some(idx) = clicked {
-        let next = if idx == 0 {
-            crate::RightDrawerMode::Profile
-        } else {
-            crate::RightDrawerMode::Settings
-        };
-        if app.view.right_drawer_mode != next {
-            app.view.right_drawer_mode = next;
-            if next == crate::RightDrawerMode::Profile {
-                crate::prepare_profile_drawer(app);
-            } else if app.view.screen == crate::AppScreen::Home
-                && app.view.settings_tab == SettingsTab::Pen
-            {
-                app.view.settings_tab = SettingsTab::Appearance;
-            }
-        }
-    }
-}
-
-fn draw_settings_header(
-    app: &mut PaperCraftApp,
-    ui: &mut egui::Ui,
-    kind: PenKind,
-    is_home: bool,
-    t: &Tokens,
-) {
+fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, kind: PenKind, t: &Tokens) {
     let header_w = ui.available_width();
     ui.horizontal(|ui| {
         ui.set_height(28.0);
@@ -1190,10 +1138,6 @@ fn draw_settings_header(
         )
         .wrap(),
     );
-    if is_home {
-        ui.add_space(6.0);
-        draw_home_drawer_mode_switch(app, ui, t);
-    }
     ui.add_space(6.0);
 
     let system_tip = if cfg!(target_arch = "wasm32") {
@@ -1310,71 +1254,57 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
     )
     .show_collapsible(ui, &mut panel_open, |ui| {
         ui.multiply_opacity(content_opacity);
-        let is_home = app.view.screen == crate::AppScreen::Home;
-        let effective_mode = if is_home {
-            app.view.right_drawer_mode
-        } else {
-            crate::RightDrawerMode::Settings
-        };
+        if app.view.screen == crate::AppScreen::Home {
+            crate::profile_drawer::show_drawer_contents(app, ui, &t);
+            return;
+        }
+
         let dt = ui.ctx().input(|i| i.stable_dt);
-        if app.view.motion.drawer_mode.advance(effective_mode, dt) {
+        let kind = app.session.active_pen_kind();
+        draw_settings_header(app, ui, kind, &t);
+        ui.separator();
+
+        if app
+            .view
+            .motion
+            .settings_tab
+            .advance(app.view.settings_tab, dt)
+        {
             ui.ctx().request_repaint();
         }
-        let mode_opacity = app.view.motion.drawer_mode.opacity();
+        let tab_opacity = app.view.motion.settings_tab.opacity();
 
-        ui.scope(|ui| {
-            ui.multiply_opacity(mode_opacity);
-            if effective_mode == crate::RightDrawerMode::Profile {
-                crate::profile_drawer::show_drawer_contents(app, ui, is_home, &t);
-                return;
-            }
-
-            let kind = app.session.active_pen_kind();
-            draw_settings_header(app, ui, kind, is_home, &t);
-            ui.separator();
-
-            if app
-                .view
-                .motion
-                .settings_tab
-                .advance(app.view.settings_tab, dt)
-            {
-                ui.ctx().request_repaint();
-            }
-            let tab_opacity = app.view.motion.settings_tab.opacity();
-
-            egui::ScrollArea::vertical()
-                .id_salt("papercraft_inspector_settings_scroll")
-                .show(ui, |ui| {
-                    ui.scope(|ui| {
-                        ui.multiply_opacity(tab_opacity);
-                        match app.view.settings_tab {
-                            SettingsTab::Pen => {
-                                draw_touch_and_palm_card(app, ui, &t);
-                                ui.add_space(8.0);
-                                if app.is_stylus_connected() {
-                                    draw_stylus_shortcuts_card(app, ui, &t);
-                                } else {
-                                    draw_stylus_disconnected_card(ui, &t);
-                                }
-                            }
-                            SettingsTab::Appearance => {
-                                draw_appearance_card(app, ui, &t);
-                                ui.add_space(8.0);
-                                draw_app_scale_card(app, ui, &t);
-                            }
-                            SettingsTab::System => {
-                                draw_system_info_card(app, ui, &t);
-                                #[cfg(not(target_arch = "wasm32"))]
-                                {
-                                    ui.add_space(8.0);
-                                    draw_app_updates_card(app, ui, &t);
-                                }
+        egui::ScrollArea::vertical()
+            .id_salt("papercraft_inspector_settings_scroll")
+            .show(ui, |ui| {
+                ui.scope(|ui| {
+                    ui.multiply_opacity(tab_opacity);
+                    match app.view.settings_tab {
+                        SettingsTab::Pen => {
+                            draw_touch_and_palm_card(app, ui, &t);
+                            ui.add_space(8.0);
+                            if app.is_stylus_connected() {
+                                draw_stylus_shortcuts_card(app, ui, &t);
+                            } else {
+                                draw_stylus_disconnected_card(ui, &t);
                             }
                         }
-                    });
+                        SettingsTab::Appearance => {
+                            draw_appearance_card(app, ui, &t);
+                            ui.add_space(8.0);
+                            draw_app_scale_card(app, ui, &t);
+                        }
+                        SettingsTab::System => {
+                            draw_system_info_card(app, ui, &t);
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                ui.add_space(8.0);
+                                draw_app_updates_card(app, ui, &t);
+                            }
+                        }
+                    }
                 });
-        });
+            });
     })
     .map_or(Rect::NOTHING, |resp| resp.response.rect);
     if panel_open != prev_open {
@@ -1633,6 +1563,7 @@ mod tests {
     }
 
     fn render_inspector_tab(app: &mut PaperCraftApp, tab: SettingsTab) -> (Rect, String) {
+        app.view.screen = crate::AppScreen::Editor;
         app.view.inspector_open = true;
         app.view.settings_tab = tab;
         let ctx = egui::Context::default();
@@ -1807,6 +1738,7 @@ mod tests {
     #[test]
     fn settings_header_has_pen_appearance_and_system_tabs_on_single_row() {
         let mut app = PaperCraftApp::default();
+        app.view.screen = crate::AppScreen::Editor;
         app.view.inspector_open = true;
         let ctx = egui::Context::default();
         let mut shapes = Vec::new();
@@ -1839,6 +1771,7 @@ mod tests {
     #[test]
     fn app_scale_presets_and_reset_update_session_scale() {
         let mut app = PaperCraftApp::default();
+        app.view.screen = crate::AppScreen::Editor;
         app.view.inspector_open = true;
         app.view.settings_tab = SettingsTab::Appearance;
         let ctx = egui::Context::default();
@@ -2292,5 +2225,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn home_renders_profile_sync_only_and_editor_renders_settings_only() {
+        let mut app = PaperCraftApp::default();
+        app.view.inspector_open = true;
+        let ctx = egui::Context::default();
+
+        let render_once = |ctx: &egui::Context, app: &mut PaperCraftApp, time: f64| -> String {
+            let mut texts = String::new();
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1280.0, 800.0),
+                )),
+                time: Some(time),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                crate::theme::apply_light_visuals(ui.ctx());
+                let _ = show_inner(app, ui);
+            });
+            texts.push_str(&collect_text_shapes(&out.shapes));
+            out.drop_without_applying_deltas();
+            texts
+        };
+
+        // On Home, right drawer always shows Profile & Sync with no Settings switch.
+        app.view.screen = crate::AppScreen::Home;
+        let _ = render_once(&ctx, &mut app, 0.02);
+        let home_texts = render_once(&ctx, &mut app, 0.25);
+        assert!(home_texts.contains("Profile & Sync"), "{home_texts}");
+        assert!(!home_texts.lines().any(|line| line == "Settings"));
+        assert!(!home_texts.contains("App Scale"));
+        assert!(!home_texts.contains("Stylus detection"));
+
+        // Inside a notebook (Editor), right drawer shows Settings and never Profile & Sync.
+        app.view.screen = crate::AppScreen::Editor;
+        let _ = render_once(&ctx, &mut app, 0.30);
+        let editor_texts = render_once(&ctx, &mut app, 0.50);
+        assert!(editor_texts.lines().any(|line| line == "Settings"));
+        assert!(editor_texts.lines().any(|line| line == "Pen"));
+        assert!(editor_texts.lines().any(|line| line == "Appearance"));
+        assert!(editor_texts.lines().any(|line| line == "System"));
+        assert!(!editor_texts.contains("Profile & Sync"));
     }
 }

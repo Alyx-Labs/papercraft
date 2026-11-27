@@ -77,14 +77,6 @@ pub enum AppScreen {
     Editor,
 }
 
-/// Top-level mode shown inside the right-hand side drawer on Home.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RightDrawerMode {
-    Profile,
-    #[default]
-    Settings,
-}
-
 /// Active section tab inside the right-hand Settings studio drawer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SettingsTab {
@@ -284,7 +276,6 @@ pub struct PdfExportProgressView {
 #[derive(Clone, Debug)]
 pub struct ViewState {
     pub screen: AppScreen,
-    pub right_drawer_mode: RightDrawerMode,
     pub open_tabs: Vec<tab_strip::OpenTab>,
     pub library_search: String,
     pub library_show_trash: bool,
@@ -476,7 +467,6 @@ impl Default for ViewState {
         let default_preset = papercraft_doc::NotebookPreset::EverydayLined;
         Self {
             screen: AppScreen::Home,
-            right_drawer_mode: RightDrawerMode::Settings,
             open_tabs: Vec::new(),
             library_search: String::new(),
             library_show_trash: false,
@@ -2576,8 +2566,6 @@ impl PaperCraftApp {
     fn detect_home_shortcut(&self, i: &egui::InputState) -> Option<KeyboardShortcutAction> {
         if i.modifiers.command && i.key_pressed(egui::Key::N) {
             Some(KeyboardShortcutAction::HomeNewNotebook)
-        } else if i.key_pressed(egui::Key::S) && !i.modifiers.command {
-            Some(KeyboardShortcutAction::HomeToggleSettings)
         } else if i.key_pressed(egui::Key::Escape) && !self.view.library_search.is_empty() {
             Some(KeyboardShortcutAction::HomeClearSearch)
         } else {
@@ -2595,7 +2583,6 @@ impl PaperCraftApp {
         if self.view.screen == AppScreen::Home {
             if i.key_pressed(egui::Key::Escape)
                 && self.view.inspector_open
-                && self.view.right_drawer_mode == RightDrawerMode::Profile
                 && (self.view.account.pending_delete_profile_id.is_some()
                     || self.view.account.pending_forget_server_key.is_some())
             {
@@ -2702,17 +2689,6 @@ impl PaperCraftApp {
             }
             KeyboardShortcutAction::HomeNewNotebook => {
                 modal::open(self, modal::ActiveModal::NewNotebook);
-            }
-            KeyboardShortcutAction::HomeToggleSettings => {
-                if self.view.inspector_open
-                    && self.view.right_drawer_mode == RightDrawerMode::Settings
-                {
-                    self.view.inspector_open = false;
-                } else {
-                    self.view.right_drawer_mode = RightDrawerMode::Settings;
-                    self.view.settings_tab = SettingsTab::Appearance;
-                    self.view.inspector_open = true;
-                }
             }
             KeyboardShortcutAction::HomeClearPendingAccountConfirm => {
                 self.view.account.clear_pending_delete_profile();
@@ -2840,7 +2816,6 @@ impl PaperCraftApp {
 enum KeyboardShortcutAction {
     OpenNotebookDialog,
     HomeNewNotebook,
-    HomeToggleSettings,
     HomeClearPendingAccountConfirm,
     HomeClearSearch,
     EditorEscape,
@@ -4394,8 +4369,21 @@ pub(crate) fn prepare_profile_drawer(app: &mut PaperCraftApp) {
 
 pub(crate) fn open_profile_drawer(app: &mut PaperCraftApp) {
     prepare_profile_drawer(app);
-    app.view.right_drawer_mode = RightDrawerMode::Profile;
     app.view.inspector_open = true;
+}
+
+/// Closes any open account modal, opens Home's Profile drawer, and lands directly on the Sync tab.
+pub(crate) fn open_profile_sync_drawer(app: &mut PaperCraftApp) {
+    crate::modal::close(app);
+    if app.view.screen != AppScreen::Home {
+        return_to_home(app);
+    }
+    open_profile_drawer(app);
+    app.view.account.profile_section = account_modal::ProfileSection::Sync;
+    app.view
+        .motion
+        .profile_section
+        .sync((app.session.is_signed_in(), 2), 2);
 }
 
 /// Standardized width shared by the left navigation sidebars (Library and Pages)
@@ -4715,7 +4703,7 @@ mod tests {
             });
             out.drop_without_applying_deltas();
         }
-        // Verify right Settings drawer width on Home separately via direct panel render at 1280x800.
+        // Verify right Profile drawer width on Home separately via direct panel render at 1280x800.
         let right_ctx = egui::Context::default();
         for f in 0..3 {
             let raw = egui::RawInput {
@@ -5514,7 +5502,7 @@ mod tests {
     }
 
     #[test]
-    fn app_scale_syncs_bidirectionally_with_ctrl_zoom_shortcuts_and_home_settings() {
+    fn app_scale_syncs_bidirectionally_with_ctrl_zoom_shortcuts_and_editor_settings() {
         let mut app = PaperCraftApp::default();
         app.session
             .execute("theme.set", &json!({ "ui_scale": 1.25 }))
@@ -5564,7 +5552,7 @@ mod tests {
         run_step(&ctx, &mut app, 0.04, Vec::new());
         assert!((ctx.zoom_factor() - 1.25).abs() < 1e-4);
 
-        // Pressing S on Home opens Settings sidebar on Appearance showing live scale (125%).
+        // Pressing S on Home does not open Settings (Settings is Editor-only).
         run_step(
             &ctx,
             &mut app,
@@ -5577,11 +5565,29 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             }],
         );
+        assert!(!app.view.inspector_open);
+
+        // Opening a notebook in Editor lets S open Settings, where Appearance shows live scale (125%).
+        open_notebook_in_editor(&mut app, 0);
+        app.view.motion.screen = motion::ScreenTransition::new(AppScreen::Editor);
+        run_step(&ctx, &mut app, 0.08, Vec::new());
+        run_step(
+            &ctx,
+            &mut app,
+            0.10,
+            vec![egui::Event::Key {
+                key: egui::Key::S,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
         assert!(app.view.inspector_open);
-        assert_eq!(app.view.settings_tab, SettingsTab::Appearance);
-        let home_texts = run_step(&ctx, &mut app, 0.25, Vec::new());
-        assert!(home_texts.contains("App Scale"));
-        assert!(home_texts.contains("125%"));
+        app.view.settings_tab = SettingsTab::Appearance;
+        let editor_texts = run_step(&ctx, &mut app, 0.25, Vec::new());
+        assert!(editor_texts.contains("App Scale"));
+        assert!(editor_texts.contains("125%"));
 
         // Ctrl + = increases zoom via egui's built-in shortcut and syncs back into prefs & sidebar UI.
         run_step(

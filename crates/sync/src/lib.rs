@@ -263,4 +263,20 @@ mod tests {
             "unexpected leftover temp files: {leftovers:?}"
         );
     }
+
+    #[test]
+    fn server_configured_defaults_false_and_infers_legacy_custom_or_linked_state() {
+        let dir = temp_dir("server_configured_flag");
+        let default_only = GlobalSyncState::with_defaults("Desk".to_string());
+        assert!(!default_only.server_configured);
+        save_global_state(&dir.0, &default_only).unwrap();
+        let reloaded_default = load_global_state(&dir.0);
+        assert!(!reloaded_default.server_configured);
+
+        let mut custom_url = GlobalSyncState::with_defaults("Desk".to_string());
+        custom_url.server_url = "http://100.64.0.5:8787".to_string();
+        save_global_state(&dir.0, &custom_url).unwrap();
+        let reloaded_custom = load_global_state(&dir.0);
+        assert!(reloaded_custom.server_configured);
+    }
 }

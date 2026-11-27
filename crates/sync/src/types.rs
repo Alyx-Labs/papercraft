@@ -129,6 +129,8 @@ pub enum ActiveWorkspaceTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalSyncState {
     pub server_url: String,
+    #[serde(default)]
+    pub server_configured: bool,
     pub device_name: String,
     /// Legacy persisted session field retained deserialize-only so upgrades migrate it into
     /// `cached_server_sessions` and `remembered_server_accounts`.
@@ -162,6 +164,7 @@ impl GlobalSyncState {
     pub fn with_defaults(device_name: String) -> Self {
         Self {
             server_url: DEFAULT_SERVER_URL.to_string(),
+            server_configured: false,
             device_name,
             legacy_session: None,
             cached_server_sessions: Vec::new(),

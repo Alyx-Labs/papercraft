@@ -6,10 +6,11 @@ use papercraft_sync::{SyncConnectionState, SyncStatusSummary};
 use crate::PaperCraftApp;
 use crate::account_modal::{
     AddAccountMode, BannerTone, ProfileSection, ServerProbeState, account_icon_and_colors,
-    draw_account_type_badge, draw_hairline, draw_section_card, draw_status_banner,
-    draw_sync_connection_pill, format_notebook_count, probe_all_known_servers,
-    render_account_email_card, render_accounts_switcher_section, render_auth_banners,
-    render_change_password_card, render_expired_session_reauth_box,
+    draw_account_type_badge, draw_active_pill, draw_hairline, draw_section_card,
+    draw_status_banner, draw_sync_connection_pill, fixed_secondary_button, format_notebook_count,
+    norm_probe_url_key, probe_all_known_servers, render_account_email_card,
+    render_accounts_switcher_section, render_auth_banners, render_change_password_card,
+    render_expired_session_reauth_box, render_forget_server_account_confirmation,
     render_local_profile_identity_card, render_profile_identity_card, render_server_probe_section,
     render_signed_in_server_card, render_unsynced_switch_confirmation, trigger_test_connection,
 };
@@ -20,13 +21,8 @@ use crate::modal::{danger_action_button, primary_action_button, secondary_action
 use crate::sync_worker::{complete_sign_out, trigger_manual_sync};
 use crate::theme::Tokens;
 
-/// Renders the Profile & Sync header, mode/section switches, and scrollable body inside the right drawer.
-pub(crate) fn show_drawer_contents(
-    app: &mut PaperCraftApp,
-    ui: &mut egui::Ui,
-    is_home: bool,
-    t: &Tokens,
-) {
+/// Renders the Profile & Sync header, active account hero card, section switches, and scrollable body.
+pub(crate) fn show_drawer_contents(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     if std::mem::take(&mut app.view.account.profile_probe_pending) {
         probe_all_known_servers(app, ui.ctx());
     }
@@ -34,7 +30,7 @@ pub(crate) fn show_drawer_contents(
     let summary = app.session.sync_status_summary();
     let cloud_pending = app.session.cloud_pending_changes_count();
 
-    draw_profile_drawer_header(app, ui, &summary, is_home, t);
+    draw_profile_drawer_header(app, ui, &summary, cloud_pending, t);
     ui.separator();
 
     let dt = ui.ctx().input(|i| i.stable_dt);
@@ -62,13 +58,10 @@ pub(crate) fn show_drawer_contents(
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 0.0;
 
-            draw_active_account_summary_card(app, ui, &summary, cloud_pending, t);
-            ui.add_space(10.0);
-
             crate::motion::show_flow_content(ui, flow_opacity, flow_offset_x, |ui| {
                 match app.view.account.profile_section {
                     ProfileSection::Accounts => {
-                        render_accounts_switcher_section(app, ui, &summary, cloud_pending, t);
+                        render_accounts_switcher_section(app, ui, &summary, t);
                     }
                     ProfileSection::Profile => {
                         draw_profile_details_tab(app, ui, &summary, t);
@@ -95,7 +88,7 @@ fn draw_profile_drawer_header(
     app: &mut PaperCraftApp,
     ui: &mut egui::Ui,
     summary: &SyncStatusSummary,
-    is_home: bool,
+    cloud_pending: usize,
     t: &Tokens,
 ) {
     let header_w = ui.available_width();
@@ -132,7 +125,9 @@ fn draw_profile_drawer_header(
                     app.view.account.status_message = None;
                     trigger_manual_sync(app, ui.ctx());
                 }
-            } else {
+            } else if app.session.is_server_configured()
+                || !app.session.remembered_server_accounts().is_empty()
+            {
                 let lbl = if header_w >= 210.0 {
                     Some(if any_checking { "..." } else { "Check" })
                 } else {
@@ -159,12 +154,9 @@ fn draw_profile_drawer_header(
         .wrap(),
     );
 
-    if is_home {
-        ui.add_space(6.0);
-        crate::inspector::draw_home_drawer_mode_switch(app, ui, t);
-    }
-
-    ui.add_space(6.0);
+    ui.add_space(8.0);
+    draw_active_account_summary_card(app, ui, summary, cloud_pending, t);
+    ui.add_space(8.0);
     draw_profile_subtabs(app, ui, t);
 }
 
@@ -250,12 +242,40 @@ fn draw_active_account_summary_card(
     };
     let (acct_icon, icon_fg, icon_bg, icon_border) =
         account_icon_and_colors(summary.signed_in, server_online, t);
+    let active_acct = summary
+        .signed_in
+        .then(|| app.session.active_account_session().cloned())
+        .flatten();
+    let is_confirming_forget = active_acct.as_ref().is_some_and(|acct| {
+        let key = (
+            norm_probe_url_key(&acct.server_url),
+            acct.user.user_id.clone(),
+        );
+        app.view.account.pending_forget_server_key.as_ref() == Some(&key)
+    });
+    let hero_fill = if is_confirming_forget {
+        t.danger_bg
+    } else {
+        crate::motion::lerp_color(
+            t.field_bg,
+            t.accent_soft,
+            if t.is_dark { 0.42 } else { 0.55 },
+        )
+    };
+    let hero_stroke = if is_confirming_forget {
+        Stroke::new(1.25, t.danger_border)
+    } else {
+        Stroke::new(
+            1.25,
+            t.accent.gamma_multiply(if t.is_dark { 0.55 } else { 0.65 }),
+        )
+    };
 
     egui::Frame::new()
-        .fill(t.field_bg)
-        .stroke(Stroke::new(1.0, t.border))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::same(10))
+        .fill(hero_fill)
+        .stroke(hero_stroke)
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(11, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 6.0;
@@ -275,35 +295,46 @@ fn draw_active_account_summary_card(
                 paint_icon(ui.painter(), badge_rect.shrink(7.0), acct_icon, icon_fg);
 
                 ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    ui.horizontal(|ui| {
+                        let name_max_w = (ui.available_width() - 78.0).max(48.0);
+                        ui.scope(|ui| {
+                            ui.set_max_width(name_max_w);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&primary)
+                                        .size(14.0)
+                                        .strong()
+                                        .color(t.text),
+                                )
+                                .truncate(),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            draw_active_pill(ui, t);
+                        });
+                    });
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(6.0, 3.0);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(&primary)
-                                    .size(13.5)
-                                    .strong()
-                                    .color(t.text),
-                            )
-                            .truncate(),
-                        );
                         draw_account_type_badge(ui, summary.signed_in, server_online, t);
                         if summary.signed_in {
                             draw_sync_connection_pill(ui, summary.connection, t);
                         }
                     });
-                    if !subtitle.is_empty() {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(&subtitle)
-                                    .size(11.0)
-                                    .color(t.text_muted),
-                            )
-                            .wrap(),
-                        );
-                    }
                 });
             });
+
+            if !subtitle.is_empty() {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&subtitle)
+                            .size(11.0)
+                            .color(t.text_muted),
+                    )
+                    .wrap(),
+                );
+            }
 
             let nb_label = format_notebook_count(app.session.notebooks.len());
             let meta = if summary.signed_in {
@@ -320,41 +351,126 @@ fn draw_active_account_summary_card(
                 egui::Label::new(egui::RichText::new(meta).size(11.0).color(t.text_muted)).wrap(),
             );
 
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                if summary.signed_in {
-                    let in_flight = app.session.is_sync_in_flight();
-                    let can_sync = !in_flight && app.session.is_viewing_cloud();
-                    let sync_lbl = if in_flight { "Syncing..." } else { "Sync Now" };
-                    if primary_action_button(ui, sync_lbl, can_sync, t).clicked() {
-                        app.view.account.error_message = None;
-                        app.view.account.status_message = None;
-                        trigger_manual_sync(app, ui.ctx());
-                    }
-                    if danger_action_button(ui, "Sign Out", true, t).clicked() {
-                        complete_sign_out(app, ui.ctx());
-                    }
-                } else if primary_action_button(ui, "Connect Server", true, t).clicked() {
-                    app.view.account.add_account_mode = AddAccountMode::Server;
-                    crate::modal::open(app, crate::modal::ActiveModal::AddAccount);
-                }
-            });
-
-            if summary.signed_in
-                && app.session.is_session_expired()
-                && let Some(acct) = app.session.active_account_session().cloned()
-            {
-                ui.add_space(4.0);
-                render_expired_session_reauth_box(
-                    app,
-                    ui,
-                    &acct,
-                    cloud_pending,
-                    "summary_reauth_pw",
-                    t,
-                );
-            }
+            draw_active_account_actions(
+                app,
+                ui,
+                summary,
+                active_acct.as_ref(),
+                is_confirming_forget,
+                t,
+            );
+            draw_active_account_alerts(
+                app,
+                ui,
+                active_acct.as_ref(),
+                is_confirming_forget,
+                &primary,
+                cloud_pending,
+                t,
+            );
         });
+}
+
+fn draw_active_account_actions(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    summary: &SyncStatusSummary,
+    active_acct: Option<&papercraft_sync::ActiveAccountSession>,
+    is_confirming_forget: bool,
+    t: &Tokens,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+        if summary.signed_in {
+            let in_flight = app.session.is_sync_in_flight();
+            let can_sync = !in_flight && app.session.is_viewing_cloud();
+            let sync_lbl = if in_flight { "Syncing..." } else { "Sync Now" };
+            if primary_action_button(ui, sync_lbl, can_sync, t).clicked() {
+                app.view.account.error_message = None;
+                app.view.account.status_message = None;
+                trigger_manual_sync(app, ui.ctx());
+            }
+            if danger_action_button(ui, "Sign Out", true, t).clicked() {
+                complete_sign_out(app, ui.ctx());
+            }
+            if !is_confirming_forget
+                && let Some(acct) = active_acct
+                && fixed_secondary_button(ui, "Forget Account", 104.0, true, t)
+                    .on_hover_text(
+                        "Remove this account shortcut and delete ONLY its local cache on this device",
+                    )
+                    .clicked()
+            {
+                app.view.account.pending_forget_server_key = Some((
+                    norm_probe_url_key(&acct.server_url),
+                    acct.user.user_id.clone(),
+                ));
+                app.view.account.clear_quick_login_draft();
+                app.view.account.clear_pending_delete_profile();
+            }
+        } else {
+            if primary_action_button(ui, "Connect Server", true, t).clicked() {
+                app.view.account.add_account_mode = AddAccountMode::Server;
+                crate::modal::open(app, crate::modal::ActiveModal::AddAccount);
+            }
+            if let Some(active_local) = app.session.active_local_profile().cloned()
+                && fixed_secondary_button(ui, "Upload to Server", 118.0, true, t)
+                    .on_hover_text(
+                        "Convert this local account to a synced server account while keeping an Offline-First local copy",
+                    )
+                    .clicked()
+            {
+                app.view.account.convert_source_profile_id = active_local.local_profile_id;
+                app.view.account.convert_source_nickname = active_local.nickname;
+                app.view.account.convert_source_notebook_count = app.session.notebooks.len();
+                app.view.account.convert_email.clear();
+                app.view.account.convert_password.clear();
+                app.view.account.convert_show_password = false;
+                crate::modal::open(app, crate::modal::ActiveModal::ConvertLocalAccount);
+            }
+        }
+    });
+}
+
+fn draw_active_account_alerts(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    active_acct: Option<&papercraft_sync::ActiveAccountSession>,
+    is_confirming_forget: bool,
+    primary: &str,
+    cloud_pending: usize,
+    t: &Tokens,
+) {
+    let Some(acct) = active_acct else {
+        return;
+    };
+    crate::motion::animated_collapse_with_duration(
+        ui,
+        ui.make_persistent_id((
+            "summary_forget_confirm",
+            &acct.server_url,
+            &acct.user.user_id,
+        )),
+        is_confirming_forget,
+        152.0,
+        crate::motion::MICRO_DURATION_S,
+        |ui| {
+            ui.add_space(4.0);
+            render_forget_server_account_confirmation(
+                app,
+                ui,
+                &acct.server_url,
+                &acct.user.user_id,
+                primary,
+                cloud_pending,
+                t,
+            );
+        },
+    );
+    if app.session.is_session_expired() {
+        ui.add_space(4.0);
+        render_expired_session_reauth_box(app, ui, acct, cloud_pending, "summary_reauth_pw", t);
+    }
 }
 
 fn resolve_summary_identity(summary: &SyncStatusSummary) -> (String, String) {
@@ -421,7 +537,7 @@ fn draw_sync_and_backup_tab(
         if summary.signed_in {
             test_on_enter = render_signed_in_server_card(app, ui, summary, t);
         } else {
-            test_on_enter = render_server_probe_section(app, ui, t, false);
+            test_on_enter = render_server_probe_section(app, ui, t, true);
         }
     });
     if test_on_enter && !app.view.account.is_testing() {
@@ -770,14 +886,23 @@ mod tests {
         app.session.enter_online_server_session(acct, empty_pull);
         crate::open_profile_drawer(&mut app);
         assert!(app.view.inspector_open);
-        assert_eq!(app.view.right_drawer_mode, crate::RightDrawerMode::Profile);
         assert_eq!(app.view.account.profile_section, ProfileSection::Accounts);
 
         let accts_text = render_drawer_text(&ctx, &mut app);
-        assert!(accts_text.contains("Profile"), "{accts_text}");
-        assert!(accts_text.contains("Settings"), "{accts_text}");
+        assert!(accts_text.contains("Profile & Sync"), "{accts_text}");
+        assert!(
+            !accts_text.lines().any(|line| line == "Settings"),
+            "Home Profile drawer must not show Settings switch: {accts_text}"
+        );
+        assert!(accts_text.contains("Active"), "{accts_text}");
+        assert!(accts_text.contains("Alex Silva"), "{accts_text}");
+        assert!(accts_text.contains("Forget Account"), "{accts_text}");
         assert!(accts_text.contains("Local Accounts (1)"), "{accts_text}");
-        assert!(accts_text.contains("Server Accounts"), "{accts_text}");
+        assert!(accts_text.contains("Server Accounts (0)"), "{accts_text}");
+        assert!(
+            accts_text.contains("No other server accounts saved on this device."),
+            "{accts_text}"
+        );
         assert!(accts_text.contains("Add Account"), "{accts_text}");
         assert!(accts_text.contains("Ana"), "{accts_text}");
 
@@ -830,7 +955,14 @@ mod tests {
         });
         crate::open_profile_drawer(&mut app);
         let acct_text = render_drawer_text(&ctx, &mut app);
+        assert!(acct_text.contains("Active"), "{acct_text}");
         assert!(acct_text.contains("Connect Server"), "{acct_text}");
+        assert!(acct_text.contains("Upload to Server"), "{acct_text}");
+        assert!(acct_text.contains("Local Accounts (0)"), "{acct_text}");
+        assert!(
+            acct_text.contains("No other local accounts on this device."),
+            "{acct_text}"
+        );
         assert!(acct_text.contains("Add Account"), "{acct_text}");
         assert!(acct_text.contains("Mia"), "{acct_text}");
 
@@ -1037,5 +1169,210 @@ mod tests {
         assert!(text.contains("System"), "{text}");
         assert!(!text.contains("Profile & Sync"), "{text}");
         assert!(!text.contains("+ Add Account"), "{text}");
+    }
+
+    #[test]
+    fn active_account_card_sits_above_subtabs_and_excludes_active_from_lists() {
+        fn render_text_ys(
+            ctx: &egui::Context,
+            app: &mut PaperCraftApp,
+            start_t: f64,
+        ) -> Vec<(String, f32)> {
+            fn collect(shape: &Shape, out: &mut Vec<(String, f32)>) {
+                match shape {
+                    Shape::Text(text) => {
+                        out.push((
+                            text.galley.text().to_string(),
+                            text.visual_bounding_rect().center().y,
+                        ));
+                    }
+                    Shape::Vec(items) => {
+                        for item in items {
+                            collect(item, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut out_items = Vec::new();
+            for step in 0..8 {
+                let out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 900.0),
+                        )),
+                        time: Some(start_t + f64::from(step) * 0.04),
+                        predicted_dt: 0.04,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                        crate::inspector::show(app, ui);
+                    },
+                );
+                out_items.clear();
+                for clipped in &out.shapes {
+                    collect(&clipped.shape, &mut out_items);
+                }
+                out.drop_without_applying_deltas();
+            }
+            out_items
+        }
+
+        let ctx = egui::Context::default();
+        let mut session = papercraft_engine::Session::open_web_cache(None);
+        session
+            .execute(
+                "profile.completeFirstAccess",
+                &serde_json::json!({ "nickname": "Alyx" }),
+            )
+            .unwrap();
+        let _ = session
+            .execute(
+                "profile.create",
+                &serde_json::json!({ "nickname": "Work", "switch_now": false }),
+            )
+            .unwrap();
+        let mut app = PaperCraftApp::new(session, crate::PlatformHooks::default());
+        app.view.active_modal = None;
+        crate::open_profile_drawer(&mut app);
+
+        let local_items = render_text_ys(&ctx, &mut app, 0.0);
+        let alyx_ys: Vec<f32> = local_items
+            .iter()
+            .filter(|(label, _)| label == "Alyx")
+            .map(|(_, y)| *y)
+            .collect();
+        let accounts_tab_y = local_items
+            .iter()
+            .find(|(label, _)| label == "Accounts")
+            .map(|(_, y)| *y)
+            .expect("Accounts subtab");
+        let add_acct_y = local_items
+            .iter()
+            .find(|(label, _)| label == "+ Add Account")
+            .map(|(_, y)| *y)
+            .expect("+ Add Account button");
+        let local_header_y = local_items
+            .iter()
+            .find(|(label, _)| label == "Local Accounts (1)")
+            .map(|(_, y)| *y)
+            .expect("Local Accounts (1) header");
+        let work_y = local_items
+            .iter()
+            .find(|(label, _)| label == "Work")
+            .map(|(_, y)| *y)
+            .expect("inactive Work local profile");
+        assert_eq!(
+            alyx_ys.len(),
+            1,
+            "active local account must appear only in hero card: {local_items:?}"
+        );
+        assert!(
+            alyx_ys[0] < accounts_tab_y
+                && accounts_tab_y < add_acct_y
+                && add_acct_y < local_header_y
+                && local_header_y < work_y,
+            "unexpected local drawer hierarchy: {local_items:?}"
+        );
+
+        // Now add a remembered server account "Bob" and sign in as active server account "Alex Silva".
+        let bob = ActiveAccountSession {
+            server_url: DEFAULT_SERVER_URL.to_string(),
+            user: UserProfile {
+                user_id: "u-bob".to_string(),
+                email: Some("bob@example.com".to_string()),
+                username: "bob_notes".to_string(),
+                display_name: "Bob".to_string(),
+                created_at_ms: 1000,
+                must_change_password: false,
+            },
+            access_token: "acc-b".to_string(),
+            refresh_token: "ref-b".to_string(),
+            access_expires_at_ms: 99_999,
+            refresh_expires_at_ms: 99_999,
+            device_name: "Desk".to_string(),
+            last_auth_ms: 1000,
+        };
+        app.session.enter_online_server_session(
+            bob.clone(),
+            SyncPullResponse {
+                server_cursor: 0,
+                user: bob.user,
+                notebooks: Vec::new(),
+                folders: Vec::new(),
+                studio_prefs: None,
+            },
+        );
+        assert!(app.session.sign_out_from_server_session());
+
+        let alex = ActiveAccountSession {
+            server_url: DEFAULT_SERVER_URL.to_string(),
+            user: UserProfile {
+                user_id: "u-alex".to_string(),
+                email: Some("alex@example.com".to_string()),
+                username: "alex_notes".to_string(),
+                display_name: "Alex Silva".to_string(),
+                created_at_ms: 2000,
+                must_change_password: false,
+            },
+            access_token: "acc-a".to_string(),
+            refresh_token: "ref-a".to_string(),
+            access_expires_at_ms: 99_999,
+            refresh_expires_at_ms: 99_999,
+            device_name: "Desk".to_string(),
+            last_auth_ms: 2000,
+        };
+        app.session.enter_online_server_session(
+            alex.clone(),
+            SyncPullResponse {
+                server_cursor: 0,
+                user: alex.user,
+                notebooks: Vec::new(),
+                folders: Vec::new(),
+                studio_prefs: None,
+            },
+        );
+
+        let server_items = render_text_ys(&ctx, &mut app, 1.0);
+        let alex_ys: Vec<f32> = server_items
+            .iter()
+            .filter(|(label, _)| label == "Alex Silva")
+            .map(|(_, y)| *y)
+            .collect();
+        let s_accounts_tab_y = server_items
+            .iter()
+            .find(|(label, _)| label == "Accounts")
+            .map(|(_, y)| *y)
+            .expect("Accounts subtab");
+        let s_local_hdr_y = server_items
+            .iter()
+            .find(|(label, _)| label == "Local Accounts (2)")
+            .map(|(_, y)| *y)
+            .expect("Local Accounts (2) header");
+        let s_server_hdr_y = server_items
+            .iter()
+            .find(|(label, _)| label == "Server Accounts (1)")
+            .map(|(_, y)| *y)
+            .expect("Server Accounts (1) header");
+        let bob_y = server_items
+            .iter()
+            .find(|(label, _)| label == "Bob")
+            .map(|(_, y)| *y)
+            .expect("inactive remembered server account Bob");
+        assert_eq!(
+            alex_ys.len(),
+            1,
+            "active server account must appear only in hero card: {server_items:?}"
+        );
+        assert!(
+            alex_ys[0] < s_accounts_tab_y
+                && s_accounts_tab_y < s_local_hdr_y
+                && s_local_hdr_y < s_server_hdr_y
+                && s_server_hdr_y < bob_y,
+            "unexpected signed-in drawer hierarchy: {server_items:?}"
+        );
     }
 }

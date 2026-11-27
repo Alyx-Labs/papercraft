@@ -850,8 +850,7 @@ fn show_dialog(
         if app.view.account.selector_other_server_open {
             spec.width = 560.0;
             spec.title = "Sign In with a Server Account";
-            spec.subtitle =
-                "Enter your self-hosted server address and sign in or create an account.";
+            spec.subtitle = "Sign in or create an account on your configured sync server.";
         } else if app.session.needs_initial_nickname() && !app.session.has_any_saved_accounts() {
             spec.title = "Welcome to PaperCraft";
             spec.subtitle = "Start immediately with a local offline account, or sign in to a self-hosted server.";

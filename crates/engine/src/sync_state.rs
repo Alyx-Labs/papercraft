@@ -552,6 +552,13 @@ impl Session {
             })
     }
 
+    /// Returns `true` when a self-hosted sync server has been configured or previously linked on this device.
+    pub fn is_server_configured(&self) -> bool {
+        self.sync.global.server_configured
+            || self.is_signed_in()
+            || !self.sync.global.remembered_server_accounts.is_empty()
+    }
+
     /// Returns the user's configured default/preferred server URL independent of any active session.
     pub fn preferred_server_url(&self) -> &str {
         &self.sync.global.server_url
@@ -980,6 +987,7 @@ impl Session {
         }
         self.sync.session_expired = false;
         self.sync.global.server_url = updated.server_url.clone();
+        self.sync.global.server_configured = true;
         self.sync.global.remember_server_account(&updated);
         self.sync
             .global
@@ -993,6 +1001,7 @@ impl Session {
     pub fn set_server_url_preference(&mut self, raw_url: &str) -> Result<String, String> {
         let normalized = normalize_server_url(raw_url).map_err(|e| e.to_string())?;
         self.sync.global.server_url = normalized.clone();
+        self.sync.global.server_configured = true;
         self.sync_persist_global_state();
         self.capture_active_web_delta_into_pending(true);
         Ok(normalized)
@@ -1226,6 +1235,7 @@ impl Session {
         }
 
         self.sync.global.server_url = cached.server_url.clone();
+        self.sync.global.server_configured = true;
         self.sync.global.remember_server_account(&cached);
         self.sync.global.active_workspace = ActiveWorkspaceTarget::Cloud {
             server_url: cached.server_url.clone(),
@@ -1274,6 +1284,7 @@ impl Session {
         }
 
         self.sync.global.server_url = auth.server_url.clone();
+        self.sync.global.server_configured = true;
         self.sync.global.device_name = auth.device_name.clone();
         self.sync.global.remember_server_account(&auth);
         self.sync.global.upsert_cached_server_session(auth.clone());
@@ -2019,6 +2030,7 @@ impl Session {
 
         if let Some(refreshed) = outcome.refreshed_session {
             self.sync.global.server_url = refreshed.server_url.clone();
+            self.sync.global.server_configured = true;
             self.sync.global.remember_server_account(&refreshed);
             self.sync
                 .global
@@ -3539,6 +3551,13 @@ pub(crate) fn sanitize_global_state(global: &mut GlobalSyncState) {
     for prof in &mut global.local_profiles {
         prof.local_profile_id = sanitize_account_dir_segment(&prof.local_profile_id);
         prof.nickname = sanitize_profile_nickname(&prof.nickname);
+    }
+    if !global.server_configured
+        && (!global.cached_server_sessions.is_empty()
+            || !global.remembered_server_accounts.is_empty()
+            || !global.server_url.eq_ignore_ascii_case(DEFAULT_SERVER_URL))
+    {
+        global.server_configured = true;
     }
 }
 

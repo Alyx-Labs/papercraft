@@ -240,6 +240,13 @@ pub fn load_global_state(root_dir: &Path) -> GlobalSyncState {
         profile.local_profile_id = sanitize_account_dir_segment(&profile.local_profile_id);
         profile.nickname = sanitize_profile_nickname(&profile.nickname);
     }
+    if !parsed.server_configured
+        && (!parsed.cached_server_sessions.is_empty()
+            || !parsed.remembered_server_accounts.is_empty()
+            || !parsed.server_url.eq_ignore_ascii_case(DEFAULT_SERVER_URL))
+    {
+        parsed.server_configured = true;
+    }
     parsed.client_id = sanitize_client_id(&parsed.client_id);
     parsed
 }

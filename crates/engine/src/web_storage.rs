@@ -665,6 +665,10 @@ pub fn merge_global_states_for_commit(
     idb: &GlobalSyncState,
 ) -> GlobalSyncState {
     let mut out = local.clone();
+    if idb.server_configured && !out.server_configured {
+        out.server_url = idb.server_url.clone();
+        out.server_configured = true;
+    }
     merge_local_profiles(&mut out.local_profiles, &idb.local_profiles);
     merge_remembered_accounts(
         &mut out.remembered_server_accounts,
@@ -1895,7 +1899,15 @@ impl Session {
         let prev_profiles = self.sync.global.local_profiles.len();
         let prev_remembered = self.sync.global.remembered_server_accounts.len();
         let prev_sessions = self.sync.global.cached_server_sessions.clone();
+        let prev_server_url = self.sync.global.server_url.clone();
+        let prev_server_configured = self.sync.global.server_configured;
 
+        if incoming.server_configured
+            && (!self.sync.global.server_configured || !self.is_viewing_cloud())
+        {
+            self.sync.global.server_url = incoming.server_url.clone();
+            self.sync.global.server_configured = true;
+        }
         merge_local_profiles(
             &mut self.sync.global.local_profiles,
             &incoming.local_profiles,
@@ -1947,6 +1959,8 @@ impl Session {
         if self.sync.global.local_profiles.len() != prev_profiles
             || self.sync.global.remembered_server_accounts.len() != prev_remembered
             || self.sync.global.cached_server_sessions != prev_sessions
+            || self.sync.global.server_url != prev_server_url
+            || self.sync.global.server_configured != prev_server_configured
         {
             result.changed_ui = true;
         }

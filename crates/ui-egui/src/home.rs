@@ -454,7 +454,7 @@ fn draw_home_profile_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Toke
             .as_deref()
             .map_or_else(String::new, |u| format!(" · @{u}"));
         format!(
-            "Profile & Settings: {}{handle}\nStatus: {} ({cloud_pending} pending)\nClick to open Profile, switch accounts, or adjust Settings.",
+            "Profile & Sync: {}{handle}\nStatus: {} ({cloud_pending} pending)\nClick to open Profile, switch accounts, or manage sync.",
             summary.workspace_badge_text(),
             state_label,
         )
@@ -464,7 +464,7 @@ fn draw_home_profile_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Toke
             .as_deref()
             .unwrap_or("Local");
         format!(
-            "Profile & Settings: Local ({prof})\nClick to open Profile, switch accounts, sign in, or adjust Settings."
+            "Profile & Sync: Local ({prof})\nClick to open Profile, switch accounts, sign in, or manage sync."
         )
     };
     let resp = sidebar_edge_button_sized(
@@ -3876,10 +3876,11 @@ mod tests {
         out_rects
     }
 
-    fn assert_profile_to_settings_drawer_switch(
+    fn assert_home_profile_drawer_without_settings_switch(
         ctx: &egui::Context,
         app: &mut PaperCraftApp,
         viewport: Vec2,
+        profile_tab_rect: Rect,
     ) {
         let inspector_texts = settle_home_text_rects(ctx, app, viewport, 0.10, 10);
         assert!(
@@ -3889,8 +3890,14 @@ mod tests {
             "expected Profile & Sync drawer when clicking Home Profile tab, got {inspector_texts:?}"
         );
         assert!(
-            inspector_texts.iter().any(|(label, _)| label == "Settings"),
-            "expected Profile | Settings switch in Home drawer, got {inspector_texts:?}"
+            !inspector_texts.iter().any(|(label, _)| label == "Settings"),
+            "Home Profile drawer must not show Profile | Settings switch, got {inspector_texts:?}"
+        );
+        assert!(
+            !inspector_texts
+                .iter()
+                .any(|(label, _)| label == "App Scale"),
+            "Home drawer must not show Settings content, got {inspector_texts:?}"
         );
         assert!(
             inspector_texts
@@ -3899,27 +3906,12 @@ mod tests {
             "expected + Add Account button in Accounts section, got {inspector_texts:?}"
         );
 
-        let settings_switch_pos = inspector_texts
-            .iter()
-            .find(|(label, _)| label == "Settings")
-            .map(|(_, rect)| rect.center())
-            .expect("Settings segment button in Home drawer");
-        click_home_at(ctx, app, viewport, settings_switch_pos, 0.45);
-        assert_eq!(app.view.right_drawer_mode, crate::RightDrawerMode::Settings);
-        assert_eq!(app.view.settings_tab, crate::SettingsTab::Appearance);
-
-        let settings_texts = settle_home_text_rects(ctx, app, viewport, 0.50, 10);
-        assert!(
-            settings_texts
-                .iter()
-                .any(|(label, _)| label == "Appearance")
-        );
-        assert!(settings_texts.iter().any(|(label, _)| label == "App Scale"));
-        assert!(settings_texts.iter().any(|(label, _)| label == "100%"));
+        click_home_at(ctx, app, viewport, profile_tab_rect.center(), 0.45);
+        assert!(!app.view.inspector_open);
     }
 
     #[test]
-    fn home_header_renders_brand_logo_omits_new_notebook_and_toggles_settings_sidebar() {
+    fn home_header_renders_brand_logo_omits_new_notebook_and_toggles_profile_drawer() {
         let mut app = PaperCraftApp::default();
         app.session
             .execute(
@@ -4048,14 +4040,18 @@ mod tests {
         );
         click_home_at(&ctx, &mut app, viewport, profile_tab_rect.center(), 0.05);
         assert!(app.view.inspector_open);
-        assert_eq!(app.view.right_drawer_mode, crate::RightDrawerMode::Profile);
         assert_eq!(
             app.view.account.profile_section,
             crate::account_modal::ProfileSection::Accounts
         );
         assert_eq!(app.view.active_modal, None);
 
-        assert_profile_to_settings_drawer_switch(&ctx, &mut app, viewport);
+        assert_home_profile_drawer_without_settings_switch(
+            &ctx,
+            &mut app,
+            viewport,
+            profile_tab_rect,
+        );
     }
 
     #[test]
