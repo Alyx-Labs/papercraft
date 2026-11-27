@@ -413,8 +413,18 @@ fn read_library_entries(dir: &Path) -> Vec<LoadedEntry> {
         });
     }
     loaded.sort_by(|a, b| {
-        b.modified
-            .cmp(&a.modified)
+        b.doc
+            .updated_at_ms
+            .cmp(&a.doc.updated_at_ms)
+            .then_with(|| b.modified.cmp(&a.modified))
+            .then_with(|| b.doc.created_at_ms.cmp(&a.doc.created_at_ms))
+            .then_with(|| {
+                a.doc
+                    .title
+                    .to_ascii_lowercase()
+                    .cmp(&b.doc.title.to_ascii_lowercase())
+            })
+            .then_with(|| a.doc.id.cmp(&b.doc.id))
             .then_with(|| a.path.cmp(&b.path))
     });
     loaded.truncate(MAX_NOTEBOOKS);

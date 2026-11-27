@@ -1923,30 +1923,88 @@ fn prepare_push_change(
     })
 }
 
+fn accept_existing_unchanged_row(
+    notebook_id: String,
+    row: &StoredNotebookRow,
+    ctx: &mut PushWriteCtx<'_, '_>,
+) {
+    ctx.accepted.push(AcceptedNotebookSync {
+        notebook_id,
+        new_version: row.version,
+        cursor: row.cursor,
+        deleted: row.deleted,
+        content_hash: row.content_hash.clone(),
+        body_hash: row.body_hash.clone(),
+        meta_hash: row.meta_hash.clone(),
+    });
+}
+
 fn apply_single_notebook_push(
     mut prepared: PreparedPushChange,
     existing: Option<StoredNotebookRow>,
     ctx: &mut PushWriteCtx<'_, '_>,
 ) -> Result<(), DbError> {
     let existing_version = existing.as_ref().map_or(0, |r| r.version);
+    let mut skip_version_check = false;
 
     if let Some(ref row) = existing {
-        // Idempotent retry or identical state across devices.
+        // Idempotent retry or identical state across devices; still propagate strictly
+        // newer document timestamps since timestamps are excluded from `content_hash`.
         if row.deleted == prepared.deleted
             && (row.deleted || row.content_hash == prepared.content_hash)
         {
-            ctx.accepted.push(AcceptedNotebookSync {
-                notebook_id: prepared.notebook_id,
-                new_version: row.version,
-                cursor: row.cursor,
-                deleted: row.deleted,
-                content_hash: row.content_hash.clone(),
-                body_hash: row.body_hash.clone(),
-                meta_hash: row.meta_hash.clone(),
-            });
-            return Ok(());
+            let mut timestamp_updated = false;
+            if !row.deleted
+                && let Some(ref client_doc) = prepared.doc
+            {
+                let blob = ctx
+                    .blobs
+                    .get(ctx.key)
+                    .map_err(map_storage_err)?
+                    .map(|g| g.value().to_vec());
+                let mut server_doc = stored_row_to_remote(row, blob.as_deref())?
+                    .document
+                    .unwrap_or_default();
+                if client_doc.updated_at_ms > server_doc.updated_at_ms {
+                    server_doc.updated_at_ms = client_doc.updated_at_ms;
+                    timestamp_updated = true;
+                }
+                if client_doc.meta_updated_at_ms > server_doc.meta_updated_at_ms {
+                    server_doc.meta_updated_at_ms = client_doc.meta_updated_at_ms;
+                    timestamp_updated = true;
+                }
+                if server_doc.created_at_ms == 0 && client_doc.created_at_ms > 0 {
+                    server_doc.created_at_ms = client_doc.created_at_ms;
+                    timestamp_updated = true;
+                }
+                if timestamp_updated {
+                    server_doc.sync_active_to_pages();
+                    server_doc.load_active_from_pages();
+                    let ncraft_bytes = save_document_bytes(&server_doc).map_err(|e| {
+                        DbError::Validation(format!("invalid notebook `{}`: {e}", row.notebook_id))
+                    })?;
+                    if ncraft_bytes.len() > ctx.max_notebook_bytes {
+                        return Err(DbError::PayloadTooLarge {
+                            title: server_doc.title,
+                            actual_bytes: ncraft_bytes.len(),
+                            limit_bytes: ctx.max_notebook_bytes,
+                        });
+                    }
+                    prepared.title = server_doc.title.clone();
+                    prepared.meta_updated_at_ms = prepared
+                        .meta_updated_at_ms
+                        .max(server_doc.meta_updated_at_ms);
+                    prepared.doc = Some(server_doc);
+                    prepared.ncraft_bytes = Some(ncraft_bytes);
+                    skip_version_check = true;
+                }
+            }
+            if !timestamp_updated {
+                accept_existing_unchanged_row(prepared.notebook_id, row, ctx);
+                return Ok(());
+            }
         }
-        if !ctx.force_overwrite && prepared.base_version != row.version {
+        if !skip_version_check && !ctx.force_overwrite && prepared.base_version != row.version {
             let same_body = !row.deleted
                 && !prepared.deleted
                 && !row.body_hash.is_empty()
@@ -2043,6 +2101,10 @@ fn merge_client_metadata_onto_server(
         server_doc.favorite = client_doc.favorite;
         server_doc.tags = client_doc.tags.clone();
         server_doc.meta_updated_at_ms = prepared.meta_updated_at_ms;
+        if server_doc.created_at_ms == 0 && client_doc.created_at_ms > 0 {
+            server_doc.created_at_ms = client_doc.created_at_ms;
+        }
+        server_doc.updated_at_ms = server_doc.updated_at_ms.max(client_doc.updated_at_ms);
     }
     server_doc.sync_active_to_pages();
     server_doc.load_active_from_pages();

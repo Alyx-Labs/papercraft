@@ -1431,6 +1431,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
             session.touch_cloud_dirty_clock_if_needed();
         }
         session.sync_active_notebook_slot();
+        session.sync_active_notebook_id();
     }
     result
 }
@@ -4408,6 +4409,16 @@ fn insert_loaded_document(
         doc.id = clean_existing_id;
     }
     doc.title = sanitize_notebook_title(&doc.title);
+    let now = papercraft_sync_protocol::now_unix_ms();
+    if doc.created_at_ms == 0 {
+        doc.created_at_ms = now;
+    }
+    if doc.updated_at_ms == 0 {
+        doc.updated_at_ms = doc.created_at_ms.max(now);
+    }
+    if doc.meta_updated_at_ms == 0 {
+        doc.meta_updated_at_ms = doc.updated_at_ms;
+    }
     doc.sync_active_to_pages();
     doc.load_active_from_pages();
 
@@ -4427,14 +4438,18 @@ fn insert_loaded_document(
         session.sync_mark_slot_dirty(session.active_notebook);
     } else {
         session.notebooks.push(Arc::clone(&arc_doc));
+        let new_idx = session.notebooks.len().saturating_sub(1);
         session
             .library
             .push_slot(None, true, session.notebooks.len());
-        session.active_notebook = session.notebooks.len().saturating_sub(1);
+        session.active_notebook = new_idx;
+        session.sync_mark_slot_dirty(new_idx);
     }
     session.doc = arc_doc;
     session.history.clear();
+    session.sync_active_notebook_id();
     session.bump_revision();
+    session.touch_cloud_dirty_clock_if_needed();
     if persist_now {
         let _ = session.save_library();
     }
@@ -4704,11 +4719,21 @@ fn commit_pdf_into_active(
     next.current_page = insert_at;
     next.load_active_from_pages();
 
+    let now = papercraft_sync_protocol::now_unix_ms();
+    if next.created_at_ms == 0 {
+        next.created_at_ms = now;
+    }
+    next.updated_at_ms = now.max(next.updated_at_ms);
+    if next.meta_updated_at_ms == 0 {
+        next.meta_updated_at_ms = next.updated_at_ms;
+    }
+
     session.history.record("Import PDF Pages", before);
     session.doc = Arc::new(next);
     session.sync_active_notebook_slot();
     session.mark_active_dirty();
     session.bump_revision();
+    session.touch_cloud_dirty_clock_if_needed();
     if persist_now {
         let _ = session.save_library();
     }

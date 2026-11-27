@@ -13,7 +13,7 @@ pub const ACCOUNTS_DIR: &str = "accounts";
 pub const PROFILES_DIR: &str = "profiles";
 pub const MAX_PROFILE_NICKNAME_LEN: usize = 48;
 pub const MAX_REMEMBERED_SERVER_ACCOUNTS: usize = 32;
-pub const SYNC_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const SYNC_MANIFEST_SCHEMA_VERSION: u32 = 3;
 
 /// Strict ownership boundary for local profiles and Offline-First server accounts.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -414,6 +414,8 @@ pub struct SyncManifest {
     pub tombstones: Vec<NotebookTombstone>,
     #[serde(default)]
     pub last_sync_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub active_notebook_id: String,
 }
 
 impl Default for SyncManifest {
@@ -429,11 +431,24 @@ impl Default for SyncManifest {
             folders: Vec::new(),
             tombstones: Vec::new(),
             last_sync_at_ms: None,
+            active_notebook_id: String::new(),
         }
     }
 }
 
 impl SyncManifest {
+    /// Upgrades older persisted manifests so cloud accounts trigger one full-pull
+    /// reconciliation pass to backfill timestamps across devices.
+    pub fn migrate_if_needed(&mut self) -> bool {
+        if self.schema_version >= SYNC_MANIFEST_SCHEMA_VERSION {
+            return false;
+        }
+        if self.owner_id.as_ref().is_some_and(OwnerId::is_cloud) {
+            self.last_server_cursor = 0;
+        }
+        self.schema_version = SYNC_MANIFEST_SCHEMA_VERSION;
+        true
+    }
     pub fn meta(&self, notebook_id: &str) -> Option<&NotebookSyncMeta> {
         self.notebooks
             .iter()

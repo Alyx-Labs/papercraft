@@ -115,8 +115,11 @@ impl SyncCycleDriver {
                     .any(|af| af.folder_id == rf.folder_id && af.new_version == rf.version)
             })
             .collect();
-        let updated_prefs =
-            select_pulled_prefs(pull_resp.studio_prefs, self.accum.ack_prefs.as_ref());
+        let updated_prefs = select_pulled_prefs(
+            pull_resp.studio_prefs,
+            self.accum.prefs_conflict,
+            self.accum.ack_prefs.as_ref(),
+        );
         let new_cursor = pull_resp.server_cursor.max(self.accum.highest_cursor);
 
         SyncCycleOutcome {
@@ -220,6 +223,7 @@ struct PushAccum {
     downloaded_updates: Vec<RemoteNotebookUpdate>,
     conflict_updates: Vec<RemoteNotebookUpdate>,
     ack_prefs: Option<(u64, String)>,
+    prefs_conflict: Option<RemotePrefsRecord>,
     highest_cursor: u64,
     pushed_count: usize,
 }
@@ -238,6 +242,15 @@ fn build_pending_changes(
         let mut doc = snap.doc.clone();
         if doc.id.is_empty() {
             doc.id = snap.notebook_id.clone();
+        }
+        if doc.created_at_ms == 0 {
+            doc.created_at_ms = now;
+        }
+        if doc.updated_at_ms == 0 {
+            doc.updated_at_ms = doc.created_at_ms.max(now);
+        }
+        if doc.meta_updated_at_ms == 0 {
+            doc.meta_updated_at_ms = doc.updated_at_ms;
         }
         let hashes = canonical_document_all_hashes(&doc);
         let content_hash = if snap.content_hash.is_empty() {
@@ -371,9 +384,15 @@ fn record_push_response(
     accum: &mut PushAccum,
 ) {
     accum.highest_cursor = accum.highest_cursor.max(resp.server_cursor);
-    if resp.prefs_conflict.is_none()
-        && let Some(prefs) = sent_prefs
-    {
+    if let Some(conflict_prefs) = resp.prefs_conflict {
+        let should_take = accum
+            .prefs_conflict
+            .as_ref()
+            .is_none_or(|cur| conflict_prefs.version >= cur.version);
+        if should_take {
+            accum.prefs_conflict = Some(conflict_prefs);
+        }
+    } else if let Some(prefs) = sent_prefs {
         accum.ack_prefs = Some((resp.prefs_version, prefs.content_hash.clone()));
     }
 
@@ -464,17 +483,23 @@ fn upsert_downloaded_update(record: &RemoteNotebookRecord, target: &mut Vec<Remo
 }
 
 fn select_pulled_prefs(
-    remote: Option<RemotePrefsRecord>,
+    pulled: Option<RemotePrefsRecord>,
+    conflict: Option<RemotePrefsRecord>,
     ack_prefs: Option<&(u64, String)>,
 ) -> Option<RemotePrefsRecord> {
-    let remote = remote?;
+    let best = match (pulled, conflict) {
+        (Some(p), Some(c)) => Some(if c.version > p.version { c } else { p }),
+        (Some(p), None) => Some(p),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    }?;
     if let Some((acked_ver, acked_hash)) = ack_prefs
-        && remote.version <= *acked_ver
-        && remote.content_hash == *acked_hash
+        && best.version <= *acked_ver
+        && best.content_hash == *acked_hash
     {
         return None;
     }
-    Some(remote)
+    Some(best)
 }
 
 #[cfg(test)]

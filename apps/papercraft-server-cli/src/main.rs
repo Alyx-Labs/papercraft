@@ -2004,4 +2004,95 @@ mod tests {
             .unwrap();
         assert_ne!(re_reg.user.user_id, reg.user.user_id);
     }
+
+    #[test]
+    fn http_e2e_push_matching_content_hash_propagates_newer_timestamps() {
+        let dir = temp_dir("push_ts_reconcile");
+        let agent = test_http_agent();
+        let srv = spawn_server_on(&dir.0);
+        let reg = register_and_push_single_notebook(
+            &srv.base_url,
+            &agent,
+            "ts_sync@example.com",
+            "ts_sync",
+            "nb-ts-1",
+        );
+
+        let mut base_doc = Document {
+            id: "nb-ts-1".to_string(),
+            title: "Timestamp Test".to_string(),
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            meta_updated_at_ms: 1_000,
+            ..Default::default()
+        };
+        base_doc.sync_active_to_pages();
+        let shared_hash = canonical_document_hash(&base_doc);
+        let shared_body = canonical_document_body_hash(&base_doc);
+        let shared_meta = canonical_document_meta_hash(&base_doc);
+
+        let push_doc = |doc: Document, base_version: u64| {
+            let mut resp = agent
+                .post(&format!("{}/api/v1/sync/push", srv.base_url))
+                .header("Authorization", &format!("Bearer {}", reg.access_token))
+                .send_json(SyncPushRequest {
+                    client_cursor: 0,
+                    device_name: "Desk".to_string(),
+                    changes: vec![LocalNotebookChange {
+                        notebook_id: doc.id.clone(),
+                        base_version,
+                        deleted: false,
+                        updated_at_ms: doc.updated_at_ms.max(1_000),
+                        deleted_at_ms: None,
+                        content_hash: shared_hash.clone(),
+                        body_hash: shared_body.clone(),
+                        meta_hash: shared_meta.clone(),
+                        meta_updated_at_ms: doc.meta_updated_at_ms.max(1_000),
+                        document: Some(doc),
+                    }],
+                    folders: Vec::new(),
+                    studio_prefs: None,
+                    force_overwrite: false,
+                })
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+            resp.body_mut()
+                .read_json::<papercraft_sync_protocol::SyncPushResponse>()
+                .unwrap()
+        };
+
+        // First push replaces initial title with base_doc (version 2).
+        let r1 = push_doc(base_doc.clone(), 1);
+        assert_eq!(r1.accepted[0].new_version, 2);
+
+        // Identical retry at same timestamps stays a fast no-op (version remains 2).
+        let r_retry = push_doc(base_doc.clone(), 0);
+        assert!(r_retry.conflicts.is_empty());
+        assert_eq!(r_retry.accepted[0].new_version, 2);
+
+        // Second device pushes same content_hash with newer updated_at_ms -> bumps version & saves timestamp.
+        let mut newer_doc = base_doc;
+        newer_doc.updated_at_ms = 5_000;
+        newer_doc.meta_updated_at_ms = 5_000;
+        newer_doc.sync_active_to_pages();
+        let r2 = push_doc(newer_doc, 0);
+        assert!(r2.conflicts.is_empty());
+        assert_eq!(r2.accepted[0].new_version, 3);
+
+        let mut pull_resp = agent
+            .get(&format!("{}/api/v1/sync/pull?cursor=0", srv.base_url))
+            .header("Authorization", &format!("Bearer {}", reg.access_token))
+            .call()
+            .unwrap();
+        assert_eq!(pull_resp.status().as_u16(), 200);
+        let pulled: papercraft_sync_protocol::SyncPullResponse =
+            pull_resp.body_mut().read_json().unwrap();
+        let rec = pulled
+            .notebooks
+            .iter()
+            .find(|n| n.notebook_id == "nb-ts-1")
+            .expect("pulled notebook");
+        assert_eq!(rec.version, 3);
+        assert_eq!(rec.document.as_ref().expect("doc").updated_at_ms, 5_000);
+    }
 }

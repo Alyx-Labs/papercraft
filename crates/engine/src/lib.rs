@@ -732,7 +732,12 @@ impl Session {
         if index >= self.notebooks.len() {
             return false;
         }
+        let prev_active_id = self.sync.manifest.active_notebook_id.clone();
         if index == self.active_notebook {
+            self.sync_active_notebook_id();
+            if self.sync.manifest.active_notebook_id != prev_active_id {
+                self.sync_persist_manifest();
+            }
             return true;
         }
         self.cancel_live_stroke();
@@ -740,6 +745,10 @@ impl Session {
         self.active_notebook = index;
         self.doc = Arc::clone(&self.notebooks[index]);
         self.history.clear();
+        self.sync_active_notebook_id();
+        if self.sync.manifest.active_notebook_id != prev_active_id {
+            self.sync_persist_manifest();
+        }
         self.bump_revision();
         true
     }
@@ -902,6 +911,9 @@ mod pdf_command_tests {
             .expect("import pdf");
         assert_eq!(res["mode"], "new_notebook");
         assert_eq!(res["pageCount"], 2);
+        assert!(s.doc.created_at_ms > 0);
+        assert!(s.doc.updated_at_ms > 0);
+        assert!(s.doc.meta_updated_at_ms > 0);
         assert_eq!(s.doc.title, "Lecture Notes");
         assert_eq!(s.doc.width, 600);
         assert_eq!(s.doc.height, 800);

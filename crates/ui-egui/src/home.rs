@@ -743,24 +743,52 @@ fn matching_notebook_indices(app: &PaperCraftApp) -> Vec<usize> {
     let asc = app.session.prefs.library_sort_ascending;
     let notebooks = &app.session.notebooks;
     matched.sort_by(|&a, &b| {
-        let da = &notebooks[a];
-        let db = &notebooks[b];
-        db.favorite
-            .cmp(&da.favorite)
-            .then_with(|| {
-                let ord = match sort_by {
-                    LibrarySortBy::ModifiedDate => da.updated_at_ms.cmp(&db.updated_at_ms),
-                    LibrarySortBy::CreatedDate => da.created_at_ms.cmp(&db.created_at_ms),
-                    LibrarySortBy::Name => da
-                        .title
-                        .to_ascii_lowercase()
-                        .cmp(&db.title.to_ascii_lowercase()),
-                };
-                if asc { ord } else { ord.reverse() }
-            })
-            .then_with(|| a.cmp(&b))
+        compare_notebook_sort_order(&notebooks[a], &notebooks[b], a, b, sort_by, asc)
     });
     matched
+}
+
+/// Compare two notebooks deterministically for library sorting so instances with
+/// different slot orders (e.g. disk mtime vs. server pull order) render the same sequence.
+fn compare_notebook_sort_order(
+    da: &papercraft_doc::Document,
+    db: &papercraft_doc::Document,
+    a_idx: usize,
+    b_idx: usize,
+    sort_by: LibrarySortBy,
+    asc: bool,
+) -> std::cmp::Ordering {
+    let apply_dir = |ord: std::cmp::Ordering| if asc { ord } else { ord.reverse() };
+    db.favorite
+        .cmp(&da.favorite)
+        .then_with(|| {
+            let primary = match sort_by {
+                LibrarySortBy::ModifiedDate => da.updated_at_ms.cmp(&db.updated_at_ms),
+                LibrarySortBy::CreatedDate => da.created_at_ms.cmp(&db.created_at_ms),
+                LibrarySortBy::Name => da
+                    .title
+                    .to_ascii_lowercase()
+                    .cmp(&db.title.to_ascii_lowercase()),
+            };
+            apply_dir(primary)
+        })
+        .then_with(|| match sort_by {
+            LibrarySortBy::ModifiedDate => apply_dir(da.created_at_ms.cmp(&db.created_at_ms)),
+            LibrarySortBy::CreatedDate => apply_dir(da.updated_at_ms.cmp(&db.updated_at_ms)),
+            LibrarySortBy::Name => da
+                .title
+                .cmp(&db.title)
+                .then_with(|| db.updated_at_ms.cmp(&da.updated_at_ms))
+                .then_with(|| db.created_at_ms.cmp(&da.created_at_ms)),
+        })
+        .then_with(|| {
+            da.title
+                .to_ascii_lowercase()
+                .cmp(&db.title.to_ascii_lowercase())
+        })
+        .then_with(|| da.title.cmp(&db.title))
+        .then_with(|| da.id.cmp(&db.id))
+        .then_with(|| a_idx.cmp(&b_idx))
 }
 
 fn matching_trash_indices(app: &PaperCraftApp) -> Vec<usize> {
@@ -4319,5 +4347,86 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn matching_notebook_indices_is_order_independent_for_inverted_slot_orders() {
+        let mut english = papercraft_doc::Document {
+            id: "nb-english".to_string(),
+            title: "English for Everyone English Grammar".to_string(),
+            created_at_ms: 1_000,
+            updated_at_ms: 5_000,
+            meta_updated_at_ms: 5_000,
+            ..Default::default()
+        };
+        english.sync_active_to_pages();
+        let mut daily = papercraft_doc::Document {
+            id: "nb-daily".to_string(),
+            title: "Daily Notebook".to_string(),
+            created_at_ms: 2_000,
+            updated_at_ms: 2_000,
+            meta_updated_at_ms: 2_000,
+            ..Default::default()
+        };
+        daily.sync_active_to_pages();
+
+        let make_app = |docs: Vec<papercraft_doc::Document>| {
+            let mut session = papercraft_engine::Session::open_web_cache(None);
+            session.notebooks = docs.into_iter().map(std::sync::Arc::new).collect();
+            session.active_notebook = 0;
+            session.doc = std::sync::Arc::clone(&session.notebooks[0]);
+            PaperCraftApp::new(session, crate::PlatformHooks::default())
+        };
+
+        let mut app_a = make_app(vec![english.clone(), daily.clone()]);
+        let mut app_b = make_app(vec![daily.clone(), english.clone()]);
+
+        for sort_by in [
+            papercraft_doc::LibrarySortBy::ModifiedDate,
+            papercraft_doc::LibrarySortBy::CreatedDate,
+            papercraft_doc::LibrarySortBy::Name,
+        ] {
+            for asc in [false, true] {
+                app_a.session.prefs.library_sort_by = sort_by;
+                app_a.session.prefs.library_sort_ascending = asc;
+                app_b.session.prefs.library_sort_by = sort_by;
+                app_b.session.prefs.library_sort_ascending = asc;
+
+                let ids_a: Vec<&str> = matching_notebook_indices(&app_a)
+                    .into_iter()
+                    .map(|idx| app_a.session.notebooks[idx].id.as_str())
+                    .collect();
+                let ids_b: Vec<&str> = matching_notebook_indices(&app_b)
+                    .into_iter()
+                    .map(|idx| app_b.session.notebooks[idx].id.as_str())
+                    .collect();
+                assert_eq!(
+                    ids_a, ids_b,
+                    "sort order diverged on inverted slots for {sort_by:?} asc={asc}"
+                );
+            }
+        }
+
+        // Equal updated_at_ms (such as post-conversion ties) must still sort identically.
+        let mut tied_english = english;
+        tied_english.updated_at_ms = 9_000;
+        let mut tied_daily = daily;
+        tied_daily.updated_at_ms = 9_000;
+        let mut tied_a = make_app(vec![tied_english.clone(), tied_daily.clone()]);
+        let mut tied_b = make_app(vec![tied_daily, tied_english]);
+        tied_a.session.prefs.library_sort_by = papercraft_doc::LibrarySortBy::ModifiedDate;
+        tied_a.session.prefs.library_sort_ascending = false;
+        tied_b.session.prefs.library_sort_by = papercraft_doc::LibrarySortBy::ModifiedDate;
+        tied_b.session.prefs.library_sort_ascending = false;
+
+        let ids_a: Vec<&str> = matching_notebook_indices(&tied_a)
+            .into_iter()
+            .map(|idx| tied_a.session.notebooks[idx].id.as_str())
+            .collect();
+        let ids_b: Vec<&str> = matching_notebook_indices(&tied_b)
+            .into_iter()
+            .map(|idx| tied_b.session.notebooks[idx].id.as_str())
+            .collect();
+        assert_eq!(ids_a, ids_b);
     }
 }

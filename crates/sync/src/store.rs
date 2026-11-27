@@ -255,13 +255,15 @@ pub fn load_manifest(library_dir: &Path) -> SyncManifest {
     let Ok(raw) = fs::read_to_string(&path) else {
         return SyncManifest::default();
     };
-    serde_json::from_str::<SyncManifest>(&raw).unwrap_or_else(|err| {
+    let mut manifest = serde_json::from_str::<SyncManifest>(&raw).unwrap_or_else(|err| {
         log::warn!(
             "Resetting malformed sync manifest `{}`: {err}",
             path.display()
         );
         SyncManifest::default()
-    })
+    });
+    manifest.migrate_if_needed();
+    manifest
 }
 
 pub fn save_manifest(library_dir: &Path, manifest: &SyncManifest) -> Result<(), SyncError> {
