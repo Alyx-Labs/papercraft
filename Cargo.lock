@@ -2997,7 +2997,7 @@ dependencies = [
 
 [[package]]
 name = "papercraft"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "eframe",
  "egui",
@@ -3011,7 +3011,7 @@ dependencies = [
 
 [[package]]
 name = "papercraft-cli"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "clap",
  "papercraft-compose",
@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "papercraft-color"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "papercraft-geom",
  "serde",
@@ -3032,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "papercraft-compose"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "flate2",
  "fontdue",
@@ -3047,7 +3047,7 @@ dependencies = [
 
 [[package]]
 name = "papercraft-doc"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "papercraft-color",
  "papercraft-geom",
@@ -3057,7 +3057,7 @@ dependencies = [
 
 [[package]]
 name = "papercraft-engine"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "image",
  "log",
@@ -3080,7 +3080,7 @@ dependencies = [
 
 [[package]]
 name = "papercraft-format"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "flate2",
  "papercraft-color",
@@ -3092,21 +3092,21 @@ dependencies = [
 
 [[package]]
 name = "papercraft-geom"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "papercraft-ops"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "papercraft-doc",
 ]
 
 [[package]]
 name = "papercraft-paint"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "papercraft-color",
  "papercraft-doc",
@@ -3116,7 +3116,7 @@ dependencies = [
 
 [[package]]
 name = "papercraft-raster"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "flate2",
  "papercraft-color",
@@ -3126,7 +3126,7 @@ dependencies = [
 
 [[package]]
 name = "papercraft-server"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "eframe",
  "egui",
@@ -3146,7 +3146,7 @@ dependencies = [
 
 [[package]]
 name = "papercraft-server-cli"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "argon2",
  "axum",
@@ -3171,7 +3171,7 @@ dependencies = [
 
 [[package]]
 name = "papercraft-sync"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "log",
  "papercraft-doc",
@@ -3186,7 +3186,7 @@ dependencies = [
 
 [[package]]
 name = "papercraft-sync-protocol"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "js-sys",
  "papercraft-doc",
@@ -3198,14 +3198,14 @@ dependencies = [
 
 [[package]]
 name = "papercraft-tablet"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "log",
 ]
 
 [[package]]
 name = "papercraft-ui-egui"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "eframe",
  "egui",
@@ -3228,7 +3228,7 @@ dependencies = [
 
 [[package]]
 name = "papercraft-updater"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "log",
  "papercraft-tablet",
@@ -3240,7 +3240,7 @@ dependencies = [
 
 [[package]]
 name = "papercraft-web"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "console_error_panic_hook",
  "eframe",
@@ -5660,7 +5660,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "image",
  "papercraft-updater",
