@@ -8,7 +8,7 @@
   Write across pages, choose your paper, and export your notes in a few clicks.
 </p>
 <p align="center">
-  <a href="https://github.com/Alyx-Labs/papercraft/releases/latest"><img alt="Release v0.7.1-alpha" src="https://img.shields.io/badge/release-v0.7.1--alpha-f59e0b?style=flat-square"></a>
+  <a href="https://github.com/Alyx-Labs/papercraft/releases/latest"><img alt="Release v0.7.2-alpha" src="https://img.shields.io/badge/release-v0.7.2--alpha-f59e0b?style=flat-square"></a>
   <a href="#downloads"><img alt="Downloads for Windows, Linux, and macOS" src="https://img.shields.io/badge/downloads-Windows%20%7C%20Linux%20%7C%20macOS-10b981?style=flat-square"></a>
   <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust-b7410e?style=flat-square&logo=rust">
   <a href="https://web.papercraft.ink/"><img alt="Live Web Demo" src="https://img.shields.io/badge/live%20demo-web.papercraft.ink-2f7bf5?style=flat-square"></a>
@@ -78,7 +78,7 @@ PaperCraft is built around three simple principles:
 
 > **Live Web Demo:** Try PaperCraft directly in your browser at **[https://web.papercraft.ink/](https://web.papercraft.ink/)** — runs 100% client-side via WebAssembly with no installation required.
 
-Pre-built binaries are published on [GitHub Releases (`v0.7.1-alpha`)](https://github.com/Alyx-Labs/papercraft/releases/latest) for **Windows**, **Linux**, and **macOS**. PaperCraft ships as **two separate standalone apps**—install the Desktop App on its own for offline note-taking, and add the Server only if you want self-hosted multi-device sync:
+Pre-built binaries are published on [GitHub Releases (`v0.7.2-alpha`)](https://github.com/Alyx-Labs/papercraft/releases/latest) for **Windows**, **Linux**, and **macOS**. PaperCraft ships as **two separate standalone apps**—install the Desktop App on its own for offline note-taking, and add the Server only if you want self-hosted multi-device sync:
 
 <table>
   <tr>

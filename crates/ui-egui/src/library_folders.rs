@@ -2687,7 +2687,7 @@ mod tests {
         let ctx = egui::Context::default();
         let viewport = Vec2::new(1280.0, 800.0);
         let expected_version = crate::display_version_label();
-        assert_eq!(expected_version, "v0.7.1-alpha");
+        assert_eq!(expected_version, "v0.7.2-alpha");
 
         let mut sidebar_rect = Rect::NOTHING;
         let mut website_rect = None;
