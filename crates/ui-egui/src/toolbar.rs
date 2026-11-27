@@ -32,7 +32,7 @@ const EDGE_TAB_NEIGHBOR_GAP: f32 = 6.0;
 const DIVIDER_WIDTH: f32 = 8.0;
 const ZOOM_PILL_WIDTH: f32 = 44.0;
 const RIGHT_UTILITIES_WIDTH: f32 =
-    TOOLBAR_ROW_HEIGHT * 7.0 + ZOOM_PILL_WIDTH + DIVIDER_WIDTH * 2.0 + ZONE_ITEM_SPACING * 9.0;
+    TOOLBAR_ROW_HEIGHT * 6.0 + ZOOM_PILL_WIDTH + DIVIDER_WIDTH * 2.0 + ZONE_ITEM_SPACING * 8.0;
 const RULER_ANGLE_CONTROL_WIDTH: f32 = 62.0;
 const SHAPE_CURVE_CONTROL_WIDTH: f32 = 84.0;
 const PATH_SIZE_SLIDER_WIDTH: f32 = 126.0;
@@ -4061,51 +4061,6 @@ fn draw_right_utility_controls(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &T
         } else {
             crate::modal::open(app, crate::modal::ActiveModal::Export);
         }
-    }
-
-    draw_sync_profile_button(app, ui, t);
-}
-
-/// Renders the `36x36` Profile & Accounts icon button with a live connection status dot.
-pub(crate) fn draw_sync_profile_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
-    let acct_active = app.view.screen == crate::AppScreen::Profile
-        || app.view.active_modal == Some(crate::modal::ActiveModal::AccountSync);
-    let summary = app.session.sync_status_summary();
-    let cloud_pending = app.session.cloud_pending_changes_count();
-    let (state_label, _) = crate::account_modal::status_badge_style(summary.connection, t);
-    let dot_color = if summary.viewing_cloud {
-        crate::account_modal::header_status_dot_color(summary.connection, t)
-    } else {
-        t.header_fg_muted
-    };
-    let sync_tip = if summary.viewing_cloud {
-        let handle = summary
-            .username
-            .as_deref()
-            .map_or_else(String::new, |u| format!(" · @{u}"));
-        format!(
-            "Profile: {}{handle}\nStatus: {} ({cloud_pending} pending sync)\nServer: {} · Offline-First Cache\nClick to switch accounts or manage Profile.",
-            summary.workspace_badge_text(),
-            state_label,
-            summary.server_url
-        )
-    } else {
-        let prof = summary
-            .active_local_profile_name
-            .as_deref()
-            .unwrap_or("Local");
-        format!(
-            "Profile: Local Account ({prof})\nSaved only on this device. Click to switch accounts, sign in to a server, or sync to the cloud."
-        )
-    };
-    let sync_resp = toolbar_icon_button(ui, Icon::Account, None, acct_active, true, t);
-    if ui.is_rect_visible(sync_resp.rect) {
-        let dot_c = egui::pos2(sync_resp.rect.right() - 6.5, sync_resp.rect.bottom() - 6.5);
-        ui.painter().circle_filled(dot_c, 4.2, t.header_bg);
-        ui.painter().circle_filled(dot_c, 3.0, dot_color);
-    }
-    if sync_resp.on_hover_text(sync_tip).clicked() {
-        crate::open_profile_screen(app);
     }
 }
 

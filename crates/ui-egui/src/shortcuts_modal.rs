@@ -624,7 +624,6 @@ mod tests {
             let ws_rect = match screen {
                 AppScreen::Home => app.view.last_home_rect,
                 AppScreen::Editor => app.view.last_canvas_rect,
-                AppScreen::Profile => None,
             }
             .expect("workspace rect");
             let btn_pos = trigger_button_center(ws_rect);

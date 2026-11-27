@@ -259,7 +259,7 @@ To test **Desktop + Web + Sync** side by side, open **3 terminals** at the works
    cargo run -p papercraft
    ```
 
-In both apps, open **Profile & Cloud Sync**, keep `http://127.0.0.1:8787`, create an account on one client, and sign in with the same credentials on the other.
+In both apps, open the Home **Profile** drawer (top-right icon), click **+ Add Account**, keep `http://127.0.0.1:8787`, create an account on one client, and sign in with the same credentials on the other.
 
 ---
 

@@ -1,3 +1,4 @@
+use crate::merge::{DocumentMergeBase, PageElementFingerprints};
 use papercraft_doc::Document;
 use papercraft_sync_protocol::{
     AcceptedFolderSync, AcceptedNotebookSync, DEFAULT_SERVER_URL, LocalFolderChange,
@@ -343,6 +344,14 @@ pub struct NotebookSyncMeta {
     pub last_synced_meta_hash: String,
     #[serde(default)]
     pub last_synced_page_hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_synced_page_element_hashes: Vec<PageElementFingerprints>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_push_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_push_page_hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_push_page_elements: Vec<PageElementFingerprints>,
     pub cloud_dirty: bool,
     pub last_synced_at_ms: i64,
     #[serde(default)]
@@ -512,6 +521,10 @@ impl SyncManifest {
                 last_synced_body_hash: String::new(),
                 last_synced_meta_hash: String::new(),
                 last_synced_page_hashes: Vec::new(),
+                last_synced_page_element_hashes: Vec::new(),
+                pending_push_hash: None,
+                pending_push_page_hashes: Vec::new(),
+                pending_push_page_elements: Vec::new(),
                 cloud_dirty: true,
                 last_synced_at_ms: 0,
                 updated_at_ms: now,
@@ -611,6 +624,10 @@ impl SyncManifest {
                 last_synced_body_hash: String::new(),
                 last_synced_meta_hash: String::new(),
                 last_synced_page_hashes: Vec::new(),
+                last_synced_page_element_hashes: Vec::new(),
+                pending_push_hash: None,
+                pending_push_page_hashes: Vec::new(),
+                pending_push_page_elements: Vec::new(),
                 cloud_dirty: still_dirty,
                 last_synced_at_ms: synced_at_ms,
                 updated_at_ms: synced_at_ms,
@@ -631,6 +648,54 @@ impl SyncManifest {
         }
     }
 
+    /// Updates the stored per-page element fingerprints used for element-level 3-way merges.
+    pub fn set_notebook_synced_page_elements(
+        &mut self,
+        notebook_id: &str,
+        page_elements: Vec<PageElementFingerprints>,
+    ) {
+        if let Some(meta) = self
+            .notebooks
+            .iter_mut()
+            .find(|item| item.notebook_id == notebook_id)
+        {
+            meta.last_synced_page_element_hashes = page_elements;
+        }
+    }
+
+    /// Records the exact snapshot fingerprints being uploaded so an interrupted HTTP ACK can
+    /// recognize and rebase cleanly onto our own prior push on retry.
+    pub fn record_pending_push_base(
+        &mut self,
+        notebook_id: &str,
+        content_hash: String,
+        page_hashes: Vec<String>,
+        page_elements: Vec<PageElementFingerprints>,
+    ) {
+        if let Some(meta) = self
+            .notebooks
+            .iter_mut()
+            .find(|item| item.notebook_id == notebook_id)
+        {
+            meta.pending_push_hash = Some(content_hash);
+            meta.pending_push_page_hashes = page_hashes;
+            meta.pending_push_page_elements = page_elements;
+        }
+    }
+
+    /// Clears recorded pending-push fingerprints once the upload is acknowledged or superseded.
+    pub fn clear_pending_push_base(&mut self, notebook_id: &str) {
+        if let Some(meta) = self
+            .notebooks
+            .iter_mut()
+            .find(|item| item.notebook_id == notebook_id)
+        {
+            meta.pending_push_hash = None;
+            meta.pending_push_page_hashes.clear();
+            meta.pending_push_page_elements.clear();
+        }
+    }
+
     pub fn reassign_owner(&mut self, next_owner: OwnerId, mark_pending: bool) {
         let is_cloud = next_owner.is_cloud();
         self.owner_id = Some(next_owner.clone());
@@ -642,6 +707,10 @@ impl SyncManifest {
                 nb.last_synced_body_hash.clear();
                 nb.last_synced_meta_hash.clear();
                 nb.last_synced_page_hashes.clear();
+                nb.last_synced_page_element_hashes.clear();
+                nb.pending_push_hash = None;
+                nb.pending_push_page_hashes.clear();
+                nb.pending_push_page_elements.clear();
                 nb.cloud_dirty = true;
                 nb.last_synced_at_ms = 0;
                 nb.status = EntitySyncStatus::PendingPush;
@@ -742,6 +811,7 @@ pub struct LocalNotebookSnapshot {
     pub cloud_dirty: bool,
     pub content_hash: String,
     pub doc: Document,
+    pub merge_base: DocumentMergeBase,
 }
 
 #[derive(Clone, Debug)]
@@ -778,6 +848,9 @@ pub struct SyncCycleOutcome {
     pub server_user: UserProfile,
     pub accepted_uploads: Vec<AcceptedNotebookSync>,
     pub accepted_page_hashes: std::collections::HashMap<String, Vec<String>>,
+    pub accepted_page_elements: std::collections::HashMap<String, Vec<PageElementFingerprints>>,
+    pub rebased_docs: std::collections::HashMap<String, Document>,
+    pub rebased_ancestors: std::collections::HashMap<String, DocumentMergeBase>,
     pub accepted_folders: Vec<AcceptedFolderSync>,
     pub cleared_tombstones: Vec<String>,
     pub downloaded_updates: Vec<RemoteNotebookUpdate>,

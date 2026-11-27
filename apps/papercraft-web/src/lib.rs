@@ -11,6 +11,8 @@
 #[cfg(target_arch = "wasm32")]
 mod web_files;
 #[cfg(target_arch = "wasm32")]
+mod web_locks;
+#[cfg(target_arch = "wasm32")]
 mod web_pdf_worker;
 #[cfg(target_arch = "wasm32")]
 mod web_storage;
@@ -97,7 +99,8 @@ mod web {
                     let flush_ctrl = storage_ctrl.clone();
                     let poll_ctrl = storage_ctrl.clone();
                     let retry_ctrl = storage_ctrl.clone();
-                    let writing_ctrl = storage_ctrl;
+                    let writing_ctrl = storage_ctrl.clone();
+                    let sync_ctrl = storage_ctrl;
 
                     let hooks = PlatformHooks {
                         tablet_poll: Some(Box::new(move || stylus_poll.drain_samples())),
@@ -174,8 +177,8 @@ mod web {
                             &ctx_slot,
                         ))
                         .map(|bridge| bridge.into_hooks()),
-                        web_sync_dispatch: Some(Box::new(|cmd, evt_tx, ctx| {
-                            web_sync::dispatch_sync_command(cmd, evt_tx, ctx);
+                        web_sync_dispatch: Some(Box::new(move |cmd, evt_tx, ctx| {
+                            web_sync::dispatch_sync_command(cmd, evt_tx, ctx, sync_ctrl.clone());
                         })),
                         ..PlatformHooks::default()
                     };

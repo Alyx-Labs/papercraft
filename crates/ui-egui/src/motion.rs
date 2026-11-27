@@ -756,6 +756,7 @@ pub struct MotionState {
     pub profile_identity: RevealFade<String>,
     pub account_banner: RevealFade<String>,
     pub settings_tab: TabFadeTransition,
+    pub drawer_mode: RevealFade<crate::RightDrawerMode>,
     pub page_fade: PageFadeTransition,
     pub home_scope: RevealFade<String>,
     pub home_view: RevealFade<HomeViewKey>,

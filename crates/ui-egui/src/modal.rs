@@ -21,6 +21,7 @@ pub enum ActiveModal {
     ConfirmDeleteNotebook,
     ConfirmReorderPage,
     AccountSync,
+    AddAccount,
     FirstAccessNickname,
     SelectLocalAccount,
     ConvertLocalAccount,
@@ -74,6 +75,7 @@ impl ActiveModal {
             Self::NotebookSettings => 3,
             Self::ConfirmDeleteNotebook => 4,
             Self::AccountSync => 5,
+            Self::AddAccount => 21,
             Self::FirstAccessNickname => 14,
             Self::SelectLocalAccount => 15,
             Self::ConvertLocalAccount => 20,
@@ -133,6 +135,13 @@ impl ActiveModal {
                 title: "Account & Cloud Sync",
                 subtitle: "Switch between device-local accounts and Offline-First cloud accounts.",
                 width: 530.0,
+                min_body_height: 0.0,
+            },
+            Self::AddAccount => DialogSpec {
+                icon: Icon::Account,
+                title: "Add Account",
+                subtitle: "Create a local account on this device or sign in to a sync server.",
+                width: 460.0,
                 min_body_height: 0.0,
             },
             Self::TransferPages => DialogSpec {
@@ -396,6 +405,18 @@ pub(crate) fn open(app: &mut PaperCraftApp, target: ActiveModal) {
                 .sync(auth_key, isize::from(auth_key));
             app.view.motion.account_banner.reset();
         }
+        ActiveModal::AddAccount => {
+            app.view.account.server_url = app.session.preferred_server_url().to_string();
+            app.view.account.invalidate_probe_if_url_changed();
+            app.view.account.select_local_new_name.clear();
+            app.view.account.select_local_error = None;
+            app.view.account.select_local_focus_pending =
+                app.view.account.add_account_mode == crate::account_modal::AddAccountMode::Local;
+            app.view.account.clear_auth_form_credentials();
+            app.view.account.profile_probe_pending = true;
+            app.view.motion.auth_flow.sync(0, 0);
+            app.view.motion.account_banner.reset();
+        }
         ActiveModal::TransferPages => {
             if app.view.transfer_pages_list.is_empty()
                 && app.view.transfer_merge_whole_notebook.is_none()
@@ -626,6 +647,14 @@ fn show_inner_with_motion(
             crate::account_modal::render_body,
             crate::account_modal::render_footer,
         ),
+        ActiveModal::AddAccount => show_dialog(
+            app,
+            ui,
+            active,
+            motion,
+            crate::account_modal::render_add_account_body,
+            crate::account_modal::render_add_account_footer,
+        ),
         ActiveModal::FirstAccessNickname => show_dialog(
             app,
             ui,
@@ -758,6 +787,7 @@ fn modal_steps(active: ActiveModal) -> Option<&'static [ModalStepSpec]> {
         | ActiveModal::ConfirmDeleteNotebook
         | ActiveModal::ConfirmReorderPage
         | ActiveModal::AccountSync
+        | ActiveModal::AddAccount
         | ActiveModal::FirstAccessNickname
         | ActiveModal::SelectLocalAccount
         | ActiveModal::ConvertLocalAccount
@@ -1741,6 +1771,7 @@ mod tests {
             ActiveModal::NewNotebook,
             ActiveModal::NotebookSettings,
             ActiveModal::AccountSync,
+            ActiveModal::AddAccount,
             ActiveModal::SelectLocalAccount,
             ActiveModal::ConvertLocalAccount,
             ActiveModal::TransferPages,

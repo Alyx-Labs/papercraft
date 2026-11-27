@@ -27,7 +27,7 @@ pub mod motion;
 pub mod page_format_picker;
 pub mod pages_sidebar;
 pub mod pdf_view;
-pub mod profile_screen;
+pub mod profile_drawer;
 pub mod shortcuts_modal;
 pub mod stylus;
 pub mod sync_worker;
@@ -75,7 +75,14 @@ pub enum AppScreen {
     #[default]
     Home,
     Editor,
+}
+
+/// Top-level mode shown inside the right-hand side drawer on Home.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RightDrawerMode {
     Profile,
+    #[default]
+    Settings,
 }
 
 /// Active section tab inside the right-hand Settings studio drawer.
@@ -277,7 +284,7 @@ pub struct PdfExportProgressView {
 #[derive(Clone, Debug)]
 pub struct ViewState {
     pub screen: AppScreen,
-    pub profile_return_screen: AppScreen,
+    pub right_drawer_mode: RightDrawerMode,
     pub open_tabs: Vec<tab_strip::OpenTab>,
     pub library_search: String,
     pub library_show_trash: bool,
@@ -469,7 +476,7 @@ impl Default for ViewState {
         let default_preset = papercraft_doc::NotebookPreset::EverydayLined;
         Self {
             screen: AppScreen::Home,
-            profile_return_screen: AppScreen::Home,
+            right_drawer_mode: RightDrawerMode::Settings,
             open_tabs: Vec::new(),
             library_search: String::new(),
             library_show_trash: false,
@@ -750,7 +757,7 @@ pub enum WebStorageBackend {
     MemoryOnly,
 }
 
-/// Live browser storage status, quota metrics, error state, and multi-tab activity.
+/// Live browser storage status, quota metrics, error state, and cross-tab sync activity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebStorageStatus {
     pub backend: WebStorageBackend,
@@ -762,7 +769,8 @@ pub struct WebStorageStatus {
     pub quota_exceeded: bool,
     pub last_error: Option<String>,
     pub other_tab_active: bool,
-    pub other_tab_wrote: bool,
+    pub cross_tab_syncing: bool,
+    pub cross_tab_error: Option<String>,
 }
 
 impl WebStorageStatus {
@@ -795,10 +803,24 @@ impl WebStorageStatus {
     }
 }
 
-/// Asynchronous storage status update emitted by the WebAssembly persistence controller.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Browser visibility, focus, connectivity, and peer-sync lifecycle triggers emitted by the Web shell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebSyncTriggerReason {
+    TabVisible,
+    TabHidden,
+    WindowFocused,
+    NetworkOnline,
+    NetworkOffline,
+    PeerSyncFinished,
+}
+
+/// Asynchronous storage status update, cross-tab patch, or sync lifecycle trigger emitted by the
+/// WebAssembly persistence controller.
+#[derive(Clone, Debug)]
 pub enum WebStorageEvent {
     Status(WebStorageStatus),
+    RemotePatch(Box<papercraft_engine::web_storage::WebStorageRemotePatch>),
+    SyncTrigger(WebSyncTriggerReason),
 }
 
 pub type TabletPollFn = Box<dyn FnMut() -> Vec<stylus::PenSample>>;
@@ -1122,7 +1144,10 @@ pub struct PaperCraftApp {
     pub(crate) wgpu_enabled: bool,
     pub web_storage_status: Option<WebStorageStatus>,
     web_storage_low_quota_dismissed: bool,
-    web_storage_multitab_dismissed: bool,
+    web_storage_cross_tab_error_dismissed: bool,
+    pending_web_remote_patch: Option<papercraft_engine::web_storage::WebStorageRemotePatch>,
+    pub(crate) web_tab_visible: bool,
+    pub(crate) last_viewport_focused: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1228,7 +1253,10 @@ impl PaperCraftApp {
             wgpu_enabled: false,
             web_storage_status: None,
             web_storage_low_quota_dismissed: false,
-            web_storage_multitab_dismissed: false,
+            web_storage_cross_tab_error_dismissed: false,
+            pending_web_remote_patch: None,
+            web_tab_visible: true,
+            last_viewport_focused: true,
         }
     }
 
@@ -2271,18 +2299,20 @@ impl PaperCraftApp {
             }
         }
     }
+}
 
-    pub(crate) fn flush_web_cache_if_needed(&mut self) {
-        self.flush_web_storage(false);
-    }
+pub(crate) fn can_apply_live_document_updates(app: &PaperCraftApp) -> bool {
+    app.session.live_stroke.is_none()
+        && app.session.live_eraser.is_none()
+        && !app.view.text_editing
+        && app.view.shape_drag_start.is_none()
+        && app.view.selection_drag.is_none()
+        && app.view.ruler_drag_mode.is_none()
+}
 
-    pub(crate) fn flush_web_storage(&mut self, force_urgent: bool) {
-        let now_ms = papercraft_sync_protocol::now_unix_ms() as f64;
-        if self.session.live_stroke.is_some() || self.session.live_eraser.is_some() {
-            self.last_writing_activity_ms = now_ms;
-            return;
-        }
-        let state_key = WebCacheStateKey {
+impl PaperCraftApp {
+    fn web_cache_state_key(&self) -> WebCacheStateKey {
+        WebCacheStateKey {
             revision: self.session.revision,
             notebook_count: self.session.notebooks.len(),
             trashed_count: self.session.trashed_notebooks.len(),
@@ -2294,7 +2324,20 @@ impl PaperCraftApp {
             needs_initial_nickname: self.session.needs_initial_nickname(),
             last_sync_at_ms: self.session.sync_status_summary().last_sync_at_ms,
             active_notebook: self.session.active_notebook,
-        };
+        }
+    }
+
+    pub(crate) fn flush_web_cache_if_needed(&mut self) {
+        self.flush_web_storage(false);
+    }
+
+    pub(crate) fn flush_web_storage(&mut self, force_urgent: bool) {
+        let now_ms = papercraft_sync_protocol::now_unix_ms() as f64;
+        if self.session.live_stroke.is_some() || self.session.live_eraser.is_some() {
+            self.last_writing_activity_ms = now_ms;
+            return;
+        }
+        let state_key = self.web_cache_state_key();
         if self.hooks.flush_web_storage_delta.is_some() {
             if !force_urgent
                 && self.last_saved_cache_state == Some(state_key)
@@ -2324,7 +2367,7 @@ impl PaperCraftApp {
             {
                 flush(delta);
             }
-            self.last_saved_cache_state = Some(state_key);
+            self.last_saved_cache_state = Some(self.web_cache_state_key());
             self.last_web_pending_check_ms = now_ms;
             return;
         }
@@ -2339,34 +2382,89 @@ impl PaperCraftApp {
         }
     }
 
-    fn poll_web_storage_events(&mut self) {
-        let Some(poll) = self.hooks.poll_web_storage_events.as_mut() else {
-            return;
+    pub(crate) fn poll_web_storage_events(&mut self, ctx: &egui::Context) {
+        let events = if let Some(poll) = self.hooks.poll_web_storage_events.as_mut() {
+            poll()
+        } else {
+            Vec::new()
         };
-        let events = poll();
         for event in events {
-            let WebStorageEvent::Status(status) = event;
-            let prev_low = self
-                .web_storage_status
-                .as_ref()
-                .is_some_and(WebStorageStatus::is_low_quota);
-            let prev_other_active = self
-                .web_storage_status
-                .as_ref()
-                .is_some_and(|s| s.other_tab_active);
-            let prev_other_wrote = self
-                .web_storage_status
-                .as_ref()
-                .is_some_and(|s| s.other_tab_wrote);
-            if status.is_low_quota() && !prev_low {
-                self.web_storage_low_quota_dismissed = false;
+            match event {
+                WebStorageEvent::Status(status) => {
+                    let prev_low = self
+                        .web_storage_status
+                        .as_ref()
+                        .is_some_and(WebStorageStatus::is_low_quota);
+                    let prev_err = self
+                        .web_storage_status
+                        .as_ref()
+                        .and_then(|s| s.cross_tab_error.as_ref());
+                    if status.is_low_quota() && !prev_low {
+                        self.web_storage_low_quota_dismissed = false;
+                    }
+                    if status.cross_tab_error.is_some()
+                        && status.cross_tab_error.as_ref() != prev_err
+                    {
+                        self.web_storage_cross_tab_error_dismissed = false;
+                    }
+                    self.web_storage_status = Some(status);
+                }
+                WebStorageEvent::RemotePatch(patch) => {
+                    if let Some(ref mut pending) = self.pending_web_remote_patch {
+                        pending.merge(*patch);
+                    } else {
+                        self.pending_web_remote_patch = Some(*patch);
+                    }
+                }
+                WebStorageEvent::SyncTrigger(reason) => {
+                    sync_worker::handle_web_sync_trigger(self, ctx, reason);
+                }
             }
-            if (status.other_tab_wrote && !prev_other_wrote)
-                || (status.other_tab_active && !prev_other_active)
-            {
-                self.web_storage_multitab_dismissed = false;
-            }
-            self.web_storage_status = Some(status);
+        }
+
+        if can_apply_live_document_updates(self)
+            && let Some(patch) = self.pending_web_remote_patch.take()
+        {
+            self.apply_web_storage_remote_patch_to_ui(patch, ctx);
+        }
+    }
+
+    fn apply_web_storage_remote_patch_to_ui(
+        &mut self,
+        patch: papercraft_engine::web_storage::WebStorageRemotePatch,
+        ctx: &egui::Context,
+    ) {
+        let prev_theme = self.session.prefs.theme;
+        let prev_active_title = self.session.doc.title.clone();
+        let prev_active_cover = self.session.doc.cover;
+        let prev_rev = self.session.revision;
+
+        let res = self.session.apply_web_storage_remote_patch(patch);
+        tab_strip::sync_open_tabs(self);
+
+        if res.rotated_tokens_adopted {
+            self.view
+                .account
+                .sync_identity_from_session(self.session.active_account_session());
+        }
+        if self.session.revision != prev_rev {
+            self.mesh_cache.clear();
+        }
+        if self.session.prefs.theme != prev_theme {
+            theme::apply_visuals(ctx, self.session.prefs.theme);
+        }
+        if self.session.doc.title != prev_active_title
+            || self.session.doc.cover != prev_active_cover
+        {
+            self.view.notebook_title_draft = self.session.doc.title.clone();
+            self.view.notebook_cover_draft = self.session.doc.cover;
+        }
+        if !res.needs_writeback {
+            self.last_saved_cache_state = Some(self.web_cache_state_key());
+            self.last_web_pending_check_ms = papercraft_sync_protocol::now_unix_ms() as f64;
+        }
+        if res.changed_ui {
+            ctx.request_repaint();
         }
     }
 
@@ -2410,12 +2508,21 @@ impl PaperCraftApp {
                     self.view.tag_edit_index = None;
                     self.view.tag_edit_draft.clear();
                     self.view.tag_edit_focus_pending = false;
-                } else if self.view.active_modal == Some(modal::ActiveModal::AccountSync)
+                } else if (self.view.active_modal == Some(modal::ActiveModal::AccountSync)
+                    || self.view.active_modal == Some(modal::ActiveModal::AddAccount))
                     && (self.view.account.pending_delete_profile_id.is_some()
-                        || self.view.account.pending_forget_server_key.is_some())
+                        || self.view.account.pending_forget_server_key.is_some()
+                        || self.view.account.pending_unsynced_switch.is_some())
                 {
                     self.view.account.clear_pending_delete_profile();
                     self.view.account.clear_pending_forget_server();
+                    self.view.account.clear_pending_unsynced_switch();
+                } else if self.view.active_modal == Some(modal::ActiveModal::AddAccount)
+                    && self.view.account.password_reset.active
+                {
+                    if !self.view.account.password_reset.busy {
+                        self.view.account.exit_password_reset_flow();
+                    }
                 } else if self.view.active_modal == Some(modal::ActiveModal::Export)
                     && self.is_pdf_export_active()
                 {
@@ -2486,16 +2593,15 @@ impl PaperCraftApp {
             return Some(KeyboardShortcutAction::OpenNotebookDialog);
         }
         if self.view.screen == AppScreen::Home {
+            if i.key_pressed(egui::Key::Escape)
+                && self.view.inspector_open
+                && self.view.right_drawer_mode == RightDrawerMode::Profile
+                && (self.view.account.pending_delete_profile_id.is_some()
+                    || self.view.account.pending_forget_server_key.is_some())
+            {
+                return Some(KeyboardShortcutAction::HomeClearPendingAccountConfirm);
+            }
             return self.detect_home_shortcut(i);
-        }
-        if self.view.screen == AppScreen::Profile {
-            if i.key_pressed(egui::Key::Escape) {
-                return Some(KeyboardShortcutAction::CloseProfile);
-            }
-            if i.key_pressed(egui::Key::S) && !i.modifiers.command {
-                return Some(KeyboardShortcutAction::HomeToggleSettings);
-            }
-            return None;
         }
         let has_escape_target = self.view.text_editing
             || self.view.text_insert_mode
@@ -2598,10 +2704,19 @@ impl PaperCraftApp {
                 modal::open(self, modal::ActiveModal::NewNotebook);
             }
             KeyboardShortcutAction::HomeToggleSettings => {
-                if !self.view.inspector_open {
+                if self.view.inspector_open
+                    && self.view.right_drawer_mode == RightDrawerMode::Settings
+                {
+                    self.view.inspector_open = false;
+                } else {
+                    self.view.right_drawer_mode = RightDrawerMode::Settings;
                     self.view.settings_tab = SettingsTab::Appearance;
+                    self.view.inspector_open = true;
                 }
-                self.view.inspector_open = !self.view.inspector_open;
+            }
+            KeyboardShortcutAction::HomeClearPendingAccountConfirm => {
+                self.view.account.clear_pending_delete_profile();
+                self.view.account.clear_pending_forget_server();
             }
             KeyboardShortcutAction::HomeClearSearch => {
                 self.view.library_search.clear();
@@ -2692,13 +2807,6 @@ impl PaperCraftApp {
             KeyboardShortcutAction::CloseActiveTab => {
                 tab_strip::close_active_tab(self);
             }
-            KeyboardShortcutAction::CloseProfile => {
-                if self.view.account.pending_delete_profile_id.is_some() {
-                    self.view.account.clear_pending_delete_profile();
-                } else {
-                    close_profile_screen(self);
-                }
-            }
             KeyboardShortcutAction::ToggleKeyboardShortcuts => {
                 if self.view.active_modal == Some(modal::ActiveModal::KeyboardShortcuts) {
                     modal::close(self);
@@ -2733,6 +2841,7 @@ enum KeyboardShortcutAction {
     OpenNotebookDialog,
     HomeNewNotebook,
     HomeToggleSettings,
+    HomeClearPendingAccountConfirm,
     HomeClearSearch,
     EditorEscape,
     ActivateSelectTool,
@@ -2748,7 +2857,6 @@ enum KeyboardShortcutAction {
     TogglePagesSidebar,
     ReturnToHome,
     CloseActiveTab,
-    CloseProfile,
     ToggleKeyboardShortcuts,
     StepPage(isize),
 }
@@ -2955,7 +3063,7 @@ impl PaperCraftApp {
         self.handle_shortcuts(&ctx);
         self.handle_page_clipboard_events(&ctx, &events);
         self.poll_async_file_events_and_drops(&ctx);
-        self.poll_web_storage_events();
+        self.poll_web_storage_events(&ctx);
         sync_worker::poll_and_tick(self, &ctx, now_ms);
         self.pump_background_autosave(now_s);
 
@@ -2996,9 +3104,6 @@ impl PaperCraftApp {
                 color_picker::show_popover(self, ui);
                 toolbar::show_elements_popover(self, ui);
                 toolbar::show_smoothing_popover(self, ui);
-            }
-            AppScreen::Profile => {
-                profile_screen::show(self, ui);
             }
         }
         if self.view.motion.screen.rendered != self.view.screen
@@ -3388,14 +3493,13 @@ fn resolve_web_storage_banner(app: &PaperCraftApp) -> Option<WebStorageBannerKin
             allow_retry: false,
         });
     }
-    if (status.other_tab_wrote || status.other_tab_active) && !app.web_storage_multitab_dismissed {
-        let message = if status.other_tab_wrote {
-            "Another PaperCraft tab saved newer changes. Reload this tab before editing to avoid overwriting work.".to_string()
-        } else {
-            "PaperCraft is open in another browser tab. Close extra tabs to prevent conflicting edits.".to_string()
-        };
+    if let Some(ref err_msg) = status.cross_tab_error
+        && !app.web_storage_cross_tab_error_dismissed
+    {
         return Some(WebStorageBannerKind::Warning {
-            message,
+            message: format!(
+                "Live cross-tab sync hit a storage error ({err_msg}). Reload this tab or export a .pcraftpkg backup if changes look out of date."
+            ),
             dismiss_target: 1,
         });
     }
@@ -3498,7 +3602,7 @@ fn render_web_storage_banner(app: &mut PaperCraftApp, ctx: &egui::Context, t: &t
                                 .clicked()
                                 {
                                     if dismiss_target == 1 {
-                                        app.web_storage_multitab_dismissed = true;
+                                        app.web_storage_cross_tab_error_dismissed = true;
                                     } else {
                                         app.web_storage_low_quota_dismissed = true;
                                     }
@@ -4257,17 +4361,11 @@ pub(crate) fn return_to_home(app: &mut PaperCraftApp) {
     let _ = app.session.save_library();
     app.flush_web_storage(true);
     app.view.inspector_open = false;
-    app.view.profile_return_screen = AppScreen::Home;
     app.view.screen = AppScreen::Home;
 }
 
-pub(crate) fn open_profile_screen(app: &mut PaperCraftApp) {
-    if app.view.screen == AppScreen::Profile {
-        return;
-    }
+pub(crate) fn prepare_profile_drawer(app: &mut PaperCraftApp) {
     canvas::commit_pending_text(app);
-    app.view.profile_return_screen = app.view.screen;
-    app.view.inspector_open = false;
     crate::account_modal::sync_draft_from_session(app);
     app.view.account.profile_section = account_modal::ProfileSection::Accounts;
     app.view.account.profile_probe_pending = true;
@@ -4292,19 +4390,12 @@ pub(crate) fn open_profile_screen(app: &mut PaperCraftApp) {
         .sync(auth_key, isize::from(auth_key));
     app.view.motion.profile_identity.reset();
     app.view.motion.account_banner.reset();
-    app.view.screen = AppScreen::Profile;
 }
 
-pub(crate) fn close_profile_screen(app: &mut PaperCraftApp) {
-    app.view.inspector_open = false;
-    app.view.account.clear_pending_delete_profile();
-    let target = match app.view.profile_return_screen {
-        AppScreen::Editor if app.session.active_notebook < app.session.notebooks.len() => {
-            AppScreen::Editor
-        }
-        _ => AppScreen::Home,
-    };
-    app.view.screen = target;
+pub(crate) fn open_profile_drawer(app: &mut PaperCraftApp) {
+    prepare_profile_drawer(app);
+    app.view.right_drawer_mode = RightDrawerMode::Profile;
+    app.view.inspector_open = true;
 }
 
 /// Standardized width shared by the left navigation sidebars (Library and Pages)
@@ -5781,7 +5872,8 @@ mod tests {
                 quota_exceeded: false,
                 last_error: None,
                 other_tab_active: false,
-                other_tab_wrote: false,
+                cross_tab_syncing: false,
+                cross_tab_error: None,
             },
         )]));
         let poll_events = Arc::clone(&pending_events);
@@ -5829,7 +5921,8 @@ mod tests {
                 quota_exceeded: true,
                 last_error: Some("QuotaExceededError".to_string()),
                 other_tab_active: false,
-                other_tab_wrote: false,
+                cross_tab_syncing: false,
+                cross_tab_error: None,
             }));
         }
         time += 0.04;
@@ -5857,7 +5950,7 @@ mod tests {
         }
         assert_eq!(retried.load(std::sync::atomic::Ordering::Relaxed), 1);
 
-        // Multi-tab warning renders when another tab is active.
+        // Normal multi-tab activity syncs silently without any reload warning banner.
         if let Ok(mut guard) = pending_events.lock() {
             guard.push(WebStorageEvent::Status(WebStorageStatus {
                 backend: WebStorageBackend::IndexedDb,
@@ -5869,13 +5962,132 @@ mod tests {
                 quota_exceeded: false,
                 last_error: None,
                 other_tab_active: true,
-                other_tab_wrote: true,
+                cross_tab_syncing: true,
+                cross_tab_error: None,
+            }));
+        }
+        time += 0.04;
+        let _ = run_banner_frame(&ctx, &mut app, time, Vec::new());
+        time += 0.04;
+        let (silent_texts, _) = run_banner_frame(&ctx, &mut app, time, Vec::new());
+        assert!(!silent_texts.contains("Another PaperCraft tab saved newer changes"));
+        assert!(!silent_texts.contains("Close extra tabs"));
+
+        // Cross-tab error banner renders when live cross-tab sync reports an error.
+        if let Ok(mut guard) = pending_events.lock() {
+            guard.push(WebStorageEvent::Status(WebStorageStatus {
+                backend: WebStorageBackend::IndexedDb,
+                persisted: Some(true),
+                usage_bytes: Some(1024 * 1024),
+                quota_bytes: Some(1024 * 1024 * 1024),
+                in_flight: false,
+                has_unsaved_error: false,
+                quota_exceeded: false,
+                last_error: None,
+                other_tab_active: true,
+                cross_tab_syncing: false,
+                cross_tab_error: Some("IndexedDB lock timeout".to_string()),
             }));
         }
         time += 0.04;
         let _ = run_banner_frame(&ctx, &mut app, time, Vec::new());
         time += 0.04;
         let (multi_texts, _) = run_banner_frame(&ctx, &mut app, time, Vec::new());
-        assert!(multi_texts.contains("Another PaperCraft tab saved newer changes"));
+        assert!(multi_texts.contains("Live cross-tab sync hit a storage error"));
+    }
+
+    #[test]
+    fn remote_patch_defers_during_live_stroke_and_preserves_ui_state() {
+        let mut session = Session::open_web_storage(None);
+        session.complete_first_access_nickname("DrawUser").unwrap();
+        let _ = session.take_web_storage_delta(false);
+        let ws_key = session.active_web_workspace_key().unwrap();
+        let nb_id = session.doc.id.clone();
+
+        let mut remote_doc = (*session.doc).clone();
+        remote_doc.title = "Updated From Tab A".to_string();
+        remote_doc.meta_updated_at_ms = session.doc.meta_updated_at_ms.saturating_add(10);
+        let r_sid = remote_doc.alloc_stroke_id();
+        let r_pts = vec![
+            papercraft_doc::StrokeSample::from_xy_pressure(220.0, 240.0, 0.6),
+            papercraft_doc::StrokeSample::from_xy_pressure(290.0, 310.0, 0.8),
+        ];
+        remote_doc
+            .strokes
+            .push(Arc::new(papercraft_doc::InkStroke::new(
+                r_sid,
+                papercraft_doc::PenSettings::fountain_pen(),
+                r_pts.clone(),
+                r_pts,
+            )));
+        remote_doc.sync_active_to_pages();
+
+        let mut patch = papercraft_engine::web_storage::WebStorageRemotePatch::default();
+        patch
+            .put_notebooks
+            .insert((ws_key, nb_id.clone()), remote_doc);
+
+        let pending_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let poll_events = Arc::clone(&pending_events);
+        let hooks = PlatformHooks {
+            poll_web_storage_events: Some(Box::new(move || {
+                if let Ok(mut guard) = poll_events.lock() {
+                    std::mem::take(&mut *guard)
+                } else {
+                    Vec::new()
+                }
+            })),
+            ..PlatformHooks::default()
+        };
+
+        let mut app = PaperCraftApp::new(session, hooks);
+        let ctx = egui::Context::default();
+        app.view.screen = AppScreen::Editor;
+        app.view.zoom = 1.65;
+        app.view.pan = [42.0, -18.0];
+        let expected_tabs = vec![tab_strip::OpenTab {
+            id: nb_id,
+            index: 0,
+        }];
+        app.view.open_tabs = expected_tabs.clone();
+        app.session
+            .set_active_tool(papercraft_engine::ToolKind::Pen(
+                papercraft_doc::PenKind::Highlighter,
+            ));
+        let _ = app.session.take_web_storage_delta(false);
+
+        app.session
+            .begin_live_stroke(papercraft_doc::StrokeSample::from_xy_pressure(
+                10.0, 10.0, 0.5,
+            ));
+        app.session
+            .update_live_stroke(papercraft_doc::StrokeSample::from_xy_pressure(
+                80.0, 80.0, 0.7,
+            ));
+        if let Ok(mut guard) = pending_events.lock() {
+            guard.push(WebStorageEvent::RemotePatch(Box::new(patch)));
+        }
+
+        // While drawing is active, incoming patches must queue without interrupting the stroke.
+        app.poll_web_storage_events(&ctx);
+        assert!(!can_apply_live_document_updates(&app));
+        assert!(app.pending_web_remote_patch.is_some());
+        assert!(app.session.live_stroke.is_some());
+        assert_ne!(app.session.doc.title, "Updated From Tab A");
+
+        // As soon as the stroke finishes, the deferred patch merges cleanly while preserving UI state.
+        let _ = app.session.finish_live_stroke();
+        assert!(can_apply_live_document_updates(&app));
+        app.poll_web_storage_events(&ctx);
+        assert!(app.pending_web_remote_patch.is_none());
+        assert_eq!(app.session.doc.title, "Updated From Tab A");
+        assert_eq!(app.session.doc.strokes.len(), 2);
+        assert_eq!(app.view.zoom, 1.65);
+        assert_eq!(app.view.pan, [42.0, -18.0]);
+        assert_eq!(app.view.open_tabs, expected_tabs);
+        assert_eq!(
+            app.session.active_tool,
+            papercraft_engine::ToolKind::Pen(papercraft_doc::PenKind::Highlighter)
+        );
     }
 }

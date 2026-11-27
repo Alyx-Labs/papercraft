@@ -12,11 +12,17 @@
 
 pub mod client;
 pub mod engine;
+pub mod merge;
 pub mod store;
 pub mod types;
 
 pub use client::SyncHttpClient;
 pub use engine::{SyncCycleDriver, outcome_from_full_pull, run_sync_cycle};
+pub use merge::{
+    DocumentMergeBase, MergeDecision, MergeKind, PageElementFingerprints,
+    compute_document_page_elements, compute_page_elements, merge_documents_three_way,
+    strip_conflict_copy_suffix,
+};
 pub use store::{
     account_library_dir, default_device_name, inspect_local_accounts_in_library, load_global_state,
     load_manifest, profile_library_dir, sanitize_account_dir_segment, sanitize_client_id,

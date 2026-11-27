@@ -1,5 +1,6 @@
 use std::sync::mpsc;
 
+use papercraft_engine::web_storage::cloud_workspace_key;
 use papercraft_sync::{
     ActiveAccountSession, SyncBatch, SyncCycleDriver, SyncCycleOutcome, SyncError,
 };
@@ -20,13 +21,18 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
+use crate::{web_locks, web_storage};
+
+const CLOUD_SYNC_LOCK_LEASE_MS: f64 = 45_000.0;
+
 pub fn dispatch_sync_command(
     cmd: SyncWorkerCommand,
     evt_tx: mpsc::Sender<SyncWorkerEvent>,
     ctx: Option<egui::Context>,
+    storage_ctrl: web_storage::WebStorageController,
 ) {
     spawn_local(async move {
-        let evt = execute_async_command(cmd, &evt_tx, ctx.as_ref()).await;
+        let evt = execute_async_command(cmd, &evt_tx, ctx.as_ref(), &storage_ctrl).await;
         if let Some(event) = evt {
             let _ = evt_tx.send(event);
             if let Some(egui_ctx) = ctx {
@@ -75,6 +81,7 @@ async fn execute_async_command(
     cmd: SyncWorkerCommand,
     evt_tx: &mpsc::Sender<SyncWorkerEvent>,
     ctx: Option<&egui::Context>,
+    storage_ctrl: &web_storage::WebStorageController,
 ) -> Option<SyncWorkerEvent> {
     match cmd {
         SyncWorkerCommand::TestConnection { server_url } => {
@@ -109,47 +116,18 @@ async fn execute_async_command(
             password,
             display_name,
             device_name,
-        } => {
-            let req = match build_register_request(
+        } => Some(
+            exec_web_register(
+                session_generation,
+                &server_url,
                 &email,
                 username.as_deref(),
                 password,
                 display_name,
                 &device_name,
-            ) {
-                Ok(req) => req,
-                Err(message) => {
-                    return Some(SyncWorkerEvent::AuthErr {
-                        session_generation,
-                        offline: false,
-                        message,
-                    });
-                }
-            };
-            let mut auth =
-                match web_auth("/api/v1/auth/register", &server_url, &req, &device_name).await {
-                    Ok(auth) => auth,
-                    Err(err) => {
-                        return Some(SyncWorkerEvent::AuthErr {
-                            session_generation,
-                            offline: matches!(err, SyncError::Network(_)),
-                            message: friendly_web_auth_error(&err),
-                        });
-                    }
-                };
-            match pull_with_refresh(&mut auth, 0).await {
-                Ok((pull_resp, _)) => Some(SyncWorkerEvent::AuthOk {
-                    session_generation,
-                    auth,
-                    initial_pull: Box::new(pull_resp),
-                }),
-                Err(err) => Some(SyncWorkerEvent::AuthErr {
-                    session_generation,
-                    offline: matches!(err, SyncError::Network(_)),
-                    message: friendly_web_error(&err),
-                }),
-            }
-        }
+            )
+            .await,
+        ),
         SyncWorkerCommand::Login {
             session_generation,
             server_url,
@@ -210,65 +188,70 @@ async fn execute_async_command(
         ),
         SyncWorkerCommand::UpdateProfile {
             session_generation,
-            session,
+            mut session,
             username,
             display_name,
         } => {
-            Some(exec_web_update_profile(session_generation, session, username, display_name).await)
+            let before = (
+                session.access_token.clone(),
+                session.refresh_token.clone(),
+                session.last_auth_ms,
+            );
+            let evt =
+                exec_web_update_profile(session_generation, &mut session, username, display_name)
+                    .await;
+            if matches!(evt, SyncWorkerEvent::ProfileUpdated { .. })
+                && tokens_rotated(&session, &before.0, &before.1, before.2)
+            {
+                storage_ctrl.persist_rotated_session_tokens(&session).await;
+            }
+            Some(evt)
         }
         SyncWorkerCommand::ChangePassword {
             session_generation,
-            session,
+            mut session,
             current_password,
             new_password,
-        } => Some(
-            exec_web_change_password(session_generation, session, current_password, new_password)
-                .await,
-        ),
+        } => {
+            let before = (
+                session.access_token.clone(),
+                session.refresh_token.clone(),
+                session.last_auth_ms,
+            );
+            let evt = exec_web_change_password(
+                session_generation,
+                &mut session,
+                current_password,
+                new_password,
+            )
+            .await;
+            if matches!(evt, SyncWorkerEvent::PasswordChanged { .. })
+                && tokens_rotated(&session, &before.0, &before.1, before.2)
+            {
+                storage_ctrl.persist_rotated_session_tokens(&session).await;
+            }
+            Some(evt)
+        }
         SyncWorkerCommand::ChangeEmail {
             session_generation,
-            mut session,
+            session,
             new_email,
             current_password,
-        } => {
-            let req = match build_change_email_request(&new_email, current_password) {
-                Ok(req) => req,
-                Err(message) => {
-                    return Some(SyncWorkerEvent::EmailChangeErr {
-                        session_generation,
-                        offline: false,
-                        unauthorized: false,
-                        message,
-                    });
-                }
-            };
-            match web_change_email_with_refresh(&mut session, &req).await {
-                Ok(profile) => {
-                    session.user = profile;
-                    Some(SyncWorkerEvent::EmailChanged {
-                        session_generation,
-                        updated_session: session,
-                    })
-                }
-                Err(err) => Some(SyncWorkerEvent::EmailChangeErr {
-                    session_generation,
-                    offline: matches!(err, SyncError::Network(_)),
-                    unauthorized: matches!(err, SyncError::Unauthorized(_)),
-                    message: friendly_web_error(&err),
-                }),
-            }
-        }
+        } => Some(
+            exec_web_change_email(
+                session_generation,
+                session,
+                &new_email,
+                current_password,
+                storage_ctrl,
+            )
+            .await,
+        ),
         SyncWorkerCommand::SyncNow {
             session_generation,
-            mut session,
+            session,
             batch,
-        } => match run_web_sync_cycle(&mut session, &batch).await {
-            Ok(outcome) => Some(SyncWorkerEvent::SyncOk {
-                session_generation,
-                outcome: Box::new(outcome),
-            }),
-            Err(err) => Some(web_sync_err_event(session_generation, &err)),
-        },
+        } => Some(exec_web_sync_now(session_generation, session, *batch, storage_ctrl).await),
         SyncWorkerCommand::Logout { session } => {
             let url = format!("{}/api/v1/auth/logout", session.server_url);
             let body = LogoutRequest {
@@ -279,6 +262,170 @@ async fn execute_async_command(
             None
         }
     }
+}
+
+async fn exec_web_register(
+    session_generation: u64,
+    server_url: &str,
+    email: &str,
+    username: Option<&str>,
+    password: String,
+    display_name: Option<String>,
+    device_name: &str,
+) -> SyncWorkerEvent {
+    let req = match build_register_request(email, username, password, display_name, device_name) {
+        Ok(req) => req,
+        Err(message) => {
+            return SyncWorkerEvent::AuthErr {
+                session_generation,
+                offline: false,
+                message,
+            };
+        }
+    };
+    let mut auth = match web_auth("/api/v1/auth/register", server_url, &req, device_name).await {
+        Ok(auth) => auth,
+        Err(err) => {
+            return SyncWorkerEvent::AuthErr {
+                session_generation,
+                offline: matches!(err, SyncError::Network(_)),
+                message: friendly_web_auth_error(&err),
+            };
+        }
+    };
+    match pull_with_refresh(&mut auth, 0).await {
+        Ok((pull_resp, _)) => SyncWorkerEvent::AuthOk {
+            session_generation,
+            auth,
+            initial_pull: Box::new(pull_resp),
+        },
+        Err(err) => SyncWorkerEvent::AuthErr {
+            session_generation,
+            offline: matches!(err, SyncError::Network(_)),
+            message: friendly_web_error(&err),
+        },
+    }
+}
+
+async fn exec_web_change_email(
+    session_generation: u64,
+    mut session: ActiveAccountSession,
+    new_email: &str,
+    current_password: String,
+    storage_ctrl: &web_storage::WebStorageController,
+) -> SyncWorkerEvent {
+    let before = (
+        session.access_token.clone(),
+        session.refresh_token.clone(),
+        session.last_auth_ms,
+    );
+    let req = match build_change_email_request(new_email, current_password) {
+        Ok(req) => req,
+        Err(message) => {
+            return SyncWorkerEvent::EmailChangeErr {
+                session_generation,
+                offline: false,
+                unauthorized: false,
+                message,
+            };
+        }
+    };
+    match web_change_email_with_refresh(&mut session, &req).await {
+        Ok(profile) => {
+            session.user = profile;
+            if tokens_rotated(&session, &before.0, &before.1, before.2) {
+                storage_ctrl.persist_rotated_session_tokens(&session).await;
+            }
+            SyncWorkerEvent::EmailChanged {
+                session_generation,
+                updated_session: session,
+            }
+        }
+        Err(err) => SyncWorkerEvent::EmailChangeErr {
+            session_generation,
+            offline: matches!(err, SyncError::Network(_)),
+            unauthorized: matches!(err, SyncError::Unauthorized(_)),
+            message: friendly_web_error(&err),
+        },
+    }
+}
+
+fn tokens_rotated(
+    session: &ActiveAccountSession,
+    before_access: &str,
+    before_refresh: &str,
+    before_auth_ms: i64,
+) -> bool {
+    session.access_token != before_access
+        || session.refresh_token != before_refresh
+        || session.last_auth_ms != before_auth_ms
+}
+
+async fn exec_web_sync_now(
+    session_generation: u64,
+    session: ActiveAccountSession,
+    batch: SyncBatch,
+    storage_ctrl: &web_storage::WebStorageController,
+) -> SyncWorkerEvent {
+    let ws_key = cloud_workspace_key(&session.server_url, &session.user.user_id);
+    let lock_name = format!("papercraft:cloud-sync:{ws_key}");
+    let tab_id = storage_ctrl.tab_id();
+    let ctrl = storage_ctrl.clone();
+    let ws_key_lock = ws_key.clone();
+
+    let locked_result = web_locks::try_with_exclusive_lock_if_available(
+        &lock_name,
+        &tab_id,
+        CLOUD_SYNC_LOCK_LEASE_MS,
+        move || async move {
+            let mut active_session = session;
+            if let Some(latest) = ctrl
+                .read_latest_cached_session(
+                    &active_session.server_url,
+                    &active_session.user.user_id,
+                )
+                .await
+                && latest.last_auth_ms >= active_session.last_auth_ms
+                && (!latest.access_token.is_empty() || active_session.access_token.is_empty())
+            {
+                active_session = latest;
+            }
+            let before_access = active_session.access_token.clone();
+            let before_refresh = active_session.refresh_token.clone();
+            let before_auth_ms = active_session.last_auth_ms;
+
+            ctrl.broadcast_sync_lifecycle("sync_start", &ws_key_lock, false);
+            let cycle_res = run_web_sync_cycle(&mut active_session, &batch).await;
+
+            // Persist and broadcast rotated tokens BEFORE releasing `papercraft:cloud-sync`.
+            if tokens_rotated(
+                &active_session,
+                &before_access,
+                &before_refresh,
+                before_auth_ms,
+            ) {
+                ctrl.persist_rotated_session_tokens(&active_session).await;
+            }
+            let had_changes = cycle_res.as_ref().is_ok_and(|o| {
+                o.pushed_count > 0
+                    || o.pulled_count > 0
+                    || o.updated_prefs.is_some()
+                    || !o.downloaded_folders.is_empty()
+            });
+            ctrl.broadcast_sync_lifecycle("sync_done", &ws_key_lock, had_changes);
+
+            match cycle_res {
+                Ok(outcome) => SyncWorkerEvent::SyncOk {
+                    session_generation,
+                    outcome: Box::new(outcome),
+                },
+                Err(err) => web_sync_err_event(session_generation, &err),
+            }
+        },
+    )
+    .await;
+
+    locked_result.unwrap_or(SyncWorkerEvent::SyncDeferredByPeer { session_generation })
 }
 
 async fn exec_web_login(
@@ -509,7 +656,7 @@ async fn exec_web_convert_local_account(
 
 async fn exec_web_update_profile(
     session_generation: u64,
-    mut session: ActiveAccountSession,
+    session: &mut ActiveAccountSession,
     username: Option<String>,
     display_name: Option<String>,
 ) -> SyncWorkerEvent {
@@ -524,12 +671,12 @@ async fn exec_web_update_profile(
             };
         }
     };
-    match web_post_profile_with_refresh(&mut session, "/api/v1/auth/update-profile", &req).await {
+    match web_post_profile_with_refresh(session, "/api/v1/auth/update-profile", &req).await {
         Ok(profile) => {
             session.user = profile;
             SyncWorkerEvent::ProfileUpdated {
                 session_generation,
-                updated_session: session,
+                updated_session: session.clone(),
             }
         }
         Err(err) => SyncWorkerEvent::ProfileUpdateErr {
@@ -543,7 +690,7 @@ async fn exec_web_update_profile(
 
 async fn exec_web_change_password(
     session_generation: u64,
-    mut session: ActiveAccountSession,
+    session: &mut ActiveAccountSession,
     current_password: String,
     new_password: String,
 ) -> SyncWorkerEvent {
@@ -558,12 +705,12 @@ async fn exec_web_change_password(
             };
         }
     };
-    match web_post_profile_with_refresh(&mut session, "/api/v1/auth/change-password", &req).await {
+    match web_post_profile_with_refresh(session, "/api/v1/auth/change-password", &req).await {
         Ok(profile) => {
             session.user = profile;
             SyncWorkerEvent::PasswordChanged {
                 session_generation,
-                updated_session: session,
+                updated_session: session.clone(),
             }
         }
         Err(err) => SyncWorkerEvent::PasswordChangeErr {
@@ -687,16 +834,38 @@ async fn run_web_sync_cycle(
     let initial_access = session.access_token.clone();
     yield_to_browser().await;
     let mut driver = SyncCycleDriver::new(batch);
+    let mut did_pre_pull = false;
 
-    while let Some(req) = driver.next_push_request(batch) {
-        let resp = push_with_refresh(session, &req).await?;
-        driver.record_push_chunk_response(resp, batch);
+    if !batch.force_overwrite {
+        let (pre_pull, _) = pull_with_refresh(session, batch.client_cursor).await?;
+        driver.apply_pre_pull(pre_pull, batch);
+        did_pre_pull = true;
         yield_to_browser().await;
     }
 
-    let (pull_resp, refreshed_on_pull) = pull_with_refresh(session, batch.client_cursor).await?;
-    let token_changed = refreshed_on_pull || session.access_token != initial_access;
-    Ok(driver.finish(pull_resp, token_changed.then(|| session.clone())))
+    while let Some(req) = driver.next_push_request(batch) {
+        match push_with_refresh(session, &req).await {
+            Ok(resp) => driver.record_push_chunk_response(resp, batch),
+            Err(SyncError::Server { status: 409, .. }) if driver.can_retry_http_conflict() => {
+                let (pull_resp, _) = pull_with_refresh(session, driver.pull_since_cursor()).await?;
+                if !driver.apply_http_conflict_pull(pull_resp, batch) {
+                    break;
+                }
+            }
+            Err(err) => return Err(err),
+        }
+        yield_to_browser().await;
+    }
+
+    if driver.had_push_requests() || !did_pre_pull {
+        let (pull_resp, refreshed_on_pull) =
+            pull_with_refresh(session, driver.pull_since_cursor()).await?;
+        let token_changed = refreshed_on_pull || session.access_token != initial_access;
+        Ok(driver.finish(pull_resp, token_changed.then(|| session.clone())))
+    } else {
+        let token_changed = session.access_token != initial_access;
+        Ok(driver.finish_from_pre_pull(token_changed.then(|| session.clone())))
+    }
 }
 
 async fn push_with_refresh(

@@ -437,17 +437,41 @@ fn draw_home_brand(ui: &mut egui::Ui, show_subtitle: bool, t: &Tokens) {
     }
 }
 
-fn draw_home_settings_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
-    let settings_tip = if cfg!(target_arch = "wasm32") {
-        "Settings (Shortcut: S)\nPen shortcuts, studio appearance, and system info."
+fn draw_home_profile_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    let summary = app.session.sync_status_summary();
+    let cloud_pending = app.session.cloud_pending_changes_count();
+    let (state_label, _) = crate::account_modal::status_badge_style(summary.connection, t);
+    let dot_color = if summary.viewing_cloud {
+        crate::account_modal::header_status_dot_color(summary.connection, t)
+    } else if app.view.inspector_open && !t.is_dark {
+        t.header_active_fg
     } else {
-        "Settings (Shortcut: S)\nPen shortcuts, studio appearance, system info, and app updates."
+        Color32::from_rgb(0x82, 0xCA, 0xF2)
     };
-    if sidebar_edge_button_sized(
+    let tip = if summary.viewing_cloud {
+        let handle = summary
+            .username
+            .as_deref()
+            .map_or_else(String::new, |u| format!(" · @{u}"));
+        format!(
+            "Profile & Settings: {}{handle}\nStatus: {} ({cloud_pending} pending)\nClick to open Profile, switch accounts, or adjust Settings.",
+            summary.workspace_badge_text(),
+            state_label,
+        )
+    } else {
+        let prof = summary
+            .active_local_profile_name
+            .as_deref()
+            .unwrap_or("Local");
+        format!(
+            "Profile & Settings: Local ({prof})\nClick to open Profile, switch accounts, sign in, or adjust Settings."
+        )
+    };
+    let resp = sidebar_edge_button_sized(
         ui,
         SidebarEdgeButtonSpec {
             edge: SidebarEdge::Right,
-            icon: Icon::Settings,
+            icon: Icon::Account,
             label: "",
             max_width: None,
             open: app.view.inspector_open,
@@ -455,14 +479,23 @@ fn draw_home_settings_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tok
         },
         SidebarEdgeSize::Toolbar,
         t,
-    )
-    .on_hover_text(settings_tip)
-    .clicked()
-    {
-        if !app.view.inspector_open {
-            app.view.settings_tab = crate::SettingsTab::Appearance;
+    );
+    if ui.is_rect_visible(resp.rect) {
+        let ring_bg = if app.view.inspector_open {
+            t.header_active_bg
+        } else {
+            t.header_bg
+        };
+        let dot_c = pos2(resp.rect.right() - 8.5, resp.rect.bottom() - 7.5);
+        ui.painter().circle_filled(dot_c, 4.2, ring_bg);
+        ui.painter().circle_filled(dot_c, 3.0, dot_color);
+    }
+    if resp.on_hover_text(tip).clicked() {
+        if app.view.inspector_open {
+            app.view.inspector_open = false;
+        } else {
+            crate::open_profile_drawer(app);
         }
-        app.view.inspector_open = !app.view.inspector_open;
     }
 }
 
@@ -539,10 +572,9 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
                         ui.set_height(HEADER_ROW_HEIGHT);
                         ui.spacing_mut().item_spacing.x = 6.0;
 
-                        draw_home_settings_button(app, ui, t);
+                        draw_home_profile_button(app, ui, t);
                         draw_home_package_button(app, ui, t);
                         draw_home_open_pcraft_button(app, ui, t);
-                        crate::toolbar::draw_sync_profile_button(app, ui, t);
                         draw_search_input(app, ui, t);
                     });
                 });
@@ -554,7 +586,7 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.set_height(HEADER_ROW_HEIGHT);
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        draw_home_settings_button(app, ui, t);
+                        draw_home_profile_button(app, ui, t);
                     });
                 });
                 ui.add_space(6.0);
@@ -572,7 +604,6 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
                             HEADER_ROW_HEIGHT,
                             |ui| {
                                 draw_search_input(app, ui, t);
-                                crate::toolbar::draw_sync_profile_button(app, ui, t);
                                 draw_home_open_pcraft_button(app, ui, t);
                                 draw_home_package_button(app, ui, t);
                             },
@@ -3772,6 +3803,121 @@ mod tests {
         assert_eq!(app.view.motion.home_view.opacity(), 1.0);
     }
 
+    fn click_home_at(
+        ctx: &egui::Context,
+        app: &mut PaperCraftApp,
+        viewport: Vec2,
+        pos: Pos2,
+        t0: f64,
+    ) {
+        for (pressed, time) in [(true, t0), (false, t0 + 0.04)] {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, viewport)),
+                time: Some(time),
+                predicted_dt: 0.04,
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                crate::theme::apply_light_visuals(ui.ctx());
+                let _ = show_inner(app, ui);
+            });
+            out.drop_without_applying_deltas();
+        }
+    }
+
+    fn collect_text_rects_from_shape(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                out.push((text.galley.text().to_string(), text.visual_bounding_rect()));
+            }
+            egui::Shape::Vec(items) => {
+                for item in items {
+                    collect_text_rects_from_shape(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn settle_home_text_rects(
+        ctx: &egui::Context,
+        app: &mut PaperCraftApp,
+        viewport: Vec2,
+        t0: f64,
+        frames: u32,
+    ) -> Vec<(String, Rect)> {
+        let mut out_rects = Vec::new();
+        for f in 1..=frames {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, viewport)),
+                time: Some(t0 + f as f64 * 0.03),
+                predicted_dt: 0.03,
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                crate::theme::apply_light_visuals(ui.ctx());
+                let _ = show_inner(app, ui);
+            });
+            out_rects.clear();
+            for clipped in &out.shapes {
+                collect_text_rects_from_shape(&clipped.shape, &mut out_rects);
+            }
+            out.drop_without_applying_deltas();
+        }
+        out_rects
+    }
+
+    fn assert_profile_to_settings_drawer_switch(
+        ctx: &egui::Context,
+        app: &mut PaperCraftApp,
+        viewport: Vec2,
+    ) {
+        let inspector_texts = settle_home_text_rects(ctx, app, viewport, 0.10, 10);
+        assert!(
+            inspector_texts
+                .iter()
+                .any(|(label, _)| label == "Profile & Sync"),
+            "expected Profile & Sync drawer when clicking Home Profile tab, got {inspector_texts:?}"
+        );
+        assert!(
+            inspector_texts.iter().any(|(label, _)| label == "Settings"),
+            "expected Profile | Settings switch in Home drawer, got {inspector_texts:?}"
+        );
+        assert!(
+            inspector_texts
+                .iter()
+                .any(|(label, _)| label == "+ Add Account"),
+            "expected + Add Account button in Accounts section, got {inspector_texts:?}"
+        );
+
+        let settings_switch_pos = inspector_texts
+            .iter()
+            .find(|(label, _)| label == "Settings")
+            .map(|(_, rect)| rect.center())
+            .expect("Settings segment button in Home drawer");
+        click_home_at(ctx, app, viewport, settings_switch_pos, 0.45);
+        assert_eq!(app.view.right_drawer_mode, crate::RightDrawerMode::Settings);
+        assert_eq!(app.view.settings_tab, crate::SettingsTab::Appearance);
+
+        let settings_texts = settle_home_text_rects(ctx, app, viewport, 0.50, 10);
+        assert!(
+            settings_texts
+                .iter()
+                .any(|(label, _)| label == "Appearance")
+        );
+        assert!(settings_texts.iter().any(|(label, _)| label == "App Scale"));
+        assert!(settings_texts.iter().any(|(label, _)| label == "100%"));
+    }
+
     #[test]
     fn home_header_renders_brand_logo_omits_new_notebook_and_toggles_settings_sidebar() {
         let mut app = PaperCraftApp::default();
@@ -3882,79 +4028,34 @@ mod tests {
         assert!(
             !header_texts.iter().any(|(label, _)| matches!(
                 label.as_str(),
-                "New Notebook" | "Import PDF" | "Theme" | "Package" | "Open .pcraft" | "Settings"
+                "New Notebook"
+                    | "Import PDF"
+                    | "Theme"
+                    | "Package"
+                    | "Open .pcraft"
+                    | "Settings"
+                    | "Profile"
+                    | "Sign In"
             )),
             "home header buttons must be icon-only without text labels, got {header_texts:?}"
         );
-        let settings_tab_rect = right_edge_tab.expect("expected Settings edge tab in home header");
+        let profile_tab_rect = right_edge_tab.expect("expected Profile edge tab in home header");
         assert!(
-            (header_rect.right() - settings_tab_rect.right()).abs() <= 2.5,
-            "expected Settings edge tab flush to header right ({:.1}), got {:.1}",
+            (header_rect.right() - profile_tab_rect.right()).abs() <= 2.5,
+            "expected Profile edge tab flush to header right ({:.1}), got {:.1}",
             header_rect.right(),
-            settings_tab_rect.right()
+            profile_tab_rect.right()
         );
-        let settings_pos = settings_tab_rect.center();
-
-        for (pressed, time) in [(true, 0.05), (false, 0.10)] {
-            let raw = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, viewport)),
-                time: Some(time),
-                events: vec![
-                    egui::Event::PointerMoved(settings_pos),
-                    egui::Event::PointerButton {
-                        pos: settings_pos,
-                        button: egui::PointerButton::Primary,
-                        pressed,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..Default::default()
-            };
-            let out = ctx.run_ui(raw, |ui| {
-                crate::theme::apply_light_visuals(ui.ctx());
-                let _ = show_inner(&mut app, ui);
-            });
-            out.drop_without_applying_deltas();
-        }
+        click_home_at(&ctx, &mut app, viewport, profile_tab_rect.center(), 0.05);
         assert!(app.view.inspector_open);
-        assert_eq!(app.view.settings_tab, crate::SettingsTab::Appearance);
+        assert_eq!(app.view.right_drawer_mode, crate::RightDrawerMode::Profile);
+        assert_eq!(
+            app.view.account.profile_section,
+            crate::account_modal::ProfileSection::Accounts
+        );
         assert_eq!(app.view.active_modal, None);
 
-        // Settle sidebar open on Home and verify Appearance + App Scale render inside the sidebar.
-        let mut body_texts = String::new();
-        for f in 1..=8 {
-            let raw = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, viewport)),
-                time: Some(0.10 + f as f64 * 0.03),
-                ..Default::default()
-            };
-            let out = ctx.run_ui(raw, |ui| {
-                crate::theme::apply_light_visuals(ui.ctx());
-                let _ = show_inner(&mut app, ui);
-            });
-            body_texts.clear();
-            fn collect_all(shape: &egui::Shape, out: &mut String) {
-                match shape {
-                    egui::Shape::Text(text) => {
-                        out.push_str(text.galley.text());
-                        out.push('\n');
-                    }
-                    egui::Shape::Vec(items) => {
-                        for item in items {
-                            collect_all(item, out);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            for clipped in &out.shapes {
-                collect_all(&clipped.shape, &mut body_texts);
-            }
-            out.drop_without_applying_deltas();
-        }
-        assert!(body_texts.contains("Appearance"));
-        assert!(body_texts.contains("App Scale"));
-        assert!(body_texts.contains("100%"));
+        assert_profile_to_settings_drawer_switch(&ctx, &mut app, viewport);
     }
 
     #[test]
@@ -4107,8 +4208,8 @@ mod tests {
             "home sync button should be icon-only without pill text:\n{local_text}"
         );
         assert!(
-            local_dots.contains(&t.header_fg_muted),
-            "expected muted local status dot on header sync button, got {local_dots:?}"
+            local_dots.contains(&egui::Color32::from_rgb(0x82, 0xCA, 0xF2)),
+            "expected blue local status dot on header profile button, got {local_dots:?}"
         );
         assert!(
             local_text.contains("On device"),

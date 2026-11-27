@@ -980,6 +980,78 @@ mod tests {
         }
     }
 
+    fn assert_same_page_merge_and_template_conflict(
+        client: &papercraft_sync::SyncHttpClient,
+        pc1: &mut papercraft_engine::Session,
+        acct1: &mut papercraft_sync::ActiveAccountSession,
+        pc2: &mut papercraft_engine::Session,
+        acct2: &mut papercraft_sync::ActiveAccountSession,
+        slots: (usize, usize),
+    ) {
+        use papercraft_doc::{PenSettings, StrokeSample};
+        use papercraft_sync::run_sync_cycle;
+        use serde_json::json;
+
+        let (idx1, merged_idx2) = slots;
+
+        // Concurrent independent strokes on Page 0 ALSO merge at element level with ZERO Conflict Copy!
+        pc1.execute("page.select", &json!({ "index": 0 })).unwrap();
+        pc1.commit_raw_stroke(
+            PenSettings::fountain_pen(),
+            vec![
+                StrokeSample::from_xy_pressure(22.0, 22.0, 0.5),
+                StrokeSample::from_xy_pressure(42.0, 42.0, 0.7),
+            ],
+        );
+        pc2.execute("page.select", &json!({ "index": 0 })).unwrap();
+        pc2.commit_raw_stroke(
+            PenSettings::ball_pen(),
+            vec![
+                StrokeSample::from_xy_pressure(200.0, 200.0, 0.5),
+                StrokeSample::from_xy_pressure(240.0, 240.0, 0.8),
+            ],
+        );
+
+        let out1_same = run_sync_cycle(client, acct1, &pc1.prepare_sync_batch().unwrap()).unwrap();
+        pc1.apply_sync_outcome(out1_same).unwrap();
+        let out2_same = run_sync_cycle(client, acct2, &pc2.prepare_sync_batch().unwrap()).unwrap();
+        pc2.apply_sync_outcome(out2_same).unwrap();
+        assert!(
+            !pc2.notebooks
+                .iter()
+                .any(|n| n.title.contains("Conflict Copy")),
+            "independent same-page strokes must merge cleanly without creating a Conflict Copy"
+        );
+        assert_eq!(pc2.notebooks[merged_idx2].pages[0].strokes.len(), 3);
+        assert_eq!(pc2.notebooks[merged_idx2].pages[1].strokes.len(), 1);
+
+        // PC2 pushes the merged same-page result and PC1 pulls it cleanly.
+        let out2_same_push =
+            run_sync_cycle(client, acct2, &pc2.prepare_sync_batch().unwrap()).unwrap();
+        pc2.apply_sync_outcome(out2_same_push).unwrap();
+        let out1_same_pull =
+            run_sync_cycle(client, acct1, &pc1.prepare_sync_batch().unwrap()).unwrap();
+        pc1.apply_sync_outcome(out1_same_pull).unwrap();
+        assert_eq!(pc1.notebooks[idx1].pages[0].strokes.len(), 3);
+
+        // True irreconcilable Page 0 property collision (Grid vs Dotted template) preserves BOTH via Conflict Copy!
+        pc1.execute("page.setTemplate", &json!({ "template": "Grid" }))
+            .unwrap();
+        pc2.execute("page.setTemplate", &json!({ "template": "Dotted" }))
+            .unwrap();
+        let out1_prop = run_sync_cycle(client, acct1, &pc1.prepare_sync_batch().unwrap()).unwrap();
+        pc1.apply_sync_outcome(out1_prop).unwrap();
+        let out2_prop = run_sync_cycle(client, acct2, &pc2.prepare_sync_batch().unwrap()).unwrap();
+        pc2.apply_sync_outcome(out2_prop).unwrap();
+
+        assert!(
+            pc2.notebooks
+                .iter()
+                .any(|n| n.title == "Linear Algebra (Conflict Copy)"),
+            "irreconcilable same-page property collision must create a labeled backup copy"
+        );
+    }
+
     #[test]
     fn two_desktop_sessions_offline_first_sync_conversion_and_conflict_resolution_work_end_to_end()
     {
@@ -1143,36 +1215,13 @@ mod tests {
         assert_eq!(pc1.notebooks[idx1].pages[0].strokes.len(), 1);
         assert_eq!(pc1.notebooks[idx1].pages[1].strokes.len(), 1);
 
-        // Offline same-page collision on Page 0 -> preserves BOTH devices' work via a Conflict Copy!
-        pc1.execute("page.select", &json!({ "index": 0 })).unwrap();
-        pc1.commit_raw_stroke(
-            PenSettings::fountain_pen(),
-            vec![
-                StrokeSample::from_xy_pressure(22.0, 22.0, 0.5),
-                StrokeSample::from_xy_pressure(42.0, 42.0, 0.7),
-            ],
-        );
-        pc2.execute("page.select", &json!({ "index": 0 })).unwrap();
-        pc2.commit_raw_stroke(
-            PenSettings::ball_pen(),
-            vec![
-                StrokeSample::from_xy_pressure(200.0, 200.0, 0.5),
-                StrokeSample::from_xy_pressure(240.0, 240.0, 0.8),
-            ],
-        );
-
-        let out1_same =
-            run_sync_cycle(&client, &mut acct1, &pc1.prepare_sync_batch().unwrap()).unwrap();
-        pc1.apply_sync_outcome(out1_same).unwrap();
-        let out2_same =
-            run_sync_cycle(&client, &mut acct2, &pc2.prepare_sync_batch().unwrap()).unwrap();
-        pc2.apply_sync_outcome(out2_same).unwrap();
-
-        assert!(
-            pc2.notebooks
-                .iter()
-                .any(|n| n.title == "Linear Algebra (Conflict Copy)"),
-            "same-page offline collision must create a labeled backup copy"
+        assert_same_page_merge_and_template_conflict(
+            &client,
+            &mut pc1,
+            &mut acct1,
+            &mut pc2,
+            &mut acct2,
+            (idx1, merged_idx2),
         );
 
         let global1_raw = std::fs::read_to_string(pc1_dir.0.join(GLOBAL_SYNC_FILE)).unwrap();
@@ -2094,5 +2143,145 @@ mod tests {
             .expect("pulled notebook");
         assert_eq!(rec.version, 3);
         assert_eq!(rec.document.as_ref().expect("doc").updated_at_ms, 5_000);
+    }
+
+    #[test]
+    fn online_revision_mismatch_rebases_and_retries_without_duplicate_notebooks() {
+        use papercraft_doc::{PenSettings, StrokeSample};
+        use papercraft_engine::Session;
+        use papercraft_sync::{SyncHttpClient, run_sync_cycle};
+        use papercraft_sync_protocol::{LoginRequest, RegisterRequest};
+        use serde_json::json;
+
+        let srv_dir = temp_dir("online_rebase_srv");
+        let srv = spawn_server_on(&srv_dir.0);
+        let client = SyncHttpClient::new();
+        let dir1 = temp_dir("online_rebase_d1");
+        let dir2 = temp_dir("online_rebase_d2");
+
+        let mut d1 = Session::open_desktop_library(dir1.0.clone());
+        d1.execute("profile.completeFirstAccess", &json!({ "nickname": "D1" }))
+            .unwrap();
+        let prof1 = d1.active_local_profile().unwrap().local_profile_id.clone();
+        d1.execute("notebook.create", &json!({ "title": "Shared Notes" }))
+            .unwrap();
+        let nb_id = d1
+            .notebooks
+            .iter()
+            .find(|n| n.title == "Shared Notes")
+            .unwrap()
+            .id
+            .clone();
+        let (nick, conv_batch) = d1.prepare_local_account_conversion_batch(&prof1).unwrap();
+
+        let mut auth1 = client
+            .register(
+                &srv.base_url,
+                &RegisterRequest {
+                    email: Some("rebase@example.com".to_string()),
+                    username: String::new(),
+                    password: "strong-password-1".to_string(),
+                    display_name: Some(nick),
+                    device_name: Some("D1".to_string()),
+                },
+                "D1",
+            )
+            .unwrap();
+        let _conv_out = run_sync_cycle(&client, &mut auth1, &conv_batch).unwrap();
+        let (pull1, _) = client.pull_with_refresh(&mut auth1, 0).unwrap();
+        d1.complete_local_account_conversion(&prof1, auth1, pull1);
+        let mut acct1 = d1.active_account_session().unwrap().clone();
+        assert!(d1.notebooks.iter().any(|n| n.id == nb_id));
+
+        // D2 logs in and pulls server version 1.
+        let mut d2 = Session::open_desktop_library(dir2.0.clone());
+        let mut acct2 = client
+            .login(
+                &srv.base_url,
+                &LoginRequest {
+                    email: Some("rebase@example.com".to_string()),
+                    username: String::new(),
+                    password: "strong-password-1".to_string(),
+                    device_name: Some("D2".to_string()),
+                },
+                "D2",
+            )
+            .unwrap();
+        let (pull2, _) = client.pull_with_refresh(&mut acct2, 0).unwrap();
+        d2.enter_online_server_session(acct2.clone(), pull2);
+
+        // Identical retry / fast-forward produces zero duplicates.
+        let batch_ff = d2.prepare_sync_batch().unwrap();
+        let out_ff = run_sync_cycle(&client, &mut acct2, &batch_ff).unwrap();
+        d2.apply_sync_outcome(out_ff).unwrap();
+        let count_after_ff = d2.notebooks.len();
+
+        // D1 edits and advances server to version 2.
+        let s1_idx = d1.notebooks.iter().position(|n| n.id == nb_id).unwrap();
+        assert!(d1.switch_notebook(s1_idx));
+        d1.commit_raw_stroke(
+            PenSettings::fountain_pen(),
+            vec![
+                StrokeSample::from_xy_pressure(10.0, 10.0, 0.5),
+                StrokeSample::from_xy_pressure(50.0, 50.0, 0.7),
+            ],
+        );
+        let out_d1_v2 =
+            run_sync_cycle(&client, &mut acct1, &d1.prepare_sync_batch().unwrap()).unwrap();
+        d1.apply_sync_outcome(out_d1_v2).unwrap();
+
+        // Meanwhile D2 holds stale base_version = 1 and commits a stroke offline ->
+        // first test SyncCycleDriver direct push conflict (server returns conflicts -> auto 3-way merge -> retry push),
+        // then confirm a full run_sync_cycle keeps both clients converged with zero duplicates.
+        let s2_idx = d2.notebooks.iter().position(|n| n.id == nb_id).unwrap();
+        assert!(d2.switch_notebook(s2_idx));
+        d2.commit_raw_stroke(
+            PenSettings::ball_pen(),
+            vec![
+                StrokeSample::from_xy_pressure(120.0, 120.0, 0.6),
+                StrokeSample::from_xy_pressure(170.0, 160.0, 0.8),
+            ],
+        );
+        let stale_batch = d2.prepare_sync_batch().unwrap();
+        let mut retry_driver = papercraft_sync::SyncCycleDriver::new(&stale_batch);
+        let push_req1 = retry_driver
+            .next_push_request(&stale_batch)
+            .expect("initial push");
+        let (push_resp1, _) = client.push_with_refresh(&mut acct2, &push_req1).unwrap();
+        assert_eq!(push_resp1.conflicts.len(), 1);
+        retry_driver.record_push_chunk_response(push_resp1, &stale_batch);
+
+        let retry_req = retry_driver
+            .next_push_request(&stale_batch)
+            .expect("retry push must be scheduled automatically after conflict");
+        let (push_resp2, _) = client.push_with_refresh(&mut acct2, &retry_req).unwrap();
+        assert!(push_resp2.conflicts.is_empty());
+        assert_eq!(push_resp2.accepted.len(), 1);
+        retry_driver.record_push_chunk_response(push_resp2, &stale_batch);
+        assert!(retry_driver.next_push_request(&stale_batch).is_none());
+
+        let (post_pull, _) = client
+            .pull_with_refresh(&mut acct2, retry_driver.pull_since_cursor())
+            .unwrap();
+        let out_d2 = retry_driver.finish(post_pull, None);
+        assert_eq!(out_d2.pushed_count, 1);
+        d2.apply_sync_outcome(out_d2).unwrap();
+
+        assert_eq!(d2.notebooks.len(), count_after_ff);
+        assert!(
+            !d2.notebooks
+                .iter()
+                .any(|n| n.title.contains("Conflict Copy"))
+        );
+        let merged_idx = d2.notebooks.iter().position(|n| n.id == nb_id).unwrap();
+        assert_eq!(d2.notebooks[merged_idx].pages[0].strokes.len(), 2);
+
+        // Verify D1 pulls the merged 2-stroke notebook cleanly too.
+        let out_d1_final =
+            run_sync_cycle(&client, &mut acct1, &d1.prepare_sync_batch().unwrap()).unwrap();
+        d1.apply_sync_outcome(out_d1_final).unwrap();
+        assert_eq!(d1.notebooks.len(), count_after_ff);
+        let merged_idx1 = d1.notebooks.iter().position(|n| n.id == nb_id).unwrap();
+        assert_eq!(d1.notebooks[merged_idx1].pages[0].strokes.len(), 2);
     }
 }

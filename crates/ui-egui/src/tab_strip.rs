@@ -49,7 +49,6 @@ enum TabAction {
     Activate(usize),
     Close(usize),
     NewNotebook,
-    OpenProfile,
 }
 
 /// Rendered strip geometry, used to merge the active tab into the panel below it.
@@ -173,9 +172,6 @@ fn apply_action(app: &mut PaperCraftApp, action: TabAction) {
         TabAction::Close(pos) => close_tab(app, pos),
         TabAction::NewNotebook => {
             crate::modal::open(app, crate::modal::ActiveModal::NewNotebook);
-        }
-        TabAction::OpenProfile => {
-            crate::open_profile_screen(app);
         }
     }
 }
@@ -607,169 +603,7 @@ fn draw_strip(
     let home_quiet = !on_home && !home_resp.contains_pointer();
     draw_tab_separators(ui.painter(), &slots, home_quiet, cy, t);
 
-    if in_editor {
-        let tabs_right = slots.last().map_or(area_left, |s| s.rect.right());
-        let indicator_left = tabs_right + 10.0;
-        let indicator_right = new_rect.left() - 8.0;
-        if let Some(profile_action) =
-            draw_editor_status_indicator(app, ui, base_id, indicator_left, indicator_right, cy, t)
-        {
-            action = Some(profile_action);
-        }
-    }
-
     action
-}
-
-pub(crate) fn editor_sync_status_indicator(
-    summary: &papercraft_sync::SyncStatusSummary,
-    pending: usize,
-    in_flight: bool,
-    session_expired: bool,
-    t: &Tokens,
-) -> (&'static str, Color32, Color32, String) {
-    if !summary.viewing_cloud {
-        let prof = summary
-            .active_local_profile_name
-            .as_deref()
-            .unwrap_or("Local");
-        return (
-            "Saved on this device",
-            t.tab_strip_fg_muted,
-            t.tab_strip_fg_muted,
-            format!("Local account '{prof}' — saved on this device. Click to open Accounts."),
-        );
-    }
-    if session_expired {
-        return (
-            "Session expired — sign in to sync",
-            t.danger_fg,
-            t.danger_fg,
-            format!(
-                "Session expired ({pending} queued locally). Click to enter your password and sync your offline changes."
-            ),
-        );
-    }
-    match summary.connection {
-        papercraft_sync::SyncConnectionState::Offline => (
-            "Offline — changes saved locally",
-            t.warning_fg,
-            t.warning_fg,
-            format!(
-                "Server offline ({pending} queued). Edits stay saved locally and sync automatically when online."
-            ),
-        ),
-        papercraft_sync::SyncConnectionState::Error => (
-            "Sync paused — saved locally",
-            t.danger_fg,
-            t.danger_fg,
-            "Sync needs attention; edits remain saved locally. Click to open Profile.".to_string(),
-        ),
-        papercraft_sync::SyncConnectionState::Syncing => (
-            "Syncing...",
-            t.accent,
-            t.accent,
-            "Syncing changes with the server in the background...".to_string(),
-        ),
-        papercraft_sync::SyncConnectionState::Synced => {
-            if in_flight || pending > 0 {
-                (
-                    "Syncing...",
-                    t.accent,
-                    t.accent,
-                    format!("{pending} pending change(s) queued to sync with your server."),
-                )
-            } else {
-                (
-                    "Synced to cloud",
-                    t.success_fg,
-                    t.success_fg,
-                    format!(
-                        "All changes synced to {} and cached locally for offline access.",
-                        summary.server_url
-                    ),
-                )
-            }
-        }
-        papercraft_sync::SyncConnectionState::SignedOut => (
-            "Saved on this device",
-            t.tab_strip_fg_muted,
-            t.tab_strip_fg_muted,
-            "Saved on this device. Click to open Accounts.".to_string(),
-        ),
-    }
-}
-
-fn draw_editor_status_indicator(
-    app: &PaperCraftApp,
-    ui: &mut egui::Ui,
-    base_id: egui::Id,
-    min_x: f32,
-    max_x: f32,
-    cy: f32,
-    t: &Tokens,
-) -> Option<TabAction> {
-    let avail = max_x - min_x;
-    if !avail.is_finite() || avail < 22.0 {
-        return None;
-    }
-    let summary = app.session.sync_status_summary();
-    let pending = app.session.cloud_pending_changes_count();
-    let in_flight = app.session.is_sync_in_flight();
-    let (label, dot_color, text_color, tooltip) = editor_sync_status_indicator(
-        &summary,
-        pending,
-        in_flight,
-        app.session.is_session_expired(),
-        t,
-    );
-
-    let galley =
-        ui.painter()
-            .layout_no_wrap(label.to_string(), FontId::proportional(11.0), text_color);
-    let full_w = (galley.size().x + 26.0).ceil();
-    let pill_h = 22.0_f32;
-    let show_text = avail >= full_w;
-    let pill_w = if show_text { full_w } else { 22.0 };
-    let rect = Rect::from_min_size(
-        pos2(max_x - pill_w, cy - pill_h * 0.5),
-        Vec2::new(pill_w, pill_h),
-    );
-
-    let resp = ui
-        .interact(rect, base_id.with("editor_sync_pill"), Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(tooltip);
-    let hover_t = crate::motion::hover_factor(ui.ctx(), resp.id.with("hov"), resp.hovered());
-    let fill = crate::motion::lerp_color(
-        t.header_bg.gamma_multiply(0.58),
-        t.header_bg.gamma_multiply(0.95),
-        hover_t,
-    );
-    let border = crate::motion::lerp_color(
-        t.header_border.gamma_multiply(0.65),
-        t.header_border,
-        hover_t,
-    );
-    let p = ui.painter();
-    p.rect(
-        rect,
-        CornerRadius::same(11),
-        fill,
-        Stroke::new(1.0, border),
-        StrokeKind::Inside,
-    );
-    let dot_pos = if show_text {
-        pos2(rect.left() + 10.0, cy)
-    } else {
-        rect.center()
-    };
-    p.circle_filled(dot_pos, 3.3, dot_color);
-    if show_text {
-        let text_pos = pos2(rect.left() + 18.0, cy - galley.size().y * 0.5);
-        p.galley(text_pos, galley, text_color);
-    }
-    resp.clicked().then_some(TabAction::OpenProfile)
 }
 
 #[cfg(test)]
@@ -1016,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn editor_top_strip_shows_discrete_local_and_cloud_sync_indicators() {
+    fn editor_top_strip_omits_profile_and_sync_status_pill() {
         let ctx = egui::Context::default();
         let mut app = PaperCraftApp::default();
         crate::open_notebook_in_editor(&mut app, 0);
@@ -1055,8 +889,8 @@ mod tests {
 
         let local_text = collect_top_text(&mut app);
         assert!(
-            local_text.contains("Saved on this device"),
-            "missing local editor indicator in:\n{local_text}"
+            !local_text.contains("Saved on this device"),
+            "unexpected local sync pill in editor tab strip:\n{local_text}"
         );
 
         let acct = papercraft_sync::ActiveAccountSession {
@@ -1087,23 +921,8 @@ mod tests {
 
         let synced_text = collect_top_text(&mut app);
         assert!(
-            synced_text.contains("Synced to cloud"),
-            "missing synced editor indicator in:\n{synced_text}"
-        );
-
-        app.session.record_sync_failure(true, "timeout".to_string());
-        let offline_text = collect_top_text(&mut app);
-        assert!(
-            offline_text.contains("Offline — changes saved locally"),
-            "missing offline editor indicator in:\n{offline_text}"
-        );
-
-        app.session
-            .record_session_expired("Session expired".to_string());
-        let expired_text = collect_top_text(&mut app);
-        assert!(
-            expired_text.contains("Session expired — sign in to sync"),
-            "missing expired-session editor indicator in:\n{expired_text}"
+            !synced_text.contains("Synced to cloud"),
+            "unexpected cloud sync pill in editor tab strip:\n{synced_text}"
         );
     }
 }

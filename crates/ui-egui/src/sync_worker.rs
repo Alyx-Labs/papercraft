@@ -190,6 +190,9 @@ pub enum SyncWorkerEvent {
         session_generation: u64,
         outcome: Box<SyncCycleOutcome>,
     },
+    SyncDeferredByPeer {
+        session_generation: u64,
+    },
     SyncErr {
         session_generation: u64,
         offline: bool,
@@ -241,6 +244,7 @@ impl SyncWorkerEvent {
             | Self::SyncOk {
                 session_generation, ..
             }
+            | Self::SyncDeferredByPeer { session_generation }
             | Self::SyncErr {
                 session_generation, ..
             } => Some(*session_generation),
@@ -374,6 +378,7 @@ pub(crate) struct BackgroundSyncWorker {
     session_generation: u64,
     pending_outcome: Option<SyncCycleOutcome>,
     startup_sync_queued: bool,
+    pending_focus_sync: bool,
     last_attempt_ui_ms: f64,
     next_retry_delay_ms: f64,
     last_discovery_sent: Option<(f64, LocalDiscoveryReport)>,
@@ -412,6 +417,7 @@ impl BackgroundSyncWorker {
             session_generation: 0,
             pending_outcome: None,
             startup_sync_queued: false,
+            pending_focus_sync: false,
             last_attempt_ui_ms: -100_000.0,
             next_retry_delay_ms: 8_000.0,
             last_discovery_sent: None,
@@ -435,6 +441,7 @@ impl BackgroundSyncWorker {
 
     pub(crate) fn bump_session_generation(&mut self) -> u64 {
         self.session_generation = self.session_generation.wrapping_add(1);
+        self.pending_focus_sync = false;
         self.session_generation
     }
 
@@ -569,6 +576,7 @@ pub(crate) fn trigger_manual_sync(app: &mut PaperCraftApp, ctx: &egui::Context) 
     };
     let session_gen = app.sync_worker.current_session_generation();
     app.session.set_sync_in_flight(true);
+    app.sync_worker.pending_focus_sync = false;
     app.sync_worker.last_attempt_ui_ms = ctx.input(|i| i.time * 1000.0);
     if !dispatch_command(
         app,
@@ -582,6 +590,39 @@ pub(crate) fn trigger_manual_sync(app: &mut PaperCraftApp, ctx: &egui::Context) 
         app.view.account.clear_transient_auth_status();
         app.session
             .record_sync_failure(false, "Background sync worker unavailable.".to_string());
+    }
+}
+
+pub(crate) fn handle_web_sync_trigger(
+    app: &mut PaperCraftApp,
+    ctx: &egui::Context,
+    reason: crate::WebSyncTriggerReason,
+) {
+    match reason {
+        crate::WebSyncTriggerReason::TabHidden => {
+            app.web_tab_visible = false;
+        }
+        crate::WebSyncTriggerReason::TabVisible | crate::WebSyncTriggerReason::WindowFocused => {
+            app.web_tab_visible = true;
+            app.sync_worker.pending_focus_sync = true;
+            ctx.request_repaint();
+        }
+        crate::WebSyncTriggerReason::NetworkOffline => {
+            app.session.set_network_offline_state(true);
+        }
+        crate::WebSyncTriggerReason::NetworkOnline => {
+            app.session.set_network_offline_state(false);
+            app.sync_worker.next_retry_delay_ms = 2_000.0;
+            app.sync_worker.pending_focus_sync = true;
+            ctx.request_repaint();
+        }
+        crate::WebSyncTriggerReason::PeerSyncFinished => {
+            if app.session.cloud_pending_changes_count() > 0 {
+                app.sync_worker.pending_focus_sync = true;
+                app.sync_worker.next_retry_delay_ms = 4_000.0;
+                ctx.request_repaint();
+            }
+        }
     }
 }
 
@@ -618,7 +659,6 @@ pub(crate) fn create_local_account_and_switch(
     app.view.account.reset_after_sign_out(&server_url);
     app.view.account.status_message = None;
     app.view.screen = crate::AppScreen::Home;
-    app.view.profile_return_screen = crate::AppScreen::Home;
     finish_workspace_switch(app, ctx);
     maybe_report_local_discovery(app, ctx, ctx.input(|i| i.time * 1000.0));
     Ok(())
@@ -642,7 +682,6 @@ pub(crate) fn switch_to_local_account_clean(
     app.view.account.disconnect_notice = None;
     app.view.account.reset_after_sign_out(&server_url);
     app.view.account.status_message = Some("Switched to local account.".to_string());
-    app.view.profile_return_screen = crate::AppScreen::Home;
     finish_workspace_switch(app, ctx);
     Ok(())
 }
@@ -680,7 +719,6 @@ pub(crate) fn complete_forget_server_account(
         app.view.account.disconnect_notice = None;
         app.view.account.reset_after_sign_out(server_url);
         app.view.screen = crate::AppScreen::Home;
-        app.view.profile_return_screen = crate::AppScreen::Home;
         finish_workspace_switch(app, ctx);
         let next_modal = if app.session.has_any_saved_accounts() {
             crate::modal::ActiveModal::SelectLocalAccount
@@ -703,7 +741,13 @@ pub(crate) fn complete_forget_server_account(
 
 pub(crate) fn poll_and_tick(app: &mut PaperCraftApp, ctx: &egui::Context, now_ui_ms: f64) {
     drain_worker_events(app, ctx);
-    let can_mutate_docs = app.session.live_stroke.is_none() && app.session.live_eraser.is_none();
+    let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+    if focused && !app.last_viewport_focused {
+        app.sync_worker.pending_focus_sync = true;
+    }
+    app.last_viewport_focused = focused;
+
+    let can_mutate_docs = crate::can_apply_live_document_updates(app);
     if can_mutate_docs {
         maybe_report_local_discovery(app, ctx, now_ui_ms);
     }
@@ -725,7 +769,9 @@ pub(crate) fn poll_and_tick(app: &mut PaperCraftApp, ctx: &egui::Context, now_ui
             }
             if app.session.revision != prev_rev {
                 app.mesh_cache.clear();
+                app.flush_web_storage(true);
             }
+            crate::tab_strip::sync_open_tabs(app);
             if app.session.prefs.theme != prev_theme {
                 crate::theme::apply_visuals(ctx, app.session.prefs.theme);
             }
@@ -764,15 +810,17 @@ pub(crate) fn poll_and_tick(app: &mut PaperCraftApp, ctx: &egui::Context, now_ui
     let has_dirty_ready = app.session.last_dirty_at_ms().is_some_and(|dirty_wall_ms| {
         now_unix_ms() - dirty_wall_ms >= debounce_ms as i64 && elapsed_since_last >= dirty_gate_ms
     });
-    let periodic_pull =
-        elapsed_since_last >= AUTO_SYNC_IDLE_PULL_MS.max(app.sync_worker.next_retry_delay_ms);
+    let periodic_pull = app.web_tab_visible
+        && elapsed_since_last >= AUTO_SYNC_IDLE_PULL_MS.max(app.sync_worker.next_retry_delay_ms);
+    let focus_pull = app.sync_worker.pending_focus_sync && elapsed_since_last >= 2_500.0;
 
-    if should_startup_sync || has_dirty_ready || periodic_pull {
+    if should_startup_sync || has_dirty_ready || periodic_pull || focus_pull {
         app.sync_worker.startup_sync_queued = true;
+        app.sync_worker.pending_focus_sync = false;
         trigger_manual_sync(app, ctx);
     } else if app.session.last_dirty_at_ms().is_some() {
         ctx.request_repaint_after(Duration::from_millis(500));
-    } else {
+    } else if app.web_tab_visible {
         ctx.request_repaint_after(Duration::from_secs(6));
     }
 }
@@ -796,7 +844,6 @@ pub(crate) fn complete_authenticated_switch(
     app.view.account.apply_auth_ok(&server_url, &label);
     app.view.account.sync_identity_from_session(Some(&auth));
     app.view.account.disconnect_notice = None;
-    app.view.profile_return_screen = crate::AppScreen::Home;
     app.session.enter_online_server_session(auth, initial_pull);
     if let Some(msg) = app.session.take_last_conflict_notice() {
         app.view.account.status_message = Some(msg);
@@ -811,6 +858,7 @@ pub(crate) fn complete_authenticated_switch(
             crate::modal::ActiveModal::SelectLocalAccount
                 | crate::modal::ActiveModal::ConvertLocalAccount
                 | crate::modal::ActiveModal::AccountSync
+                | crate::modal::ActiveModal::AddAccount
         )
     ) {
         crate::modal::close(app);
@@ -835,7 +883,6 @@ pub(crate) fn complete_sign_out(app: &mut PaperCraftApp, ctx: &egui::Context) {
     }
     let _ = app.session.sign_out_from_server_session();
     app.view.screen = crate::AppScreen::Home;
-    app.view.profile_return_screen = crate::AppScreen::Home;
     app.view.account.disconnect_notice = None;
     app.view.account.reset_after_sign_out(&prev_url);
     finish_workspace_switch(app, ctx);
@@ -933,7 +980,6 @@ pub(crate) fn apply_worker_event(
             app.sync_worker.next_retry_delay_ms = 8_000.0;
             app.sync_worker.startup_sync_queued = true;
             app.sync_worker.last_attempt_ui_ms = ctx.input(|i| i.time * 1000.0);
-            app.view.profile_return_screen = crate::AppScreen::Home;
             finish_workspace_switch(app, ctx);
             if app.view.active_modal == Some(crate::modal::ActiveModal::ConvertLocalAccount) {
                 crate::modal::close(app);
@@ -959,6 +1005,13 @@ pub(crate) fn apply_worker_event(
                 .enter_password_reset_flow(identifier, prefill_code, message);
             if app.view.active_modal == Some(crate::modal::ActiveModal::SelectLocalAccount) {
                 app.view.account.selector_other_server_open = true;
+            } else {
+                app.view.account.add_account_mode = crate::account_modal::AddAccountMode::Server;
+                if app.view.active_modal != Some(crate::modal::ActiveModal::AddAccount)
+                    && app.view.active_modal != Some(crate::modal::ActiveModal::AccountSync)
+                {
+                    crate::modal::open(app, crate::modal::ActiveModal::AddAccount);
+                }
             }
         }
         SyncWorkerEvent::ProfileUpdated {
@@ -1085,6 +1138,11 @@ pub(crate) fn apply_worker_event(
             if matches_active {
                 app.sync_worker.pending_outcome = Some(*outcome);
             }
+        }
+        SyncWorkerEvent::SyncDeferredByPeer { .. } => {
+            app.session.clear_sync_in_flight_for_peer();
+            app.sync_worker.last_attempt_ui_ms = ctx.input(|i| i.time * 1000.0);
+            app.sync_worker.next_retry_delay_ms = 4_000.0;
         }
         SyncWorkerEvent::SyncErr {
             offline,
@@ -2500,5 +2558,63 @@ mod tests {
             1,
             "Account A's cached pending-change count must remain 1"
         );
+    }
+
+    #[test]
+    fn sync_deferred_by_peer_and_lifecycle_triggers_behave_cleanly() {
+        let ctx = egui::Context::default();
+        let session = papercraft_engine::Session::open_web_cache(None);
+        let mut app = PaperCraftApp::new(session, crate::PlatformHooks::default());
+
+        let auth = make_test_auth("u-a", "alice@example.com", "alice", "Alice");
+        let pull = SyncPullResponse {
+            server_cursor: 1,
+            user: auth.user.clone(),
+            notebooks: vec![make_remote_notebook("nb-alice", "Alice Notebook")],
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        complete_authenticated_switch(&mut app, &ctx, auth, pull);
+
+        app.session.set_sync_in_flight(true);
+        let session_gen = app.sync_worker.current_session_generation();
+        apply_worker_event(
+            &mut app,
+            &ctx,
+            SyncWorkerEvent::SyncDeferredByPeer {
+                session_generation: session_gen,
+            },
+        );
+        assert!(!app.session.is_sync_in_flight());
+        assert!(app.session.sync_status_summary().last_error.is_none());
+        assert_eq!(
+            app.session.sync_status_summary().connection,
+            papercraft_sync::SyncConnectionState::Synced
+        );
+
+        handle_web_sync_trigger(&mut app, &ctx, crate::WebSyncTriggerReason::NetworkOffline);
+        assert_eq!(
+            app.session.sync_status_summary().connection,
+            papercraft_sync::SyncConnectionState::Offline
+        );
+
+        app.sync_worker.pending_focus_sync = false;
+        app.sync_worker.next_retry_delay_ms = 20_000.0;
+        handle_web_sync_trigger(&mut app, &ctx, crate::WebSyncTriggerReason::NetworkOnline);
+        assert!(app.sync_worker.pending_focus_sync);
+        assert_eq!(app.sync_worker.next_retry_delay_ms, 2_000.0);
+
+        handle_web_sync_trigger(&mut app, &ctx, crate::WebSyncTriggerReason::TabHidden);
+        assert!(!app.web_tab_visible);
+
+        app.sync_worker.pending_focus_sync = false;
+        handle_web_sync_trigger(&mut app, &ctx, crate::WebSyncTriggerReason::TabVisible);
+        assert!(app.web_tab_visible);
+        assert!(app.sync_worker.pending_focus_sync);
+
+        app.sync_worker.pending_focus_sync = false;
+        handle_web_sync_trigger(&mut app, &ctx, crate::WebSyncTriggerReason::WindowFocused);
+        assert!(app.web_tab_visible);
+        assert!(app.sync_worker.pending_focus_sync);
     }
 }

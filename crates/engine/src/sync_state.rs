@@ -9,19 +9,21 @@ use papercraft_doc::{
     sanitize_notebook_id, sanitize_notebook_title,
 };
 use papercraft_sync::{
-    ActiveAccountSession, ActiveWorkspaceTarget, EntitySyncStatus, FolderSyncMeta,
-    GLOBAL_SYNC_FILE, GlobalSyncState, LocalNotebookSnapshot, LocalProfile, OwnerId,
-    RememberedServerAccount, RemoteNotebookUpdate, SyncBatch, SyncConnectionState,
-    SyncCycleOutcome, SyncManifest, SyncStatusSummary, account_library_dir, default_device_name,
-    load_global_state, load_manifest, outcome_from_full_pull, profile_library_dir,
-    sanitize_account_dir_segment, sanitize_client_id, sanitize_profile_nickname,
-    sanitize_remembered_accounts, save_global_state, save_manifest,
+    ActiveAccountSession, ActiveWorkspaceTarget, DocumentMergeBase, EntitySyncStatus,
+    FolderSyncMeta, GLOBAL_SYNC_FILE, GlobalSyncState, LocalNotebookSnapshot, LocalProfile,
+    MergeDecision, MergeKind, OwnerId, PageElementFingerprints, RememberedServerAccount,
+    RemoteNotebookUpdate, SyncBatch, SyncConnectionState, SyncCycleOutcome, SyncManifest,
+    SyncStatusSummary, account_library_dir, compute_document_page_elements, default_device_name,
+    load_global_state, load_manifest, merge_documents_three_way, outcome_from_full_pull,
+    profile_library_dir, sanitize_account_dir_segment, sanitize_client_id,
+    sanitize_profile_nickname, sanitize_remembered_accounts, save_global_state, save_manifest,
+    strip_conflict_copy_suffix,
 };
 use papercraft_sync_protocol::{
     DEFAULT_SERVER_URL, LocalDiscoveryReport, LocalFolderChange, LocalPrefsPush,
     RemoteFolderRecord, SyncPullResponse, canonical_document_body_hash, canonical_document_hash,
-    canonical_document_page_hashes, canonical_page_hash, canonical_prefs_hash,
-    normalize_server_url, now_unix_ms, sanitize_device_name,
+    canonical_document_page_hashes, canonical_prefs_hash, normalize_server_url, now_unix_ms,
+    sanitize_device_name,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -706,6 +708,9 @@ impl Session {
 
     pub fn set_network_offline_state(&mut self, offline: bool) {
         self.sync.network_probed_offline = offline;
+        if offline && self.is_viewing_cloud() && !self.sync.sync_in_flight {
+            self.sync.connection = SyncConnectionState::Offline;
+        }
     }
 
     pub(crate) fn touch_cloud_dirty_clock_if_needed(&mut self) {
@@ -927,6 +932,41 @@ impl Session {
             SyncConnectionState::Error
         };
         self.sync.last_error = Some(message);
+    }
+
+    /// Clears the active in-flight flag without marking an error when a peer tab holds the
+    /// cross-tab cloud sync leader lock.
+    pub fn clear_sync_in_flight_for_peer(&mut self) {
+        self.sync.sync_in_flight = false;
+        self.sync.in_flight_slot_gens.clear();
+        if self.sync.connection == SyncConnectionState::Syncing {
+            self.sync.connection = if !self.is_viewing_cloud() {
+                SyncConnectionState::SignedOut
+            } else if self.sync.network_probed_offline {
+                SyncConnectionState::Offline
+            } else {
+                SyncConnectionState::Synced
+            };
+        }
+    }
+
+    /// Persists unacknowledged push snapshot fingerprints so a subsequent retry after a dropped
+    /// HTTP ACK recognizes the server record as its own prior push.
+    pub fn record_pending_push_bases(&mut self, bases: HashMap<String, DocumentMergeBase>) {
+        if bases.is_empty() {
+            return;
+        }
+        for (nb_id, base) in bases {
+            if let Some(hash) = base.pending_push_hash {
+                self.sync.manifest.record_pending_push_base(
+                    &nb_id,
+                    hash,
+                    base.pending_push_page_hashes,
+                    base.pending_push_page_elements,
+                );
+            }
+        }
+        self.sync_persist_manifest();
     }
 
     pub fn update_active_session_tokens(&mut self, updated: ActiveAccountSession) {
@@ -1481,6 +1521,7 @@ impl Session {
                 // Computed asynchronously on the sync worker thread to keep UI responsiveness intact.
                 content_hash: String::new(),
                 doc,
+                merge_base: DocumentMergeBase::default(),
             });
         }
 
@@ -1883,6 +1924,13 @@ impl Session {
             {
                 let edit_gen = self.sync.slot_edit_gen[idx];
                 self.sync.in_flight_slot_gens.insert(id.clone(), edit_gen);
+                let merge_base = DocumentMergeBase {
+                    page_hashes: meta.last_synced_page_hashes.clone(),
+                    page_elements: meta.last_synced_page_element_hashes.clone(),
+                    pending_push_hash: meta.pending_push_hash.clone(),
+                    pending_push_page_hashes: meta.pending_push_page_hashes.clone(),
+                    pending_push_page_elements: meta.pending_push_page_elements.clone(),
+                };
                 local_docs.push(LocalNotebookSnapshot {
                     notebook_id: id,
                     base_version: meta.server_version,
@@ -1890,6 +1938,7 @@ impl Session {
                     // Defer expensive SHA-256 hashing of strokes and embedded assets to `papercraft-sync`.
                     content_hash: String::new(),
                     doc: (**doc_arc).clone(),
+                    merge_base,
                 });
             }
         }
@@ -1987,9 +2036,12 @@ impl Session {
         }
 
         self.sync.manifest.last_server_cursor = outcome.new_cursor;
-        self.ack_accepted_uploads(
+        let rebased_changed = self.ack_accepted_uploads(
             &outcome.accepted_uploads,
             &outcome.accepted_page_hashes,
+            &outcome.accepted_page_elements,
+            &outcome.rebased_docs,
+            &outcome.rebased_ancestors,
             outcome.synced_at_ms,
         );
         self.ack_accepted_folders(&outcome.accepted_folders);
@@ -2001,7 +2053,7 @@ impl Session {
         let was_empty_before_pull = self.notebooks.is_empty();
         let had_saved_active =
             !sanitize_notebook_id(&self.sync.manifest.active_notebook_id).is_empty();
-        let mut updated_any_doc = false;
+        let mut updated_any_doc = rebased_changed;
         for update in &outcome.downloaded_updates {
             if !update.deleted && self.apply_remote_upsert(update, outcome.synced_at_ms) {
                 updated_any_doc = true;
@@ -2587,12 +2639,16 @@ impl Session {
         &mut self,
         accepted: &[papercraft_sync_protocol::AcceptedNotebookSync],
         accepted_page_hashes: &HashMap<String, Vec<String>>,
+        accepted_page_elements: &HashMap<String, Vec<PageElementFingerprints>>,
+        rebased_docs: &HashMap<String, Document>,
+        rebased_ancestors: &HashMap<String, DocumentMergeBase>,
         synced_at_ms: i64,
-    ) {
+    ) -> bool {
+        let mut updated_any = false;
         for acc in accepted {
             let sent_gen = self.sync.in_flight_slot_gens.remove(&acc.notebook_id);
             let slot_idx = self.find_slot_by_id(&acc.notebook_id);
-            let still_dirty = match (sent_gen, slot_idx) {
+            let mut still_dirty = match (sent_gen, slot_idx) {
                 (Some(expected_gen), Some(idx)) => {
                     self.sync.slot_dirty_hash.get(idx).copied().unwrap_or(false)
                         || self.sync.slot_edit_gen.get(idx).copied() != Some(expected_gen)
@@ -2603,6 +2659,56 @@ impl Session {
                 }
                 (None, None) => false,
             };
+
+            if let Some(rebased_doc) = rebased_docs.get(&acc.notebook_id)
+                && let Some(idx) = slot_idx
+            {
+                let prev_hash = canonical_document_hash(&self.notebooks[idx]);
+                if !still_dirty {
+                    let mut installed = rebased_doc.clone();
+                    installed.current_page = self.notebooks[idx]
+                        .current_page
+                        .min(installed.page_count().saturating_sub(1));
+                    installed.sync_active_to_pages();
+                    installed.load_active_from_pages();
+                    self.install_remote_doc_at_slot(idx, installed, prev_hash != acc.content_hash);
+                    updated_any = true;
+                } else {
+                    let ancestor = rebased_ancestors
+                        .get(&acc.notebook_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    match merge_documents_three_way(&self.notebooks[idx], rebased_doc, &ancestor) {
+                        MergeDecision::FastForward(ff) => {
+                            let changed = canonical_document_hash(&ff) != prev_hash;
+                            self.install_remote_doc_at_slot(idx, ff, changed);
+                            still_dirty = false;
+                            updated_any = true;
+                        }
+                        MergeDecision::Merged { doc: merged, .. } => {
+                            let changed = canonical_document_hash(&merged) != prev_hash;
+                            self.install_remote_doc_at_slot(idx, merged, changed);
+                            still_dirty = true;
+                            updated_any = true;
+                        }
+                        MergeDecision::Conflict => {
+                            let local_work = (*self.notebooks[idx]).clone();
+                            self.install_remote_doc_at_slot(
+                                idx,
+                                rebased_doc.clone(),
+                                prev_hash != acc.content_hash,
+                            );
+                            let backup_title = self.append_conflict_copy_notebook(local_work);
+                            self.sync.last_conflict_notice = Some(format!(
+                                "Saved \"{backup_title}\" to keep offline changes made during sync."
+                            ));
+                            still_dirty = false;
+                            updated_any = true;
+                        }
+                    }
+                }
+            }
+
             self.sync.manifest.mark_notebook_synced_with_dirty(
                 &acc.notebook_id,
                 acc.new_version,
@@ -2610,15 +2716,45 @@ impl Session {
                 still_dirty,
                 synced_at_ms,
             );
+            self.sync.manifest.clear_pending_push_base(&acc.notebook_id);
             if let Some(hashes) = accepted_page_hashes.get(&acc.notebook_id) {
                 self.sync
                     .manifest
                     .set_notebook_synced_page_hashes(&acc.notebook_id, hashes.clone());
             }
-            if let Some(idx) = slot_idx
-                && !still_dirty
-            {
-                self.sync.slot_dirty_hash[idx] = false;
+            if let Some(elements) = accepted_page_elements.get(&acc.notebook_id) {
+                self.sync
+                    .manifest
+                    .set_notebook_synced_page_elements(&acc.notebook_id, elements.clone());
+            } else if let Some(rebased_doc) = rebased_docs.get(&acc.notebook_id) {
+                self.sync.manifest.set_notebook_synced_page_elements(
+                    &acc.notebook_id,
+                    compute_document_page_elements(rebased_doc),
+                );
+            }
+            if let Some(idx) = slot_idx {
+                self.sync.slot_dirty_hash[idx] = still_dirty;
+            }
+        }
+        updated_any
+    }
+
+    pub(crate) fn install_remote_doc_at_slot(
+        &mut self,
+        idx: usize,
+        mut doc: Document,
+        content_changed: bool,
+    ) {
+        doc.sync_active_to_pages();
+        doc.load_active_from_pages();
+        self.notebooks[idx] = Arc::new(doc);
+        self.library.mark_dirty(idx, self.notebooks.len());
+        self.sync.slot_edit_gen[idx] = self.sync.slot_edit_gen[idx].wrapping_add(1);
+        self.sync.slot_placeholder_blank[idx] = false;
+        if idx == self.active_notebook {
+            self.doc = Arc::clone(&self.notebooks[idx]);
+            if content_changed {
+                self.history.clear();
             }
         }
     }
@@ -2679,7 +2815,7 @@ impl Session {
         local_changed: bool,
         doc: &Document,
         update: &RemoteNotebookUpdate,
-        remote_page_hashes: Vec<String>,
+        (remote_page_hashes, remote_page_elements): (Vec<String>, Vec<PageElementFingerprints>),
         synced_at_ms: i64,
     ) -> bool {
         let mut timestamp_changed = false;
@@ -2735,7 +2871,13 @@ impl Session {
         );
         self.sync
             .manifest
+            .clear_pending_push_base(&update.notebook_id);
+        self.sync
+            .manifest
             .set_notebook_synced_page_hashes(&update.notebook_id, remote_page_hashes);
+        self.sync
+            .manifest
+            .set_notebook_synced_page_elements(&update.notebook_id, remote_page_elements);
         if local_ahead_of_remote {
             self.sync.last_dirty_at_ms = Some(now_unix_ms());
         }
@@ -2763,6 +2905,7 @@ impl Session {
         } else {
             update.page_hashes.clone()
         };
+        let remote_page_elements = compute_document_page_elements(&doc);
 
         if let Some(idx) = self.find_slot_by_id(&update.notebook_id) {
             let cur_hash = canonical_document_hash(&self.notebooks[idx]);
@@ -2791,124 +2934,113 @@ impl Session {
                     self.sync.last_dirty_at_ms = Some(now_unix_ms());
                     return false;
                 }
-                let local_body = canonical_document_body_hash(&self.notebooks[idx]);
-                let remote_body = canonical_document_body_hash(&doc);
-                if local_body == remote_body {
-                    let remote_orig_updated = doc.updated_at_ms;
-                    let remote_orig_meta = doc.meta_updated_at_ms;
-                    let remote_orig_created = doc.created_at_ms;
-                    let local_doc = &self.notebooks[idx];
-                    if local_doc.created_at_ms > 0
-                        && (doc.created_at_ms == 0 || local_doc.created_at_ms < doc.created_at_ms)
-                    {
-                        doc.created_at_ms = local_doc.created_at_ms;
-                    }
-                    doc.updated_at_ms = doc.updated_at_ms.max(local_doc.updated_at_ms);
-                    if local_doc.meta_updated_at_ms > doc.meta_updated_at_ms {
-                        doc.title = local_doc.title.clone();
-                        doc.cover = local_doc.cover;
-                        doc.folder_path = local_doc.folder_path.clone();
-                        doc.favorite = local_doc.favorite;
-                        doc.tags = local_doc.tags.clone();
-                        doc.meta_updated_at_ms = local_doc.meta_updated_at_ms;
-                    }
-                    doc.sync_active_to_pages();
-                    let merged_hash = canonical_document_hash(&doc);
-                    let timestamps_ahead_of_remote = doc.updated_at_ms > remote_orig_updated
-                        || doc.meta_updated_at_ms > remote_orig_meta
-                        || (remote_orig_created == 0 && doc.created_at_ms > 0);
-                    self.notebooks[idx] = Arc::new(doc);
-                    self.library.mark_dirty(idx, self.notebooks.len());
-                    let dirty = merged_hash != update.content_hash || timestamps_ahead_of_remote;
-                    self.sync.slot_dirty_hash[idx] = dirty;
-                    self.sync.slot_edit_gen[idx] = self.sync.slot_edit_gen[idx].wrapping_add(1);
-                    self.sync.slot_placeholder_blank[idx] = false;
-                    if idx == self.active_notebook {
-                        self.doc = Arc::clone(&self.notebooks[idx]);
-                        self.history.clear();
-                    }
-                    self.sync.manifest.mark_notebook_synced_with_dirty(
-                        &update.notebook_id,
-                        update.version,
-                        update.content_hash.clone(),
-                        dirty,
-                        synced_at_ms,
-                    );
-                    self.sync
-                        .manifest
-                        .set_notebook_synced_page_hashes(&update.notebook_id, remote_page_hashes);
-                    if dirty {
-                        self.sync.last_dirty_at_ms = Some(now_unix_ms());
-                    }
-                    return true;
-                }
-
-                let base_hashes = self
+                let base = self
                     .sync
                     .manifest
                     .meta(&update.notebook_id)
-                    .map(|m| m.last_synced_page_hashes.clone())
+                    .map(|m| DocumentMergeBase {
+                        page_hashes: m.last_synced_page_hashes.clone(),
+                        page_elements: m.last_synced_page_element_hashes.clone(),
+                        pending_push_hash: m.pending_push_hash.clone(),
+                        pending_push_page_hashes: m.pending_push_page_hashes.clone(),
+                        pending_push_page_elements: m.pending_push_page_elements.clone(),
+                    })
                     .unwrap_or_default();
-                if let Some(mut merged) =
-                    try_three_way_page_merge(&self.notebooks[idx], &doc, &base_hashes)
-                {
-                    merged.id = update.notebook_id.clone();
-                    merged.updated_at_ms = now_unix_ms();
-                    merged.sync_active_to_pages();
-                    merged.load_active_from_pages();
-                    let merged_title = merged.title.clone();
-                    self.notebooks[idx] = Arc::new(merged);
-                    self.library.mark_dirty(idx, self.notebooks.len());
-                    self.sync.slot_dirty_hash[idx] = true;
-                    self.sync.slot_edit_gen[idx] = self.sync.slot_edit_gen[idx].wrapping_add(1);
-                    self.sync.slot_placeholder_blank[idx] = false;
-                    if idx == self.active_notebook {
-                        self.doc = Arc::clone(&self.notebooks[idx]);
-                        self.history.clear();
+                let remote_orig_updated = doc.updated_at_ms;
+                let remote_orig_meta = doc.meta_updated_at_ms;
+                let remote_orig_created = doc.created_at_ms;
+                match merge_documents_three_way(&self.notebooks[idx], &doc, &base) {
+                    MergeDecision::FastForward(_) => {
+                        return self.reconcile_matching_hash_upsert(
+                            idx,
+                            local_changed,
+                            &doc,
+                            update,
+                            (remote_page_hashes, remote_page_elements),
+                            synced_at_ms,
+                        );
                     }
-                    self.sync.manifest.mark_notebook_synced_with_dirty(
-                        &update.notebook_id,
-                        update.version,
-                        update.content_hash.clone(),
-                        true,
-                        synced_at_ms,
-                    );
-                    self.sync
-                        .manifest
-                        .set_notebook_synced_page_hashes(&update.notebook_id, remote_page_hashes);
-                    self.sync.last_dirty_at_ms = Some(now_unix_ms());
-                    self.sync.last_conflict_notice = Some(format!(
-                        "Merged offline changes across different pages in \"{merged_title}\"."
-                    ));
-                    return true;
+                    MergeDecision::Merged {
+                        doc: mut merged,
+                        kind,
+                    } => {
+                        merged.id = update.notebook_id.clone();
+                        merged.sync_active_to_pages();
+                        merged.load_active_from_pages();
+                        let merged_hash = canonical_document_hash(&merged);
+                        let content_changed = merged_hash != cur_hash;
+                        let dirty = match kind {
+                            MergeKind::MetadataOnly => {
+                                merged_hash != update.content_hash
+                                    || merged.updated_at_ms > remote_orig_updated
+                                    || merged.meta_updated_at_ms > remote_orig_meta
+                                    || (remote_orig_created == 0 && merged.created_at_ms > 0)
+                            }
+                            MergeKind::RebasedPendingPush
+                            | MergeKind::PageLevel
+                            | MergeKind::ElementLevel => true,
+                        };
+                        let merged_title = merged.title.clone();
+                        self.install_remote_doc_at_slot(idx, merged, content_changed);
+                        self.sync.slot_dirty_hash[idx] = dirty;
+                        self.sync.manifest.mark_notebook_synced_with_dirty(
+                            &update.notebook_id,
+                            update.version,
+                            update.content_hash.clone(),
+                            dirty,
+                            synced_at_ms,
+                        );
+                        self.sync
+                            .manifest
+                            .clear_pending_push_base(&update.notebook_id);
+                        self.sync.manifest.set_notebook_synced_page_hashes(
+                            &update.notebook_id,
+                            remote_page_hashes,
+                        );
+                        self.sync.manifest.set_notebook_synced_page_elements(
+                            &update.notebook_id,
+                            remote_page_elements,
+                        );
+                        if dirty {
+                            self.sync.last_dirty_at_ms = Some(now_unix_ms());
+                        }
+                        if matches!(kind, MergeKind::PageLevel | MergeKind::ElementLevel) {
+                            self.sync.last_conflict_notice =
+                                Some(format!("Merged offline changes in \"{merged_title}\"."));
+                        }
+                        return true;
+                    }
+                    MergeDecision::Conflict => {
+                        // Irreconcilable same-element or structural collision: apply server record
+                        // AND keep all local work in a single non-cascading Conflict Copy.
+                        let local_work = (*self.notebooks[idx]).clone();
+                        self.install_remote_doc_at_slot(idx, doc, true);
+                        self.sync.slot_dirty_hash[idx] = false;
+                        self.sync.manifest.mark_notebook_synced_with_dirty(
+                            &update.notebook_id,
+                            update.version,
+                            update.content_hash.clone(),
+                            false,
+                            synced_at_ms,
+                        );
+                        self.sync
+                            .manifest
+                            .clear_pending_push_base(&update.notebook_id);
+                        self.sync.manifest.set_notebook_synced_page_hashes(
+                            &update.notebook_id,
+                            remote_page_hashes,
+                        );
+                        self.sync.manifest.set_notebook_synced_page_elements(
+                            &update.notebook_id,
+                            remote_page_elements,
+                        );
+                        let backup_title = self.append_conflict_copy_notebook(local_work);
+                        self.sync.last_conflict_notice = Some(format!(
+                            "Saved \"{backup_title}\" to keep offline changes made on the same element."
+                        ));
+                        return true;
+                    }
                 }
-
-                // Same-page collision: apply the server record AND keep all local work in a labeled Conflict Copy.
-                let local_work = (*self.notebooks[idx]).clone();
-                self.notebooks[idx] = Arc::new(doc);
-                self.library.mark_dirty(idx, self.notebooks.len());
-                self.sync.slot_dirty_hash[idx] = false;
-                self.sync.slot_edit_gen[idx] = self.sync.slot_edit_gen[idx].wrapping_add(1);
-                self.sync.slot_placeholder_blank[idx] = false;
-                if idx == self.active_notebook {
-                    self.doc = Arc::clone(&self.notebooks[idx]);
-                    self.history.clear();
-                }
-                self.sync.manifest.mark_notebook_synced_with_dirty(
-                    &update.notebook_id,
-                    update.version,
-                    update.content_hash.clone(),
-                    false,
-                    synced_at_ms,
-                );
-                self.sync
-                    .manifest
-                    .set_notebook_synced_page_hashes(&update.notebook_id, remote_page_hashes);
-                let backup_title = self.append_conflict_copy_notebook(local_work);
-                self.sync.last_conflict_notice = Some(format!(
-                    "Saved \"{backup_title}\" to keep offline changes made on the same page."
-                ));
-                return true;
             }
 
             if cur_hash == update.content_hash {
@@ -2917,20 +3049,13 @@ impl Session {
                     local_changed,
                     &doc,
                     update,
-                    remote_page_hashes,
+                    (remote_page_hashes, remote_page_elements),
                     synced_at_ms,
                 );
             }
 
-            self.notebooks[idx] = Arc::new(doc);
-            self.library.mark_dirty(idx, self.notebooks.len());
+            self.install_remote_doc_at_slot(idx, doc, cur_hash != update.content_hash);
             self.sync.slot_dirty_hash[idx] = false;
-            self.sync.slot_edit_gen[idx] = self.sync.slot_edit_gen[idx].wrapping_add(1);
-            self.sync.slot_placeholder_blank[idx] = false;
-            if idx == self.active_notebook {
-                self.doc = Arc::clone(&self.notebooks[idx]);
-                self.history.clear();
-            }
             self.sync.manifest.mark_notebook_synced_with_dirty(
                 &update.notebook_id,
                 update.version,
@@ -2940,21 +3065,20 @@ impl Session {
             );
             self.sync
                 .manifest
+                .clear_pending_push_base(&update.notebook_id);
+            self.sync
+                .manifest
                 .set_notebook_synced_page_hashes(&update.notebook_id, remote_page_hashes);
+            self.sync
+                .manifest
+                .set_notebook_synced_page_elements(&update.notebook_id, remote_page_elements);
             return true;
         }
 
         if let Some(p_idx) = self.sync.slot_placeholder_blank.iter().position(|&b| b) {
-            self.notebooks[p_idx] = Arc::new(doc);
-            self.library.mark_dirty(p_idx, self.notebooks.len());
             self.sync.slot_ids[p_idx] = update.notebook_id.clone();
             self.sync.slot_dirty_hash[p_idx] = false;
-            self.sync.slot_edit_gen[p_idx] = self.sync.slot_edit_gen[p_idx].wrapping_add(1);
-            self.sync.slot_placeholder_blank[p_idx] = false;
-            if p_idx == self.active_notebook {
-                self.doc = Arc::clone(&self.notebooks[p_idx]);
-                self.history.clear();
-            }
+            self.install_remote_doc_at_slot(p_idx, doc, true);
             self.sync.manifest.mark_notebook_synced_with_dirty(
                 &update.notebook_id,
                 update.version,
@@ -2964,7 +3088,13 @@ impl Session {
             );
             self.sync
                 .manifest
+                .clear_pending_push_base(&update.notebook_id);
+            self.sync
+                .manifest
                 .set_notebook_synced_page_hashes(&update.notebook_id, remote_page_hashes);
+            self.sync
+                .manifest
+                .set_notebook_synced_page_elements(&update.notebook_id, remote_page_elements);
             return true;
         }
 
@@ -2996,12 +3126,29 @@ impl Session {
         );
         self.sync
             .manifest
+            .clear_pending_push_base(&update.notebook_id);
+        self.sync
+            .manifest
             .set_notebook_synced_page_hashes(&update.notebook_id, remote_page_hashes);
+        self.sync
+            .manifest
+            .set_notebook_synced_page_elements(&update.notebook_id, remote_page_elements);
         true
     }
 
-    fn append_conflict_copy_notebook(&mut self, mut copy_doc: Document) -> String {
+    pub(crate) fn append_conflict_copy_notebook(&mut self, mut copy_doc: Document) -> String {
         let now = now_unix_ms();
+        copy_doc.sync_active_to_pages();
+        copy_doc.load_active_from_pages();
+        let copy_body_hash = canonical_document_body_hash(&copy_doc);
+        let stripped_base = strip_conflict_copy_suffix(&copy_doc.title);
+        if let Some(existing) = self.notebooks.iter().find(|nb| {
+            strip_conflict_copy_suffix(&nb.title).eq_ignore_ascii_case(&stripped_base)
+                && canonical_document_body_hash(nb) == copy_body_hash
+        }) {
+            return existing.title.clone();
+        }
+
         let copy_id = Uuid::new_v4().to_string();
         let copy_title = format_conflict_copy_title(&copy_doc.title, &self.notebooks);
         copy_doc.id = copy_id.clone();
@@ -3211,77 +3358,8 @@ fn migrate_local_profile_dir_to_cloud_account(src_dir: &Path, dst_dir: &Path) {
     let _ = fs::remove_dir_all(src_dir);
 }
 
-fn attachments_match(local: &Document, server: &Document) -> bool {
-    if local.pdf_documents.len() != server.pdf_documents.len()
-        || local.image_templates.len() != server.image_templates.len()
-    {
-        return false;
-    }
-    for (lp, sp) in local.pdf_documents.iter().zip(&server.pdf_documents) {
-        if lp.name != sp.name || lp.bytes != sp.bytes {
-            return false;
-        }
-    }
-    for (lt, st) in local.image_templates.iter().zip(&server.image_templates) {
-        if lt.name != st.name || lt.png_bytes != st.png_bytes {
-            return false;
-        }
-    }
-    true
-}
-
-fn try_three_way_page_merge(
-    local: &Document,
-    server: &Document,
-    base_page_hashes: &[String],
-) -> Option<Document> {
-    if base_page_hashes.is_empty() || !attachments_match(local, server) {
-        return None;
-    }
-    let local_pages = local.resolved_pages();
-    let server_pages = server.resolved_pages();
-    let base_len = base_page_hashes.len();
-    if local_pages.len() < base_len || server_pages.len() < base_len {
-        return None;
-    }
-
-    let local_hashes: Vec<String> = local_pages.iter().map(canonical_page_hash).collect();
-    let server_hashes: Vec<String> = server_pages.iter().map(canonical_page_hash).collect();
-    let mut merged_pages = Vec::with_capacity(server_pages.len().max(local_pages.len()));
-
-    for i in 0..base_len {
-        let l_changed = local_hashes[i] != base_page_hashes[i];
-        let s_changed = server_hashes[i] != base_page_hashes[i];
-        if l_changed && s_changed && local_hashes[i] != server_hashes[i] {
-            return None;
-        }
-        if l_changed {
-            merged_pages.push(local_pages[i].clone());
-        } else {
-            merged_pages.push(server_pages[i].clone());
-        }
-    }
-    for page in &server_pages[base_len..] {
-        merged_pages.push(page.clone());
-    }
-    for page in &local_pages[base_len..] {
-        merged_pages.push(page.clone());
-    }
-
-    let mut merged = if local.meta_updated_at_ms > server.meta_updated_at_ms {
-        local.clone()
-    } else {
-        server.clone()
-    };
-    merged.next_stroke_id = local.next_stroke_id.max(server.next_stroke_id);
-    merged.current_page = local.current_page.min(merged_pages.len().saturating_sub(1));
-    merged.pages = merged_pages;
-    merged.load_active_from_pages();
-    Some(merged)
-}
-
 fn format_conflict_copy_title(original_title: &str, existing: &[Arc<Document>]) -> String {
-    let base = sanitize_notebook_title(original_title);
+    let base = strip_conflict_copy_suffix(original_title);
     let first = sanitize_notebook_title(&format!("{base} (Conflict Copy)"));
     if !existing
         .iter()
@@ -3704,6 +3782,19 @@ mod tests {
                 )
             })
             .collect();
+        let accepted_page_elements: std::collections::HashMap<
+            String,
+            Vec<papercraft_sync::PageElementFingerprints>,
+        > = batch
+            .local_docs
+            .iter()
+            .map(|snap| {
+                (
+                    snap.notebook_id.clone(),
+                    papercraft_sync::compute_document_page_elements(&snap.doc),
+                )
+            })
+            .collect();
         let server_user = session
             .active_account_session()
             .map(|s| s.user.clone())
@@ -3715,6 +3806,9 @@ mod tests {
                 server_user,
                 accepted_uploads: accepted,
                 accepted_page_hashes,
+                accepted_page_elements,
+                rebased_docs: std::collections::HashMap::new(),
+                rebased_ancestors: std::collections::HashMap::new(),
                 accepted_folders: Vec::new(),
                 cleared_tombstones: Vec::new(),
                 downloaded_updates: Vec::new(),
@@ -3933,6 +4027,9 @@ mod tests {
                 server_user: acct.user.clone(),
                 accepted_uploads: Vec::new(),
                 accepted_page_hashes: Default::default(),
+                accepted_page_elements: Default::default(),
+                rebased_docs: Default::default(),
+                rebased_ancestors: Default::default(),
                 accepted_folders: Vec::new(),
                 cleared_tombstones: Vec::new(),
                 downloaded_updates: vec![RemoteNotebookUpdate {
@@ -3995,6 +4092,9 @@ mod tests {
                 server_user: acct.user.clone(),
                 accepted_uploads: Vec::new(),
                 accepted_page_hashes: Default::default(),
+                accepted_page_elements: Default::default(),
+                rebased_docs: Default::default(),
+                rebased_ancestors: Default::default(),
                 accepted_folders: Vec::new(),
                 cleared_tombstones: Vec::new(),
                 downloaded_updates: Vec::new(),
@@ -4027,7 +4127,7 @@ mod tests {
         assert_eq!(session.notebooks[0].pages[1].strokes.len(), 1);
         assert!(session.take_last_conflict_notice().is_some());
 
-        // Now simulate a true same-page collision on Page 0!
+        // Concurrent independent strokes on Page 0 ALSO merge at the element level cleanly!
         let mut remote_same_page = remote_diff_page;
         let csid = remote_same_page.alloc_stroke_id();
         let cpts = vec![
@@ -4051,9 +4151,12 @@ mod tests {
             .apply_sync_outcome(SyncCycleOutcome {
                 new_cursor: 3,
                 refreshed_session: None,
-                server_user: acct.user,
+                server_user: acct.user.clone(),
                 accepted_uploads: Vec::new(),
                 accepted_page_hashes: Default::default(),
+                accepted_page_elements: Default::default(),
+                rebased_docs: Default::default(),
+                rebased_ancestors: Default::default(),
                 accepted_folders: Vec::new(),
                 cleared_tombstones: Vec::new(),
                 downloaded_updates: Vec::new(),
@@ -4068,7 +4171,7 @@ mod tests {
                     body_hash: canonical_document_body_hash(&remote_same_page),
                     meta_hash: canonical_document_meta_hash(&remote_same_page),
                     meta_updated_at_ms: 3000,
-                    document: Some(remote_same_page),
+                    document: Some(remote_same_page.clone()),
                     page_hashes: remote_same_pages,
                 }],
                 downloaded_folders: Vec::new(),
@@ -4077,6 +4180,61 @@ mod tests {
                 pushed_count: 0,
                 pulled_count: 1,
                 synced_at_ms: 3500,
+            })
+            .unwrap();
+
+        assert_eq!(session.notebooks.len(), 1);
+        assert_eq!(session.notebooks[0].pages[0].strokes.len(), 2);
+        assert_eq!(session.notebooks[0].pages[1].strokes.len(), 1);
+
+        // Now simulate a true irreconcilable collision on Page 0 properties (conflicting templates).
+        {
+            let doc = Arc::make_mut(&mut session.notebooks[0]);
+            doc.pages[0].paper_template = papercraft_doc::PaperTemplate::Grid;
+            doc.load_active_from_pages();
+        }
+        session.doc = Arc::clone(&session.notebooks[0]);
+
+        let mut remote_prop_conflict = remote_same_page;
+        remote_prop_conflict.pages[0].paper_template = papercraft_doc::PaperTemplate::Dotted;
+        remote_prop_conflict.load_active_from_pages();
+        let remote_prop_hash = canonical_document_hash(&remote_prop_conflict);
+        let remote_prop_pages =
+            papercraft_sync_protocol::canonical_document_page_hashes(&remote_prop_conflict);
+
+        session
+            .apply_sync_outcome(SyncCycleOutcome {
+                new_cursor: 4,
+                refreshed_session: None,
+                server_user: acct.user,
+                accepted_uploads: Vec::new(),
+                accepted_page_hashes: Default::default(),
+                accepted_page_elements: Default::default(),
+                rebased_docs: Default::default(),
+                rebased_ancestors: Default::default(),
+                accepted_folders: Vec::new(),
+                cleared_tombstones: Vec::new(),
+                downloaded_updates: Vec::new(),
+                conflict_updates: vec![RemoteNotebookUpdate {
+                    notebook_id: "nb-merge".to_string(),
+                    version: 4,
+                    cursor: 4,
+                    deleted: false,
+                    updated_at_ms: 4000,
+                    deleted_at_ms: None,
+                    content_hash: remote_prop_hash,
+                    body_hash: canonical_document_body_hash(&remote_prop_conflict),
+                    meta_hash: canonical_document_meta_hash(&remote_prop_conflict),
+                    meta_updated_at_ms: 4000,
+                    document: Some(remote_prop_conflict),
+                    page_hashes: remote_prop_pages,
+                }],
+                downloaded_folders: Vec::new(),
+                updated_prefs: None,
+                ack_prefs: None,
+                pushed_count: 0,
+                pulled_count: 1,
+                synced_at_ms: 4500,
             })
             .unwrap();
 
@@ -4986,6 +5144,9 @@ mod tests {
             server_user: fake_account("u-a", "alice@example.com", "alice").user,
             accepted_uploads: Vec::new(),
             accepted_page_hashes: std::collections::HashMap::new(),
+            accepted_page_elements: std::collections::HashMap::new(),
+            rebased_docs: std::collections::HashMap::new(),
+            rebased_ancestors: std::collections::HashMap::new(),
             accepted_folders: Vec::new(),
             cleared_tombstones: Vec::new(),
             downloaded_updates: vec![papercraft_sync::RemoteNotebookUpdate {
@@ -5304,6 +5465,9 @@ mod tests {
             server_user: acct.user,
             accepted_uploads: Vec::new(),
             accepted_page_hashes: std::collections::HashMap::new(),
+            accepted_page_elements: std::collections::HashMap::new(),
+            rebased_docs: std::collections::HashMap::new(),
+            rebased_ancestors: std::collections::HashMap::new(),
             accepted_folders: Vec::new(),
             cleared_tombstones: Vec::new(),
             pulled_count: 1,
@@ -5382,6 +5546,9 @@ mod tests {
             server_user: acct.user,
             accepted_uploads: Vec::new(),
             accepted_page_hashes: std::collections::HashMap::new(),
+            accepted_page_elements: std::collections::HashMap::new(),
+            rebased_docs: std::collections::HashMap::new(),
+            rebased_ancestors: std::collections::HashMap::new(),
             accepted_folders: Vec::new(),
             cleared_tombstones: Vec::new(),
             pulled_count: 0,

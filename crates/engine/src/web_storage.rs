@@ -9,17 +9,25 @@ use papercraft_doc::{
     PdfPageBackdrop, UiTheme, UserStudioConfig, sanitize_notebook_id, sanitize_notebook_title,
 };
 use papercraft_format::{load_document_bytes, save_document_bytes_fast};
-use papercraft_sync::{ActiveWorkspaceTarget, GlobalSyncState, OwnerId, SyncManifest};
+use papercraft_sync::{
+    ActiveAccountSession, ActiveWorkspaceTarget, DocumentMergeBase, GlobalSyncState, LocalProfile,
+    MergeDecision, NotebookSyncMeta, OwnerId, RememberedServerAccount, SyncManifest,
+    compute_document_page_elements, merge_documents_three_way, strip_conflict_copy_suffix,
+};
+use papercraft_sync_protocol::{
+    canonical_document_hash, canonical_document_page_hashes, now_unix_ms,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::Session;
 use crate::library::TrashedNotebook;
 use crate::sync_state::{
     CachedLibraryBundle, CachedTrashEntry, WebWorkspaceCache, cloud_account_cache_key,
-    ensure_default_profile_in_global, migrate_web_cache_if_needed, sanitize_global_state,
+    ensure_default_profile_in_global, merge_studio_prefs, migrate_web_cache_if_needed,
+    sanitize_global_state,
 };
+use crate::{MAX_NOTEBOOKS, Session};
 
 pub const DETACHED_DOC_MAGIC: &[u8; 4] = b"PCDB";
 pub const DETACHED_DOC_VERSION: u16 = 1;
@@ -220,6 +228,8 @@ pub struct WebStorageDelta {
     pub delete_notebooks: HashSet<(String, String)>,
     pub put_trash: HashMap<(String, String), (i64, Arc<Document>)>,
     pub delete_trash: HashSet<(String, String)>,
+    /// Pre-edit per-notebook merge bases used to reconcile concurrent commits across browser tabs.
+    pub notebook_bases: HashMap<(String, String), DocumentMergeBase>,
     pub theme_hint: Option<UiTheme>,
     pub urgent: bool,
 }
@@ -246,7 +256,8 @@ impl WebStorageDelta {
             || !self.delete_trash.is_empty()
     }
 
-    /// Coalesces `newer` onto `self`, ensuring deletions cancel superseded puts and vice versa.
+    /// Coalesces `newer` onto `self`, ensuring deletions cancel superseded puts and preserving the
+    /// oldest pre-edit merge base for concurrent cross-tab 3-way merges.
     pub fn merge(&mut self, newer: Self) {
         if let Some(global) = newer.global {
             self.global = Some(global);
@@ -255,6 +266,7 @@ impl WebStorageDelta {
             self.put_workspaces.remove(&ws_key);
             self.put_notebooks.retain(|(ws, _), _| ws != &ws_key);
             self.delete_notebooks.retain(|(ws, _)| ws != &ws_key);
+            self.notebook_bases.retain(|(ws, _), _| ws != &ws_key);
             self.put_trash.retain(|(ws, _), _| ws != &ws_key);
             self.delete_trash.retain(|(ws, _)| ws != &ws_key);
             self.delete_workspaces.insert(ws_key);
@@ -265,11 +277,17 @@ impl WebStorageDelta {
         }
         for key in newer.delete_notebooks {
             self.put_notebooks.remove(&key);
+            self.notebook_bases.remove(&key);
             self.delete_notebooks.insert(key);
         }
         for (key, doc) in newer.put_notebooks {
             self.delete_notebooks.remove(&key);
             self.put_notebooks.insert(key, doc);
+        }
+        for (key, base) in newer.notebook_bases {
+            if !self.delete_notebooks.contains(&key) && !self.delete_workspaces.contains(&key.0) {
+                self.notebook_bases.entry(key).or_insert(base);
+            }
         }
         for key in newer.delete_trash {
             self.put_trash.remove(&key);
@@ -283,6 +301,578 @@ impl WebStorageDelta {
             self.theme_hint = Some(theme);
         }
         self.urgent |= newer.urgent;
+    }
+}
+
+/// Monotonic revision counters for a single IndexedDB workspace (`meta`, `trash`, and per-notebook).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRevisionEntry {
+    #[serde(default)]
+    pub meta_rev: u64,
+    #[serde(default)]
+    pub trash_rev: u64,
+    #[serde(default)]
+    pub notebooks: HashMap<String, u64>,
+}
+
+/// Persisted IndexedDB revision registry (`meta/"revisions"`) used to detect and selectively
+/// reload cross-tab changes without re-reading unchanged payloads.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageRevisionRegistry {
+    #[serde(default)]
+    pub global_rev: u64,
+    #[serde(default)]
+    pub workspaces: HashMap<String, WorkspaceRevisionEntry>,
+}
+
+impl StorageRevisionRegistry {
+    /// Returns the revision counters tracked for `ws_key`, if any.
+    #[must_use]
+    pub fn workspace_rev(&self, ws_key: &str) -> Option<&WorkspaceRevisionEntry> {
+        self.workspaces.get(ws_key)
+    }
+
+    /// Advances counters in `self` to reflect every mutation contained in `delta`.
+    pub fn apply_delta_bumps(&mut self, delta: &WebStorageDelta) {
+        if delta.global.is_some() {
+            self.global_rev = self.global_rev.saturating_add(1).max(1);
+        }
+        for ws_key in &delta.delete_workspaces {
+            self.workspaces.remove(ws_key);
+        }
+        for ws_key in delta.put_workspaces.keys() {
+            let entry = self.workspaces.entry(ws_key.clone()).or_default();
+            entry.meta_rev = entry.meta_rev.saturating_add(1).max(1);
+        }
+        for (ws_key, nb_id) in &delta.delete_notebooks {
+            if !delta.delete_workspaces.contains(ws_key) {
+                let entry = self.workspaces.entry(ws_key.clone()).or_default();
+                entry.notebooks.remove(nb_id);
+                entry.meta_rev = entry.meta_rev.saturating_add(1).max(1);
+            }
+        }
+        for (ws_key, nb_id) in delta.put_notebooks.keys() {
+            let entry = self.workspaces.entry(ws_key.clone()).or_default();
+            let next = entry
+                .notebooks
+                .get(nb_id)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(1);
+            entry.notebooks.insert(nb_id.clone(), next);
+        }
+        for (ws_key, _) in &delta.delete_trash {
+            if !delta.delete_workspaces.contains(ws_key) {
+                let entry = self.workspaces.entry(ws_key.clone()).or_default();
+                entry.trash_rev = entry.trash_rev.saturating_add(1).max(1);
+            }
+        }
+        for (ws_key, _) in delta.put_trash.keys() {
+            let entry = self.workspaces.entry(ws_key.clone()).or_default();
+            entry.trash_rev = entry.trash_rev.saturating_add(1).max(1);
+        }
+    }
+}
+
+/// Selective remote IndexedDB patch delivered to a sibling tab for hot-reload and live merge.
+#[derive(Clone, Debug, Default)]
+pub struct WebStorageRemotePatch {
+    pub revisions: StorageRevisionRegistry,
+    pub global: Option<GlobalSyncState>,
+    pub put_workspaces: HashMap<String, WebWorkspaceMetaSnapshot>,
+    pub delete_workspaces: HashSet<String>,
+    pub put_notebooks: HashMap<(String, String), Document>,
+    pub delete_notebooks: HashSet<(String, String)>,
+    pub put_trash: HashMap<(String, String), (i64, Document)>,
+    pub delete_trash: HashSet<(String, String)>,
+}
+
+impl WebStorageRemotePatch {
+    /// Returns `true` when this patch carries no state changes beyond `revisions`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.global.is_none()
+            && self.put_workspaces.is_empty()
+            && self.delete_workspaces.is_empty()
+            && self.put_notebooks.is_empty()
+            && self.delete_notebooks.is_empty()
+            && self.put_trash.is_empty()
+            && self.delete_trash.is_empty()
+    }
+
+    /// Coalesces `newer` onto `self`, keeping deletions and latest revisions aligned.
+    pub fn merge(&mut self, newer: Self) {
+        self.revisions.global_rev = self.revisions.global_rev.max(newer.revisions.global_rev);
+        if let Some(global) = newer.global {
+            self.global = Some(global);
+        }
+        for ws_key in &newer.delete_workspaces {
+            self.put_workspaces.remove(ws_key);
+            self.put_notebooks.retain(|(ws, _), _| ws != ws_key);
+            self.delete_notebooks.retain(|(ws, _)| ws != ws_key);
+            self.put_trash.retain(|(ws, _), _| ws != ws_key);
+            self.delete_trash.retain(|(ws, _)| ws != ws_key);
+            self.revisions.workspaces.remove(ws_key);
+            self.delete_workspaces.insert(ws_key.clone());
+        }
+        for (ws_key, meta) in newer.put_workspaces {
+            self.delete_workspaces.remove(&ws_key);
+            self.put_workspaces.insert(ws_key, meta);
+        }
+        for key in &newer.delete_notebooks {
+            self.put_notebooks.remove(key);
+            if let Some(ws_rev) = self.revisions.workspaces.get_mut(&key.0) {
+                ws_rev.notebooks.remove(&key.1);
+            }
+            self.delete_notebooks.insert(key.clone());
+        }
+        for (key, doc) in newer.put_notebooks {
+            self.delete_notebooks.remove(&key);
+            self.put_notebooks.insert(key, doc);
+        }
+        for key in &newer.delete_trash {
+            self.put_trash.remove(key);
+            self.delete_trash.insert(key.clone());
+        }
+        for (key, entry) in newer.put_trash {
+            self.delete_trash.remove(&key);
+            self.put_trash.insert(key, entry);
+        }
+        for (ws_key, newer_entry) in newer.revisions.workspaces {
+            if self.delete_workspaces.contains(&ws_key) {
+                continue;
+            }
+            let target = self.revisions.workspaces.entry(ws_key.clone()).or_default();
+            target.meta_rev = target.meta_rev.max(newer_entry.meta_rev);
+            target.trash_rev = target.trash_rev.max(newer_entry.trash_rev);
+            for (nb_id, rev) in newer_entry.notebooks {
+                if !self
+                    .delete_notebooks
+                    .contains(&(ws_key.clone(), nb_id.clone()))
+                {
+                    let cur = target.notebooks.get(&nb_id).copied().unwrap_or(0);
+                    target.notebooks.insert(nb_id, cur.max(rev));
+                }
+            }
+        }
+    }
+}
+
+/// Summary returned after applying a [`WebStorageRemotePatch`] to [`Session`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WebRemotePatchResult {
+    pub changed_ui: bool,
+    pub active_doc_changed: bool,
+    pub active_doc_content_changed: bool,
+    pub needs_writeback: bool,
+    pub active_workspace_removed: bool,
+    pub rotated_tokens_adopted: bool,
+}
+
+/// Result of reconciling a pending local notebook commit against a newer IndexedDB snapshot.
+#[derive(Clone, Debug)]
+pub struct CommitConflictResolution {
+    pub merged_doc: Document,
+    pub conflict_copy: Option<Document>,
+    pub emit_to_local_session: bool,
+}
+
+/// Computes per-page hashes and element-level fingerprints for `doc`.
+#[must_use]
+pub fn document_merge_base_from_doc(doc: &Document) -> DocumentMergeBase {
+    DocumentMergeBase {
+        page_hashes: canonical_document_page_hashes(doc),
+        page_elements: compute_document_page_elements(doc),
+        pending_push_hash: None,
+        pending_push_page_hashes: Vec::new(),
+        pending_push_page_elements: Vec::new(),
+    }
+}
+
+fn index_existing_attachment_arcs(
+    existing: &Document,
+    cache: &mut BlobHashCache,
+) -> HashMap<String, Arc<Vec<u8>>> {
+    let mut map = HashMap::new();
+    for pdf in &existing.pdf_documents {
+        if !pdf.bytes.is_empty() {
+            let h = cache.hash_arc(&pdf.bytes);
+            map.entry(h).or_insert_with(|| Arc::clone(&pdf.bytes));
+        }
+    }
+    for tpl in &existing.image_templates {
+        if !tpl.png_bytes.is_empty() {
+            let h = cache.hash_arc(&tpl.png_bytes);
+            map.entry(h).or_insert_with(|| Arc::clone(&tpl.png_bytes));
+        }
+    }
+    for page in &existing.pages {
+        for img in &page.images {
+            if !img.png_bytes.is_empty() {
+                let h = cache.hash_arc(&img.png_bytes);
+                map.entry(h).or_insert_with(|| Arc::clone(&img.png_bytes));
+            }
+        }
+    }
+    for img in &existing.images {
+        if !img.png_bytes.is_empty() {
+            let h = cache.hash_arc(&img.png_bytes);
+            map.entry(h).or_insert_with(|| Arc::clone(&img.png_bytes));
+        }
+    }
+    map
+}
+
+/// Replaces matching PDF/template/image buffers in `incoming` with shared `Arc` handles from
+/// `existing` whenever SHA-256 content matches, keeping GPU/PDF render caches warm across reloads.
+pub fn reuse_unchanged_attachment_arcs(
+    existing: &Document,
+    incoming: &mut Document,
+    cache: &mut BlobHashCache,
+) {
+    let existing_arcs = index_existing_attachment_arcs(existing, cache);
+    if existing_arcs.is_empty() {
+        return;
+    }
+    for pdf in &mut incoming.pdf_documents {
+        if !pdf.bytes.is_empty() {
+            let h = cache.hash_arc(&pdf.bytes);
+            if let Some(shared) = existing_arcs.get(&h)
+                && !Arc::ptr_eq(&pdf.bytes, shared)
+            {
+                pdf.bytes = Arc::clone(shared);
+            }
+        }
+    }
+    for tpl in &mut incoming.image_templates {
+        if !tpl.png_bytes.is_empty() {
+            let h = cache.hash_arc(&tpl.png_bytes);
+            if let Some(shared) = existing_arcs.get(&h)
+                && !Arc::ptr_eq(&tpl.png_bytes, shared)
+            {
+                tpl.png_bytes = Arc::clone(shared);
+            }
+        }
+    }
+    let mut active_page_images_changed = false;
+    let active_idx = incoming.active_page_index();
+    for (page_idx, page) in incoming.pages.iter_mut().enumerate() {
+        for img_arc in &mut page.images {
+            if !img_arc.png_bytes.is_empty() {
+                let h = cache.hash_arc(&img_arc.png_bytes);
+                if let Some(shared) = existing_arcs.get(&h)
+                    && !Arc::ptr_eq(&img_arc.png_bytes, shared)
+                {
+                    Arc::make_mut(img_arc).png_bytes = Arc::clone(shared);
+                    if page_idx == active_idx {
+                        active_page_images_changed = true;
+                    }
+                }
+            }
+        }
+    }
+    for img_arc in &mut incoming.images {
+        if !img_arc.png_bytes.is_empty() {
+            let h = cache.hash_arc(&img_arc.png_bytes);
+            if let Some(shared) = existing_arcs.get(&h)
+                && !Arc::ptr_eq(&img_arc.png_bytes, shared)
+            {
+                Arc::make_mut(img_arc).png_bytes = Arc::clone(shared);
+            }
+        }
+    }
+    if active_page_images_changed {
+        incoming.load_active_from_pages();
+    }
+}
+
+fn merge_cached_server_sessions(
+    target: &mut Vec<ActiveAccountSession>,
+    incoming: &[ActiveAccountSession],
+) {
+    let mut by_key: HashMap<String, ActiveAccountSession> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for sess in target.iter() {
+        let key = cloud_account_cache_key(&sess.server_url, &sess.user.user_id);
+        if let std::collections::hash_map::Entry::Vacant(entry) = by_key.entry(key.clone()) {
+            order.push(key);
+            entry.insert(sess.clone());
+        }
+    }
+    for sess in incoming {
+        let key = cloud_account_cache_key(&sess.server_url, &sess.user.user_id);
+        match by_key.get_mut(&key) {
+            Some(cur) => {
+                if sess.last_auth_ms >= cur.last_auth_ms
+                    && (!sess.access_token.is_empty() || cur.access_token.is_empty())
+                {
+                    *cur = sess.clone();
+                }
+            }
+            None => {
+                order.push(key.clone());
+                by_key.insert(key, sess.clone());
+            }
+        }
+    }
+    *target = order
+        .into_iter()
+        .filter_map(|k| by_key.remove(&k))
+        .collect();
+}
+
+fn merge_local_profiles(target: &mut Vec<LocalProfile>, incoming: &[LocalProfile]) {
+    for prof in incoming {
+        if let Some(cur) = target
+            .iter_mut()
+            .find(|p| p.local_profile_id == prof.local_profile_id)
+        {
+            if prof.last_used_at_ms > cur.last_used_at_ms && !prof.nickname.trim().is_empty() {
+                cur.nickname = prof.nickname.clone();
+            }
+            cur.last_used_at_ms = cur.last_used_at_ms.max(prof.last_used_at_ms);
+        } else {
+            target.push(prof.clone());
+        }
+    }
+}
+
+fn merge_remembered_accounts(
+    target: &mut Vec<RememberedServerAccount>,
+    incoming: &[RememberedServerAccount],
+) {
+    for acct in incoming {
+        let key = cloud_account_cache_key(&acct.server_url, &acct.user_id);
+        if let Some(cur) = target
+            .iter_mut()
+            .find(|a| cloud_account_cache_key(&a.server_url, &a.user_id) == key)
+        {
+            if acct.last_used_at_ms >= cur.last_used_at_ms {
+                *cur = acct.clone();
+            }
+        } else {
+            target.push(acct.clone());
+        }
+    }
+}
+
+/// Reconciles `local` global sync state with an updated `idb` snapshot during serialized commit
+/// without losing rotated tokens, newly added local profiles, or remembered cloud accounts.
+#[must_use]
+pub fn merge_global_states_for_commit(
+    local: &GlobalSyncState,
+    idb: &GlobalSyncState,
+) -> GlobalSyncState {
+    let mut out = local.clone();
+    merge_local_profiles(&mut out.local_profiles, &idb.local_profiles);
+    merge_remembered_accounts(
+        &mut out.remembered_server_accounts,
+        &idb.remembered_server_accounts,
+    );
+    merge_cached_server_sessions(&mut out.cached_server_sessions, &idb.cached_server_sessions);
+    out.welcome_banner_seen |= idb.welcome_banner_seen;
+    if out.welcome_banner_seen_version.is_none() {
+        out.welcome_banner_seen_version = idb.welcome_banner_seen_version.clone();
+    }
+    out.first_notebook_data_notice_seen |= idb.first_notebook_data_notice_seen;
+    sanitize_global_state(&mut out);
+    out
+}
+
+fn merge_notebook_sync_meta(
+    local: &NotebookSyncMeta,
+    other: &NotebookSyncMeta,
+) -> NotebookSyncMeta {
+    let mut out = if other.server_version > local.server_version {
+        other.clone()
+    } else {
+        local.clone()
+    };
+    out.cloud_dirty = local.cloud_dirty || other.cloud_dirty;
+    out.last_synced_at_ms = local.last_synced_at_ms.max(other.last_synced_at_ms);
+    out.updated_at_ms = local.updated_at_ms.max(other.updated_at_ms);
+    if out.deleted_at_ms.is_none() {
+        out.deleted_at_ms = local.deleted_at_ms.or(other.deleted_at_ms);
+    }
+    if out.pending_push_hash.is_none() {
+        out.pending_push_hash = other.pending_push_hash.clone();
+        if out.pending_push_page_hashes.is_empty() {
+            out.pending_push_page_hashes = other.pending_push_page_hashes.clone();
+        }
+        if out.pending_push_page_elements.is_empty() {
+            out.pending_push_page_elements = other.pending_push_page_elements.clone();
+        }
+    }
+    out
+}
+
+pub(crate) fn merge_manifests_monotonically(
+    local: &SyncManifest,
+    incoming: &SyncManifest,
+) -> SyncManifest {
+    let mut out = local.clone();
+    out.last_server_cursor = local.last_server_cursor.max(incoming.last_server_cursor);
+    out.prefs_version = local.prefs_version.max(incoming.prefs_version);
+    if out.prefs_hash.is_empty() {
+        out.prefs_hash = incoming.prefs_hash.clone();
+    }
+    out.prefs_dirty = local.prefs_dirty || incoming.prefs_dirty;
+    out.last_sync_at_ms = match (local.last_sync_at_ms, incoming.last_sync_at_ms) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    if out.owner_id.is_none() {
+        out.owner_id = incoming.owner_id.clone();
+    }
+
+    for inc_nb in &incoming.notebooks {
+        if let Some(cur) = out
+            .notebooks
+            .iter_mut()
+            .find(|n| n.notebook_id == inc_nb.notebook_id)
+        {
+            *cur = merge_notebook_sync_meta(cur, inc_nb);
+        } else {
+            out.notebooks.push(inc_nb.clone());
+        }
+    }
+    for inc_folder in &incoming.folders {
+        if let Some(cur) = out
+            .folders
+            .iter_mut()
+            .find(|f| f.folder_id == inc_folder.folder_id)
+        {
+            if inc_folder.server_version > cur.server_version
+                || inc_folder.updated_at_ms > cur.updated_at_ms
+            {
+                *cur = inc_folder.clone();
+            }
+        } else {
+            out.folders.push(inc_folder.clone());
+        }
+    }
+    for tomb in &incoming.tombstones {
+        if let Some(cur) = out
+            .tombstones
+            .iter_mut()
+            .find(|t| t.notebook_id == tomb.notebook_id)
+        {
+            cur.base_version = cur.base_version.max(tomb.base_version);
+            cur.deleted_at_ms = cur.deleted_at_ms.max(tomb.deleted_at_ms);
+        } else {
+            out.tombstones.push(tomb.clone());
+        }
+    }
+    out
+}
+
+/// Reconciles `local` workspace metadata against a newer `idb` record inside the serialized commit
+/// lock so concurrent notebook additions/removals and manifest progress survive cleanly.
+#[must_use]
+pub fn merge_workspace_meta_for_commit(
+    local: &WebWorkspaceMetaSnapshot,
+    idb: &WebWorkspaceMetaSnapshot,
+    local_deleted_nbs: &HashSet<String>,
+    local_deleted_trash: &HashSet<String>,
+) -> WebWorkspaceMetaSnapshot {
+    let mut out = local.clone();
+    let mut seen_ids: HashSet<String> = out.notebook_ids.iter().cloned().collect();
+    for (idx, id) in idb.notebook_ids.iter().enumerate() {
+        if local_deleted_nbs.contains(id) || !seen_ids.insert(id.clone()) {
+            continue;
+        }
+        out.notebook_ids.push(id.clone());
+        out.slot_ids
+            .push(idb.slot_ids.get(idx).cloned().unwrap_or_else(|| id.clone()));
+        out.slot_dirty_hash
+            .push(idb.slot_dirty_hash.get(idx).copied().unwrap_or(false));
+        out.slot_placeholder_blank.push(
+            idb.slot_placeholder_blank
+                .get(idx)
+                .copied()
+                .unwrap_or(false),
+        );
+    }
+
+    let mut trash_map: HashMap<String, i64> = HashMap::new();
+    let mut trash_order = Vec::new();
+    for (tid, ts) in out.trash_entries.drain(..) {
+        if !local_deleted_trash.contains(&tid) {
+            trash_order.push(tid.clone());
+            trash_map.insert(tid, ts);
+        }
+    }
+    for (tid, ts) in &idb.trash_entries {
+        if local_deleted_trash.contains(tid) {
+            continue;
+        }
+        if let Some(cur) = trash_map.get_mut(tid) {
+            *cur = (*cur).max(*ts);
+        } else {
+            trash_order.push(tid.clone());
+            trash_map.insert(tid.clone(), *ts);
+        }
+    }
+    out.trash_entries = trash_order
+        .into_iter()
+        .filter_map(|tid| trash_map.remove(&tid).map(|ts| (tid, ts)))
+        .collect();
+
+    out.manifest = merge_manifests_monotonically(&local.manifest, &idb.manifest);
+    let overwrite_prefs = idb.last_dirty_at_ms.unwrap_or(0) > local.last_dirty_at_ms.unwrap_or(0)
+        && !local.prefs_dirty_pending;
+    merge_studio_prefs(&mut out.prefs, idb.prefs.clone(), overwrite_prefs);
+    out.prefs_dirty_pending = local.prefs_dirty_pending || idb.prefs_dirty_pending;
+    out.last_dirty_at_ms = match (local.last_dirty_at_ms, idb.last_dirty_at_ms) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    out
+}
+
+/// Runs a 3-way merge when a local commit races against a newer IndexedDB revision of the same
+/// notebook inside the serialized `papercraft:idb:commit` lock.
+#[must_use]
+pub fn reconcile_concurrent_notebook_commit(
+    local_doc: &Document,
+    idb_doc: &Document,
+    base: Option<&DocumentMergeBase>,
+    now_ms: i64,
+) -> CommitConflictResolution {
+    let default_base = DocumentMergeBase::default();
+    let base_ref = base.unwrap_or(&default_base);
+    match merge_documents_three_way(local_doc, idb_doc, base_ref) {
+        MergeDecision::FastForward(remote) => CommitConflictResolution {
+            merged_doc: remote,
+            conflict_copy: None,
+            emit_to_local_session: true,
+        },
+        MergeDecision::Merged { mut doc, .. } => {
+            doc.updated_at_ms = doc.updated_at_ms.max(now_ms);
+            doc.sync_active_to_pages();
+            doc.load_active_from_pages();
+            CommitConflictResolution {
+                merged_doc: doc,
+                conflict_copy: None,
+                emit_to_local_session: true,
+            }
+        }
+        MergeDecision::Conflict => {
+            let mut copy = local_doc.clone();
+            copy.id = Uuid::new_v4().to_string();
+            let base_title = strip_conflict_copy_suffix(&copy.title);
+            copy.title = sanitize_notebook_title(&format!("{base_title} (Conflict Copy)"));
+            copy.updated_at_ms = copy.updated_at_ms.max(now_ms);
+            copy.meta_updated_at_ms = copy.meta_updated_at_ms.max(now_ms);
+            copy.sync_active_to_pages();
+            copy.load_active_from_pages();
+            CommitConflictResolution {
+                merged_doc: idb_doc.clone(),
+                conflict_copy: Some(copy),
+                emit_to_local_session: true,
+            }
+        }
     }
 }
 
@@ -932,6 +1522,7 @@ pub(crate) struct TrackedWorkspaceState {
     pub(crate) last_meta_json: Option<String>,
     pub(crate) last_structural_json: Option<String>,
     pub(crate) notebooks: HashMap<String, u64>,
+    pub(crate) notebook_bases: HashMap<String, DocumentMergeBase>,
     pub(crate) trash_ids: HashSet<String>,
 }
 
@@ -1021,6 +1612,11 @@ pub(crate) fn build_tracker_from_loaded_state(state: &WebStorageLoadedState) -> 
                 Err(_) => (None, None),
             };
         let notebooks = ws.notebooks.keys().map(|id| (id.clone(), 0u64)).collect();
+        let notebook_bases = ws
+            .notebooks
+            .iter()
+            .map(|(id, doc)| (id.clone(), document_merge_base_from_doc(doc)))
+            .collect();
         let trash_ids = ws.trash.keys().cloned().collect();
         tracker.workspaces.insert(
             ws.workspace_key.clone(),
@@ -1028,6 +1624,7 @@ pub(crate) fn build_tracker_from_loaded_state(state: &WebStorageLoadedState) -> 
                 last_meta_json: meta_json,
                 last_structural_json: structural_json,
                 notebooks,
+                notebook_bases,
                 trash_ids,
             },
         );
@@ -1183,11 +1780,18 @@ impl Session {
                 if changed {
                     let mut doc_snapshot = (*self.notebooks[idx]).clone();
                     doc_snapshot.sync_active_to_pages();
+                    let new_base = document_merge_base_from_doc(&doc_snapshot);
                     let doc_arc = Arc::new(doc_snapshot);
                     self.notebooks[idx] = Arc::clone(&doc_arc);
                     if idx == self.active_notebook {
                         self.doc = Arc::clone(&doc_arc);
                     }
+                    if let Some(prev_base) = tracked_ws.notebook_bases.get(&nb_id) {
+                        delta
+                            .notebook_bases
+                            .insert((ws_key.clone(), nb_id.clone()), prev_base.clone());
+                    }
+                    tracked_ws.notebook_bases.insert(nb_id.clone(), new_base);
                     delta
                         .put_notebooks
                         .insert((ws_key.clone(), nb_id.clone()), doc_arc);
@@ -1209,6 +1813,7 @@ impl Session {
                 .collect();
             for nb_id in removed_nb_ids {
                 tracked_ws.notebooks.remove(&nb_id);
+                tracked_ws.notebook_bases.remove(&nb_id);
                 delta.delete_notebooks.insert((ws_key.clone(), nb_id));
                 delta.urgent = true;
             }
@@ -1245,6 +1850,582 @@ impl Session {
         if !delta.is_empty() {
             self.sync.pending_web_delta.merge(delta);
         }
+    }
+
+    /// Applies an incremental [`WebStorageRemotePatch`] received from a sibling browser tab or
+    /// serialized commit merge, updating notebooks/metadata in-place and preserving UI state.
+    pub fn apply_web_storage_remote_patch(
+        &mut self,
+        patch: WebStorageRemotePatch,
+    ) -> WebRemotePatchResult {
+        let mut result = WebRemotePatchResult::default();
+        if !self.sync.web_cache_enabled || patch.is_empty() {
+            return result;
+        }
+
+        let active_ws_key = self.active_web_workspace_key();
+        if let Some(ref incoming_global) = patch.global {
+            self.apply_remote_global_patch(incoming_global, &patch.delete_workspaces, &mut result);
+        } else if let Some(ref ws_key) = active_ws_key
+            && patch.delete_workspaces.contains(ws_key)
+        {
+            result.active_workspace_removed = true;
+        }
+
+        self.apply_remote_inactive_workspace_patch(&patch, active_ws_key.as_deref());
+
+        if let Some(ref ws_key) = active_ws_key
+            && !patch.delete_workspaces.contains(ws_key)
+        {
+            self.apply_remote_active_workspace_patch(ws_key, &patch, &mut result);
+        }
+
+        if result.changed_ui {
+            self.bump_revision();
+        }
+        result
+    }
+
+    fn apply_remote_global_patch(
+        &mut self,
+        incoming: &GlobalSyncState,
+        delete_workspaces: &HashSet<String>,
+        result: &mut WebRemotePatchResult,
+    ) {
+        let prev_profiles = self.sync.global.local_profiles.len();
+        let prev_remembered = self.sync.global.remembered_server_accounts.len();
+        let prev_sessions = self.sync.global.cached_server_sessions.clone();
+
+        merge_local_profiles(
+            &mut self.sync.global.local_profiles,
+            &incoming.local_profiles,
+        );
+        merge_remembered_accounts(
+            &mut self.sync.global.remembered_server_accounts,
+            &incoming.remembered_server_accounts,
+        );
+        merge_cached_server_sessions(
+            &mut self.sync.global.cached_server_sessions,
+            &incoming.cached_server_sessions,
+        );
+        self.sync.global.welcome_banner_seen |= incoming.welcome_banner_seen;
+        if self.sync.global.welcome_banner_seen_version.is_none() {
+            self.sync.global.welcome_banner_seen_version =
+                incoming.welcome_banner_seen_version.clone();
+        }
+        self.sync.global.first_notebook_data_notice_seen |=
+            incoming.first_notebook_data_notice_seen;
+        sanitize_global_state(&mut self.sync.global);
+
+        if let Some(ref mut active_sess) = self.sync.active_server_session {
+            let active_key =
+                cloud_account_cache_key(&active_sess.server_url, &active_sess.user.user_id);
+            let active_ws = cloud_workspace_key(&active_sess.server_url, &active_sess.user.user_id);
+            if delete_workspaces.contains(&active_ws) {
+                result.active_workspace_removed = true;
+            } else if let Some(fresher) = self
+                .sync
+                .global
+                .cached_server_sessions
+                .iter()
+                .find(|s| cloud_account_cache_key(&s.server_url, &s.user.user_id) == active_key)
+                && (fresher.access_token != active_sess.access_token
+                    || fresher.refresh_token != active_sess.refresh_token
+                    || fresher.user != active_sess.user)
+                && fresher.last_auth_ms >= active_sess.last_auth_ms
+            {
+                *active_sess = fresher.clone();
+                result.rotated_tokens_adopted = true;
+                result.changed_ui = true;
+            }
+        } else if let Some(ws_key) = self.active_web_workspace_key()
+            && delete_workspaces.contains(&ws_key)
+        {
+            result.active_workspace_removed = true;
+        }
+
+        if self.sync.global.local_profiles.len() != prev_profiles
+            || self.sync.global.remembered_server_accounts.len() != prev_remembered
+            || self.sync.global.cached_server_sessions != prev_sessions
+        {
+            result.changed_ui = true;
+        }
+        self.sync.web_tracker.last_global_json = serde_json::to_string(&self.sync.global).ok();
+    }
+
+    fn find_or_insert_inactive_bundle_mut(
+        &mut self,
+        ws_key: &str,
+        allow_create: bool,
+    ) -> Option<&mut CachedLibraryBundle> {
+        if let Some(pid) = ws_key.strip_prefix("local:") {
+            if allow_create {
+                return Some(
+                    self.sync
+                        .web_local_bundles
+                        .entry(pid.to_string())
+                        .or_default(),
+                );
+            }
+            return self.sync.web_local_bundles.get_mut(pid);
+        }
+        if let Some(acct_key) = ws_key.strip_prefix("cloud:") {
+            if allow_create {
+                return Some(
+                    self.sync
+                        .web_cloud_bundles
+                        .entry(acct_key.to_string())
+                        .or_default(),
+                );
+            }
+            return self.sync.web_cloud_bundles.get_mut(acct_key);
+        }
+        None
+    }
+
+    fn apply_remote_inactive_workspace_patch(
+        &mut self,
+        patch: &WebStorageRemotePatch,
+        active_ws_key: Option<&str>,
+    ) {
+        let mut keys: HashSet<String> = HashSet::new();
+        keys.extend(patch.delete_workspaces.iter().cloned());
+        keys.extend(patch.put_workspaces.keys().cloned());
+        keys.extend(patch.put_notebooks.keys().map(|(ws, _)| ws.clone()));
+        keys.extend(patch.delete_notebooks.iter().map(|(ws, _)| ws.clone()));
+        keys.extend(patch.put_trash.keys().map(|(ws, _)| ws.clone()));
+        keys.extend(patch.delete_trash.iter().map(|(ws, _)| ws.clone()));
+
+        for ws_key in keys {
+            if active_ws_key == Some(ws_key.as_str()) {
+                continue;
+            }
+            if patch.delete_workspaces.contains(&ws_key) {
+                if let Some(pid) = ws_key.strip_prefix("local:") {
+                    self.sync.web_local_bundles.remove(pid);
+                } else if let Some(acct_key) = ws_key.strip_prefix("cloud:") {
+                    self.sync.web_cloud_bundles.remove(acct_key);
+                }
+                self.sync.web_tracker.workspaces.remove(&ws_key);
+                continue;
+            }
+            let meta_opt = patch.put_workspaces.get(&ws_key);
+            let Some(bundle) = self.find_or_insert_inactive_bundle_mut(&ws_key, meta_opt.is_some())
+            else {
+                continue;
+            };
+            if let Some(meta) = meta_opt {
+                bundle.prefs = meta.prefs.clone();
+                bundle.manifest = merge_manifests_monotonically(&bundle.manifest, &meta.manifest);
+                bundle.active_notebook = meta.active_notebook;
+                bundle.prefs_dirty_pending = meta.prefs_dirty_pending;
+                bundle.last_dirty_at_ms = meta.last_dirty_at_ms;
+            }
+            for ((del_ws, del_nb), _) in patch
+                .delete_notebooks
+                .iter()
+                .filter(|(ws, _)| ws == &ws_key)
+                .map(|k| (k, ()))
+            {
+                let _ = del_ws;
+                bundle
+                    .notebooks
+                    .retain(|d| sanitize_notebook_id(&d.id) != *del_nb);
+            }
+            for ((put_ws, put_nb), incoming_doc) in &patch.put_notebooks {
+                if put_ws != &ws_key {
+                    continue;
+                }
+                let mut doc = incoming_doc.clone();
+                doc.sync_active_to_pages();
+                doc.load_active_from_pages();
+                if let Some(existing) = bundle
+                    .notebooks
+                    .iter_mut()
+                    .find(|d| sanitize_notebook_id(&d.id) == *put_nb)
+                {
+                    *existing = doc;
+                } else if bundle.notebooks.len() < MAX_NOTEBOOKS {
+                    bundle.notebooks.push(doc);
+                }
+            }
+            if let Some(meta) = meta_opt {
+                reorder_bundle_notebooks(bundle, &meta.notebook_ids);
+            }
+            apply_remote_trash_to_inactive_bundle(bundle, &ws_key, patch);
+            if !bundle.notebooks.is_empty() {
+                bundle.active_notebook = bundle.active_notebook.min(bundle.notebooks.len() - 1);
+            } else {
+                bundle.active_notebook = 0;
+            }
+        }
+    }
+
+    fn is_slot_dirty_for_web_merge(&self, ws_key: &str, idx: usize, nb_id: &str) -> bool {
+        let slot_dirty = self.library.slot_dirty.get(idx).copied().unwrap_or(false);
+        let edit_gen = self.sync.slot_edit_gen.get(idx).copied().unwrap_or(0);
+        let tracked_gen = self
+            .sync
+            .web_tracker
+            .workspaces
+            .get(ws_key)
+            .and_then(|w| w.notebooks.get(nb_id))
+            .copied();
+        slot_dirty || tracked_gen != Some(edit_gen)
+    }
+
+    fn apply_remote_active_workspace_patch(
+        &mut self,
+        ws_key: &str,
+        patch: &WebStorageRemotePatch,
+        result: &mut WebRemotePatchResult,
+    ) {
+        self.ensure_active_web_ids();
+
+        for (del_ws, del_nb) in &patch.delete_notebooks {
+            if del_ws == ws_key {
+                self.remove_clean_notebook_by_id_for_remote_patch(ws_key, del_nb, result);
+            }
+        }
+
+        let mut nb_puts: Vec<(&String, &Document)> = patch
+            .put_notebooks
+            .iter()
+            .filter(|((ws, _), _)| ws == ws_key)
+            .map(|((_, id), doc)| (id, doc))
+            .collect();
+        nb_puts.sort_by_key(|(a, _)| *a);
+        for (nb_id, doc) in nb_puts {
+            self.apply_remote_notebook_to_active_workspace(ws_key, nb_id, doc.clone(), result);
+        }
+
+        if let Some(meta) = patch.put_workspaces.get(ws_key) {
+            self.apply_remote_active_workspace_meta(ws_key, meta, result);
+        }
+
+        self.apply_remote_trash_to_active_workspace(ws_key, patch, result);
+        self.sync
+            .web_tracker
+            .workspaces
+            .entry(ws_key.to_string())
+            .or_default();
+        if !result.needs_writeback {
+            self.refresh_web_tracker_after_remote_patch(ws_key);
+        }
+    }
+
+    fn remove_clean_notebook_by_id_for_remote_patch(
+        &mut self,
+        ws_key: &str,
+        nb_id: &str,
+        result: &mut WebRemotePatchResult,
+    ) {
+        let Some(idx) = self.find_slot_by_id(nb_id) else {
+            return;
+        };
+        if self.is_slot_dirty_for_web_merge(ws_key, idx, nb_id) || self.notebooks.len() <= 1 {
+            return;
+        }
+        let active_id = self
+            .notebooks
+            .get(self.active_notebook)
+            .map(|d| sanitize_notebook_id(&d.id));
+        self.notebooks.remove(idx);
+        self.library.remove_slot(idx);
+        if idx < self.sync.slot_ids.len() {
+            self.sync.slot_ids.remove(idx);
+        }
+        if idx < self.sync.slot_dirty_hash.len() {
+            self.sync.slot_dirty_hash.remove(idx);
+        }
+        if idx < self.sync.slot_placeholder_blank.len() {
+            self.sync.slot_placeholder_blank.remove(idx);
+        }
+        if idx < self.sync.slot_edit_gen.len() {
+            self.sync.slot_edit_gen.remove(idx);
+        }
+        if active_id.as_deref() == Some(nb_id) {
+            self.active_notebook = idx.min(self.notebooks.len().saturating_sub(1));
+            self.doc = Arc::clone(&self.notebooks[self.active_notebook]);
+            self.history.clear();
+            result.active_doc_changed = true;
+            result.active_doc_content_changed = true;
+        } else if let Some(ref prev_id) = active_id
+            && let Some(new_idx) = self.find_slot_by_id(prev_id)
+        {
+            self.active_notebook = new_idx;
+        }
+        if let Some(tws) = self.sync.web_tracker.workspaces.get_mut(ws_key) {
+            tws.notebooks.remove(nb_id);
+            tws.notebook_bases.remove(nb_id);
+        }
+        result.changed_ui = true;
+    }
+
+    fn apply_remote_notebook_to_active_workspace(
+        &mut self,
+        ws_key: &str,
+        nb_id: &str,
+        mut incoming: Document,
+        result: &mut WebRemotePatchResult,
+    ) {
+        incoming.id = sanitize_notebook_id(nb_id);
+        incoming.sync_active_to_pages();
+        incoming.load_active_from_pages();
+
+        if let Some(idx) = self.find_slot_by_id(nb_id) {
+            reuse_unchanged_attachment_arcs(
+                &self.notebooks[idx],
+                &mut incoming,
+                &mut self.sync.web_tracker.hash_cache,
+            );
+            let local_dirty = self.is_slot_dirty_for_web_merge(ws_key, idx, nb_id);
+            if !local_dirty {
+                self.apply_clean_remote_notebook_slot(ws_key, idx, nb_id, incoming, result);
+            } else {
+                self.apply_dirty_remote_notebook_slot(ws_key, idx, nb_id, incoming, result);
+            }
+            return;
+        }
+
+        if self.notebooks.len() >= MAX_NOTEBOOKS {
+            return;
+        }
+        let base = document_merge_base_from_doc(&incoming);
+        self.notebooks.push(Arc::new(incoming));
+        self.library.sync_len(self.notebooks.len());
+        self.sync.slot_ids.push(nb_id.to_string());
+        self.sync.slot_dirty_hash.push(false);
+        self.sync.slot_placeholder_blank.push(false);
+        self.sync.slot_edit_gen.push(0);
+        let tws = self
+            .sync
+            .web_tracker
+            .workspaces
+            .entry(ws_key.to_string())
+            .or_default();
+        tws.notebooks.insert(nb_id.to_string(), 0);
+        tws.notebook_bases.insert(nb_id.to_string(), base);
+        result.changed_ui = true;
+    }
+
+    fn apply_clean_remote_notebook_slot(
+        &mut self,
+        ws_key: &str,
+        idx: usize,
+        nb_id: &str,
+        mut incoming: Document,
+        result: &mut WebRemotePatchResult,
+    ) {
+        let prev_hash = canonical_document_hash(&self.notebooks[idx]);
+        let next_hash = canonical_document_hash(&incoming);
+        let content_changed = prev_hash != next_hash;
+        let new_base = document_merge_base_from_doc(&incoming);
+
+        if idx == self.active_notebook {
+            let keep_page = self
+                .doc
+                .active_page_index()
+                .min(incoming.page_count().saturating_sub(1));
+            incoming.select_page(keep_page);
+        }
+        self.notebooks[idx] = Arc::new(incoming);
+        self.library.sync_len(self.notebooks.len());
+        self.library.slot_dirty[idx] = false;
+        self.library.slot_view_dirty[idx] = false;
+        self.sync.slot_placeholder_blank[idx] = false;
+
+        if idx == self.active_notebook {
+            self.doc = Arc::clone(&self.notebooks[idx]);
+            if content_changed {
+                self.history.clear();
+                result.active_doc_content_changed = true;
+            }
+            result.active_doc_changed = true;
+        }
+        let edit_gen = self.sync.slot_edit_gen.get(idx).copied().unwrap_or(0);
+        let tws = self
+            .sync
+            .web_tracker
+            .workspaces
+            .entry(ws_key.to_string())
+            .or_default();
+        tws.notebooks.insert(nb_id.to_string(), edit_gen);
+        tws.notebook_bases.insert(nb_id.to_string(), new_base);
+        result.changed_ui = true;
+    }
+
+    fn apply_dirty_remote_notebook_slot(
+        &mut self,
+        ws_key: &str,
+        idx: usize,
+        nb_id: &str,
+        incoming: Document,
+        result: &mut WebRemotePatchResult,
+    ) {
+        let base = self
+            .sync
+            .web_tracker
+            .workspaces
+            .get(ws_key)
+            .and_then(|w| w.notebook_bases.get(nb_id))
+            .cloned()
+            .unwrap_or_default();
+        let incoming_base = document_merge_base_from_doc(&incoming);
+        let prev_hash = canonical_document_hash(&self.notebooks[idx]);
+
+        match merge_documents_three_way(&self.notebooks[idx], &incoming, &base) {
+            MergeDecision::FastForward(_) => {
+                self.apply_clean_remote_notebook_slot(ws_key, idx, nb_id, incoming, result);
+            }
+            MergeDecision::Merged { mut doc, .. } => {
+                doc.sync_active_to_pages();
+                doc.load_active_from_pages();
+                reuse_unchanged_attachment_arcs(
+                    &self.notebooks[idx],
+                    &mut doc,
+                    &mut self.sync.web_tracker.hash_cache,
+                );
+                let content_changed = canonical_document_hash(&doc) != prev_hash;
+                self.install_remote_doc_at_slot(idx, doc, content_changed);
+                self.sync.slot_dirty_hash[idx] = true;
+                self.sync.last_dirty_at_ms = Some(now_unix_ms());
+                let tws = self
+                    .sync
+                    .web_tracker
+                    .workspaces
+                    .entry(ws_key.to_string())
+                    .or_default();
+                tws.notebook_bases.insert(nb_id.to_string(), incoming_base);
+                result.changed_ui = true;
+                result.needs_writeback = true;
+                if idx == self.active_notebook {
+                    result.active_doc_changed = true;
+                    result.active_doc_content_changed |= content_changed;
+                }
+            }
+            MergeDecision::Conflict => {
+                let local_work = (*self.notebooks[idx]).clone();
+                self.install_remote_doc_at_slot(idx, incoming, true);
+                self.sync.slot_dirty_hash[idx] = false;
+                let _ = self.append_conflict_copy_notebook(local_work);
+                let tws = self
+                    .sync
+                    .web_tracker
+                    .workspaces
+                    .entry(ws_key.to_string())
+                    .or_default();
+                tws.notebook_bases.insert(nb_id.to_string(), incoming_base);
+                result.changed_ui = true;
+                result.needs_writeback = true;
+                if idx == self.active_notebook {
+                    result.active_doc_changed = true;
+                    result.active_doc_content_changed = true;
+                }
+            }
+        }
+    }
+
+    fn apply_remote_active_workspace_meta(
+        &mut self,
+        ws_key: &str,
+        meta: &WebWorkspaceMetaSnapshot,
+        result: &mut WebRemotePatchResult,
+    ) {
+        self.sync.manifest = merge_manifests_monotonically(&self.sync.manifest, &meta.manifest);
+        self.sync
+            .slot_dirty_hash
+            .resize(self.notebooks.len(), false);
+        for (idx, doc) in self.notebooks.iter().enumerate() {
+            let nb_id = sanitize_notebook_id(&doc.id);
+            if !self.is_slot_dirty_for_web_merge(ws_key, idx, &nb_id)
+                && let Some(m) = self.sync.manifest.meta(&nb_id)
+            {
+                self.sync.slot_dirty_hash[idx] = m.cloud_dirty;
+            }
+        }
+
+        if meta.prefs != self.prefs {
+            if !self.sync.prefs_dirty_pending {
+                merge_studio_prefs(&mut self.prefs, meta.prefs.clone(), true);
+                result.changed_ui = true;
+            } else {
+                merge_studio_prefs(&mut self.prefs, meta.prefs.clone(), false);
+                result.needs_writeback = true;
+                result.changed_ui = true;
+            }
+        }
+
+        if !self.sync.manifest.prefs_dirty && !self.sync.prefs_dirty_pending {
+            self.sync.prefs_dirty_pending = meta.prefs_dirty_pending;
+        }
+        self.sync_reconcile_folders();
+
+        if reorder_active_session_notebooks(self, &meta.notebook_ids) {
+            result.changed_ui = true;
+        }
+    }
+
+    fn apply_remote_trash_to_active_workspace(
+        &mut self,
+        ws_key: &str,
+        patch: &WebStorageRemotePatch,
+        result: &mut WebRemotePatchResult,
+    ) {
+        let before_len = self.trashed_notebooks.len();
+        self.trashed_notebooks.retain(|entry| {
+            !patch
+                .delete_trash
+                .contains(&(ws_key.to_string(), entry.trash_id.clone()))
+        });
+        if self.trashed_notebooks.len() != before_len {
+            result.changed_ui = true;
+        }
+
+        for ((put_ws, tid), (deleted_at_ms, doc)) in &patch.put_trash {
+            if put_ws != ws_key {
+                continue;
+            }
+            if let Some(existing) = self
+                .trashed_notebooks
+                .iter_mut()
+                .find(|e| e.trash_id == *tid)
+            {
+                existing.deleted_at_ms = existing.deleted_at_ms.max(*deleted_at_ms);
+                existing.doc = Arc::new(doc.clone());
+            } else {
+                self.trashed_notebooks.push(TrashedNotebook {
+                    trash_id: tid.clone(),
+                    doc: Arc::new(doc.clone()),
+                    deleted_at_ms: *deleted_at_ms,
+                    path: None,
+                });
+            }
+            result.changed_ui = true;
+        }
+    }
+
+    fn refresh_web_tracker_after_remote_patch(&mut self, ws_key: &str) {
+        let meta = self.build_active_web_meta_snapshot();
+        self.sync.web_tracker.last_theme = Some(self.prefs.theme);
+        self.sync.web_tracker.last_global_json = serde_json::to_string(&self.sync.global).ok();
+        let diff_keys =
+            detached_workspace_diff_keys(&meta, &mut self.sync.web_tracker.hash_cache).ok();
+        let tws = self
+            .sync
+            .web_tracker
+            .workspaces
+            .entry(ws_key.to_string())
+            .or_default();
+        if let Some((meta_json, structural_json)) = diff_keys {
+            tws.last_meta_json = Some(meta_json);
+            tws.last_structural_json = Some(structural_json);
+        }
+        tws.trash_ids = self
+            .trashed_notebooks
+            .iter()
+            .map(|t| t.trash_id.clone())
+            .collect();
     }
 
     /// Fast O(1) check for queued web storage deltas or dirty open notebooks (no serialization).
@@ -1330,6 +2511,152 @@ pub(crate) fn trashed_to_cached_entry(entry: &TrashedNotebook) -> CachedTrashEnt
         doc: (*entry.doc).clone(),
         deleted_at_ms: entry.deleted_at_ms,
     }
+}
+
+fn apply_remote_trash_to_inactive_bundle(
+    bundle: &mut CachedLibraryBundle,
+    ws_key: &str,
+    patch: &WebStorageRemotePatch,
+) {
+    bundle.trash.retain(|e| {
+        !patch
+            .delete_trash
+            .contains(&(ws_key.to_string(), e.trash_id.clone()))
+    });
+    for ((put_ws, tid), (deleted_at_ms, doc)) in &patch.put_trash {
+        if put_ws != ws_key {
+            continue;
+        }
+        if let Some(cur) = bundle.trash.iter_mut().find(|e| e.trash_id == *tid) {
+            cur.deleted_at_ms = cur.deleted_at_ms.max(*deleted_at_ms);
+            cur.doc = doc.clone();
+        } else {
+            bundle.trash.push(CachedTrashEntry {
+                trash_id: tid.clone(),
+                doc: doc.clone(),
+                deleted_at_ms: *deleted_at_ms,
+            });
+        }
+    }
+}
+
+fn reorder_bundle_notebooks(bundle: &mut CachedLibraryBundle, target_order: &[String]) {
+    let mut by_id: HashMap<String, Document> = HashMap::with_capacity(bundle.notebooks.len());
+    let mut current_order = Vec::with_capacity(bundle.notebooks.len());
+    for doc in bundle.notebooks.drain(..) {
+        let id = sanitize_notebook_id(&doc.id);
+        current_order.push(id.clone());
+        by_id.insert(id, doc);
+    }
+    let mut reordered = Vec::with_capacity(by_id.len());
+    let mut reordered_ids = Vec::with_capacity(by_id.len());
+    for id in target_order {
+        if let Some(doc) = by_id.remove(id) {
+            reordered_ids.push(id.clone());
+            reordered.push(doc);
+        }
+    }
+    for id in current_order {
+        if let Some(doc) = by_id.remove(&id) {
+            reordered_ids.push(id);
+            reordered.push(doc);
+        }
+    }
+    bundle.notebooks = reordered;
+    bundle.slot_ids = reordered_ids;
+    bundle.slot_dirty_hash.resize(bundle.notebooks.len(), false);
+    bundle
+        .slot_placeholder_blank
+        .resize(bundle.notebooks.len(), false);
+}
+
+fn reorder_active_session_notebooks(session: &mut Session, target_order: &[String]) -> bool {
+    let n = session.notebooks.len();
+    if n <= 1 {
+        return false;
+    }
+    let mut cur_ids: Vec<String> = session
+        .notebooks
+        .iter()
+        .map(|d| sanitize_notebook_id(&d.id))
+        .collect();
+    let mut desired_ids: Vec<String> = Vec::with_capacity(n);
+    let mut seen: HashSet<String> = HashSet::with_capacity(n);
+    for id in target_order {
+        if cur_ids.iter().any(|c| c == id) && seen.insert(id.clone()) {
+            desired_ids.push(id.clone());
+        }
+    }
+    for id in &cur_ids {
+        if seen.insert(id.clone()) {
+            desired_ids.push(id.clone());
+        }
+    }
+    if desired_ids == cur_ids {
+        return false;
+    }
+
+    let prev_active_id = cur_ids.get(session.active_notebook).cloned();
+    session.library.sync_len(n);
+    session.sync.slot_ids.resize_with(n, String::new);
+    session.sync.slot_dirty_hash.resize(n, false);
+    session.sync.slot_placeholder_blank.resize(n, false);
+    session.sync.slot_edit_gen.resize(n, 0);
+
+    let docs = std::mem::take(&mut session.notebooks);
+    let mut slot_dirty = std::mem::take(&mut session.library.slot_dirty);
+    let mut slot_view_dirty = std::mem::take(&mut session.library.slot_view_dirty);
+    let mut slot_ids = std::mem::take(&mut session.sync.slot_ids);
+    let mut dirty_hash = std::mem::take(&mut session.sync.slot_dirty_hash);
+    let mut placeholder = std::mem::take(&mut session.sync.slot_placeholder_blank);
+    let mut edit_gen = std::mem::take(&mut session.sync.slot_edit_gen);
+
+    let mut pos_by_id: HashMap<String, usize> = HashMap::with_capacity(n);
+    for (idx, id) in cur_ids.drain(..).enumerate() {
+        pos_by_id.entry(id).or_insert(idx);
+    }
+
+    let mut new_docs = Vec::with_capacity(n);
+    for target_id in &desired_ids {
+        if let Some(old_idx) = pos_by_id.remove(target_id) {
+            new_docs.push(Arc::clone(&docs[old_idx]));
+            session.library.slot_dirty.push(slot_dirty[old_idx]);
+            session
+                .library
+                .slot_view_dirty
+                .push(slot_view_dirty[old_idx]);
+            session
+                .sync
+                .slot_ids
+                .push(std::mem::take(&mut slot_ids[old_idx]));
+            session.sync.slot_dirty_hash.push(dirty_hash[old_idx]);
+            session
+                .sync
+                .slot_placeholder_blank
+                .push(placeholder[old_idx]);
+            session.sync.slot_edit_gen.push(edit_gen[old_idx]);
+        }
+    }
+    slot_dirty.clear();
+    slot_view_dirty.clear();
+    dirty_hash.clear();
+    placeholder.clear();
+    edit_gen.clear();
+
+    session.notebooks = new_docs;
+    if let Some(ref aid) = prev_active_id
+        && let Some(new_idx) = session.find_slot_by_id(aid)
+    {
+        session.active_notebook = new_idx;
+    } else {
+        session.active_notebook = session
+            .active_notebook
+            .min(session.notebooks.len().saturating_sub(1));
+    }
+    if let Some(active_doc) = session.notebooks.get(session.active_notebook) {
+        session.doc = Arc::clone(active_doc);
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1918,5 +3245,515 @@ mod tests {
         assert!(!session.library.slot_view_dirty[slot]);
         let saved_doc = urgent.put_notebooks.values().next().unwrap();
         assert_eq!(saved_doc.active_page_index(), 0);
+    }
+
+    fn make_two_notebook_loaded_state(
+        profile_id: &str,
+        first_doc: Document,
+        second_doc: Document,
+    ) -> (String, WebStorageLoadedState) {
+        let ws_key = local_workspace_key(profile_id);
+        let first_id = first_doc.id.clone();
+        let second_id = second_doc.id.clone();
+        let mut notebooks = HashMap::new();
+        notebooks.insert(first_id.clone(), first_doc);
+        notebooks.insert(second_id.clone(), second_doc);
+
+        let mut global = GlobalSyncState::with_defaults("Web Browser".to_string());
+        global.needs_initial_nickname = false;
+        global.active_workspace = ActiveWorkspaceTarget::Local;
+        global.active_local_profile_id = profile_id.to_string();
+        global.local_profiles.push(LocalProfile {
+            local_profile_id: profile_id.to_string(),
+            nickname: "Tester".to_string(),
+            created_at_ms: 100,
+            last_used_at_ms: 100,
+        });
+
+        let meta = WebWorkspaceMetaSnapshot {
+            active_notebook: 0,
+            notebook_ids: vec![first_id.clone(), second_id.clone()],
+            slot_ids: vec![first_id, second_id],
+            slot_dirty_hash: vec![false, false],
+            slot_placeholder_blank: vec![false, false],
+            ..Default::default()
+        };
+
+        (
+            ws_key.clone(),
+            WebStorageLoadedState {
+                global,
+                workspaces: vec![WebStorageLoadedWorkspace {
+                    workspace_key: ws_key,
+                    meta,
+                    notebooks,
+                    trash: HashMap::new(),
+                }],
+            },
+        )
+    }
+
+    fn clone_with_fresh_blob_arcs(doc: &Document) -> Document {
+        let mut out = doc.clone();
+        for pdf in &mut out.pdf_documents {
+            pdf.bytes = Arc::new((*pdf.bytes).clone());
+        }
+        for tpl in &mut out.image_templates {
+            tpl.png_bytes = Arc::new((*tpl.png_bytes).clone());
+        }
+        for page in &mut out.pages {
+            for img in &mut page.images {
+                let raw = (*img.png_bytes).clone();
+                Arc::make_mut(img).png_bytes = Arc::new(raw);
+            }
+        }
+        out.load_active_from_pages();
+        out
+    }
+
+    fn sample_cloud_auth(
+        access_token: &str,
+        refresh_token: &str,
+        last_auth_ms: i64,
+    ) -> ActiveAccountSession {
+        ActiveAccountSession {
+            server_url: "http://127.0.0.1:8787".to_string(),
+            user: UserProfile {
+                user_id: "u-sync".to_string(),
+                username: "syncuser".to_string(),
+                email: Some("sync@example.com".to_string()),
+                display_name: "Sync User".to_string(),
+                created_at_ms: 100,
+                must_change_password: false,
+            },
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.to_string(),
+            access_expires_at_ms: 9_999_999_999_000,
+            refresh_expires_at_ms: 9_999_999_999_000,
+            device_name: "Web".to_string(),
+            last_auth_ms,
+        }
+    }
+
+    #[test]
+    fn cross_tab_hot_reload_updates_clean_tab_without_echo_writeback_or_data_loss() {
+        let rich_doc = build_rich_test_doc("nb-rich", "Lecture Notes");
+        let mut second_doc = Document::new(1000, 1400);
+        second_doc.id = "nb-second".to_string();
+        second_doc.title = "Second".to_string();
+        let (ws_key, state) = make_two_notebook_loaded_state("p1", rich_doc, second_doc);
+
+        let mut tab_a = Session::open_web_storage(Some(state.clone()));
+        let mut tab_b = Session::open_web_storage(Some(state));
+        let _ = tab_a.take_web_storage_delta(false);
+        let _ = tab_b.take_web_storage_delta(false);
+
+        let pdf_arc = Arc::clone(&tab_b.notebooks[0].pdf_documents[0].bytes);
+        let img_arc = Arc::clone(&tab_b.notebooks[0].pages[0].images[0].png_bytes);
+
+        // Record an undoable edit in Tab B and drain it so Tab B is clean relative to storage.
+        tab_b
+            .execute(
+                "stroke.draw",
+                &json!({
+                    "points": [
+                        { "x": 15.0, "y": 15.0, "pressure": 0.5 },
+                        { "x": 45.0, "y": 45.0, "pressure": 0.7 }
+                    ]
+                }),
+            )
+            .unwrap();
+        let _ = tab_b.take_web_storage_delta(false);
+        assert!(tab_b.history.can_undo());
+
+        // Remote update to INACTIVE notebook nb-second must preserve Tab B's active Undo stack.
+        tab_a
+            .execute("notebook.select", &json!({ "index": 1 }))
+            .unwrap();
+        tab_a
+            .execute(
+                "notebook.rename",
+                &json!({ "index": 1, "title": "Second Renamed" }),
+            )
+            .unwrap();
+        tab_a
+            .execute(
+                "stroke.draw",
+                &json!({
+                    "points": [
+                        { "x": 20.0, "y": 25.0, "pressure": 0.6 },
+                        { "x": 80.0, "y": 75.0, "pressure": 0.8 }
+                    ]
+                }),
+            )
+            .unwrap();
+        let mut patch_inactive = WebStorageRemotePatch::default();
+        patch_inactive.put_notebooks.insert(
+            (ws_key.clone(), "nb-second".to_string()),
+            (*tab_a.notebooks[1]).clone(),
+        );
+        let res_inactive = tab_b.apply_web_storage_remote_patch(patch_inactive);
+        assert!(res_inactive.changed_ui);
+        assert!(!res_inactive.active_doc_content_changed);
+        assert!(!res_inactive.needs_writeback);
+        assert_eq!(tab_b.notebooks[1].title, "Second Renamed");
+        assert_eq!(tab_b.notebooks[1].strokes.len(), 1);
+        assert!(tab_b.history.can_undo());
+        assert!(!tab_b.has_pending_web_storage_changes());
+
+        // Remote update to ACTIVE notebook nb-rich with fresh deserialized PDF/image Arcs:
+        // must reuse Tab B's in-memory Arcs, clear active Undo, and emit zero echo writeback.
+        tab_a
+            .execute("notebook.select", &json!({ "index": 0 }))
+            .unwrap();
+        tab_a
+            .execute(
+                "notebook.rename",
+                &json!({ "index": 0, "title": "Lecture Notes v2" }),
+            )
+            .unwrap();
+        tab_a
+            .execute(
+                "stroke.draw",
+                &json!({
+                    "points": [
+                        { "x": 35.0, "y": 40.0, "pressure": 0.5 },
+                        { "x": 95.0, "y": 110.0, "pressure": 0.7 }
+                    ]
+                }),
+            )
+            .unwrap();
+        let mut patch_active = WebStorageRemotePatch::default();
+        patch_active.put_notebooks.insert(
+            (ws_key, "nb-rich".to_string()),
+            clone_with_fresh_blob_arcs(&tab_a.notebooks[0]),
+        );
+        let res_active = tab_b.apply_web_storage_remote_patch(patch_active);
+        assert!(res_active.active_doc_changed);
+        assert!(res_active.active_doc_content_changed);
+        assert!(!res_active.needs_writeback);
+        assert_eq!(tab_b.doc.title, "Lecture Notes v2");
+        assert_eq!(tab_b.doc.strokes.len(), 2);
+        assert!(Arc::ptr_eq(&tab_b.doc.pdf_documents[0].bytes, &pdf_arc));
+        assert!(Arc::ptr_eq(
+            &tab_b.doc.pages[0].images[0].png_bytes,
+            &img_arc
+        ));
+        assert!(!tab_b.history.can_undo());
+        assert!(!tab_b.has_pending_web_storage_changes());
+    }
+
+    #[test]
+    fn cross_tab_concurrent_edits_different_notebooks_and_same_notebook_merge_cleanly() {
+        let mut nb0 = Document::new(1000, 1400);
+        nb0.id = "nb-0".to_string();
+        nb0.title = "Shared".to_string();
+        nb0.add_page(None, None).unwrap();
+        nb0.select_page(0);
+
+        let mut nb1 = Document::new(1000, 1400);
+        nb1.id = "nb-1".to_string();
+        nb1.title = "Side".to_string();
+        let (ws_key, state) = make_two_notebook_loaded_state("p1", nb0, nb1);
+
+        let mut tab_a = Session::open_web_storage(Some(state.clone()));
+        let mut tab_b = Session::open_web_storage(Some(state));
+        let _ = tab_a.take_web_storage_delta(false);
+        let _ = tab_b.take_web_storage_delta(false);
+
+        // Concurrent edits on DIFFERENT notebooks: both survive cleanly.
+        tab_a
+            .execute(
+                "stroke.draw",
+                &json!({
+                    "points": [
+                        { "x": 10.0, "y": 10.0, "pressure": 0.5 },
+                        { "x": 50.0, "y": 50.0, "pressure": 0.7 }
+                    ]
+                }),
+            )
+            .unwrap();
+        tab_b
+            .execute("notebook.select", &json!({ "index": 1 }))
+            .unwrap();
+        tab_b
+            .execute(
+                "stroke.draw",
+                &json!({
+                    "points": [
+                        { "x": 100.0, "y": 120.0, "pressure": 0.6 },
+                        { "x": 160.0, "y": 180.0, "pressure": 0.8 }
+                    ]
+                }),
+            )
+            .unwrap();
+
+        let mut patch_diff = WebStorageRemotePatch::default();
+        patch_diff.put_notebooks.insert(
+            (ws_key.clone(), "nb-0".to_string()),
+            (*tab_a.notebooks[0]).clone(),
+        );
+        let res_diff = tab_b.apply_web_storage_remote_patch(patch_diff);
+        assert!(res_diff.changed_ui);
+        assert_eq!(tab_b.notebooks.len(), 2);
+        assert_eq!(tab_b.notebooks[0].pages[0].strokes.len(), 1);
+        assert_eq!(tab_b.notebooks[1].pages[0].strokes.len(), 1);
+
+        // Re-sync both tabs cleanly before testing concurrent edits on the SAME notebook.
+        let mut patch_sync_b = WebStorageRemotePatch::default();
+        patch_sync_b.put_notebooks.insert(
+            (ws_key.clone(), "nb-0".to_string()),
+            (*tab_b.notebooks[0]).clone(),
+        );
+        let _ = tab_a.take_web_storage_delta(false);
+        let _ = tab_a.apply_web_storage_remote_patch(patch_sync_b);
+        let _ = tab_b.take_web_storage_delta(false);
+        tab_b
+            .execute("notebook.select", &json!({ "index": 0 }))
+            .unwrap();
+        let _ = tab_b.take_web_storage_delta(false);
+
+        // Tab A edits Page 0 + Page 1 on nb-0; Tab B edits Page 0 on nb-0 simultaneously.
+        tab_a
+            .execute(
+                "stroke.draw",
+                &json!({
+                    "points": [
+                        { "x": 200.0, "y": 210.0, "pressure": 0.5 },
+                        { "x": 260.0, "y": 250.0, "pressure": 0.7 }
+                    ]
+                }),
+            )
+            .unwrap();
+        tab_a
+            .execute("page.select", &json!({ "index": 1 }))
+            .unwrap();
+        tab_a
+            .execute(
+                "stroke.draw",
+                &json!({
+                    "points": [
+                        { "x": 30.0, "y": 40.0, "pressure": 0.5 },
+                        { "x": 90.0, "y": 120.0, "pressure": 0.8 }
+                    ]
+                }),
+            )
+            .unwrap();
+        tab_b
+            .execute(
+                "stroke.draw",
+                &json!({
+                    "points": [
+                        { "x": 420.0, "y": 500.0, "pressure": 0.6 },
+                        { "x": 490.0, "y": 540.0, "pressure": 0.7 }
+                    ]
+                }),
+            )
+            .unwrap();
+        assert!(tab_b.history.can_undo());
+
+        let mut patch_same = WebStorageRemotePatch::default();
+        patch_same
+            .put_notebooks
+            .insert((ws_key, "nb-0".to_string()), (*tab_a.notebooks[0]).clone());
+        let res_same = tab_b.apply_web_storage_remote_patch(patch_same);
+        assert!(res_same.needs_writeback);
+        assert!(res_same.active_doc_changed);
+        assert!(res_same.active_doc_content_changed);
+        assert_eq!(tab_b.notebooks.len(), 2);
+        assert_eq!(tab_b.notebooks[0].pages[0].strokes.len(), 3);
+        assert_eq!(tab_b.notebooks[0].pages[1].strokes.len(), 1);
+        assert!(!tab_b.history.can_undo());
+    }
+
+    #[test]
+    fn serialized_commit_lock_reconciles_racing_tabs_without_overwriting() {
+        let mut base_doc = Document::new(1000, 1400);
+        base_doc.id = "nb-race".to_string();
+        base_doc.title = "Notes".to_string();
+        base_doc.add_page(None, None).unwrap();
+        base_doc.select_page(0);
+        let base = document_merge_base_from_doc(&base_doc);
+
+        let mut local_doc = base_doc.clone();
+        let s1 = local_doc.alloc_stroke_id();
+        let p1 = vec![
+            StrokeSample::from_xy_pressure(20.0, 20.0, 0.5),
+            StrokeSample::from_xy_pressure(60.0, 60.0, 0.7),
+        ];
+        local_doc.strokes.push(Arc::new(InkStroke::new(
+            s1,
+            PenSettings::fountain_pen(),
+            p1.clone(),
+            p1,
+        )));
+        local_doc.sync_active_to_pages();
+
+        let mut idb_doc = base_doc.clone();
+        let s2 = idb_doc.alloc_stroke_id();
+        let p2 = vec![
+            StrokeSample::from_xy_pressure(180.0, 220.0, 0.6),
+            StrokeSample::from_xy_pressure(240.0, 260.0, 0.8),
+        ];
+        idb_doc.strokes.push(Arc::new(InkStroke::new(
+            s2,
+            PenSettings::fountain_pen(),
+            p2.clone(),
+            p2,
+        )));
+        idb_doc.sync_active_to_pages();
+        idb_doc.select_page(1);
+        let s3 = idb_doc.alloc_stroke_id();
+        let p3 = vec![
+            StrokeSample::from_xy_pressure(40.0, 80.0, 0.5),
+            StrokeSample::from_xy_pressure(110.0, 140.0, 0.7),
+        ];
+        idb_doc.strokes.push(Arc::new(InkStroke::new(
+            s3,
+            PenSettings::fountain_pen(),
+            p3.clone(),
+            p3,
+        )));
+        idb_doc.sync_active_to_pages();
+        idb_doc.select_page(0);
+
+        let resolved =
+            reconcile_concurrent_notebook_commit(&local_doc, &idb_doc, Some(&base), 5_000);
+        assert!(resolved.conflict_copy.is_none());
+        assert!(resolved.emit_to_local_session);
+        assert_eq!(resolved.merged_doc.pages[0].strokes.len(), 2);
+        assert_eq!(resolved.merged_doc.pages[1].strokes.len(), 1);
+
+        // Irreconcilable same-page template conflict must not cascade Conflict Copy suffixes.
+        let mut local_conflict = base_doc.clone();
+        local_conflict.title = "Notes (Conflict Copy)".to_string();
+        local_conflict.pages[0].paper_template = PaperTemplate::Grid;
+        local_conflict.load_active_from_pages();
+
+        let mut idb_conflict = base_doc;
+        idb_conflict.title = "Notes (Conflict Copy)".to_string();
+        idb_conflict.pages[0].paper_template = PaperTemplate::Dotted;
+        idb_conflict.load_active_from_pages();
+
+        let conflict_res = reconcile_concurrent_notebook_commit(
+            &local_conflict,
+            &idb_conflict,
+            Some(&base),
+            6_000,
+        );
+        let copy = conflict_res
+            .conflict_copy
+            .expect("expected conflict copy on template mismatch");
+        assert_eq!(copy.title, "Notes (Conflict Copy)");
+        assert!(!copy.title.contains("(Conflict Copy) (Conflict Copy)"));
+
+        // Workspace metadata commit reconciliation unions additions & respects local deletions.
+        let local_meta = WebWorkspaceMetaSnapshot {
+            notebook_ids: vec!["nb-race".into(), "nb-local".into()],
+            slot_ids: vec!["nb-race".into(), "nb-local".into()],
+            trash_entries: vec![("tr-local".into(), 100)],
+            manifest: SyncManifest {
+                last_server_cursor: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let idb_meta = WebWorkspaceMetaSnapshot {
+            notebook_ids: vec!["nb-race".into(), "nb-deleted".into(), "nb-peer".into()],
+            slot_ids: vec!["nb-race".into(), "nb-deleted".into(), "nb-peer".into()],
+            trash_entries: vec![("tr-peer".into(), 200), ("tr-del".into(), 150)],
+            manifest: SyncManifest {
+                last_server_cursor: 9,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let del_nbs = HashSet::from(["nb-deleted".to_string()]);
+        let del_trash = HashSet::from(["tr-del".to_string()]);
+        let merged_meta =
+            merge_workspace_meta_for_commit(&local_meta, &idb_meta, &del_nbs, &del_trash);
+        assert!(merged_meta.notebook_ids.contains(&"nb-local".to_string()));
+        assert!(merged_meta.notebook_ids.contains(&"nb-peer".to_string()));
+        assert!(!merged_meta.notebook_ids.contains(&"nb-deleted".to_string()));
+        assert_eq!(merged_meta.trash_entries.len(), 2);
+        assert_eq!(merged_meta.manifest.last_server_cursor, 9);
+
+        // Global state commit reconciliation retains newer rotated tokens & unions profiles.
+        let mut local_g = GlobalSyncState::with_defaults("Web".to_string());
+        local_g.upsert_cached_server_session(sample_cloud_auth("tok-old", "ref-old", 1_000));
+        local_g.local_profiles.push(LocalProfile {
+            local_profile_id: "p-a".into(),
+            nickname: "Alpha".into(),
+            created_at_ms: 10,
+            last_used_at_ms: 10,
+        });
+        let mut idb_g = GlobalSyncState::with_defaults("Web".to_string());
+        idb_g.upsert_cached_server_session(sample_cloud_auth("tok-new", "ref-new", 2_000));
+        idb_g.local_profiles.push(LocalProfile {
+            local_profile_id: "p-b".into(),
+            nickname: "Beta".into(),
+            created_at_ms: 20,
+            last_used_at_ms: 20,
+        });
+        let merged_g = merge_global_states_for_commit(&local_g, &idb_g);
+        let merged_sess = merged_g
+            .cached_server_session("http://127.0.0.1:8787", "u-sync")
+            .unwrap();
+        assert_eq!(merged_sess.access_token, "tok-new");
+        assert_eq!(merged_sess.refresh_token, "ref-new");
+        assert_eq!(merged_g.local_profiles.len(), 2);
+    }
+
+    #[test]
+    fn rotated_auth_token_patch_updates_active_session_without_switching_workspace() {
+        let mut session = Session::open_web_storage(None);
+        let old_auth = sample_cloud_auth("tok-old", "ref-old", 1_000);
+        let cloud_nb = Document::new(1000, 1400);
+        let pull = SyncPullResponse {
+            server_cursor: 1,
+            user: old_auth.user.clone(),
+            notebooks: vec![RemoteNotebookRecord {
+                notebook_id: cloud_nb.id.clone(),
+                version: 1,
+                cursor: 1,
+                deleted: false,
+                updated_at_ms: 1000,
+                deleted_at_ms: None,
+                title: cloud_nb.title.clone(),
+                content_hash: canonical_document_hash(&cloud_nb),
+                body_hash: canonical_document_body_hash(&cloud_nb),
+                meta_hash: canonical_document_meta_hash(&cloud_nb),
+                meta_updated_at_ms: 1000,
+                document: Some(cloud_nb),
+            }],
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        session.enter_online_server_session(old_auth, pull);
+        let _ = session.take_web_storage_delta(false);
+        assert!(session.is_viewing_cloud());
+
+        let mut rotated_global = GlobalSyncState::with_defaults("Web".to_string());
+        rotated_global.needs_initial_nickname = false;
+        rotated_global.active_workspace = ActiveWorkspaceTarget::Local;
+        rotated_global.active_local_profile_id = "p-other".to_string();
+        rotated_global.local_profiles.push(LocalProfile {
+            local_profile_id: "p-other".to_string(),
+            nickname: "OtherTab".to_string(),
+            created_at_ms: 50,
+            last_used_at_ms: 50,
+        });
+        rotated_global.upsert_cached_server_session(sample_cloud_auth("tok-new", "ref-new", 2_500));
+
+        let patch = WebStorageRemotePatch {
+            global: Some(rotated_global),
+            ..Default::default()
+        };
+        let res = session.apply_web_storage_remote_patch(patch);
+        assert!(res.rotated_tokens_adopted);
+        assert!(session.is_viewing_cloud());
+        let active_sess = session.active_account_session().unwrap();
+        assert_eq!(active_sess.access_token, "tok-new");
+        assert_eq!(active_sess.refresh_token, "ref-new");
     }
 }

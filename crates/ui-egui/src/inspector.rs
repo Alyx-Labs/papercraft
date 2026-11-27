@@ -924,7 +924,9 @@ pub(crate) fn web_storage_info_from_status(
         }
     };
     if status.other_tab_active {
-        tip.push_str(" Another PaperCraft tab is currently open on this browser.");
+        tip.push_str(
+            " Another PaperCraft tab is open on this browser — changes stay synchronized automatically.",
+        );
     }
     let label = match status.backend {
         crate::WebStorageBackend::IndexedDb => {
@@ -1093,7 +1095,59 @@ fn draw_system_info_card(app: &PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     });
 }
 
-fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, kind: PenKind, t: &Tokens) {
+pub(crate) fn draw_home_drawer_mode_switch(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    let options = [
+        SwitchOption::new(
+            Some(Icon::Account),
+            Some("Profile"),
+            "Accounts, server sign-in, profile details, and backups",
+            true,
+        ),
+        SwitchOption::new(
+            Some(Icon::Settings),
+            Some("Settings"),
+            "Studio appearance, app scale, system info, and stylus settings",
+            true,
+        ),
+    ];
+    let active = match app.view.right_drawer_mode {
+        crate::RightDrawerMode::Profile => 0,
+        crate::RightDrawerMode::Settings => 1,
+    };
+    let (clicked, _) = segmented_switch(
+        ui,
+        "inspector_home_drawer_mode_switch",
+        &options,
+        Some(active),
+        SwitchLayout::EqualWidth,
+        t,
+    );
+    if let Some(idx) = clicked {
+        let next = if idx == 0 {
+            crate::RightDrawerMode::Profile
+        } else {
+            crate::RightDrawerMode::Settings
+        };
+        if app.view.right_drawer_mode != next {
+            app.view.right_drawer_mode = next;
+            if next == crate::RightDrawerMode::Profile {
+                crate::prepare_profile_drawer(app);
+            } else if app.view.screen == crate::AppScreen::Home
+                && app.view.settings_tab == SettingsTab::Pen
+            {
+                app.view.settings_tab = SettingsTab::Appearance;
+            }
+        }
+    }
+}
+
+fn draw_settings_header(
+    app: &mut PaperCraftApp,
+    ui: &mut egui::Ui,
+    kind: PenKind,
+    is_home: bool,
+    t: &Tokens,
+) {
     let header_w = ui.available_width();
     ui.horizontal(|ui| {
         ui.set_height(28.0);
@@ -1136,6 +1190,10 @@ fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, kind: PenKin
         )
         .wrap(),
     );
+    if is_home {
+        ui.add_space(6.0);
+        draw_home_drawer_mode_switch(app, ui, t);
+    }
     ui.add_space(6.0);
 
     let system_tip = if cfg!(target_arch = "wasm32") {
@@ -1252,49 +1310,70 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
     )
     .show_collapsible(ui, &mut panel_open, |ui| {
         ui.multiply_opacity(content_opacity);
-        let kind = app.session.active_pen_kind();
-        draw_settings_header(app, ui, kind, &t);
-        ui.separator();
-
+        let is_home = app.view.screen == crate::AppScreen::Home;
+        let effective_mode = if is_home {
+            app.view.right_drawer_mode
+        } else {
+            crate::RightDrawerMode::Settings
+        };
         let dt = ui.ctx().input(|i| i.stable_dt);
-        if app
-            .view
-            .motion
-            .settings_tab
-            .advance(app.view.settings_tab, dt)
-        {
+        if app.view.motion.drawer_mode.advance(effective_mode, dt) {
             ui.ctx().request_repaint();
         }
-        let tab_opacity = app.view.motion.settings_tab.opacity();
+        let mode_opacity = app.view.motion.drawer_mode.opacity();
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.scope(|ui| {
-                ui.multiply_opacity(tab_opacity);
-                match app.view.settings_tab {
-                    SettingsTab::Pen => {
-                        draw_touch_and_palm_card(app, ui, &t);
-                        ui.add_space(8.0);
-                        if app.is_stylus_connected() {
-                            draw_stylus_shortcuts_card(app, ui, &t);
-                        } else {
-                            draw_stylus_disconnected_card(ui, &t);
+        ui.scope(|ui| {
+            ui.multiply_opacity(mode_opacity);
+            if effective_mode == crate::RightDrawerMode::Profile {
+                crate::profile_drawer::show_drawer_contents(app, ui, is_home, &t);
+                return;
+            }
+
+            let kind = app.session.active_pen_kind();
+            draw_settings_header(app, ui, kind, is_home, &t);
+            ui.separator();
+
+            if app
+                .view
+                .motion
+                .settings_tab
+                .advance(app.view.settings_tab, dt)
+            {
+                ui.ctx().request_repaint();
+            }
+            let tab_opacity = app.view.motion.settings_tab.opacity();
+
+            egui::ScrollArea::vertical()
+                .id_salt("papercraft_inspector_settings_scroll")
+                .show(ui, |ui| {
+                    ui.scope(|ui| {
+                        ui.multiply_opacity(tab_opacity);
+                        match app.view.settings_tab {
+                            SettingsTab::Pen => {
+                                draw_touch_and_palm_card(app, ui, &t);
+                                ui.add_space(8.0);
+                                if app.is_stylus_connected() {
+                                    draw_stylus_shortcuts_card(app, ui, &t);
+                                } else {
+                                    draw_stylus_disconnected_card(ui, &t);
+                                }
+                            }
+                            SettingsTab::Appearance => {
+                                draw_appearance_card(app, ui, &t);
+                                ui.add_space(8.0);
+                                draw_app_scale_card(app, ui, &t);
+                            }
+                            SettingsTab::System => {
+                                draw_system_info_card(app, ui, &t);
+                                #[cfg(not(target_arch = "wasm32"))]
+                                {
+                                    ui.add_space(8.0);
+                                    draw_app_updates_card(app, ui, &t);
+                                }
+                            }
                         }
-                    }
-                    SettingsTab::Appearance => {
-                        draw_appearance_card(app, ui, &t);
-                        ui.add_space(8.0);
-                        draw_app_scale_card(app, ui, &t);
-                    }
-                    SettingsTab::System => {
-                        draw_system_info_card(app, ui, &t);
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            ui.add_space(8.0);
-                            draw_app_updates_card(app, ui, &t);
-                        }
-                    }
-                }
-            });
+                    });
+                });
         });
     })
     .map_or(Rect::NOTHING, |resp| resp.response.rect);
@@ -1630,7 +1709,8 @@ mod tests {
                 quota_exceeded: false,
                 last_error: None,
                 other_tab_active: false,
-                other_tab_wrote: false,
+                cross_tab_syncing: false,
+                cross_tab_error: None,
             }),
             ..PaperCraftApp::default()
         };
@@ -1649,7 +1729,8 @@ mod tests {
             quota_exceeded: true,
             last_error: Some("QuotaExceededError".to_string()),
             other_tab_active: true,
-            other_tab_wrote: false,
+            cross_tab_syncing: false,
+            cross_tab_error: None,
         });
         let (_, persisted_texts) = render_inspector_tab(&mut app, SettingsTab::System);
         assert!(persisted_texts.contains("IndexedDB (Persistent)"));
