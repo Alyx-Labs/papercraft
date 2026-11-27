@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
 
 [workspace.package]
-version = "0.7.3"
+version = "0.7.4"
 edition = "2024"
 authors = ["Alyx Labs"]
 description = "A native notebook and handwriting studio, built in pure Rust."
