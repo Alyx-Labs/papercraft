@@ -1,13 +1,52 @@
 //! UI design tokens and Light/Dark theme visual styling for PaperCraft.
 
 use egui::Color32;
-use papercraft_color::Color;
+use papercraft_color::{
+    Color, adjust_oklch_lightness_for_contrast, contrast_ratio, oklch_lightness,
+    relative_luminance, with_oklch_lightness,
+};
 use papercraft_doc::{InfiniteThemeConfig, UiTheme, UserStudioConfig};
 
 #[inline]
 pub fn to_color32(c: Color) -> Color32 {
     let [r, g, b, a] = c.to_rgba8();
     Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+#[inline]
+pub(crate) fn to_doc_color(c: Color32) -> Color {
+    let [r, g, b, a] = c.to_srgba_unmultiplied();
+    Color::from_rgba8(r, g, b, a)
+}
+
+#[inline]
+pub(crate) fn wcag_contrast(a: Color32, b: Color32) -> f32 {
+    contrast_ratio(to_doc_color(a), to_doc_color(b))
+}
+
+/// Adjusts `fg` along its perceptual OKLCH lightness so it achieves at least `min_ratio` WCAG
+/// contrast against every color in `bgs` (or the highest achievable contrast).
+pub(crate) fn ensure_contrast_against(
+    fg: Color32,
+    bgs: &[Color32],
+    min_ratio: f32,
+    prefer_lighter: Option<bool>,
+) -> Color32 {
+    if bgs.iter().all(|&bg| wcag_contrast(fg, bg) >= min_ratio) {
+        return fg;
+    }
+    let bg_docs: Vec<Color> = bgs.iter().copied().map(to_doc_color).collect();
+    to_color32(adjust_oklch_lightness_for_contrast(
+        to_doc_color(fg),
+        &bg_docs,
+        min_ratio + 0.08,
+        prefer_lighter,
+    ))
+}
+
+#[inline]
+fn with_oklch_l(c: Color32, target_ok_l: f32) -> Color32 {
+    to_color32(with_oklch_lightness(to_doc_color(c), target_ok_l))
 }
 
 /// Color token set backing every PaperCraft shell, sidebar, dialog, and canvas backdrop.
@@ -109,7 +148,8 @@ impl Tokens {
     }
 
     /// Applies Infinite Theme hue rotation and saturation scaling to UI chrome tokens while
-    /// keeping semantic status colors (`danger_*`, `success_*`, `warning_fg`) hue-consistent.
+    /// enforcing perceptual WCAG contrast across toolbar, tab strip, header, and body controls
+    /// (especially keeping Light-theme toolbar icons and text crisp on any hue/saturation).
     #[must_use]
     pub fn with_infinite(self, infinite: InfiniteThemeConfig) -> Self {
         if infinite.is_identity() {
@@ -120,7 +160,8 @@ impl Tokens {
             |c: Color32| apply_hue_saturation(c, clean.hue_degrees, clean.saturation_percent);
         let status_sat = clean.saturation_percent.min(100.0);
         let shift_status = |c: Color32| apply_hue_saturation(c, 0.0, status_sat);
-        Self {
+
+        let mut out = Self {
             is_dark: self.is_dark,
             toolbar_bg: shift(self.toolbar_bg),
             panel_bg: shift(self.panel_bg),
@@ -152,7 +193,136 @@ impl Tokens {
             success_border: shift_status(self.success_border),
             success_bg: shift_status(self.success_bg),
             warning_fg: shift_status(self.warning_fg),
+        };
+        out.enforce_infinite_contrast();
+        out
+    }
+
+    fn enforce_infinite_contrast(&mut self) {
+        let hdr_doc = to_doc_color(self.header_bg);
+        let hdr_lum = relative_luminance(hdr_doc);
+        let hdr_ok_l = oklch_lightness(hdr_doc);
+        let hdr_fg_probe = adjust_oklch_lightness_for_contrast(
+            to_doc_color(self.header_fg),
+            &[hdr_doc],
+            6.0,
+            None,
+        );
+        let header_fg_is_light = relative_luminance(hdr_fg_probe) > hdr_lum;
+
+        if header_fg_is_light {
+            let track_lum = relative_luminance(to_doc_color(self.header_track_bg));
+            if track_lum > hdr_lum + 0.03 || track_lum + 0.03 < hdr_lum {
+                self.header_track_bg =
+                    with_oklch_l(self.header_track_bg, (hdr_ok_l + 0.02).clamp(0.0, 0.44));
+            }
+            self.header_track_bg =
+                ensure_contrast_against(self.header_track_bg, &[Color32::WHITE], 4.8, Some(false));
+
+            let hover_ok_l = oklch_lightness(to_doc_color(self.header_control_hover));
+            let hover_lum = relative_luminance(to_doc_color(self.header_control_hover));
+            if hover_lum > hdr_lum + 0.06 || hover_ok_l < hdr_ok_l + 0.04 {
+                self.header_control_hover = with_oklch_l(
+                    self.header_control_hover,
+                    (hdr_ok_l + 0.07).clamp(0.0, 0.48),
+                );
+            }
+            self.header_control_hover = ensure_contrast_against(
+                self.header_control_hover,
+                &[Color32::WHITE],
+                4.8,
+                Some(false),
+            );
+
+            if wcag_contrast(self.header_border, self.header_bg) < 1.28
+                || relative_luminance(to_doc_color(self.header_border)) < hdr_lum
+            {
+                self.header_border = ensure_contrast_against(
+                    with_oklch_l(self.header_border, (hdr_ok_l + 0.11).clamp(0.0, 0.70)),
+                    &[self.header_bg],
+                    1.32,
+                    Some(true),
+                );
+            }
+        } else {
+            if oklch_lightness(to_doc_color(self.header_track_bg)) < hdr_ok_l {
+                self.header_track_bg =
+                    with_oklch_l(self.header_track_bg, (hdr_ok_l + 0.05).min(0.96));
+            }
+            if oklch_lightness(to_doc_color(self.header_control_hover)) < hdr_ok_l + 0.04 {
+                self.header_control_hover =
+                    with_oklch_l(self.header_control_hover, (hdr_ok_l + 0.10).min(0.98));
+            }
+            self.header_border =
+                ensure_contrast_against(self.header_border, &[self.header_bg], 1.32, Some(false));
         }
+
+        let header_bgs = [
+            self.header_bg,
+            self.header_track_bg,
+            self.header_control_hover,
+        ];
+        self.header_fg =
+            ensure_contrast_against(self.header_fg, &header_bgs, 6.0, Some(header_fg_is_light));
+        self.header_fg_muted = ensure_contrast_against(
+            self.header_fg_muted,
+            &header_bgs,
+            4.5,
+            Some(header_fg_is_light),
+        );
+        self.brand_craft = ensure_contrast_against(
+            self.brand_craft,
+            &[self.header_bg],
+            4.5,
+            Some(header_fg_is_light),
+        );
+        let min_active_ratio = if self.is_dark { 5.5 } else { 7.0 };
+        self.header_active_fg = ensure_contrast_against(
+            self.header_active_fg,
+            &[self.header_active_bg],
+            min_active_ratio,
+            None,
+        );
+
+        let tab_probe = ensure_contrast_against(self.tab_strip_fg, &[self.tab_strip_bg], 7.0, None);
+        let tab_fg_is_light = relative_luminance(to_doc_color(tab_probe))
+            > relative_luminance(to_doc_color(self.tab_strip_bg));
+        self.tab_strip_fg = tab_probe;
+        self.tab_strip_fg_muted = ensure_contrast_against(
+            self.tab_strip_fg_muted,
+            &[self.tab_strip_bg],
+            4.5,
+            Some(tab_fg_is_light),
+        );
+
+        let body_bgs = [
+            self.panel_bg,
+            self.toolbar_bg,
+            self.field_bg,
+            self.accent_soft,
+        ];
+        let accent_bgs = [
+            self.panel_bg,
+            self.toolbar_bg,
+            self.field_bg,
+            self.accent_soft,
+            self.header_active_bg,
+        ];
+        let body_fg_is_light = self.is_dark;
+        self.text = ensure_contrast_against(self.text, &body_bgs, 7.0, Some(body_fg_is_light));
+        self.text_muted =
+            ensure_contrast_against(self.text_muted, &body_bgs, 4.5, Some(body_fg_is_light));
+        self.accent =
+            ensure_contrast_against(self.accent, &accent_bgs, 4.5, Some(body_fg_is_light));
+        self.accent_hover =
+            ensure_contrast_against(self.accent_hover, &body_bgs, 4.5, Some(body_fg_is_light));
+        self.on_accent = ensure_contrast_against(self.on_accent, &[self.accent], 4.5, None);
+        self.border = ensure_contrast_against(
+            self.border,
+            &[self.panel_bg, self.field_bg],
+            1.28,
+            Some(body_fg_is_light),
+        );
     }
 
     /// Calm bright daylight studio palette.
@@ -776,5 +946,80 @@ mod tests {
         assert_eq!(style.visuals.selection.bg_fill, expected.accent_soft);
         assert_eq!(style.visuals.panel_fill, expected.panel_bg);
         assert_ne!(style.visuals.selection.stroke.color, base_accent);
+    }
+
+    #[test]
+    fn infinite_theme_maintains_toolbar_header_and_accent_contrast_across_all_hues_and_saturations()
+    {
+        use papercraft_doc::InfiniteThemeConfig;
+
+        for theme in [UiTheme::Light, UiTheme::Dark] {
+            for hue_step in 0..=24 {
+                let hue = hue_step as f32 * 15.0;
+                for sat in [0.0_f32, 50.0, 100.0, 150.0, 200.0, 250.0] {
+                    let cfg = InfiniteThemeConfig {
+                        enabled: true,
+                        hue_degrees: hue,
+                        saturation_percent: sat,
+                    };
+                    if cfg.is_identity() {
+                        continue;
+                    }
+                    let t = Tokens::for_theme_with_infinite(theme, cfg);
+                    for bg in [t.header_bg, t.header_track_bg, t.header_control_hover] {
+                        let cr_fg = contrast_ratio(t.header_fg, bg);
+                        let cr_muted = contrast_ratio(t.header_fg_muted, bg);
+                        assert!(
+                            cr_fg >= 4.5,
+                            "{theme:?} hue={hue} sat={sat}: header_fg contrast {cr_fg:.2} too low"
+                        );
+                        assert!(
+                            cr_muted >= 4.45,
+                            "{theme:?} hue={hue} sat={sat}: header_fg_muted contrast {cr_muted:.2} too low"
+                        );
+                    }
+                    let cr_craft = contrast_ratio(t.brand_craft, t.header_bg);
+                    assert!(
+                        cr_craft >= 4.45,
+                        "{theme:?} hue={hue} sat={sat}: brand_craft contrast {cr_craft:.2} too low"
+                    );
+                    let min_active_cr = if theme == UiTheme::Dark { 5.5 } else { 7.0 };
+                    assert!(
+                        contrast_ratio(t.header_active_fg, t.header_active_bg) >= min_active_cr,
+                        "{theme:?} hue={hue} sat={sat}: header_active_fg contrast too low"
+                    );
+                    assert!(
+                        contrast_ratio(t.tab_strip_fg, t.tab_strip_bg) >= 4.5,
+                        "{theme:?} hue={hue} sat={sat}: tab_strip_fg contrast too low"
+                    );
+                    assert!(
+                        contrast_ratio(t.tab_strip_fg_muted, t.tab_strip_bg) >= 4.45,
+                        "{theme:?} hue={hue} sat={sat}: tab_strip_fg_muted contrast too low"
+                    );
+                    for bg in [t.panel_bg, t.toolbar_bg, t.field_bg, t.accent_soft] {
+                        assert!(
+                            contrast_ratio(t.text, bg) >= 7.0,
+                            "{theme:?} hue={hue} sat={sat}: text contrast too low"
+                        );
+                        assert!(
+                            contrast_ratio(t.text_muted, bg) >= 4.45,
+                            "{theme:?} hue={hue} sat={sat}: text_muted contrast too low"
+                        );
+                        assert!(
+                            contrast_ratio(t.accent, bg) >= 4.45,
+                            "{theme:?} hue={hue} sat={sat}: accent contrast too low"
+                        );
+                    }
+                    assert!(
+                        contrast_ratio(t.accent, t.header_active_bg) >= 4.45,
+                        "{theme:?} hue={hue} sat={sat}: accent vs header_active_bg contrast too low"
+                    );
+                    assert!(
+                        contrast_ratio(t.on_accent, t.accent) >= 4.45,
+                        "{theme:?} hue={hue} sat={sat}: on_accent vs accent contrast too low"
+                    );
+                }
+            }
+        }
     }
 }

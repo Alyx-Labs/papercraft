@@ -20,6 +20,7 @@ pub mod folder_modals;
 pub(crate) mod gpu_ink;
 pub mod home;
 pub mod icons;
+pub mod infinite_theme_modal;
 pub mod inspector;
 pub mod library_folders;
 pub mod modal;
@@ -2492,8 +2493,10 @@ impl PaperCraftApp {
                             | modal::ActiveModal::WelcomeBanner
                             | modal::ActiveModal::FirstNotebookDataNotice
                     )
-                ) || (self.view.active_modal == Some(modal::ActiveModal::ConvertLocalAccount)
-                    && self.view.account.convert_busy)
+                ) || (self.view.active_modal == Some(modal::ActiveModal::InfiniteTheme)
+                    && self.session.should_show_infinite_theme_notice())
+                    || (self.view.active_modal == Some(modal::ActiveModal::ConvertLocalAccount)
+                        && self.view.account.convert_busy)
                 {
                     return;
                 }
@@ -3103,6 +3106,9 @@ impl PaperCraftApp {
         }
         motion::paint_screen_veil(ui, self.view.motion.screen.veil_alpha(), tokens.panel_bg);
         modal::show(self, ui);
+        if self.view.motion.modal.rendered.is_none() {
+            infinite_theme_modal::maybe_open_release_notice(self);
+        }
         if let Some(name) = self.view.pdf_import_in_flight.as_deref() {
             render_importing_pdf_banner(&ctx, name, &tokens);
         }
@@ -3689,6 +3695,7 @@ pub(crate) fn open_notebook_in_editor(app: &mut PaperCraftApp, index: usize) {
         app.view.inspector_open = false;
         app.view.screen = AppScreen::Editor;
         tab_strip::sync_open_tabs(app);
+        infinite_theme_modal::maybe_open_release_notice(app);
     }
 }
 
@@ -4351,10 +4358,11 @@ pub(crate) fn prepare_profile_drawer(app: &mut PaperCraftApp) {
     app.view.account.quick_login_password.clear();
     app.view.account.quick_login_error = None;
     app.view.account.quick_login_focus_pending = false;
+    let acct_order = account_modal::ProfileSection::Accounts.flow_order();
     app.view
         .motion
         .profile_section
-        .sync((app.session.is_signed_in(), 0), 0);
+        .sync((app.session.is_signed_in(), acct_order as u8), acct_order);
     let auth_key = if app.view.account.password_reset.active {
         2
     } else if app.view.account.tab == account_modal::AuthTab::CreateAccount {
@@ -4383,10 +4391,11 @@ pub(crate) fn open_profile_sync_drawer(app: &mut PaperCraftApp) {
     }
     open_profile_drawer(app);
     app.view.account.profile_section = account_modal::ProfileSection::Sync;
+    let sync_order = account_modal::ProfileSection::Sync.flow_order();
     app.view
         .motion
         .profile_section
-        .sync((app.session.is_signed_in(), 2), 2);
+        .sync((app.session.is_signed_in(), sync_order as u8), sync_order);
 }
 
 /// Standardized width shared by the left navigation sidebars (Library and Pages)

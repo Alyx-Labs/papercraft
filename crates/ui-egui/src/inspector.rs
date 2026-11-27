@@ -750,6 +750,15 @@ fn draw_appearance_controls(
         )
         .wrap(),
     );
+    ui.add_space(6.0);
+    if compact_icon_button(ui, Icon::Info, Some("How Infinite works"), false, true, t)
+        .on_hover_text(
+            "Open the Infinite theme guide explaining the hue and saturation color matrix",
+        )
+        .clicked()
+    {
+        crate::modal::open(app, crate::modal::ActiveModal::InfiniteTheme);
+    }
 
     if infinite_enabled {
         ui.add_space(8.0);
@@ -1597,6 +1606,29 @@ fn draw_system_info_card(app: &PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     });
 }
 
+pub(crate) const fn system_tab_tooltip() -> &'static str {
+    if cfg!(target_arch = "wasm32") {
+        "System info and workspace diagnostics"
+    } else {
+        "System info and app updates"
+    }
+}
+
+pub(crate) fn draw_appearance_tab_contents(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    draw_appearance_card(app, ui, t);
+    ui.add_space(8.0);
+    draw_app_scale_card(app, ui, t);
+}
+
+pub(crate) fn draw_system_tab_contents(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    draw_system_info_card(app, ui, t);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        ui.add_space(8.0);
+        draw_app_updates_card(app, ui, t);
+    }
+}
+
 fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, kind: PenKind, t: &Tokens) {
     let header_w = ui.available_width();
     ui.horizontal(|ui| {
@@ -1642,11 +1674,7 @@ fn draw_settings_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, kind: PenKin
     );
     ui.add_space(6.0);
 
-    let system_tip = if cfg!(target_arch = "wasm32") {
-        "System info and workspace diagnostics"
-    } else {
-        "System info and app updates"
-    };
+    let system_tip = system_tab_tooltip();
     let tabs = [
         (
             SettingsTab::Pen,
@@ -1792,17 +1820,10 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> Rect {
                             }
                         }
                         SettingsTab::Appearance => {
-                            draw_appearance_card(app, ui, &t);
-                            ui.add_space(8.0);
-                            draw_app_scale_card(app, ui, &t);
+                            draw_appearance_tab_contents(app, ui, &t);
                         }
                         SettingsTab::System => {
-                            draw_system_info_card(app, ui, &t);
-                            #[cfg(not(target_arch = "wasm32"))]
-                            {
-                                ui.add_space(8.0);
-                                draw_app_updates_card(app, ui, &t);
-                            }
+                            draw_system_tab_contents(app, ui, &t);
                         }
                     }
                 });
@@ -2979,23 +3000,43 @@ mod tests {
             texts
         };
 
-        // On Home, right drawer always shows Profile & Sync with no Settings switch.
+        // On Home, right drawer shows Profile & Settings (Profile, Sync, Appearance, System) without Pen.
         app.view.screen = crate::AppScreen::Home;
+        app.view.account.profile_section = crate::account_modal::ProfileSection::Accounts;
         let _ = render_once(&ctx, &mut app, 0.02);
         let home_texts = render_once(&ctx, &mut app, 0.25);
-        assert!(home_texts.contains("Profile & Sync"), "{home_texts}");
+        assert!(home_texts.contains("Profile & Settings"), "{home_texts}");
+        assert!(home_texts.lines().any(|line| line == "Profile"));
+        assert!(home_texts.lines().any(|line| line == "Sync"));
+        assert!(home_texts.lines().any(|line| line == "Appearance"));
+        assert!(home_texts.lines().any(|line| line == "System"));
         assert!(!home_texts.lines().any(|line| line == "Settings"));
+        assert!(!home_texts.lines().any(|line| line == "Pen"));
         assert!(!home_texts.contains("App Scale"));
         assert!(!home_texts.contains("Stylus detection"));
 
-        // Inside a notebook (Editor), right drawer shows Settings and never Profile & Sync.
+        app.view.account.profile_section = crate::account_modal::ProfileSection::Appearance;
+        let _ = render_once(&ctx, &mut app, 0.27);
+        let home_appearance_texts = render_once(&ctx, &mut app, 0.30);
+        assert!(home_appearance_texts.contains("App Scale"));
+        assert!(home_appearance_texts.contains("Infinite theme"));
+
+        app.view.account.profile_section = crate::account_modal::ProfileSection::System;
+        let _ = render_once(&ctx, &mut app, 0.32);
+        let home_system_texts = render_once(&ctx, &mut app, 0.35);
+        assert!(home_system_texts.contains("System Info"));
+        #[cfg(not(target_arch = "wasm32"))]
+        assert!(home_system_texts.contains("App Updates"));
+
+        // Inside a notebook (Editor), right drawer shows Settings and never Profile & Settings.
         app.view.screen = crate::AppScreen::Editor;
-        let _ = render_once(&ctx, &mut app, 0.30);
-        let editor_texts = render_once(&ctx, &mut app, 0.50);
+        let _ = render_once(&ctx, &mut app, 0.40);
+        let editor_texts = render_once(&ctx, &mut app, 0.60);
         assert!(editor_texts.lines().any(|line| line == "Settings"));
         assert!(editor_texts.lines().any(|line| line == "Pen"));
         assert!(editor_texts.lines().any(|line| line == "Appearance"));
         assert!(editor_texts.lines().any(|line| line == "System"));
+        assert!(!editor_texts.contains("Profile & Settings"));
         assert!(!editor_texts.contains("Profile & Sync"));
     }
 }

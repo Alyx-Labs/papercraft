@@ -155,6 +155,12 @@ pub struct GlobalSyncState {
     #[serde(default)]
     pub first_notebook_data_notice_seen: bool,
     #[serde(default)]
+    pub first_notebook_data_notice_seen_version: Option<String>,
+    #[serde(default)]
+    pub infinite_theme_notice_seen: bool,
+    #[serde(default)]
+    pub infinite_theme_notice_seen_version: Option<String>,
+    #[serde(default)]
     pub skip_account_picker_on_startup: bool,
     #[serde(default)]
     pub client_id: String,
@@ -176,6 +182,9 @@ impl GlobalSyncState {
             welcome_banner_seen: false,
             welcome_banner_seen_version: None,
             first_notebook_data_notice_seen: false,
+            first_notebook_data_notice_seen_version: None,
+            infinite_theme_notice_seen: false,
+            infinite_theme_notice_seen_version: None,
             skip_account_picker_on_startup: false,
             client_id: uuid::Uuid::new_v4().to_string(),
         }
@@ -327,6 +336,148 @@ impl GlobalSyncState {
             .iter()
             .find(|p| p.local_profile_id == self.active_local_profile_id)
             .or_else(|| self.local_profiles.first())
+    }
+
+    /// Sanitizes stored per-release notice versions, clearing blank or control-bearing values.
+    pub fn sanitize_release_notices(&mut self) {
+        self.welcome_banner_seen_version = self
+            .welcome_banner_seen_version
+            .as_deref()
+            .and_then(sanitize_release_version);
+        self.first_notebook_data_notice_seen_version = self
+            .first_notebook_data_notice_seen_version
+            .as_deref()
+            .and_then(sanitize_release_version);
+        self.infinite_theme_notice_seen_version = self
+            .infinite_theme_notice_seen_version
+            .as_deref()
+            .and_then(sanitize_release_version);
+    }
+
+    /// Merges per-release modal dismissal markers from `other` without regressing newer versions.
+    pub fn merge_release_notices_from(&mut self, other: &Self) {
+        self.welcome_banner_seen |= other.welcome_banner_seen;
+        self.welcome_banner_seen_version = merge_release_version(
+            self.welcome_banner_seen_version.as_deref(),
+            other.welcome_banner_seen_version.as_deref(),
+        );
+        self.first_notebook_data_notice_seen |= other.first_notebook_data_notice_seen;
+        self.first_notebook_data_notice_seen_version = merge_release_version(
+            self.first_notebook_data_notice_seen_version.as_deref(),
+            other.first_notebook_data_notice_seen_version.as_deref(),
+        );
+        self.infinite_theme_notice_seen |= other.infinite_theme_notice_seen;
+        self.infinite_theme_notice_seen_version = merge_release_version(
+            self.infinite_theme_notice_seen_version.as_deref(),
+            other.infinite_theme_notice_seen_version.as_deref(),
+        );
+    }
+}
+
+/// Sanitizes a release version tag used to track per-release modal dismissals.
+#[must_use]
+pub fn sanitize_release_version(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control() && !c.is_whitespace())
+        .take(32)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// Picks the newer release version between `current` and `incoming` for cross-tab merges.
+#[must_use]
+pub fn merge_release_version(current: Option<&str>, incoming: Option<&str>) -> Option<String> {
+    match (
+        current.and_then(sanitize_release_version),
+        incoming.and_then(sanitize_release_version),
+    ) {
+        (None, None) => None,
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (Some(a), Some(b)) => {
+            if compare_release_versions(&b, &a) == std::cmp::Ordering::Greater {
+                Some(b)
+            } else {
+                Some(a)
+            }
+        }
+    }
+}
+
+fn parse_semver_tuple(raw: &str) -> Option<(u64, u64, u64, Option<&str>)> {
+    let trimmed = raw
+        .trim()
+        .strip_prefix(['v', 'V'])
+        .unwrap_or_else(|| raw.trim());
+    let before_build = trimmed.split_once('+').map_or(trimmed, |(left, _)| left);
+    let (core, pre) = match before_build.split_once('-') {
+        Some((c, p)) if !p.is_empty() => (c, Some(p)),
+        Some(_) => return None,
+        None => (before_build, None),
+    };
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch, pre))
+}
+
+fn compare_prerelease_segment(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_num = !a.is_empty() && a.bytes().all(|ch| ch.is_ascii_digit());
+    let b_num = !b.is_empty() && b.bytes().all(|ch| ch.is_ascii_digit());
+    match (a_num, b_num) {
+        (true, true) => {
+            let a_trim = a.trim_start_matches('0');
+            let b_trim = b.trim_start_matches('0');
+            a_trim
+                .len()
+                .cmp(&b_trim.len())
+                .then_with(|| a_trim.cmp(b_trim))
+        }
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => a.cmp(b),
+    }
+}
+
+fn compare_prereleases(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut a_segs = a.split('.');
+    let mut b_segs = b.split('.');
+    loop {
+        match (a_segs.next(), b_segs.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(sa), Some(sb)) => {
+                let ord = compare_prerelease_segment(sa, sb);
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+        }
+    }
+}
+
+fn compare_release_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    match (parse_semver_tuple(a), parse_semver_tuple(b)) {
+        (Some((am, an, ap, apre)), Some((bm, bn, bp, bpre))) => am
+            .cmp(&bm)
+            .then_with(|| an.cmp(&bn))
+            .then_with(|| ap.cmp(&bp))
+            .then_with(|| match (apre, bpre) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (Some(pa), Some(pb)) => compare_prereleases(pa, pb),
+            }),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => std::cmp::Ordering::Equal,
     }
 }
 

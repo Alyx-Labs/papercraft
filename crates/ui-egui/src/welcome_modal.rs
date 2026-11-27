@@ -1,5 +1,6 @@
-//! First-launch Welcome Banner modal introducing PaperCraft's core study workflow.
+//! Per-release Welcome Banner modal shown on first launch and each new release.
 
+use egui::emath::GuiRounding as _;
 use egui::{
     Color32, CornerRadius, CursorIcon, FontFamily, FontId, Margin, Rect, RichText, Sense, Stroke,
     Vec2, pos2,
@@ -180,7 +181,9 @@ pub(crate) fn show_illustrated_modal(
     app.install_rich_fonts_if_needed(ui.ctx());
     let ctx = ui.ctx().clone();
     let viewport = ctx.content_rect();
-    let dialog_width = PREFERRED_WIDTH.min((viewport.width() - 32.0).max(300.0));
+    let dialog_width = PREFERRED_WIDTH
+        .min((viewport.width() - 32.0).max(300.0))
+        .floor_ui();
     let is_dark_theme = app.session.prefs.theme == papercraft_doc::UiTheme::Dark;
 
     let backdrop_id = ui.make_persistent_id("papercraft_modal_backdrop");
@@ -209,14 +212,19 @@ pub(crate) fn show_illustrated_modal(
     let mut footer_rect = Rect::NOTHING;
 
     let shadow = ctx.style_of(ctx.theme()).visuals.window_shadow;
-    let settle_offset = egui::vec2(0.0, (1.0 - eased) * crate::motion::MODAL_SETTLE_OFFSET_Y);
+    let settle_offset = egui::vec2(
+        0.0,
+        ((1.0 - eased) * crate::motion::MODAL_SETTLE_OFFSET_Y).round_ui(),
+    );
 
     let modal_resp = egui::Area::new(modal_id)
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_CENTER, settle_offset)
         .default_size(egui::vec2(
             dialog_width,
-            540.0_f32.min((viewport.height() - 32.0).max(260.0)),
+            540.0_f32
+                .min((viewport.height() - 32.0).max(260.0))
+                .floor_ui(),
         ))
         .constrain(true)
         .fade_in(false)
@@ -356,7 +364,7 @@ fn draw_illustration(ui: &mut egui::Ui, spec: &IllustratedModalSpec, inner_w: f3
         } else {
             451.0 / 520.0
         };
-        let draw_size = Vec2::new(clamped_w, clamped_w * aspect);
+        let draw_size = Vec2::new(clamped_w.round_ui(), (clamped_w * aspect).round_ui());
         let (art_rect, _) = ui.allocate_exact_size(Vec2::new(inner_w, draw_size.y), Sense::hover());
         let centered_rect = Rect::from_center_size(art_rect.center(), draw_size);
         egui::Image::new(egui::load::SizedTexture::new(tex.id(), draw_size))

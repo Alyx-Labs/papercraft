@@ -21,7 +21,7 @@ Both options pair with an offline-first sync client across the **Desktop** appli
 | Shared Wire Protocol | L2 | `crates/sync-protocol` | Versioned JSON DTOs (`PROTOCOL_VERSION = 1`), URL/username/password/ID validators, and deterministic SHA-256 canonical document/preference hashing |
 | Client Sync Engine | L4 | `crates/sync` | Blocking `ureq` + `rustls` HTTP client (native), shared `SyncCycleDriver`, automatic `401` token refresh & retry, atomic storage for `active_session.json` and `sync_manifest.json`, and conflict-copy generation |
 | Headless Session State | L5 | `crates/engine` (`src/sync_state.rs`) | Per-account local library isolation, O(1) edit tracking during pen strokes, offline delete tombstones, and engine commands (`sync.status`, `sync.setServerUrl`, `sync.signOut`) |
-| Shared UI Shell | L6 | `crates/ui-egui` | Non-blocking sync coordinator (`sync_worker.rs`), Home right-hand **Profile & Sync** drawer (`profile_drawer.rs`), clean **Add Account** modal & shared account widgets (`account_modal.rs`) |
+| Shared UI Shell | L6 | `crates/ui-egui` | Non-blocking sync coordinator (`sync_worker.rs`), Home right-hand **Profile & Settings** drawer (`profile_drawer.rs`), clean **Add Account** modal & shared account widgets (`account_modal.rs`) |
 | Server Library & CLI | App | `apps/papercraft-server-cli` | Reusable `ServerRuntime` + `axum`/`tokio` HTTP router, `redb` ACID embedded database, Argon2id password hashing, bearer session management, CORS headers, rate limiting, and terminal admin subcommands |
 | Server Tray Control App (GUI) | App | `apps/papercraft-server` | Standalone executable embedding `papercraft_server_cli::ServerRuntime` in-process, running in the OS system tray with a minimalist control window, folder picker, copyable URLs, Users management, and `server_control_config.json` persistence |
 | Desktop Application | App | `apps/papercraft` | Opens `Session::open_desktop_library(...)` so the last signed-in account works seamlessly both online and offline |
@@ -67,7 +67,7 @@ If you want to run your own sync server with zero command-line flags or environm
 
 - **Dedicated `Server` | `Users` switch**: Keeps server controls and configuration separate from a dedicated **Users** tab showing a live count badge (`Users (N)`), instant search/filter by name, `@username`, or user ID, UTC join dates, per-account notebook counts, copyable user IDs, per-user **Reset** (generates a random one-time recovery code shown in a prominently copyable card, requiring the user to set a new password at next sign-in) and **Delete** (with inline confirmation) actions, and **Refresh** support even while the server is stopped.
 - **Auto-start & live status**: By default, opening `papercraft-server` starts the sync server immediately and shows a status badge (`Running`, `Stopped`, or `Needs attention`) alongside live counters for **Accounts**, **Notebooks**, **Active devices**, and **Database size**.
-- **One-click client addresses**: Displays ready-to-paste URLs (for example `http://127.0.0.1:8787` on the same computer and `http://<LAN-IP>:8787` when **Local network / VPN** is enabled) with **Copy** buttons to paste directly into **PaperCraft -> Profile & Sync -> Sync** (or **Add Account -> Server Account**).
+- **One-click client addresses**: Displays ready-to-paste URLs (for example `http://127.0.0.1:8787` on the same computer and `http://<LAN-IP>:8787` when **Local network / VPN** is enabled) with **Copy** buttons to paste directly into **PaperCraft -> Profile & Settings -> Sync** (or **Add Account -> Server Account**).
 - **System-tray icon & menu**:
   - The tray icon shows a live status dot (**green** = running, **slate** = stopped, **red** = error).
   - **Left-click** the tray icon to open and focus the control window; **right-click** to open the tray menu (`Open Control Window`, `Hide Window`, `Start Server` / `Stop Server`, `Restart Server`, `Copy Server Address`, `Open Data Folder`, `Quit PaperCraft Server`).
@@ -186,7 +186,7 @@ cargo run -p papercraft
 ### Connecting & Testing Sync (Web and/or Desktop)
 
 1. Open PaperCraft (Web at `http://127.0.0.1:8080` and/or the Desktop window).
-2. Click the top-right **Profile** icon in the Home header to open the **Profile & Sync** drawer, then click **+ Add Account** (or **Connect Server**).
+2. Click the top-right **Profile** icon in the Home header to open the **Profile & Settings** drawer, then click **+ Add Account** (or **Connect Server**).
 3. Keep `http://127.0.0.1:8787` (or paste the copied URL from `papercraft-server`) in **Self-Hosted Server** and click **Test** to verify `Connected`.
 4. Switch to **Create Account**, enter an email, optional `@username` (`3–32` characters), and password (`8–128` characters), and submit.
 5. On a second client (for example, sign into Web with the account you created on Desktop, or vice versa), choose **Sign In** with the same URL and credentials to see notebooks sync across both.

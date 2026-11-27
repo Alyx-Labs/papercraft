@@ -519,7 +519,12 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "profile.dismissFirstNotebookDataNotice",
         label: "Dismiss First-Notebook Data Notice",
-        description: "Mark the first-notebook data & privacy notice as seen on this device",
+        description: "Mark the first-notebook data & privacy notice as seen for the active build version",
+    },
+    CommandSpec {
+        id: "profile.dismissInfiniteThemeNotice",
+        label: "Dismiss Infinite Theme Notice",
+        description: "Mark the Infinite theme notice as seen for the active build version",
     },
     CommandSpec {
         id: "profile.create",
@@ -1363,6 +1368,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
         "profile.dismissFirstNotebookDataNotice" => {
             cmd_profile_dismiss_first_notebook_data_notice(session)
         }
+        "profile.dismissInfiniteThemeNotice" => cmd_profile_dismiss_infinite_theme_notice(session),
         "profile.create" => cmd_profile_create(session, id, params),
         "profile.rename" => cmd_profile_rename(session, id, params),
         "profile.switch" => cmd_profile_switch(session, id, params),
@@ -1416,6 +1422,7 @@ pub fn execute(session: &mut Session, id: &str, params: &Value) -> Result<Value,
                     | "profile.completeFirstAccess"
                     | "profile.dismissWelcomeBanner"
                     | "profile.dismissFirstNotebookDataNotice"
+                    | "profile.dismissInfiniteThemeNotice"
                     | "profile.rename"
                     | "profile.switch"
                     | "profile.delete"
@@ -6497,6 +6504,15 @@ fn cmd_profile_dismiss_first_notebook_data_notice(
     session.dismiss_first_notebook_data_notice();
     Ok(json!({
         "firstNotebookDataNoticeSeen": !session.should_show_first_notebook_data_notice(),
+        "firstNotebookDataNoticeSeenVersion": session.first_notebook_data_notice_seen_version(),
+    }))
+}
+
+fn cmd_profile_dismiss_infinite_theme_notice(session: &mut Session) -> Result<Value, EngineError> {
+    session.dismiss_infinite_theme_notice();
+    Ok(json!({
+        "infiniteThemeNoticeSeen": !session.should_show_infinite_theme_notice(),
+        "infiniteThemeNoticeSeenVersion": session.infinite_theme_notice_seen_version(),
     }))
 }
 

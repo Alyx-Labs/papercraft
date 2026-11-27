@@ -580,6 +580,145 @@ fn oklch_to_color(ok_l: f32, c_desired: f32, cos_h: f32, sin_h: f32, alpha: f32)
     .sanitized()
 }
 
+/// Returns the perceptual OKLCH lightness (`0.0..=1.0`) of `color`.
+#[must_use]
+pub fn oklch_lightness(color: Color) -> f32 {
+    let (ok_l, _, _) = rgb_to_oklab(color.sanitized());
+    if ok_l.is_finite() {
+        ok_l.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Returns `color` shifted to `target_ok_l` (`0.0..=1.0`) while preserving its OKLCH hue and
+/// clamping chroma into the sRGB gamut (keeping neutral grays neutral).
+#[must_use]
+pub fn with_oklch_lightness(color: Color, target_ok_l: f32) -> Color {
+    let c_in = color.sanitized();
+    let l_target = if target_ok_l.is_finite() {
+        target_ok_l.clamp(0.0, 1.0)
+    } else {
+        oklch_lightness(c_in)
+    };
+    let (_, a_in, b_in) = rgb_to_oklab(c_in);
+    let chroma = (a_in * a_in + b_in * b_in).sqrt();
+    if chroma < 0.008 {
+        return oklch_to_color(l_target, 0.0, 1.0, 0.0, c_in.a);
+    }
+    let (cos_h, sin_h) = (a_in / chroma, b_in / chroma);
+    oklch_to_color(l_target, chroma, cos_h, sin_h, c_in.a)
+}
+
+/// Adjusts `color` along its perceptual OKLCH lightness until its minimum WCAG contrast ratio
+/// against every color in `backgrounds` reaches `min_ratio` (or the highest achievable contrast).
+///
+/// When `prefer_lighter` is `None`, both lighter and darker directions are evaluated and the
+/// polarity that achieves `min_ratio` (preferring the input's side if both pass, or higher
+/// contrast if neither hits `min_ratio`) is selected.
+#[must_use]
+pub fn adjust_oklch_lightness_for_contrast(
+    color: Color,
+    backgrounds: &[Color],
+    min_ratio: f32,
+    prefer_lighter: Option<bool>,
+) -> Color {
+    let c_in = color.sanitized();
+    if backgrounds.is_empty() || !min_ratio.is_finite() || min_ratio <= 1.0 {
+        return c_in;
+    }
+    let min_cr = |cand: Color| -> f32 {
+        backgrounds
+            .iter()
+            .map(|&bg| contrast_ratio(cand, bg.sanitized()))
+            .fold(f32::INFINITY, f32::min)
+    };
+    if min_cr(c_in) >= min_ratio {
+        return c_in;
+    }
+
+    let (l_in, a_in, b_in) = rgb_to_oklab(c_in);
+    let chroma = (a_in * a_in + b_in * b_in).sqrt();
+    let is_neutral = chroma < 0.008;
+    let (cos_h, sin_h) = if chroma > 1e-5 {
+        (a_in / chroma, b_in / chroma)
+    } else {
+        (1.0, 0.0)
+    };
+    let eval_at_l = |target_l: f32| -> Color {
+        if is_neutral {
+            oklch_to_color(target_l, 0.0, 1.0, 0.0, c_in.a)
+        } else {
+            oklch_to_color(target_l, chroma, cos_h, sin_h, c_in.a)
+        }
+    };
+
+    let search_toward = |end_l: f32| -> (Color, f32) {
+        const STEPS: usize = 32;
+        let mut prev_l = l_in;
+        for i in 1..=STEPS {
+            let t = i as f32 / STEPS as f32;
+            let l = l_in + (end_l - l_in) * t;
+            let cand = eval_at_l(l);
+            let cr = min_cr(cand);
+            if cr >= min_ratio {
+                let mut lo = prev_l;
+                let mut hi = l;
+                let mut best = cand;
+                let mut best_cr = cr;
+                for _ in 0..10 {
+                    let mid = 0.5 * (lo + hi);
+                    let mid_col = eval_at_l(mid);
+                    let mid_cr = min_cr(mid_col);
+                    if mid_cr >= min_ratio {
+                        hi = mid;
+                        best = mid_col;
+                        best_cr = mid_cr;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                return (best, best_cr);
+            }
+            prev_l = l;
+        }
+
+        let mut best = eval_at_l(end_l);
+        let mut best_cr = min_cr(best);
+        for i in 0..=STEPS {
+            let t = i as f32 / STEPS as f32;
+            let l = l_in + (end_l - l_in) * t;
+            let cand = eval_at_l(l);
+            let cr = min_cr(cand);
+            if cr > best_cr {
+                best = cand;
+                best_cr = cr;
+            }
+        }
+        (best, best_cr)
+    };
+
+    match prefer_lighter {
+        Some(true) => search_toward(1.0).0,
+        Some(false) => search_toward(0.0).0,
+        None => {
+            let (dark_cand, dark_cr) = search_toward(0.0);
+            let (light_cand, light_cr) = search_toward(1.0);
+            if dark_cr >= min_ratio && light_cr < min_ratio {
+                dark_cand
+            } else if light_cr >= min_ratio && dark_cr < min_ratio {
+                light_cand
+            } else if dark_cr >= min_ratio && light_cr >= min_ratio {
+                if l_in < 0.5 { dark_cand } else { light_cand }
+            } else if light_cr >= dark_cr {
+                light_cand
+            } else {
+                dark_cand
+            }
+        }
+    }
+}
+
 /// Adapts an ink or highlighter color from `source_bg` to `target_bg` while preserving its
 /// perceptual OKLCH hue and enforcing strong WCAG readability contrast against `target_bg`.
 #[must_use]
@@ -956,5 +1095,28 @@ mod tests {
             Color::from_hex(&clear.to_hex_rgba()).unwrap().to_rgba8(),
             [0xEF, 0x44, 0x44, 0x00]
         );
+    }
+
+    #[test]
+    fn adjust_oklch_lightness_for_contrast_handles_auto_polarity_and_neutral_grays() {
+        let dark_navy = Color::from_rgba8(0x09, 0x1E, 0x2E, 255);
+        let deep_blue_bar = Color::from_rgba8(0x16, 0x3D, 0x8F, 255);
+        let bright_fg = adjust_oklch_lightness_for_contrast(dark_navy, &[deep_blue_bar], 6.0, None);
+        assert!(contrast_ratio(bright_fg, deep_blue_bar) >= 6.0);
+        assert!(relative_luminance(bright_fg) > relative_luminance(deep_blue_bar));
+
+        let bright_yellow = Color::from_rgba8(0xEC, 0xE8, 0x40, 255);
+        let white_surface = Color::WHITE;
+        let readable_accent =
+            adjust_oklch_lightness_for_contrast(bright_yellow, &[white_surface], 4.5, Some(false));
+        assert!(contrast_ratio(readable_accent, white_surface) >= 4.5);
+
+        let mid_gray = Color::from_rgba8(0x70, 0x70, 0x70, 255);
+        let adjusted_gray =
+            adjust_oklch_lightness_for_contrast(mid_gray, &[white_surface], 4.5, Some(false));
+        let [r, g, b, _] = adjusted_gray.to_rgba8();
+        assert_eq!(r, g);
+        assert_eq!(g, b);
+        assert!(contrast_ratio(adjusted_gray, white_surface) >= 4.5);
     }
 }

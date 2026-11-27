@@ -248,6 +248,7 @@ pub fn load_global_state(root_dir: &Path) -> GlobalSyncState {
         parsed.server_configured = true;
     }
     parsed.client_id = sanitize_client_id(&parsed.client_id);
+    parsed.sanitize_release_notices();
     parsed
 }
 

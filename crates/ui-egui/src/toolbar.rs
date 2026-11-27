@@ -4098,8 +4098,10 @@ fn draw_settings_edge_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tok
         );
         let badge_dot = if t.is_dark {
             t.accent
-        } else {
+        } else if app.view.inspector_open {
             t.header_active_fg
+        } else {
+            t.header_fg
         };
         let ring_bg = if app.view.inspector_open {
             t.header_active_bg

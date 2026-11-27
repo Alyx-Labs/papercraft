@@ -291,6 +291,23 @@ struct TabSlot {
     hovered: bool,
 }
 
+fn inactive_tab_fg(hover_t: f32, muted_at_rest: bool, t: &Tokens) -> Color32 {
+    let rest = if muted_at_rest {
+        t.tab_strip_fg_muted
+    } else {
+        t.tab_strip_fg
+    };
+    let hover_bg = crate::motion::lerp_color(t.tab_strip_bg, t.header_bg, 0.72);
+    let hover_target = if crate::theme::wcag_contrast(t.header_fg, hover_bg)
+        > crate::theme::wcag_contrast(t.tab_strip_fg, hover_bg)
+    {
+        t.header_fg
+    } else {
+        t.tab_strip_fg
+    };
+    crate::motion::lerp_color(rest, hover_target, hover_t)
+}
+
 fn draw_home_tab(
     ui: &mut egui::Ui,
     base_id: egui::Id,
@@ -311,7 +328,7 @@ fn draw_home_tab(
     let home_fg = if on_home {
         if t.is_dark { t.accent } else { t.header_fg }
     } else {
-        crate::motion::lerp_color(t.tab_strip_fg_muted, t.tab_strip_fg, home_hover_t)
+        inactive_tab_fg(home_hover_t, true, t)
     };
     paint_icon(
         ui.painter(),
@@ -350,7 +367,7 @@ fn draw_new_tab_button(
         ui.painter(),
         Rect::from_center_size(new_rect.center(), Vec2::splat(TAB_ICON_DIM)),
         Icon::Plus,
-        crate::motion::lerp_color(t.tab_strip_fg_muted, t.tab_strip_fg, new_hover_t),
+        inactive_tab_fg(new_hover_t, true, t),
     );
     new_resp.clicked().then_some(TabAction::NewNotebook)
 }
@@ -432,7 +449,7 @@ fn draw_notebook_tab(
         let text_color = if active {
             t.header_fg
         } else {
-            crate::motion::lerp_color(t.tab_strip_fg_muted, t.tab_strip_fg, hover_t)
+            inactive_tab_fg(hover_t, true, t)
         };
         let galley = tab_title_galley(ui, spec.title, text_right - text_left, text_color);
         let text_pos = pos2(text_left, rect.center().y - galley.size().y * 0.5);
@@ -450,12 +467,15 @@ fn draw_notebook_tab(
                 t.header_border.gamma_multiply(0.7),
             );
         }
-        let (close_rest, close_hov) = if active {
-            (t.header_fg_muted, t.header_fg)
+        let close_fg = if active {
+            if close_hovered {
+                t.header_fg
+            } else {
+                t.header_fg_muted
+            }
         } else {
-            (t.tab_strip_fg_muted, t.tab_strip_fg)
+            inactive_tab_fg(hover_t, !close_hovered, t)
         };
-        let close_fg = if close_hovered { close_hov } else { close_rest };
         paint_icon(
             ui.painter(),
             Rect::from_center_size(close_rect.center(), Vec2::splat(TAB_CLOSE_ICON_DIM)),

@@ -34,7 +34,7 @@ pub use types::{
     GLOBAL_SYNC_FILE, GlobalSyncState, LocalNotebookSnapshot, LocalProfile, NotebookSyncMeta,
     NotebookTombstone, OwnerId, PROFILES_DIR, RememberedServerAccount, RemoteNotebookUpdate,
     SYNC_MANIFEST_FILE, SyncBatch, SyncConnectionState, SyncCycleOutcome, SyncError, SyncManifest,
-    SyncStatusSummary,
+    SyncStatusSummary, merge_release_version, sanitize_release_version,
 };
 
 #[cfg(test)]
@@ -49,7 +49,7 @@ mod tests {
         account_library_dir, inspect_local_accounts_in_library, load_global_state, load_manifest,
         profile_library_dir, save_global_state, save_manifest,
     };
-    use crate::types::{GlobalSyncState, LocalProfile, SyncManifest};
+    use crate::types::{GlobalSyncState, LocalProfile, SyncManifest, merge_release_version};
 
     struct TempDirGuard(PathBuf);
     impl Drop for TempDirGuard {
@@ -278,5 +278,29 @@ mod tests {
         save_global_state(&dir.0, &custom_url).unwrap();
         let reloaded_custom = load_global_state(&dir.0);
         assert!(reloaded_custom.server_configured);
+    }
+
+    #[test]
+    fn release_notice_merge_preserves_newer_versions_without_downgrading() {
+        assert_eq!(
+            merge_release_version(Some("0.7.4"), Some("0.7.5")),
+            Some("0.7.5".to_string())
+        );
+        assert_eq!(
+            merge_release_version(Some("0.7.5"), Some("0.7.4")),
+            Some("0.7.5".to_string())
+        );
+        assert_eq!(
+            merge_release_version(Some("0.8.0-rc.1"), Some("0.8.0-rc.2")),
+            Some("0.8.0-rc.2".to_string())
+        );
+        assert_eq!(
+            merge_release_version(Some("0.8.0-rc.2"), Some("0.8.0")),
+            Some("0.8.0".to_string())
+        );
+        assert_eq!(
+            merge_release_version(None, Some("0.7.4")),
+            Some("0.7.4".to_string())
+        );
     }
 }

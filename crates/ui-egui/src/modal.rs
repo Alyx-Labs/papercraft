@@ -7,6 +7,7 @@
 //!    by a full-width divider so actions are always reachable and never occluded by scrollbars.
 
 use egui::Color32;
+use egui::emath::GuiRounding as _;
 
 use crate::icons::{Icon, icon_button, paint_icon};
 use crate::theme::Tokens;
@@ -35,6 +36,7 @@ pub enum ActiveModal {
     KeyboardShortcuts,
     WelcomeBanner,
     FirstNotebookDataNotice,
+    InfiniteTheme,
 }
 
 struct DialogSpec {
@@ -90,6 +92,7 @@ impl ActiveModal {
             Self::KeyboardShortcuts => 17,
             Self::WelcomeBanner => 18,
             Self::FirstNotebookDataNotice => 19,
+            Self::InfiniteTheme => 22,
         }
     }
 
@@ -235,6 +238,13 @@ impl ActiveModal {
                 width: 700.0,
                 min_body_height: 0.0,
             },
+            Self::InfiniteTheme => DialogSpec {
+                icon: Icon::Palette,
+                title: "Color your studio with Infinite",
+                subtitle: "How the hue & saturation matrix adapts your UI:",
+                width: 700.0,
+                min_body_height: 0.0,
+            },
         }
     }
 }
@@ -357,7 +367,8 @@ pub(crate) fn open(app: &mut PaperCraftApp, target: ActiveModal) {
         | ActiveModal::AppUpdate
         | ActiveModal::KeyboardShortcuts
         | ActiveModal::WelcomeBanner
-        | ActiveModal::FirstNotebookDataNotice => {}
+        | ActiveModal::FirstNotebookDataNotice
+        | ActiveModal::InfiniteTheme => {}
         ActiveModal::FirstAccessNickname => {
             app.view.account.select_local_new_name.clear();
             app.view.account.select_local_error = None;
@@ -757,6 +768,13 @@ fn show_inner_with_motion(
             motion.backdrop_eased,
             motion.interactive,
         ),
+        ActiveModal::InfiniteTheme => crate::infinite_theme_modal::show(
+            app,
+            ui,
+            motion.eased,
+            motion.backdrop_eased,
+            motion.interactive,
+        ),
     }
 }
 
@@ -800,7 +818,8 @@ fn modal_steps(active: ActiveModal) -> Option<&'static [ModalStepSpec]> {
         | ActiveModal::AppUpdate
         | ActiveModal::KeyboardShortcuts
         | ActiveModal::WelcomeBanner
-        | ActiveModal::FirstNotebookDataNotice => None,
+        | ActiveModal::FirstNotebookDataNotice
+        | ActiveModal::InfiniteTheme => None,
     }
 }
 
@@ -867,10 +886,13 @@ fn show_dialog(
     let viewport = ctx.content_rect();
     let margin = 18_i8;
     let margin_f = f32::from(margin);
-    let dialog_width = spec.width.min((viewport.width() - 32.0).max(320.0));
-    let inner_w = (dialog_width - margin_f * 2.0 - 2.0).max(260.0);
+    let dialog_width = spec
+        .width
+        .min((viewport.width() - 32.0).max(320.0))
+        .floor_ui();
+    let inner_w = (dialog_width - margin_f * 2.0 - 2.0).max(260.0).floor_ui();
     let chrome_reserve = if steps.is_some() { 268.0 } else { 240.0 };
-    let max_body_height = (viewport.height() - chrome_reserve).max(160.0);
+    let max_body_height = (viewport.height() - chrome_reserve).max(160.0).floor_ui();
 
     let backdrop_id = ui.make_persistent_id("papercraft_modal_backdrop");
     let modal_id = ui.make_persistent_id(("papercraft_modal_surface", tag));
@@ -907,7 +929,7 @@ fn show_dialog(
 
     let settle_offset = egui::vec2(
         0.0,
-        (1.0 - motion.eased) * crate::motion::MODAL_SETTLE_OFFSET_Y,
+        ((1.0 - motion.eased) * crate::motion::MODAL_SETTLE_OFFSET_Y).round_ui(),
     );
     let allow_close = active != ActiveModal::FirstAccessNickname
         && !(active == ActiveModal::SelectLocalAccount && !is_account_picker_dismissible(app))
@@ -919,7 +941,7 @@ fn show_dialog(
         .anchor(egui::Align2::CENTER_CENTER, settle_offset)
         .default_size(egui::vec2(
             dialog_width,
-            (viewport.height() - 48.0).max(260.0),
+            (viewport.height() - 48.0).max(260.0).floor_ui(),
         ))
         .constrain(true)
         .fade_in(false)
@@ -1046,9 +1068,9 @@ fn show_body_content(
 ) -> (bool, f32, egui::Rect) {
     let mut closed = false;
     let mut natural_h = 0.0_f32;
-    let width = bounds.width;
-    let min_height = bounds.min_height;
-    let max_height = bounds.max_height;
+    let width = bounds.width.floor_ui();
+    let min_height = bounds.min_height.round_ui();
+    let max_height = bounds.max_height.floor_ui();
     let flow_opacity = motion.flow_opacity;
     let flow_offset_x = motion.flow_offset_x;
     let content = ui.allocate_ui_with_layout(
@@ -1065,21 +1087,22 @@ fn show_body_content(
                 let min_rect = ui.min_rect();
                 natural_h = min_rect.height();
                 if min_height > natural_h {
-                    ui.expand_to_include_rect(egui::Rect::from_min_size(
-                        min_rect.min,
-                        egui::vec2(width, min_height),
-                    ));
+                    ui.expand_to_include_rect(
+                        egui::Rect::from_min_size(min_rect.min, egui::vec2(width, min_height))
+                            .round_ui(),
+                    );
                 }
             } else {
                 let clip_origin = ui.cursor().min;
-                let clip = ui.clip_rect().intersect(egui::Rect::from_min_size(
-                    clip_origin,
-                    egui::vec2(width, max_height + 32.0),
-                ));
-                let child_max = egui::Rect::from_min_size(
-                    clip_origin + egui::vec2(flow_offset_x, 0.0),
-                    egui::vec2(width, max_height + 64.0),
+                let clip = ui.clip_rect().intersect(
+                    egui::Rect::from_min_size(clip_origin, egui::vec2(width, max_height + 32.0))
+                        .round_ui(),
                 );
+                let child_max = egui::Rect::from_min_size(
+                    clip_origin + egui::vec2(flow_offset_x.round_ui(), 0.0),
+                    egui::vec2(width, max_height + 64.0),
+                )
+                .round_ui();
                 let mut child = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(child_max)
@@ -1092,8 +1115,8 @@ fn show_body_content(
                 if body(app, &mut child, t) {
                     closed = true;
                 }
-                natural_h = child.min_rect().height().max(0.0);
-                let alloc_h = natural_h.max(min_height);
+                natural_h = child.min_rect().height().max(0.0).round_ui();
+                let alloc_h = natural_h.max(min_height).round_ui();
                 let _ = ui.allocate_exact_size(egui::vec2(width, alloc_h), egui::Sense::hover());
             }
         },
@@ -1122,7 +1145,7 @@ fn show_adaptive_body(
     let needs_scroll = last_natural_h > max_body_height + 2.0;
 
     let base_min = if base_min_body_height > 0.0 {
-        base_min_body_height.min(max_body_height)
+        base_min_body_height.min(max_body_height).round_ui()
     } else {
         0.0
     };
@@ -1136,7 +1159,10 @@ fn show_adaptive_body(
         None
     };
     let effective_min_h = if motion.animate_flows {
-        prev_anim_h.unwrap_or(base_min).min(max_body_height)
+        prev_anim_h
+            .unwrap_or(base_min)
+            .min(max_body_height)
+            .round_ui()
     } else {
         base_min
     };
@@ -1158,12 +1184,13 @@ fn show_adaptive_body(
                         .max_height(max_body_height)
                         .auto_shrink([false, effective_min_h <= 0.0])
                         .show(ui, |ui| {
-                            let inner_w_avail = ui.available_width().min(inner_w);
+                            let inner_w_avail = ui.available_width().min(inner_w).floor_ui();
                             ui.set_max_width(inner_w_avail);
                             // Keep enough vertical headroom inside the scrolling body so nested
                             // auto-shrinking ScrollAreas use their full natural height rather than
                             // collapsing to `min_scrolled_size`.
-                            let content_max_h = last_natural_h.max(max_body_height + 240.0);
+                            let content_max_h =
+                                last_natural_h.max(max_body_height + 240.0).round_ui();
                             let (body_closed, nat_h, _rect) = show_body_content(
                                 app,
                                 ui,
@@ -1204,15 +1231,17 @@ fn show_adaptive_body(
     ui.ctx()
         .data_mut(|d| d.insert_temp(height_cache_id, measured_natural_h));
     if motion.animate_flows {
-        let target_h = measured_natural_h.max(base_min).min(max_body_height);
+        let target_h = measured_natural_h
+            .max(base_min)
+            .min(max_body_height)
+            .round_ui();
         let next_h = match prev_anim_h {
             Some(prev) if motion.interactive && (target_h - prev).abs() > 0.5 => {
                 let dt = crate::motion::sanitize_dt(motion.dt);
+                ui.ctx().request_repaint();
                 if dt > 0.0 {
                     let alpha = 1.0 - (-dt / 0.11).exp();
-                    let interpolated = prev + (target_h - prev) * alpha;
-                    ui.ctx().request_repaint();
-                    interpolated
+                    prev + (target_h - prev) * alpha
                 } else {
                     prev
                 }
@@ -1245,30 +1274,7 @@ pub(crate) fn apply_subflow_motion(
 
     let opacity = app.view.motion.modal_subflow.opacity();
     let offset_x = app.view.motion.modal_subflow.offset_x();
-    if opacity >= 0.999 && offset_x.abs() <= 0.05 {
-        add_contents(app, ui);
-        return;
-    }
-
-    let clip = ui.clip_rect();
-    let avail_w = ui.available_width().max(1.0);
-    let avail_h = ui.available_height().max(400.0);
-    let origin = ui.cursor().min;
-    let shifted_max = egui::Rect::from_min_size(
-        origin + egui::vec2(offset_x, 0.0),
-        egui::vec2(avail_w, avail_h),
-    );
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(shifted_max)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-    );
-    child.set_clip_rect(clip);
-    child.set_width(avail_w);
-    child.multiply_opacity(opacity);
-    add_contents(app, &mut child);
-    let measured_h = child.min_rect().height().max(0.0);
-    let _ = ui.allocate_exact_size(egui::vec2(avail_w, measured_h), egui::Sense::hover());
+    crate::motion::show_flow_content(ui, opacity, offset_x, |ui| add_contents(app, ui));
 }
 
 fn draw_dialog_header(
@@ -1283,7 +1289,9 @@ fn draw_dialog_header(
     let badge_w = 32.0;
     let close_btn_w = 28.0;
     let gap = 10.0;
-    let text_w = (inner_w - badge_w - close_btn_w - gap * 2.0).max(120.0);
+    let text_w = (inner_w - badge_w - close_btn_w - gap * 2.0)
+        .max(120.0)
+        .floor_ui();
 
     ui.allocate_ui_with_layout(
         egui::vec2(inner_w, 0.0),
@@ -1650,7 +1658,9 @@ pub(crate) fn step_action_button(
         egui::FontId::proportional(12.0),
         text_color,
     );
-    let width = pad_x * 2.0 + icon_sz + icon_gap + galley.size().x;
+    let width = ((pad_x * 2.0 + icon_sz + icon_gap + galley.size().x) / egui::emath::GUI_ROUNDING)
+        .ceil()
+        * egui::emath::GUI_ROUNDING;
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(width.max(76.0), 30.0),
         if enabled {
@@ -2389,5 +2399,244 @@ mod tests {
         assert!((metrics.modal_rect.center().x - 640.0).abs() <= 2.0);
         assert!((metrics.modal_rect.center().y - 400.0).abs() <= 2.0);
         assert!(metrics.footer_rect.top() >= metrics.body_rect.bottom() + 20.0);
+    }
+
+    fn find_unaligned_warnings(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Rect> {
+        find_unclipped_text_rects(shapes, "Unaligned")
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect()
+    }
+
+    #[test]
+    fn modals_and_transitions_never_paint_egui_unaligned_warnings() {
+        let mut failures = Vec::new();
+        let mut check_case =
+            |label: &str,
+             viewport: egui::Vec2,
+             pixels_per_point: f32,
+             setup: &dyn Fn(&mut PaperCraftApp),
+             step_fn: &dyn Fn(usize, &mut PaperCraftApp)| {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(pixels_per_point);
+                let mut app = PaperCraftApp::default();
+                app.session.prefs.theme = papercraft_doc::UiTheme::Dark;
+                setup(&mut app);
+                for frame in 0..45 {
+                    step_fn(frame, &mut app);
+                    let raw = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                        time: Some(frame as f64 * 0.016),
+                        predicted_dt: 0.016,
+                        ..Default::default()
+                    };
+                    let out = ctx.run_ui(raw, |ui| {
+                        crate::theme::apply_visuals(ui.ctx(), papercraft_doc::UiTheme::Dark);
+                        show(&mut app, ui);
+                    });
+                    let warnings = find_unaligned_warnings(&out.shapes);
+                    out.drop_without_applying_deltas();
+                    if !warnings.is_empty() {
+                        failures.push(format!(
+                            "{label} frame={frame}: {} Unaligned at {:?}",
+                            warnings.len(),
+                            warnings
+                        ));
+                    }
+                }
+            };
+
+        // 1. AddAccount opening in Server mode (unconfigured and configured), switching to Local and back, then closing.
+        for configured in [false, true] {
+            let label = format!("AddAccount configured={configured} Server<->Local");
+            check_case(
+                &label,
+                egui::vec2(1280.0, 800.0),
+                1.0,
+                &move |app| {
+                    if configured {
+                        let _ = app
+                            .session
+                            .set_server_url_preference("https://sync.example.com");
+                    }
+                    open(app, ActiveModal::AddAccount);
+                    app.view.account.add_account_mode =
+                        crate::account_modal::AddAccountMode::Server;
+                },
+                &|frame, app| {
+                    if frame == 10 {
+                        app.view.account.tab = crate::account_modal::AuthTab::CreateAccount;
+                    } else if frame == 18 {
+                        app.view.account.add_account_mode =
+                            crate::account_modal::AddAccountMode::Local;
+                    } else if frame == 28 {
+                        app.view.account.add_account_mode =
+                            crate::account_modal::AddAccountMode::Server;
+                    } else if frame == 36 {
+                        close(app);
+                    }
+                },
+            );
+        }
+
+        // 2. Stepped & collapsible modals across subflows, collapses, and close fade-outs.
+        check_case(
+            "NewNotebook steps+collapses",
+            egui::vec2(1280.0, 800.0),
+            1.25,
+            &|app| {
+                open(app, ActiveModal::NewNotebook);
+                app.session
+                    .execute(
+                        "profile.dismissFirstNotebookDataNotice",
+                        &serde_json::json!({}),
+                    )
+                    .ok();
+                open(app, ActiveModal::NewNotebook);
+            },
+            &|frame, app| {
+                if frame == 6 {
+                    app.view.new_notebook_cover =
+                        papercraft_doc::NotebookCover::custom_rgb(0x2B, 0x7A, 0x78);
+                    app.view
+                        .cover_color_draft
+                        .sync_from_cover(app.view.new_notebook_cover);
+                } else if frame == 14 {
+                    app.view.new_notebook_step = 1;
+                    app.view
+                        .new_notebook_format
+                        .select_preset(papercraft_doc::PageResolutionPreset::Custom);
+                } else if frame == 24 {
+                    app.view.new_notebook_step = 2;
+                } else if frame == 34 {
+                    close(app);
+                }
+            },
+        );
+
+        check_case(
+            "SelectLocalAccount subflows+drawer",
+            egui::vec2(1280.0, 800.0),
+            1.5,
+            &|app| {
+                let _ = app.session.execute(
+                    "profile.completeFirstAccess",
+                    &serde_json::json!({ "nickname": "Personal" }),
+                );
+                open(app, ActiveModal::SelectLocalAccount);
+            },
+            &|frame, app| {
+                if frame == 8 {
+                    app.view.account.selector_other_server_open = true;
+                } else if frame == 18 {
+                    app.view.account.selector_other_server_open = false;
+                } else if frame == 28 {
+                    close(app);
+                }
+            },
+        );
+
+        check_case(
+            "TransferPages subflow",
+            egui::vec2(1280.0, 800.0),
+            1.0,
+            &|app| {
+                let _ = app
+                    .session
+                    .execute("notebook.create", &serde_json::json!({ "title": "Second" }));
+                open(app, ActiveModal::TransferPages);
+            },
+            &|frame, app| {
+                if frame == 8 {
+                    app.view.transfer_create_new_notebook = true;
+                } else if frame == 18 {
+                    app.view.transfer_create_new_notebook = false;
+                }
+            },
+        );
+
+        check_case(
+            "AccountSync collapses + AddAccount error",
+            egui::vec2(1280.0, 800.0),
+            1.25,
+            &|app| {
+                open(app, ActiveModal::AccountSync);
+            },
+            &|frame, app| {
+                if frame == 8 {
+                    app.view.account.profiles_panel_open = true;
+                } else if frame == 18 {
+                    app.view.account.profiles_panel_open = false;
+                } else if frame == 26 {
+                    open(app, ActiveModal::AddAccount);
+                    app.view.account.add_account_mode = crate::account_modal::AddAccountMode::Local;
+                    app.view.account.select_local_error =
+                        Some("Please enter a nickname for the local account.".to_string());
+                } else if frame == 34 {
+                    app.view.account.select_local_error = None;
+                }
+            },
+        );
+
+        // 3. All modals at standard, fractional (150% DPI), and compact viewport sizes.
+        let viewports = [
+            ("1280x800@1.0", egui::vec2(1280.0, 800.0), 1.0_f32),
+            ("853.33x533.33@1.5", egui::vec2(853.3333, 533.3333), 1.5),
+            ("1024x576@1.25", egui::vec2(1024.0, 576.0), 1.25),
+            ("compact@1.0", egui::vec2(640.0, 460.0), 1.0),
+        ];
+        let modals = [
+            ActiveModal::Export,
+            ActiveModal::NewNotebook,
+            ActiveModal::NotebookSettings,
+            ActiveModal::ConfirmDeleteNotebook,
+            ActiveModal::ConfirmReorderPage,
+            ActiveModal::AccountSync,
+            ActiveModal::AddAccount,
+            ActiveModal::FirstAccessNickname,
+            ActiveModal::SelectLocalAccount,
+            ActiveModal::ConvertLocalAccount,
+            ActiveModal::TransferPages,
+            ActiveModal::NewFolder,
+            ActiveModal::RenameFolder,
+            ActiveModal::DeleteFolder,
+            ActiveModal::FolderColor,
+            ActiveModal::TagColor,
+            ActiveModal::AppUpdate,
+            ActiveModal::KeyboardShortcuts,
+            ActiveModal::WelcomeBanner,
+            ActiveModal::FirstNotebookDataNotice,
+            ActiveModal::InfiniteTheme,
+        ];
+        for (vp_name, vp, ppp) in viewports {
+            for modal in modals {
+                let tag = format!("{modal:?}@{vp_name}");
+                check_case(
+                    &tag,
+                    vp,
+                    ppp,
+                    &move |app| {
+                        open(app, modal);
+                    },
+                    &|frame, app| {
+                        if modal == ActiveModal::NewNotebook && frame == 10 {
+                            app.view.new_notebook_step = 1;
+                        } else if modal == ActiveModal::NotebookSettings && frame == 10 {
+                            app.view.notebook_settings_step = 2;
+                        } else if modal == ActiveModal::AccountSync && frame == 10 {
+                            app.view.account.tab = crate::account_modal::AuthTab::CreateAccount;
+                        } else if frame == 36 {
+                            close(app);
+                        }
+                    },
+                );
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Found Unaligned warnings:\n{}",
+            failures.join("\n")
+        );
     }
 }

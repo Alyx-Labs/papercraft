@@ -444,7 +444,11 @@ fn draw_home_profile_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Toke
     let dot_color = if summary.viewing_cloud {
         crate::account_modal::header_status_dot_color(summary.connection, t)
     } else if !t.is_dark {
-        t.header_active_fg
+        if app.view.inspector_open {
+            t.header_active_fg
+        } else {
+            t.header_fg
+        }
     } else {
         t.accent
     };
@@ -454,7 +458,7 @@ fn draw_home_profile_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Toke
             .as_deref()
             .map_or_else(String::new, |u| format!(" · @{u}"));
         format!(
-            "Profile & Sync: {}{handle}\nStatus: {} ({cloud_pending} pending)\nClick to open Profile, switch accounts, or manage sync.",
+            "Profile & Settings: {}{handle}\nStatus: {} ({cloud_pending} pending)\nClick to open Profile, sync, studio appearance, and system settings.",
             summary.workspace_badge_text(),
             state_label,
         )
@@ -464,7 +468,7 @@ fn draw_home_profile_button(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Toke
             .as_deref()
             .unwrap_or("Local");
         format!(
-            "Profile & Sync: Local ({prof})\nClick to open Profile, switch accounts, sign in, or manage sync."
+            "Profile & Settings: Local ({prof})\nClick to open Profile, sync, studio appearance, and system settings."
         )
     };
     let resp = sidebar_edge_button_sized(
@@ -640,11 +644,7 @@ fn draw_search_input(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
         t.header_fg_muted.gamma_multiply(0.7),
         hover_t,
     );
-    let focus_stroke = if t.is_dark {
-        t.accent
-    } else {
-        t.header_active_fg
-    };
+    let focus_stroke = if t.is_dark { t.accent } else { t.header_fg };
     let stroke = Stroke::new(
         crate::motion::lerp_f32(1.0, 1.5, focus_t),
         crate::motion::lerp_color(rest_stroke, focus_stroke, focus_t),
@@ -3878,7 +3878,7 @@ mod tests {
         out_rects
     }
 
-    fn assert_home_profile_drawer_without_settings_switch(
+    fn assert_home_profile_drawer_tabs_and_toggle(
         ctx: &egui::Context,
         app: &mut PaperCraftApp,
         viewport: Vec2,
@@ -3888,27 +3888,67 @@ mod tests {
         assert!(
             inspector_texts
                 .iter()
-                .any(|(label, _)| label == "Profile & Sync"),
-            "expected Profile & Sync drawer when clicking Home Profile tab, got {inspector_texts:?}"
+                .any(|(label, _)| label == "Profile & Settings"),
+            "expected Profile & Settings drawer when clicking Home Profile tab, got {inspector_texts:?}"
         );
+        for expected_tab in ["Profile", "Sync", "Appearance", "System"] {
+            assert!(
+                inspector_texts
+                    .iter()
+                    .any(|(label, _)| label == expected_tab),
+                "expected {expected_tab:?} tab in Home drawer, got {inspector_texts:?}"
+            );
+        }
         assert!(
             !inspector_texts.iter().any(|(label, _)| label == "Settings"),
-            "Home Profile drawer must not show Profile | Settings switch, got {inspector_texts:?}"
+            "Home drawer must not show separate Settings switch, got {inspector_texts:?}"
         );
         assert!(
-            !inspector_texts
-                .iter()
-                .any(|(label, _)| label == "App Scale"),
-            "Home drawer must not show Settings content, got {inspector_texts:?}"
+            !inspector_texts.iter().any(|(label, _)| label == "Pen"),
+            "Home drawer must not show Editor-only Pen tab, got {inspector_texts:?}"
         );
         assert!(
             inspector_texts
                 .iter()
                 .any(|(label, _)| label == "Add Account"),
-            "expected Add Account button in Profile & Sync header, got {inspector_texts:?}"
+            "expected Add Account button in Profile & Settings header, got {inspector_texts:?}"
         );
 
-        click_home_at(ctx, app, viewport, profile_tab_rect.center(), 0.45);
+        let appearance_tab_pos = inspector_texts
+            .iter()
+            .find(|(label, _)| label == "Appearance")
+            .map(|(_, r)| r.center())
+            .expect("Appearance tab in Home drawer");
+        click_home_at(ctx, app, viewport, appearance_tab_pos, 0.25);
+        assert_eq!(
+            app.view.account.profile_section,
+            crate::account_modal::ProfileSection::Appearance
+        );
+        let appearance_texts = settle_home_text_rects(ctx, app, viewport, 0.30, 10);
+        assert!(
+            appearance_texts
+                .iter()
+                .any(|(label, _)| label == "App Scale"),
+            "expected App Scale card on Home Appearance tab, got {appearance_texts:?}"
+        );
+
+        let system_tab_pos = appearance_texts
+            .iter()
+            .find(|(label, _)| label == "System")
+            .map(|(_, r)| r.center())
+            .expect("System tab in Home drawer");
+        click_home_at(ctx, app, viewport, system_tab_pos, 0.50);
+        assert_eq!(
+            app.view.account.profile_section,
+            crate::account_modal::ProfileSection::System
+        );
+        let system_texts = settle_home_text_rects(ctx, app, viewport, 0.55, 10);
+        assert!(
+            system_texts.iter().any(|(label, _)| label == "System Info"),
+            "expected System Info card on Home System tab, got {system_texts:?}"
+        );
+
+        click_home_at(ctx, app, viewport, profile_tab_rect.center(), 0.75);
         assert!(!app.view.inspector_open);
     }
 
@@ -4048,12 +4088,7 @@ mod tests {
         );
         assert_eq!(app.view.active_modal, None);
 
-        assert_home_profile_drawer_without_settings_switch(
-            &ctx,
-            &mut app,
-            viewport,
-            profile_tab_rect,
-        );
+        assert_home_profile_drawer_tabs_and_toggle(&ctx, &mut app, viewport, profile_tab_rect);
     }
 
     #[test]

@@ -675,11 +675,7 @@ pub fn merge_global_states_for_commit(
         &idb.remembered_server_accounts,
     );
     merge_cached_server_sessions(&mut out.cached_server_sessions, &idb.cached_server_sessions);
-    out.welcome_banner_seen |= idb.welcome_banner_seen;
-    if out.welcome_banner_seen_version.is_none() {
-        out.welcome_banner_seen_version = idb.welcome_banner_seen_version.clone();
-    }
-    out.first_notebook_data_notice_seen |= idb.first_notebook_data_notice_seen;
+    out.merge_release_notices_from(idb);
     sanitize_global_state(&mut out);
     out
 }
@@ -1920,13 +1916,7 @@ impl Session {
             &mut self.sync.global.cached_server_sessions,
             &incoming.cached_server_sessions,
         );
-        self.sync.global.welcome_banner_seen |= incoming.welcome_banner_seen;
-        if self.sync.global.welcome_banner_seen_version.is_none() {
-            self.sync.global.welcome_banner_seen_version =
-                incoming.welcome_banner_seen_version.clone();
-        }
-        self.sync.global.first_notebook_data_notice_seen |=
-            incoming.first_notebook_data_notice_seen;
+        self.sync.global.merge_release_notices_from(incoming);
         sanitize_global_state(&mut self.sync.global);
 
         if let Some(ref mut active_sess) = self.sync.active_server_session {
@@ -3701,6 +3691,12 @@ mod tests {
             created_at_ms: 10,
             last_used_at_ms: 10,
         });
+        local_g.welcome_banner_seen = true;
+        local_g.welcome_banner_seen_version = Some("0.7.3".to_string());
+        local_g.first_notebook_data_notice_seen = true;
+        local_g.first_notebook_data_notice_seen_version = Some("0.7.4".to_string());
+        local_g.infinite_theme_notice_seen = true;
+        local_g.infinite_theme_notice_seen_version = Some("0.7.3".to_string());
         let mut idb_g = GlobalSyncState::with_defaults("Web".to_string());
         idb_g.upsert_cached_server_session(sample_cloud_auth("tok-new", "ref-new", 2_000));
         idb_g.local_profiles.push(LocalProfile {
@@ -3709,6 +3705,12 @@ mod tests {
             created_at_ms: 20,
             last_used_at_ms: 20,
         });
+        idb_g.welcome_banner_seen = true;
+        idb_g.welcome_banner_seen_version = Some("0.7.4".to_string());
+        idb_g.first_notebook_data_notice_seen = true;
+        idb_g.first_notebook_data_notice_seen_version = Some("0.7.3".to_string());
+        idb_g.infinite_theme_notice_seen = true;
+        idb_g.infinite_theme_notice_seen_version = Some("0.7.4".to_string());
         let merged_g = merge_global_states_for_commit(&local_g, &idb_g);
         let merged_sess = merged_g
             .cached_server_session("http://127.0.0.1:8787", "u-sync")
@@ -3716,6 +3718,18 @@ mod tests {
         assert_eq!(merged_sess.access_token, "tok-new");
         assert_eq!(merged_sess.refresh_token, "ref-new");
         assert_eq!(merged_g.local_profiles.len(), 2);
+        assert_eq!(
+            merged_g.welcome_banner_seen_version.as_deref(),
+            Some("0.7.4")
+        );
+        assert_eq!(
+            merged_g.first_notebook_data_notice_seen_version.as_deref(),
+            Some("0.7.4")
+        );
+        assert_eq!(
+            merged_g.infinite_theme_notice_seen_version.as_deref(),
+            Some("0.7.4")
+        );
     }
 
     #[test]

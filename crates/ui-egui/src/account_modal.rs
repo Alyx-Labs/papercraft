@@ -47,6 +47,20 @@ pub enum ProfileSection {
     Accounts,
     Profile,
     Sync,
+    Appearance,
+    System,
+}
+
+impl ProfileSection {
+    pub(crate) const fn flow_order(self) -> isize {
+        match self {
+            Self::Accounts => 0,
+            Self::Profile => 1,
+            Self::Sync => 2,
+            Self::Appearance => 3,
+            Self::System => 4,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6843,13 +6857,14 @@ pub(crate) fn header_status_dot_color(state: SyncConnectionState, t: &Tokens) ->
     if t.is_dark {
         status_badge_style(state, t).1
     } else {
-        match state {
-            SyncConnectionState::SignedOut => t.header_fg_muted,
+        let base = match state {
+            SyncConnectionState::SignedOut => return t.header_fg_muted,
             SyncConnectionState::Offline => Color32::from_rgb(0xFB, 0xBF, 0x24),
             SyncConnectionState::Syncing => Color32::from_rgb(0x82, 0xCA, 0xF2),
             SyncConnectionState::Synced => Color32::from_rgb(0x4A, 0xDE, 0x80),
             SyncConnectionState::Error => Color32::from_rgb(0xF8, 0x71, 0x71),
-        }
+        };
+        crate::theme::ensure_contrast_against(base, &[t.header_bg], 3.0, None)
     }
 }
 

@@ -16,8 +16,8 @@ use papercraft_sync::{
     SyncStatusSummary, account_library_dir, compute_document_page_elements, default_device_name,
     load_global_state, load_manifest, merge_documents_three_way, outcome_from_full_pull,
     profile_library_dir, sanitize_account_dir_segment, sanitize_client_id,
-    sanitize_profile_nickname, sanitize_remembered_accounts, save_global_state, save_manifest,
-    strip_conflict_copy_suffix,
+    sanitize_profile_nickname, sanitize_release_version, sanitize_remembered_accounts,
+    save_global_state, save_manifest, strip_conflict_copy_suffix,
 };
 use papercraft_sync_protocol::{
     DEFAULT_SERVER_URL, LocalDiscoveryReport, LocalFolderChange, LocalPrefsPush,
@@ -88,6 +88,13 @@ pub(crate) struct WebWorkspaceCache {
     pub(crate) local_profiles: HashMap<String, CachedLibraryBundle>,
     #[serde(default)]
     pub(crate) cloud_accounts: HashMap<String, CachedLibraryBundle>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseNoticeKind {
+    WelcomeBanner,
+    FirstNotebookDataNotice,
+    InfiniteThemeNotice,
 }
 
 #[derive(Clone, Debug)]
@@ -646,16 +653,78 @@ impl Session {
         !self.is_viewing_cloud() && self.sync.global.needs_initial_nickname
     }
 
-    /// Returns `true` when the release welcome banner has not yet been dismissed
-    /// for `current_version` on a persisted Desktop or Web workspace.
-    pub fn should_show_welcome_banner_for_version(&self, current_version: &str) -> bool {
+    fn release_notice_seen_version(&self, kind: ReleaseNoticeKind) -> Option<&str> {
+        match kind {
+            ReleaseNoticeKind::WelcomeBanner => {
+                self.sync.global.welcome_banner_seen_version.as_deref()
+            }
+            ReleaseNoticeKind::FirstNotebookDataNotice => self
+                .sync
+                .global
+                .first_notebook_data_notice_seen_version
+                .as_deref(),
+            ReleaseNoticeKind::InfiniteThemeNotice => self
+                .sync
+                .global
+                .infinite_theme_notice_seen_version
+                .as_deref(),
+        }
+    }
+
+    fn should_show_release_notice_for_version(
+        &self,
+        kind: ReleaseNoticeKind,
+        current_version: &str,
+    ) -> bool {
         if !self.is_sync_persistence_enabled() {
             return false;
         }
-        let Some(target) = sanitize_welcome_version(current_version) else {
+        let Some(target) = sanitize_release_version(current_version) else {
             return false;
         };
-        self.sync.global.welcome_banner_seen_version.as_deref() != Some(target.as_str())
+        self.release_notice_seen_version(kind) != Some(target.as_str())
+    }
+
+    fn dismiss_release_notice_for_version(
+        &mut self,
+        kind: ReleaseNoticeKind,
+        current_version: &str,
+    ) {
+        let Some(target) = sanitize_release_version(current_version) else {
+            return;
+        };
+        let (seen, seen_version) = match kind {
+            ReleaseNoticeKind::WelcomeBanner => (
+                &mut self.sync.global.welcome_banner_seen,
+                &mut self.sync.global.welcome_banner_seen_version,
+            ),
+            ReleaseNoticeKind::FirstNotebookDataNotice => (
+                &mut self.sync.global.first_notebook_data_notice_seen,
+                &mut self.sync.global.first_notebook_data_notice_seen_version,
+            ),
+            ReleaseNoticeKind::InfiniteThemeNotice => (
+                &mut self.sync.global.infinite_theme_notice_seen,
+                &mut self.sync.global.infinite_theme_notice_seen_version,
+            ),
+        };
+        if *seen && seen_version.as_deref() == Some(target.as_str()) {
+            return;
+        }
+        *seen = true;
+        *seen_version = Some(target);
+        self.sync_persist_global_state();
+        self.save_current_web_bundle();
+        self.capture_active_web_delta_into_pending(true);
+        self.bump_revision();
+    }
+
+    /// Returns `true` when the release welcome banner has not yet been dismissed
+    /// for `current_version` on a persisted Desktop or Web workspace.
+    pub fn should_show_welcome_banner_for_version(&self, current_version: &str) -> bool {
+        self.should_show_release_notice_for_version(
+            ReleaseNoticeKind::WelcomeBanner,
+            current_version,
+        )
     }
 
     /// Returns `true` when the release welcome banner has not yet been dismissed
@@ -666,25 +735,12 @@ impl Session {
 
     /// Returns the last release version for which the welcome banner was dismissed.
     pub fn welcome_banner_seen_version(&self) -> Option<&str> {
-        self.sync.global.welcome_banner_seen_version.as_deref()
+        self.release_notice_seen_version(ReleaseNoticeKind::WelcomeBanner)
     }
 
     /// Marks the release welcome banner as seen for `current_version` and persists global state.
     pub fn dismiss_welcome_banner_for_version(&mut self, current_version: &str) {
-        let Some(target) = sanitize_welcome_version(current_version) else {
-            return;
-        };
-        if self.sync.global.welcome_banner_seen
-            && self.sync.global.welcome_banner_seen_version.as_deref() == Some(target.as_str())
-        {
-            return;
-        }
-        self.sync.global.welcome_banner_seen = true;
-        self.sync.global.welcome_banner_seen_version = Some(target);
-        self.sync_persist_global_state();
-        self.save_current_web_bundle();
-        self.capture_active_web_delta_into_pending(true);
-        self.bump_revision();
+        self.dismiss_release_notice_for_version(ReleaseNoticeKind::WelcomeBanner, current_version);
     }
 
     /// Marks the release welcome banner as seen for the running build's version.
@@ -693,24 +749,72 @@ impl Session {
     }
 
     /// Returns `true` when the first-notebook data & privacy notice has not yet been dismissed
-    /// on a persisted Desktop or Web workspace.
-    pub fn should_show_first_notebook_data_notice(&self) -> bool {
-        if !self.is_sync_persistence_enabled() {
-            return false;
-        }
-        !self.sync.global.first_notebook_data_notice_seen
+    /// for `current_version` on a persisted Desktop or Web workspace.
+    pub fn should_show_first_notebook_data_notice_for_version(
+        &self,
+        current_version: &str,
+    ) -> bool {
+        self.should_show_release_notice_for_version(
+            ReleaseNoticeKind::FirstNotebookDataNotice,
+            current_version,
+        )
     }
 
-    /// Marks the first-notebook data & privacy notice as seen and persists global state.
+    /// Returns `true` when the first-notebook data & privacy notice has not yet been dismissed
+    /// for the running build's version on a persisted Desktop or Web workspace.
+    pub fn should_show_first_notebook_data_notice(&self) -> bool {
+        self.should_show_first_notebook_data_notice_for_version(env!("CARGO_PKG_VERSION"))
+    }
+
+    /// Returns the last release version for which the first-notebook data & privacy notice was dismissed.
+    pub fn first_notebook_data_notice_seen_version(&self) -> Option<&str> {
+        self.release_notice_seen_version(ReleaseNoticeKind::FirstNotebookDataNotice)
+    }
+
+    /// Marks the first-notebook data & privacy notice as seen for `current_version` and persists global state.
+    pub fn dismiss_first_notebook_data_notice_for_version(&mut self, current_version: &str) {
+        self.dismiss_release_notice_for_version(
+            ReleaseNoticeKind::FirstNotebookDataNotice,
+            current_version,
+        );
+    }
+
+    /// Marks the first-notebook data & privacy notice as seen for the running build's version.
     pub fn dismiss_first_notebook_data_notice(&mut self) {
-        if self.sync.global.first_notebook_data_notice_seen {
-            return;
-        }
-        self.sync.global.first_notebook_data_notice_seen = true;
-        self.sync_persist_global_state();
-        self.save_current_web_bundle();
-        self.capture_active_web_delta_into_pending(true);
-        self.bump_revision();
+        self.dismiss_first_notebook_data_notice_for_version(env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Returns `true` when the Infinite theme notice has not yet been dismissed
+    /// for `current_version` on a persisted Desktop or Web workspace.
+    pub fn should_show_infinite_theme_notice_for_version(&self, current_version: &str) -> bool {
+        self.should_show_release_notice_for_version(
+            ReleaseNoticeKind::InfiniteThemeNotice,
+            current_version,
+        )
+    }
+
+    /// Returns `true` when the Infinite theme notice has not yet been dismissed
+    /// for the running build's version on a persisted Desktop or Web workspace.
+    pub fn should_show_infinite_theme_notice(&self) -> bool {
+        self.should_show_infinite_theme_notice_for_version(env!("CARGO_PKG_VERSION"))
+    }
+
+    /// Returns the last release version for which the Infinite theme notice was dismissed.
+    pub fn infinite_theme_notice_seen_version(&self) -> Option<&str> {
+        self.release_notice_seen_version(ReleaseNoticeKind::InfiniteThemeNotice)
+    }
+
+    /// Marks the Infinite theme notice as seen for `current_version` and persists global state.
+    pub fn dismiss_infinite_theme_notice_for_version(&mut self, current_version: &str) {
+        self.dismiss_release_notice_for_version(
+            ReleaseNoticeKind::InfiniteThemeNotice,
+            current_version,
+        );
+    }
+
+    /// Marks the Infinite theme notice as seen for the running build's version.
+    pub fn dismiss_infinite_theme_notice(&mut self) {
+        self.dismiss_infinite_theme_notice_for_version(env!("CARGO_PKG_VERSION"));
     }
 
     pub fn set_network_offline_state(&mut self, offline: bool) {
@@ -3524,16 +3628,6 @@ pub(crate) fn migrate_web_cache_if_needed(cache: &mut WebWorkspaceCache) {
     cache.version = WEB_CACHE_VERSION;
 }
 
-fn sanitize_welcome_version(raw: &str) -> Option<String> {
-    let cleaned: String = raw
-        .trim()
-        .chars()
-        .filter(|c| !c.is_control() && !c.is_whitespace())
-        .take(32)
-        .collect();
-    (!cleaned.is_empty()).then_some(cleaned)
-}
-
 pub(crate) fn sanitize_global_state(global: &mut GlobalSyncState) {
     global.server_url =
         normalize_server_url(&global.server_url).unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string());
@@ -3542,10 +3636,7 @@ pub(crate) fn sanitize_global_state(global: &mut GlobalSyncState) {
     if global.client_id.is_empty() {
         global.client_id = Uuid::new_v4().to_string();
     }
-    global.welcome_banner_seen_version = global
-        .welcome_banner_seen_version
-        .as_deref()
-        .and_then(sanitize_welcome_version);
+    global.sanitize_release_notices();
     let _ = global.migrate_legacy_session();
     global.remembered_server_accounts =
         sanitize_remembered_accounts(std::mem::take(&mut global.remembered_server_accounts));
@@ -4504,7 +4595,7 @@ mod tests {
     }
 
     #[test]
-    fn first_notebook_data_notice_shows_once_on_persisted_desktop_and_web_sessions() {
+    fn first_notebook_data_notice_shows_once_per_release_on_persisted_desktop_and_web_sessions() {
         let ephemeral = Session::default();
         assert!(!ephemeral.should_show_first_notebook_data_notice());
 
@@ -4515,18 +4606,78 @@ mod tests {
             .execute("profile.dismissFirstNotebookDataNotice", &json!({}))
             .unwrap();
         assert!(!desktop.should_show_first_notebook_data_notice());
+        assert_eq!(
+            desktop.first_notebook_data_notice_seen_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
 
         let reopened_desktop = Session::open_desktop_library(dir.0.clone());
         assert!(!reopened_desktop.should_show_first_notebook_data_notice());
+        assert!(reopened_desktop.should_show_first_notebook_data_notice_for_version("99.0.0"));
+
+        let mut legacy = papercraft_sync::load_global_state(&dir.0);
+        legacy.first_notebook_data_notice_seen = true;
+        legacy.first_notebook_data_notice_seen_version = None;
+        papercraft_sync::save_global_state(&dir.0, &legacy).unwrap();
+        let updated_from_legacy = Session::open_desktop_library(dir.0.clone());
+        assert!(updated_from_legacy.should_show_first_notebook_data_notice());
 
         let mut web = Session::open_web_cache(None);
         assert!(web.should_show_first_notebook_data_notice());
         web.execute("profile.dismissFirstNotebookDataNotice", &json!({}))
             .unwrap();
         assert!(!web.should_show_first_notebook_data_notice());
+        assert_eq!(
+            web.first_notebook_data_notice_seen_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
         let saved_web = web.export_web_cache_json().unwrap();
         let reopened_web = Session::open_web_cache(Some(&saved_web));
         assert!(!reopened_web.should_show_first_notebook_data_notice());
+        assert!(reopened_web.should_show_first_notebook_data_notice_for_version("99.0.0"));
+    }
+
+    #[test]
+    fn infinite_theme_notice_shows_once_per_release_on_persisted_desktop_and_web_sessions() {
+        let ephemeral = Session::default();
+        assert!(!ephemeral.should_show_infinite_theme_notice());
+
+        let dir = temp_dir("infinite_theme_notice");
+        let mut desktop = Session::open_desktop_library(dir.0.clone());
+        assert!(desktop.should_show_infinite_theme_notice());
+        desktop
+            .execute("profile.dismissInfiniteThemeNotice", &json!({}))
+            .unwrap();
+        assert!(!desktop.should_show_infinite_theme_notice());
+        assert_eq!(
+            desktop.infinite_theme_notice_seen_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+
+        let reopened_desktop = Session::open_desktop_library(dir.0.clone());
+        assert!(!reopened_desktop.should_show_infinite_theme_notice());
+        assert!(reopened_desktop.should_show_infinite_theme_notice_for_version("99.0.0"));
+
+        let mut legacy = papercraft_sync::load_global_state(&dir.0);
+        legacy.infinite_theme_notice_seen = true;
+        legacy.infinite_theme_notice_seen_version = None;
+        papercraft_sync::save_global_state(&dir.0, &legacy).unwrap();
+        let updated_from_legacy = Session::open_desktop_library(dir.0.clone());
+        assert!(updated_from_legacy.should_show_infinite_theme_notice());
+
+        let mut web = Session::open_web_cache(None);
+        assert!(web.should_show_infinite_theme_notice());
+        web.execute("profile.dismissInfiniteThemeNotice", &json!({}))
+            .unwrap();
+        assert!(!web.should_show_infinite_theme_notice());
+        assert_eq!(
+            web.infinite_theme_notice_seen_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        let saved_web = web.export_web_cache_json().unwrap();
+        let reopened_web = Session::open_web_cache(Some(&saved_web));
+        assert!(!reopened_web.should_show_infinite_theme_notice());
+        assert!(reopened_web.should_show_infinite_theme_notice_for_version("99.0.0"));
     }
 
     #[test]

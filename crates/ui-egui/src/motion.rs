@@ -5,6 +5,7 @@
 //! reveal, camera glide, and interactive hover highlight uses these shared constants
 //! and helpers so transitions bring visual comfort without abrupt cuts or aggressive motion.
 
+use egui::emath::GuiRounding as _;
 use egui::{Color32, Context, Id, Rangef, Style, Ui, style::ScrollAnimation};
 use papercraft_doc::{LibrarySortBy, LibraryViewMode};
 
@@ -485,10 +486,10 @@ pub fn animated_collapse_with_duration(
         return;
     }
 
-    let avail_w = ui.available_width().max(1.0);
+    let avail_w = ui.available_width().max(1.0).floor_ui();
     let eased_h = smoothstep(reveal);
     let known_h = cached_h.unwrap_or_else(|| fallback_h.max(1.0));
-    let target_h = (known_h * eased_h).max(0.0);
+    let target_h = (known_h * eased_h).max(0.0).round_ui();
     if target_h <= 0.5 {
         return;
     }
@@ -498,8 +499,12 @@ pub fn animated_collapse_with_duration(
     let clip_rect = ui.clip_rect().intersect(slot_rect);
     let child_max = egui::Rect::from_min_size(
         slot_rect.min,
-        egui::vec2(avail_w, (known_h.max(fallback_h) + 64.0).max(200.0)),
-    );
+        egui::vec2(
+            avail_w,
+            (known_h.max(fallback_h) + 64.0).max(200.0).round_ui(),
+        ),
+    )
+    .round_ui();
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(child_max)
@@ -534,13 +539,14 @@ pub fn show_flow_content<R>(
     }
 
     let clip = ui.clip_rect();
-    let avail_w = ui.available_width().max(1.0);
-    let avail_h = ui.available_height().max(400.0);
+    let avail_w = ui.available_width().max(1.0).floor_ui();
+    let avail_h = ui.available_height().max(400.0).round_ui();
     let origin = ui.cursor().min;
     let shifted_max = egui::Rect::from_min_size(
-        origin + egui::vec2(offset_x, 0.0),
+        origin + egui::vec2(offset_x.round_ui(), 0.0),
         egui::vec2(avail_w, avail_h),
-    );
+    )
+    .round_ui();
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(shifted_max)
@@ -550,7 +556,7 @@ pub fn show_flow_content<R>(
     child.set_width(avail_w);
     child.multiply_opacity(opacity);
     let out = add_contents(&mut child);
-    let measured_h = child.min_rect().height().max(0.0);
+    let measured_h = child.min_rect().height().max(0.0).round_ui();
     let _ = ui.allocate_exact_size(egui::vec2(avail_w, measured_h), egui::Sense::hover());
     out
 }

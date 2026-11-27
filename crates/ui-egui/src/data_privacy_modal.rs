@@ -1,4 +1,4 @@
-//! First-notebook light Data & Privacy modal explaining PaperCraft's local-first storage.
+//! Per-release light Data & Privacy modal shown on first notebook creation in each release.
 
 use egui::Color32;
 
@@ -63,21 +63,23 @@ const DATA_PRIVACY_SPEC: IllustratedModalSpec = IllustratedModalSpec {
     },
 };
 
-/// Marks the first-notebook data notice as seen and opens the New Notebook wizard.
-pub(crate) fn dismiss_and_continue(app: &mut PaperCraftApp) {
+fn dismiss_notice(app: &mut PaperCraftApp) {
     let _ = app.session.execute(
         "profile.dismissFirstNotebookDataNotice",
         &serde_json::json!({}),
     );
+    app.flush_web_storage(true);
+}
+
+/// Marks the first-notebook data notice as seen for this release and opens the New Notebook wizard.
+pub(crate) fn dismiss_and_continue(app: &mut PaperCraftApp) {
+    dismiss_notice(app);
     crate::modal::open(app, ActiveModal::NewNotebook);
 }
 
-/// Marks the first-notebook data notice as seen and returns to the workspace.
+/// Marks the first-notebook data notice as seen for this release and returns to the workspace.
 pub(crate) fn dismiss_only(app: &mut PaperCraftApp) {
-    let _ = app.session.execute(
-        "profile.dismissFirstNotebookDataNotice",
-        &serde_json::json!({}),
-    );
+    dismiss_notice(app);
     crate::modal::close(app);
 }
 
@@ -409,5 +411,85 @@ mod tests {
         click_pos(&ctx, &mut app, viewport, &mut time, close_center);
         assert!(!app.session.should_show_first_notebook_data_notice());
         assert_eq!(app.view.active_modal, None);
+    }
+
+    #[test]
+    fn onboarding_modals_appear_on_first_use_and_reappear_on_each_new_release() {
+        let dir = std::env::temp_dir().join(format!(
+            "papercraft_release_modals_ui_{}_{}",
+            std::process::id(),
+            papercraft_sync_protocol::now_unix_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        struct Guard(std::path::PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(dir.clone());
+
+        // 1. Brand-new installation shows WelcomeBanner on startup and FirstNotebookDataNotice on NewNotebook.
+        let first_session = Session::open_desktop_library(dir.clone());
+        let mut first_app = PaperCraftApp::new(first_session, crate::PlatformHooks::default());
+        assert_eq!(
+            first_app.view.active_modal,
+            Some(ActiveModal::WelcomeBanner)
+        );
+        crate::welcome_modal::dismiss(&mut first_app);
+        first_app
+            .session
+            .execute(
+                "profile.completeFirstAccess",
+                &serde_json::json!({ "nickname": "Alyx" }),
+            )
+            .unwrap();
+        first_app
+            .session
+            .execute(
+                "profile.setStartupPicker",
+                &serde_json::json!({ "skip": true }),
+            )
+            .unwrap();
+        crate::modal::close(&mut first_app);
+
+        crate::modal::open(&mut first_app, ActiveModal::NewNotebook);
+        assert_eq!(
+            first_app.view.active_modal,
+            Some(ActiveModal::FirstNotebookDataNotice)
+        );
+        dismiss_and_continue(&mut first_app);
+        assert_eq!(first_app.view.active_modal, Some(ActiveModal::NewNotebook));
+
+        // 2. Reopening within the same release skips both modals.
+        let same_release = Session::open_desktop_library(dir.clone());
+        let mut same_app = PaperCraftApp::new(same_release, crate::PlatformHooks::default());
+        assert_eq!(same_app.view.active_modal, None);
+        crate::modal::open(&mut same_app, ActiveModal::NewNotebook);
+        assert_eq!(same_app.view.active_modal, Some(ActiveModal::NewNotebook));
+
+        // 3. Launching a newer release after dismissing on an older version shows both modals again.
+        let mut upgraded = papercraft_sync::load_global_state(&dir);
+        upgraded.welcome_banner_seen_version = Some("0.7.3".to_string());
+        upgraded.first_notebook_data_notice_seen_version = Some("0.7.3".to_string());
+        papercraft_sync::save_global_state(&dir, &upgraded).unwrap();
+
+        let upgraded_session = Session::open_desktop_library(dir);
+        let mut upgraded_app =
+            PaperCraftApp::new(upgraded_session, crate::PlatformHooks::default());
+        assert_eq!(
+            upgraded_app.view.active_modal,
+            Some(ActiveModal::WelcomeBanner)
+        );
+        crate::welcome_modal::dismiss(&mut upgraded_app);
+        assert_eq!(upgraded_app.view.active_modal, None);
+
+        crate::modal::open(&mut upgraded_app, ActiveModal::NewNotebook);
+        assert_eq!(
+            upgraded_app.view.active_modal,
+            Some(ActiveModal::FirstNotebookDataNotice)
+        );
+        dismiss_only(&mut upgraded_app);
+        assert_eq!(upgraded_app.view.active_modal, None);
     }
 }
