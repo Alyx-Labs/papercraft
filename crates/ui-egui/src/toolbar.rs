@@ -234,6 +234,8 @@ fn measure_center_zone(ui: &egui::Ui) -> f32 {
 fn measure_right_zone(ui: &egui::Ui) -> f32 {
     RIGHT_UTILITIES_WIDTH
         + EDGE_TAB_NEIGHBOR_GAP
+        + TOOLBAR_ROW_HEIGHT
+        + ZONE_ITEM_SPACING
         + sidebar_edge_button_sized_width(ui, "", None, SidebarEdgeSize::Toolbar)
 }
 
@@ -5113,6 +5115,7 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> egui::Re
                         ui.set_height(TOOLBAR_ROW_HEIGHT);
                         ui.spacing_mut().item_spacing = Vec2::new(ZONE_ITEM_SPACING, 0.0);
                         draw_settings_edge_button(app, ui, &t);
+                        crate::profile_drawer::draw_header_sync_button(app, ui, &t);
                         ui.add_space((EDGE_TAB_NEIGHBOR_GAP - ZONE_ITEM_SPACING).max(0.0));
                         ui.allocate_ui_with_layout(
                             Vec2::new(RIGHT_UTILITIES_WIDTH, TOOLBAR_ROW_HEIGHT),
@@ -5132,6 +5135,7 @@ pub(crate) fn show_inner(app: &mut PaperCraftApp, ui: &mut egui::Ui) -> egui::Re
                         ui.set_height(TOOLBAR_ROW_HEIGHT);
                         ui.spacing_mut().item_spacing = Vec2::new(ZONE_ITEM_SPACING, 0.0);
                         draw_settings_edge_button(app, ui, &t);
+                        crate::profile_drawer::draw_header_sync_button(app, ui, &t);
                     });
                 });
                 ui.add_space(6.0);
@@ -9612,5 +9616,149 @@ mod tests {
             "expected 0.70 text draft alpha, got {}",
             app.view.text_color_draft.a
         );
+    }
+
+    #[test]
+    fn editor_toolbar_sync_icon_button_sits_next_to_settings_and_handles_local_and_cloud() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let sync_dispatches = Arc::new(AtomicUsize::new(0));
+        let sync_dispatches_hook = Arc::clone(&sync_dispatches);
+        let hooks = crate::PlatformHooks {
+            web_sync_dispatch: Some(Box::new(move |cmd, _, _| {
+                if matches!(cmd, crate::sync_worker::SyncWorkerCommand::SyncNow { .. }) {
+                    sync_dispatches_hook.fetch_add(1, Ordering::Relaxed);
+                }
+            })),
+            ..crate::PlatformHooks::default()
+        };
+
+        let ctx = egui::Context::default();
+        let mut session = papercraft_engine::Session::open_web_cache(None);
+        session
+            .execute(
+                "profile.completeFirstAccess",
+                &serde_json::json!({ "nickname": "alyx" }),
+            )
+            .unwrap();
+        let mut app = PaperCraftApp::new(session, hooks);
+        app.view.active_modal = None;
+        crate::open_notebook_in_editor(&mut app, 0);
+
+        let viewport = Vec2::new(1280.0, 800.0);
+        let mut settings_w = 0.0_f32;
+        let mut bar_rect = egui::Rect::NOTHING;
+        let mut bar_text = String::new();
+        for step in 0..4 {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                    time: Some(f64::from(step) * 0.05),
+                    predicted_dt: 0.05,
+                    ..Default::default()
+                },
+                |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    settings_w =
+                        sidebar_edge_button_sized_width(ui, "", None, SidebarEdgeSize::Toolbar);
+                    bar_rect = show_inner(&mut app, ui);
+                },
+            );
+            bar_text = collect_text_shapes(&out.shapes);
+            out.drop_without_applying_deltas();
+        }
+        assert!(
+            !bar_text.contains("Sync") && !bar_text.contains("Synced"),
+            "editor toolbar sync button must be icon-only without label text: {bar_text}"
+        );
+
+        let sync_pos = egui::pos2(
+            bar_rect.right() - settings_w - ZONE_ITEM_SPACING - TOOLBAR_ROW_HEIGHT * 0.5,
+            bar_rect.center().y,
+        );
+        for (idx, pressed) in [true, false].into_iter().enumerate() {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                    time: Some(0.30 + f64::from(idx as u32) * 0.04),
+                    predicted_dt: 0.04,
+                    events: vec![
+                        egui::Event::PointerMoved(sync_pos),
+                        egui::Event::PointerButton {
+                            pos: sync_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    let _ = show_inner(&mut app, ui);
+                },
+            );
+            out.drop_without_applying_deltas();
+        }
+        assert_eq!(
+            app.view.active_modal,
+            Some(crate::modal::ActiveModal::ConvertLocalAccount),
+            "clicking unlinked editor toolbar Sync button must open ConvertLocalAccount modal"
+        );
+        crate::modal::close(&mut app);
+
+        let acct = papercraft_sync::ActiveAccountSession {
+            server_url: papercraft_sync_protocol::DEFAULT_SERVER_URL.to_string(),
+            user: papercraft_sync_protocol::UserProfile {
+                user_id: "u-tb-sync".to_string(),
+                email: Some("alex@example.com".to_string()),
+                username: "alex".to_string(),
+                display_name: "Alex".to_string(),
+                created_at_ms: 1000,
+                must_change_password: false,
+            },
+            access_token: "a".to_string(),
+            refresh_token: "r".to_string(),
+            access_expires_at_ms: 99_999,
+            refresh_expires_at_ms: 99_999,
+            device_name: "PC".to_string(),
+            last_auth_ms: 1000,
+        };
+        let pull = papercraft_sync_protocol::SyncPullResponse {
+            server_cursor: 0,
+            user: acct.user.clone(),
+            notebooks: Vec::new(),
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        app.session.enter_online_server_session(acct, pull);
+        for (idx, pressed) in [true, false].into_iter().enumerate() {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                    time: Some(0.50 + f64::from(idx as u32) * 0.04),
+                    predicted_dt: 0.04,
+                    events: vec![
+                        egui::Event::PointerMoved(sync_pos),
+                        egui::Event::PointerButton {
+                            pos: sync_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    let _ = show_inner(&mut app, ui);
+                },
+            );
+            out.drop_without_applying_deltas();
+        }
+        assert_eq!(sync_dispatches.load(Ordering::Relaxed), 1);
     }
 }

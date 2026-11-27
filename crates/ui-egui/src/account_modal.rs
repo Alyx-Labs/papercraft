@@ -588,6 +588,9 @@ impl AccountDraftState {
         self.edit_display_name = display_name.to_string();
         self.error_message = None;
         self.status_message = Some(format!("Profile updated (@{username})."));
+        if self.profile_section == ProfileSection::Profile {
+            self.profile_section = ProfileSection::Accounts;
+        }
     }
 
     /// Applies a profile update error message.
@@ -605,6 +608,9 @@ impl AccountDraftState {
         self.confirm_new_password_draft.clear();
         self.error_message = None;
         self.status_message = Some("Account password updated.".to_string());
+        if self.profile_section == ProfileSection::Profile {
+            self.profile_section = ProfileSection::Accounts;
+        }
     }
 
     /// Applies a password change error message.
@@ -623,6 +629,9 @@ impl AccountDraftState {
         self.error_message = None;
         let label = new_email.unwrap_or("updated email");
         self.status_message = Some(format!("Account email updated to {label}."));
+        if self.profile_section == ProfileSection::Profile {
+            self.profile_section = ProfileSection::Accounts;
+        }
     }
 
     /// Applies an email change error message.
@@ -3613,48 +3622,36 @@ pub(crate) fn render_local_profile_identity_card(
     let dirty = !clean_draft.is_empty() && clean_draft != active.nickname;
 
     ui.add_space(10.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+    ui.horizontal(|ui| {
         if secondary_action_button(ui, "Reset", dirty, t).clicked() {
             app.view.account.local_profile_rename_draft = active.nickname.clone();
             app.view.account.error_message = None;
         }
-        if fixed_secondary_button(ui, "Upload to Server", 120.0, true, t)
-            .on_hover_text(
-                "Convert this local account to a synced server account while keeping an Offline-First local copy",
-            )
-            .clicked()
-        {
-            app.view.account.convert_source_profile_id = active.local_profile_id.clone();
-            app.view.account.convert_source_nickname = active.nickname.clone();
-            app.view.account.convert_source_notebook_count = nb_count;
-            app.view.account.convert_email.clear();
-            app.view.account.convert_password.clear();
-            app.view.account.convert_show_password = false;
-            crate::modal::open(app, crate::modal::ActiveModal::ConvertLocalAccount);
-        }
-        if primary_action_button(ui, "Save Nickname", dirty, t).clicked()
-            || (submit_rename && dirty)
-        {
-            match app.session.execute(
-                "profile.rename",
-                &json!({
-                    "profile_id": active.local_profile_id,
-                    "nickname": clean_draft,
-                }),
-            ) {
-                Ok(_) => {
-                    app.view.account.error_message = None;
-                    app.view.account.status_message =
-                        Some(format!("Local account renamed to '{clean_draft}'."));
-                    app.flush_web_storage(true);
-                }
-                Err(err) => {
-                    app.view.account.status_message = None;
-                    app.view.account.error_message = Some(err.to_string());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if primary_action_button(ui, "Save Nickname", dirty, t).clicked()
+                || (submit_rename && dirty)
+            {
+                match app.session.execute(
+                    "profile.rename",
+                    &json!({
+                        "profile_id": active.local_profile_id,
+                        "nickname": clean_draft,
+                    }),
+                ) {
+                    Ok(_) => {
+                        app.view.account.error_message = None;
+                        app.view.account.status_message =
+                            Some(format!("Local account renamed to '{clean_draft}'."));
+                        app.view.account.profile_section = ProfileSection::Accounts;
+                        app.flush_web_storage(true);
+                    }
+                    Err(err) => {
+                        app.view.account.status_message = None;
+                        app.view.account.error_message = Some(err.to_string());
+                    }
                 }
             }
-        }
+        });
     });
 }
 
@@ -4158,26 +4155,6 @@ pub(crate) fn render_accounts_switcher_section(
         AccountColumnTone::ServerOffline
     };
     let server_count = shortcuts.len();
-
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
-        if primary_action_button(ui, "+ Add Account", true, t)
-            .on_hover_text("Sign in to a server account or create a new local account")
-            .clicked()
-        {
-            app.view.account.add_account_mode = AddAccountMode::Server;
-            crate::modal::open(app, crate::modal::ActiveModal::AddAccount);
-        }
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new("Sign in to a server or create another local account.")
-                    .size(11.0)
-                    .color(t.text_muted),
-            )
-            .wrap(),
-        );
-    });
-    ui.add_space(10.0);
 
     draw_local_vs_server_split(
         ui,
@@ -7067,7 +7044,7 @@ mod tests {
         );
         assert!(text.contains("Forget Account"));
         assert!(text.contains("Sync"));
-        assert!(text.contains("+ Add Account"));
+        assert!(text.contains("Add Account"));
 
         click_profile_button(&ctx, &mut app, &shapes, "Forget Account", 0.30);
         // First click opens inline confirmation rather than deleting immediately.
@@ -7172,20 +7149,18 @@ mod tests {
         );
         app.view.account.clear_quick_login_draft();
 
-        // Clicking Upload to Server on the highlighted Personal local card opens ConvertLocalAccount modal.
-        let (_, clean_shapes) = render_profile_frames(&ctx, &mut app, 5.10, 10);
-        let personal_y = find_profile_button_center(&clean_shapes, "Personal").y;
-        let accounts_tab_y = find_profile_button_center(&clean_shapes, "Accounts").y;
+        // Active Personal local card omits Upload to Server (moved to top-bar Sync button) and Add Account sits in header above it.
+        let (clean_text, clean_shapes) = render_profile_frames(&ctx, &mut app, 5.10, 10);
         assert!(
-            personal_y < accounts_tab_y,
-            "expected highlighted active Personal card above Accounts subtab: personal={personal_y}, accounts={accounts_tab_y}"
+            !clean_text.contains("Upload to Server"),
+            "active local card should no longer show Upload to Server:\n{clean_text}"
         );
-        click_profile_button(&ctx, &mut app, &clean_shapes, "Upload to Server", 5.95);
-        assert_eq!(
-            app.view.active_modal,
-            Some(modal::ActiveModal::ConvertLocalAccount)
+        let personal_y = find_profile_button_center(&clean_shapes, "Personal").y;
+        let add_acct_y = find_profile_button_center(&clean_shapes, "Add Account").y;
+        assert!(
+            add_acct_y < personal_y,
+            "expected Add Account in top header above active Personal card: add={add_acct_y}, personal={personal_y}"
         );
-        assert_eq!(app.view.account.convert_source_nickname, "Personal");
     }
 
     #[test]
@@ -7689,8 +7664,8 @@ mod tests {
         );
         assert!(text.contains("Local"), "missing Local badge:\n{text}");
         assert!(
-            text.contains("+ Add Account"),
-            "missing + Add Account button:\n{text}"
+            text.contains("Add Account"),
+            "missing Add Account button:\n{text}"
         );
     }
 
@@ -8270,21 +8245,21 @@ mod tests {
                 text = collect_text(&shapes);
                 out.drop_without_applying_deltas();
             }
-            assert!(text.contains("+ Add Account"), "{text}");
+            let expected_add_lbl = if w >= 480.0 { "Add Account" } else { "Add" };
+            assert!(text.contains(expected_add_lbl), "{text}");
             let local_one = find_profile_button_center(&shapes, "LocalOne");
-            let accounts_tab = find_profile_button_center(&shapes, "Accounts");
-            let add_btn = find_profile_button_center(&shapes, "+ Add Account");
+            let add_btn = find_profile_button_center(&shapes, expected_add_lbl);
             let local = find_profile_button_center(&shapes, "Local Accounts (0)");
             let server = find_profile_button_center(&shapes, "Server Accounts (1)");
             assert!(
-                local_one.y < accounts_tab.y && accounts_tab.y < add_btn.y && add_btn.y < local.y,
-                "expected active card above subtabs above + Add Account above inactive lists ({theme:?}, w={w}): active={local_one:?}, tab={accounts_tab:?}, add={add_btn:?}, local={local:?}\n{text}"
+                add_btn.y < local_one.y && local_one.y < local.y,
+                "expected Add Account in header above active card above inactive lists ({theme:?}, w={w}): add={add_btn:?}, active={local_one:?}, local={local:?}\n{text}"
             );
             assert!(
                 local.y + 40.0 < server.y,
                 "expected drawer to stack Local above Server ({theme:?}, w={w}): local={local:?}, server={server:?}\n{text}"
             );
-            assert!(add_btn.x <= w, "+ Add Account overflowed {w}: {add_btn:?}");
+            assert!(add_btn.x <= w, "Add Account overflowed {w}: {add_btn:?}");
         }
 
         // Choose/Switch Account modal also splits Local (left) and Server (right) at 1280x800.
@@ -8335,7 +8310,7 @@ mod tests {
         crate::open_profile_drawer(&mut app);
 
         let (_, drawer_shapes) = render_profile_frames(&ctx, &mut app, 0.0, 8);
-        click_profile_button(&ctx, &mut app, &drawer_shapes, "+ Add Account", 0.35);
+        click_profile_button(&ctx, &mut app, &drawer_shapes, "Add Account", 0.35);
         assert_eq!(app.view.active_modal, Some(modal::ActiveModal::AddAccount));
         assert_eq!(
             app.view.account.add_account_mode,

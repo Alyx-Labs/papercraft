@@ -573,6 +573,7 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
                         ui.spacing_mut().item_spacing.x = 6.0;
 
                         draw_home_profile_button(app, ui, t);
+                        crate::profile_drawer::draw_header_sync_button(app, ui, t);
                         draw_home_package_button(app, ui, t);
                         draw_home_open_pcraft_button(app, ui, t);
                         draw_search_input(app, ui, t);
@@ -587,6 +588,7 @@ fn draw_home_header(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) -> R
                         ui.set_height(HEADER_ROW_HEIGHT);
                         ui.spacing_mut().item_spacing.x = 6.0;
                         draw_home_profile_button(app, ui, t);
+                        crate::profile_drawer::draw_header_sync_button(app, ui, t);
                     });
                 });
                 ui.add_space(6.0);
@@ -3902,8 +3904,8 @@ mod tests {
         assert!(
             inspector_texts
                 .iter()
-                .any(|(label, _)| label == "+ Add Account"),
-            "expected + Add Account button in Accounts section, got {inspector_texts:?}"
+                .any(|(label, _)| label == "Add Account"),
+            "expected Add Account button in Profile & Sync header, got {inspector_texts:?}"
         );
 
         click_home_at(ctx, app, viewport, profile_tab_rect.center(), 0.45);
@@ -4525,5 +4527,169 @@ mod tests {
             .map(|idx| tied_b.session.notebooks[idx].id.as_str())
             .collect();
         assert_eq!(ids_a, ids_b);
+    }
+
+    #[test]
+    fn home_header_sync_icon_button_links_local_and_triggers_manual_sync() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let sync_dispatches = Arc::new(AtomicUsize::new(0));
+        let sync_dispatches_hook = Arc::clone(&sync_dispatches);
+        let hooks = crate::PlatformHooks {
+            web_sync_dispatch: Some(Box::new(move |cmd, _, _| {
+                if matches!(cmd, crate::sync_worker::SyncWorkerCommand::SyncNow { .. }) {
+                    sync_dispatches_hook.fetch_add(1, Ordering::Relaxed);
+                }
+            })),
+            ..crate::PlatformHooks::default()
+        };
+
+        let ctx = egui::Context::default();
+        let mut session = papercraft_engine::Session::open_web_cache(None);
+        session
+            .execute(
+                "profile.completeFirstAccess",
+                &serde_json::json!({ "nickname": "alyx" }),
+            )
+            .unwrap();
+        let mut app = PaperCraftApp::new(session, hooks);
+        app.view.active_modal = None;
+        let viewport = Vec2::new(1280.0, 800.0);
+
+        let mut profile_w = 0.0_f32;
+        let mut header_rect = Rect::NOTHING;
+        let mut header_text = String::new();
+        for step in 0..4 {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, viewport)),
+                    time: Some(f64::from(step) * 0.05),
+                    predicted_dt: 0.05,
+                    ..Default::default()
+                },
+                |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    profile_w = crate::icons::sidebar_edge_button_sized_width(
+                        ui,
+                        "",
+                        None,
+                        crate::icons::SidebarEdgeSize::Toolbar,
+                    );
+                    header_rect = draw_home_header(&mut app, ui, &Tokens::light());
+                },
+            );
+            header_text.clear();
+            for c in &out.shapes {
+                fn collect(shape: &egui::Shape, buf: &mut String) {
+                    match shape {
+                        egui::Shape::Text(t) => {
+                            buf.push_str(t.galley.text());
+                            buf.push('\n');
+                        }
+                        egui::Shape::Vec(v) => {
+                            for item in v {
+                                collect(item, buf);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                collect(&c.shape, &mut header_text);
+            }
+            out.drop_without_applying_deltas();
+        }
+        assert!(
+            !header_text.contains("Sync") && !header_text.contains("Offline"),
+            "header sync button must be icon-only without label text: {header_text}"
+        );
+
+        let sync_btn_pos = pos2(
+            header_rect.right() - profile_w - 6.0 - crate::icons::TOOLBAR_CONTROL_HEIGHT * 0.5,
+            header_rect.center().y,
+        );
+        for (idx, pressed) in [true, false].into_iter().enumerate() {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, viewport)),
+                    time: Some(0.30 + f64::from(idx as u32) * 0.04),
+                    predicted_dt: 0.04,
+                    events: vec![
+                        egui::Event::PointerMoved(sync_btn_pos),
+                        egui::Event::PointerButton {
+                            pos: sync_btn_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    let _ = draw_home_header(&mut app, ui, &Tokens::light());
+                },
+            );
+            out.drop_without_applying_deltas();
+        }
+        assert_eq!(
+            app.view.active_modal,
+            Some(crate::modal::ActiveModal::ConvertLocalAccount),
+            "clicking unlinked header Sync button must open ConvertLocalAccount modal"
+        );
+        crate::modal::close(&mut app);
+
+        let acct = papercraft_sync::ActiveAccountSession {
+            server_url: papercraft_sync_protocol::DEFAULT_SERVER_URL.to_string(),
+            user: papercraft_sync_protocol::UserProfile {
+                user_id: "u-home-sync".to_string(),
+                email: Some("alex@example.com".to_string()),
+                username: "alex".to_string(),
+                display_name: "Alex".to_string(),
+                created_at_ms: 1000,
+                must_change_password: false,
+            },
+            access_token: "a".to_string(),
+            refresh_token: "r".to_string(),
+            access_expires_at_ms: 99_999,
+            refresh_expires_at_ms: 99_999,
+            device_name: "PC".to_string(),
+            last_auth_ms: 1000,
+        };
+        let pull = papercraft_sync_protocol::SyncPullResponse {
+            server_cursor: 0,
+            user: acct.user.clone(),
+            notebooks: Vec::new(),
+            folders: Vec::new(),
+            studio_prefs: None,
+        };
+        app.session.enter_online_server_session(acct, pull);
+        for (idx, pressed) in [true, false].into_iter().enumerate() {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, viewport)),
+                    time: Some(0.50 + f64::from(idx as u32) * 0.04),
+                    predicted_dt: 0.04,
+                    events: vec![
+                        egui::Event::PointerMoved(sync_btn_pos),
+                        egui::Event::PointerButton {
+                            pos: sync_btn_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    crate::theme::apply_light_visuals(ui.ctx());
+                    let _ = draw_home_header(&mut app, ui, &Tokens::light());
+                },
+            );
+            out.drop_without_applying_deltas();
+        }
+        assert_eq!(sync_dispatches.load(Ordering::Relaxed), 1);
     }
 }
