@@ -11,9 +11,10 @@ use papercraft_sync_protocol::{
     normalize_server_url, now_unix_ms,
 };
 use papercraft_ui_egui::sync_worker::{
-    SyncWorkerCommand, SyncWorkerEvent, build_change_email_request, build_change_password_request,
+    LocalNetworkPermissionKind, LocalNetworkTarget, SyncWorkerCommand, SyncWorkerEvent,
+    browser_permission_error_message, build_change_email_request, build_change_password_request,
     build_complete_password_reset_request, build_login_request, build_register_request,
-    build_update_profile_request,
+    build_update_profile_request, classify_local_network_target,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -55,19 +56,22 @@ fn emit_web_progress(
     }
 }
 
-fn web_convert_err_event(
+async fn web_convert_err_event(
     session_generation: u64,
+    server_url: &str,
     source_profile_id: String,
     err: &SyncError,
     is_auth: bool,
 ) -> SyncWorkerEvent {
     let offline = matches!(err, SyncError::Network(_));
     let message = if offline {
-        CONVERT_OFFLINE_ERR_MSG.to_string()
+        browser_local_network_permission_error(server_url)
+            .await
+            .unwrap_or_else(|| CONVERT_OFFLINE_ERR_MSG.to_string())
     } else if is_auth {
-        friendly_web_auth_error(err)
+        friendly_web_auth_error_for_url(server_url, err).await
     } else {
-        friendly_web_error(err)
+        friendly_web_error_for_url(server_url, err).await
     };
     SyncWorkerEvent::ConvertLocalErr {
         session_generation,
@@ -92,8 +96,8 @@ async fn execute_async_command(
                     info,
                 }),
                 Err(err) => Some(SyncWorkerEvent::HealthErr {
+                    message: friendly_web_error_for_url(&norm, &err).await,
                     server_url: norm,
-                    message: friendly_web_error(&err),
                 }),
             }
         }
@@ -289,7 +293,7 @@ async fn exec_web_register(
             return SyncWorkerEvent::AuthErr {
                 session_generation,
                 offline: matches!(err, SyncError::Network(_)),
-                message: friendly_web_auth_error(&err),
+                message: friendly_web_auth_error_for_url(server_url, &err).await,
             };
         }
     };
@@ -302,7 +306,7 @@ async fn exec_web_register(
         Err(err) => SyncWorkerEvent::AuthErr {
             session_generation,
             offline: matches!(err, SyncError::Network(_)),
-            message: friendly_web_error(&err),
+            message: friendly_web_error_for_url(&auth.server_url, &err).await,
         },
     }
 }
@@ -330,6 +334,7 @@ async fn exec_web_change_email(
             };
         }
     };
+    let server_url = session.server_url.clone();
     match web_change_email_with_refresh(&mut session, &req).await {
         Ok(profile) => {
             session.user = profile;
@@ -345,7 +350,7 @@ async fn exec_web_change_email(
             session_generation,
             offline: matches!(err, SyncError::Network(_)),
             unauthorized: matches!(err, SyncError::Unauthorized(_)),
-            message: friendly_web_error(&err),
+            message: friendly_web_error_for_url(&server_url, &err).await,
         },
     }
 }
@@ -419,7 +424,9 @@ async fn exec_web_sync_now(
                     session_generation,
                     outcome: Box::new(outcome),
                 },
-                Err(err) => web_sync_err_event(session_generation, &err),
+                Err(err) => {
+                    web_sync_err_event(&active_session.server_url, session_generation, &err).await
+                }
             }
         },
     )
@@ -472,7 +479,7 @@ async fn exec_web_login(
             return SyncWorkerEvent::AuthErr {
                 session_generation,
                 offline: matches!(err, SyncError::Network(_)),
-                message: friendly_web_auth_error(&err),
+                message: friendly_web_auth_error_for_url(server_url, &err).await,
             };
         }
     };
@@ -485,7 +492,7 @@ async fn exec_web_login(
         Err(err) => SyncWorkerEvent::AuthErr {
             session_generation,
             offline: matches!(err, SyncError::Network(_)),
-            message: friendly_web_error(&err),
+            message: friendly_web_error_for_url(&auth.server_url, &err).await,
         },
     }
 }
@@ -526,7 +533,7 @@ async fn exec_web_complete_password_reset(
             return SyncWorkerEvent::AuthErr {
                 session_generation,
                 offline: matches!(err, SyncError::Network(_)),
-                message: friendly_web_auth_error(&err),
+                message: friendly_web_auth_error_for_url(server_url, &err).await,
             };
         }
     };
@@ -539,7 +546,7 @@ async fn exec_web_complete_password_reset(
         Err(err) => SyncWorkerEvent::AuthErr {
             session_generation,
             offline: matches!(err, SyncError::Network(_)),
-            message: friendly_web_error(&err),
+            message: friendly_web_error_for_url(&auth.server_url, &err).await,
         },
     }
 }
@@ -577,7 +584,7 @@ async fn exec_web_convert_local_account(
         SyncWorkerEvent::ConvertLocalProgress {
             session_generation,
             source_profile_id: source_profile_id.clone(),
-            stage: "Creating cloud account...".to_string(),
+            stage: "Creating server account...".to_string(),
             completed: 0,
             total: total_steps,
         },
@@ -586,7 +593,14 @@ async fn exec_web_convert_local_account(
     let mut auth = match web_auth("/api/v1/auth/register", server_url, &req, device_name).await {
         Ok(auth) => auth,
         Err(err) => {
-            return web_convert_err_event(session_generation, source_profile_id, &err, true);
+            return web_convert_err_event(
+                session_generation,
+                server_url,
+                source_profile_id,
+                &err,
+                true,
+            )
+            .await;
         }
     };
 
@@ -609,7 +623,14 @@ async fn exec_web_convert_local_account(
         let resp = match push_with_refresh(&mut auth, &push_req).await {
             Ok(resp) => resp,
             Err(err) => {
-                return web_convert_err_event(session_generation, source_profile_id, &err, false);
+                return web_convert_err_event(
+                    session_generation,
+                    &auth.server_url,
+                    source_profile_id,
+                    &err,
+                    false,
+                )
+                .await;
             }
         };
         driver.record_push_chunk_response(resp, upload_batch);
@@ -650,7 +671,16 @@ async fn exec_web_convert_local_account(
             auth,
             initial_pull: Box::new(pull_resp),
         },
-        Err(err) => web_convert_err_event(session_generation, source_profile_id, &err, false),
+        Err(err) => {
+            web_convert_err_event(
+                session_generation,
+                &auth.server_url,
+                source_profile_id,
+                &err,
+                false,
+            )
+            .await
+        }
     }
 }
 
@@ -671,6 +701,7 @@ async fn exec_web_update_profile(
             };
         }
     };
+    let server_url = session.server_url.clone();
     match web_post_profile_with_refresh(session, "/api/v1/auth/update-profile", &req).await {
         Ok(profile) => {
             session.user = profile;
@@ -683,7 +714,7 @@ async fn exec_web_update_profile(
             session_generation,
             offline: matches!(err, SyncError::Network(_)),
             unauthorized: matches!(err, SyncError::Unauthorized(_)),
-            message: friendly_web_error(&err),
+            message: friendly_web_error_for_url(&server_url, &err).await,
         },
     }
 }
@@ -705,6 +736,7 @@ async fn exec_web_change_password(
             };
         }
     };
+    let server_url = session.server_url.clone();
     match web_post_profile_with_refresh(session, "/api/v1/auth/change-password", &req).await {
         Ok(profile) => {
             session.user = profile;
@@ -717,7 +749,7 @@ async fn exec_web_change_password(
             session_generation,
             offline: matches!(err, SyncError::Network(_)),
             unauthorized: matches!(err, SyncError::Unauthorized(_)),
-            message: friendly_web_error(&err),
+            message: friendly_web_error_for_url(&server_url, &err).await,
         },
     }
 }
@@ -727,12 +759,16 @@ async fn web_health(server_url: &str) -> Result<ServerInfoResponse, SyncError> {
     fetch_json::<(), ServerInfoResponse>(&format!("{base}/api/v1/health"), "GET", None, None).await
 }
 
-fn web_sync_err_event(session_generation: u64, err: &SyncError) -> SyncWorkerEvent {
+async fn web_sync_err_event(
+    server_url: &str,
+    session_generation: u64,
+    err: &SyncError,
+) -> SyncWorkerEvent {
     SyncWorkerEvent::SyncErr {
         session_generation,
         offline: matches!(err, SyncError::Network(_)),
         unauthorized: matches!(err, SyncError::Unauthorized(_)),
-        message: friendly_web_error(err),
+        message: friendly_web_error_for_url(server_url, err).await,
     }
 }
 
@@ -1019,11 +1055,64 @@ fn js_error_message(err: &JsValue) -> String {
         .unwrap_or_else(|| "browser network request failed".to_string())
 }
 
-fn friendly_web_auth_error(err: &SyncError) -> String {
+async fn query_permission_state(permissions: &JsValue, name: &str) -> Option<String> {
+    let query_fn = js_sys::Reflect::get(permissions, &JsValue::from_str("query"))
+        .ok()?
+        .dyn_into::<js_sys::Function>()
+        .ok()?;
+    let descriptor = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &descriptor,
+        &JsValue::from_str("name"),
+        &JsValue::from_str(name),
+    )
+    .ok()?;
+    let promise_val = query_fn.call1(permissions, &descriptor).ok()?;
+    let promise: js_sys::Promise = promise_val.dyn_into().ok()?;
+    let status_val = JsFuture::from(promise).await.ok()?;
+    js_sys::Reflect::get(&status_val, &JsValue::from_str("state"))
+        .ok()
+        .and_then(|v| v.as_string())
+}
+
+async fn browser_local_network_permission_error(server_url: &str) -> Option<String> {
+    let (primary_name, primary_kind) = match classify_local_network_target(server_url) {
+        LocalNetworkTarget::Loopback => ("loopback-network", LocalNetworkPermissionKind::Loopback),
+        LocalNetworkTarget::PrivateNetwork => {
+            ("local-network", LocalNetworkPermissionKind::LocalNetwork)
+        }
+        LocalNetworkTarget::Public => return None,
+    };
+    let window = web_sys::window()?;
+    let navigator = JsValue::from(window.navigator());
+    let permissions = js_sys::Reflect::get(&navigator, &JsValue::from_str("permissions")).ok()?;
+    if permissions.is_undefined() || permissions.is_null() {
+        return None;
+    }
+    if let Some(state) = query_permission_state(&permissions, primary_name).await {
+        return browser_permission_error_message(&state, primary_kind);
+    }
+    let fallback_state = query_permission_state(&permissions, "local-network-access").await?;
+    browser_permission_error_message(
+        &fallback_state,
+        LocalNetworkPermissionKind::LocalNetworkAccess,
+    )
+}
+
+async fn friendly_web_auth_error_for_url(server_url: &str, err: &SyncError) -> String {
     match err {
         SyncError::Unauthorized(msg) if !msg.trim().is_empty() => msg.clone(),
-        _ => friendly_web_error(err),
+        _ => friendly_web_error_for_url(server_url, err).await,
     }
+}
+
+async fn friendly_web_error_for_url(server_url: &str, err: &SyncError) -> String {
+    if matches!(err, SyncError::Network(_))
+        && let Some(perm_msg) = browser_local_network_permission_error(server_url).await
+    {
+        return perm_msg;
+    }
+    friendly_web_error(err)
 }
 
 fn friendly_web_error(err: &SyncError) -> String {

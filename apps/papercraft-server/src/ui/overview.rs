@@ -306,7 +306,7 @@ fn render_network_access_section(ctrl: &mut ServerController, ui: &mut egui::Ui,
                 ui,
                 "bnc_srv_custom_ip",
                 rem,
-                "127.0.0.1",
+                "Enter IP address...",
                 &mut ctrl.draft_settings.custom_ip,
                 t,
             );

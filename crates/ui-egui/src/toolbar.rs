@@ -3498,7 +3498,7 @@ fn draw_inline_link_editor_bar(
                     .id_salt("text_dock_link_url_input")
                     .margin(egui::Margin::symmetric(8, 2))
                     .align(egui::Align2::LEFT_CENTER)
-                    .hint_text("https://example.com"),
+                    .hint_text("Enter URL..."),
             );
             let enter_apply =
                 edit_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -6595,7 +6595,7 @@ mod tests {
             "Line ",
             "Letter ",
             "Link",
-            "https://example.com",
+            "Enter URL...",
             "Apply",
         ];
         let wide_ys: Vec<(&str, f32)> = wide_labels
@@ -6658,7 +6658,7 @@ mod tests {
             "row 1 items should align: font={font_y}, sans={sans_y}, size={size_y}, px={px_y}"
         );
         let hint_y =
-            find_text_center_y(&narrow_shapes, "https://example.com").expect("Link TextEdit hint");
+            find_text_center_y(&narrow_shapes, "Enter URL...").expect("Link TextEdit hint");
         let apply_y = find_text_center_y(&narrow_shapes, "Apply").expect("Apply button");
         assert!(
             (hint_y - apply_y).abs() <= 1.5,

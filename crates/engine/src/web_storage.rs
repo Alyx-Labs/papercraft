@@ -3068,7 +3068,7 @@ mod tests {
 
         let initial = session.take_web_storage_delta(false);
         assert!(!initial.is_empty());
-        assert_eq!(initial.put_notebooks.len(), 6);
+        assert_eq!(initial.put_notebooks.len(), 1);
         persist_delta_into_fake_idb(
             initial,
             &mut cache,
@@ -3196,6 +3196,9 @@ mod tests {
             )
             .unwrap();
         legacy
+            .execute("notebook.create", &json!({ "title": "Second" }))
+            .unwrap();
+        legacy
             .execute("notebook.delete", &json!({ "index": 1 }))
             .unwrap();
         let raw_json = legacy.export_web_cache_json().unwrap();
@@ -3205,12 +3208,12 @@ mod tests {
         assert_eq!(delta.theme_hint, Some(UiTheme::Dark));
         assert_eq!(loaded.workspaces.len(), 1);
         assert_eq!(loaded.workspaces[0].meta.prefs.theme, UiTheme::Dark);
-        assert_eq!(loaded.workspaces[0].notebooks.len(), 5);
+        assert_eq!(loaded.workspaces[0].notebooks.len(), 1);
         assert_eq!(loaded.workspaces[0].trash.len(), 1);
 
         let reopened = Session::open_web_storage(Some(loaded));
         assert_eq!(reopened.prefs.theme, UiTheme::Dark);
-        assert_eq!(reopened.notebooks.len(), 5);
+        assert_eq!(reopened.notebooks.len(), 1);
         assert_eq!(reopened.trashed_notebooks.len(), 1);
         assert!(!reopened.notebooks[0].strokes.is_empty());
     }

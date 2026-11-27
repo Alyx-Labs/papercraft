@@ -42,6 +42,154 @@ pub(crate) fn adaptive_sync_debounce_ms(estimated_dirty_bytes: usize) -> f64 {
     }
 }
 
+pub const BROWSER_PERMISSION_BLOCKED_PREFIX: &str = "Browser permission blocked:";
+pub const BROWSER_PERMISSION_NEEDED_PREFIX: &str = "Browser permission needed:";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserPermissionStatus {
+    None,
+    Needed,
+    Blocked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalNetworkTarget {
+    Loopback,
+    PrivateNetwork,
+    Public,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalNetworkPermissionKind {
+    Loopback,
+    LocalNetwork,
+    LocalNetworkAccess,
+}
+
+/// Classifies an error string returned by the web sync worker for browser permission issues.
+pub fn classify_browser_permission_error(message: &str) -> BrowserPermissionStatus {
+    if message.starts_with(BROWSER_PERMISSION_BLOCKED_PREFIX) {
+        BrowserPermissionStatus::Blocked
+    } else if message.starts_with(BROWSER_PERMISSION_NEEDED_PREFIX) {
+        BrowserPermissionStatus::Needed
+    } else {
+        BrowserPermissionStatus::None
+    }
+}
+
+fn extract_url_host_and_http(server_url: &str) -> (bool, String) {
+    let trimmed = server_url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let (is_plain_http, after_scheme) = if let Some(rest) = lower.strip_prefix("http://") {
+        (true, rest)
+    } else if let Some(rest) = lower.strip_prefix("https://") {
+        (false, rest)
+    } else {
+        (false, lower.as_str())
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = if let Some(inner) = host_port.strip_prefix('[') {
+        inner.split(']').next().unwrap_or_default()
+    } else {
+        host_port.split(':').next().unwrap_or_default()
+    };
+    (is_plain_http, host.trim_end_matches('.').to_string())
+}
+
+fn is_private_or_loopback_v4(v4: std::net::Ipv4Addr) -> LocalNetworkTarget {
+    let o = v4.octets();
+    if v4.is_loopback() || v4.is_unspecified() {
+        LocalNetworkTarget::Loopback
+    } else if v4.is_private() || v4.is_link_local() || (o[0] == 100 && (o[1] & 0b1100_0000) == 64) {
+        LocalNetworkTarget::PrivateNetwork
+    } else {
+        LocalNetworkTarget::Public
+    }
+}
+
+/// Classifies whether `server_url` targets loopback (`127.0.0.1`/`localhost`), a local/VPN network,
+/// or a public host so web permission queries inspect the matching Chromium LNA permission.
+pub fn classify_local_network_target(server_url: &str) -> LocalNetworkTarget {
+    let (is_plain_http, host) = extract_url_host_and_http(server_url);
+    if host.is_empty() {
+        return LocalNetworkTarget::Public;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => is_private_or_loopback_v4(v4),
+            std::net::IpAddr::V6(v6) => {
+                if v6.is_loopback() || v6.is_unspecified() {
+                    LocalNetworkTarget::Loopback
+                } else if let Some(v4) = v6.to_ipv4_mapped() {
+                    is_private_or_loopback_v4(v4)
+                } else {
+                    let seg0 = v6.segments()[0];
+                    if (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80 {
+                        LocalNetworkTarget::PrivateNetwork
+                    } else {
+                        LocalNetworkTarget::Public
+                    }
+                }
+            }
+        };
+    }
+    if host == "localhost" || host.ends_with(".localhost") {
+        LocalNetworkTarget::Loopback
+    } else if is_plain_http
+        || !host.contains('.')
+        || [
+            ".local",
+            ".lan",
+            ".home",
+            ".internal",
+            ".arpa",
+            ".localdomain",
+            ".ts.net",
+        ]
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
+    {
+        LocalNetworkTarget::PrivateNetwork
+    } else {
+        LocalNetworkTarget::Public
+    }
+}
+
+/// Formats actionable guidance when browser Local Network Access permission is `denied` or `prompt`.
+pub fn browser_permission_error_message(
+    state: &str,
+    kind: LocalNetworkPermissionKind,
+) -> Option<String> {
+    match state {
+        "denied" => {
+            let (access_desc, setting_name) = match kind {
+                LocalNetworkPermissionKind::Loopback => (
+                    "access to apps on this device",
+                    "Apps on device (or Local network access)",
+                ),
+                LocalNetworkPermissionKind::LocalNetwork => (
+                    "local network access",
+                    "Local network (or Local network access)",
+                ),
+                LocalNetworkPermissionKind::LocalNetworkAccess => {
+                    ("local network access", "Local network access")
+                }
+            };
+            Some(format!(
+                "{BROWSER_PERMISSION_BLOCKED_PREFIX} you blocked {access_desc}, so the browser will not show the permission prompt again automatically. Click the settings icon in the address bar, change {setting_name} to Allow, and test again."
+            ))
+        }
+        "prompt" => Some(format!(
+            "{BROWSER_PERMISSION_NEEDED_PREFIX} click Test and choose Allow when your browser asks permission to connect to this server."
+        )),
+        _ => None,
+    }
+}
+
 pub enum SyncWorkerCommand {
     TestConnection {
         server_url: String,
@@ -1292,7 +1440,7 @@ fn exec_convert_local_account(
         SyncWorkerEvent::ConvertLocalProgress {
             session_generation,
             source_profile_id: source_profile_id.clone(),
-            stage: "Creating cloud account...".to_string(),
+            stage: "Creating server account...".to_string(),
             completed: 0,
             total: total_steps,
         },
@@ -2619,5 +2767,72 @@ mod tests {
         handle_web_sync_trigger(&mut app, &ctx, crate::WebSyncTriggerReason::WindowFocused);
         assert!(app.web_tab_visible);
         assert!(app.sync_worker.pending_focus_sync);
+    }
+
+    #[test]
+    fn browser_local_network_target_and_permission_messages_classify_cleanly() {
+        assert_eq!(
+            super::classify_local_network_target("http://127.0.0.1:8787"),
+            super::LocalNetworkTarget::Loopback
+        );
+        assert_eq!(
+            super::classify_local_network_target("http://localhost:8787/api/v1/health"),
+            super::LocalNetworkTarget::Loopback
+        );
+        assert_eq!(
+            super::classify_local_network_target("http://[::1]:8787"),
+            super::LocalNetworkTarget::Loopback
+        );
+        assert_eq!(
+            super::classify_local_network_target("http://192.168.1.50:8787"),
+            super::LocalNetworkTarget::PrivateNetwork
+        );
+        assert_eq!(
+            super::classify_local_network_target("http://100.64.12.9:8787"),
+            super::LocalNetworkTarget::PrivateNetwork
+        );
+        assert_eq!(
+            super::classify_local_network_target("https://nas.local:8787"),
+            super::LocalNetworkTarget::PrivateNetwork
+        );
+        assert_eq!(
+            super::classify_local_network_target("https://sync.example.com"),
+            super::LocalNetworkTarget::Public
+        );
+
+        let blocked_loopback = super::browser_permission_error_message(
+            "denied",
+            super::LocalNetworkPermissionKind::Loopback,
+        )
+        .unwrap();
+        assert_eq!(
+            super::classify_browser_permission_error(&blocked_loopback),
+            super::BrowserPermissionStatus::Blocked
+        );
+        assert!(blocked_loopback.contains("Apps on device"));
+        assert!(blocked_loopback.contains("Allow"));
+
+        let prompt_msg = super::browser_permission_error_message(
+            "prompt",
+            super::LocalNetworkPermissionKind::LocalNetwork,
+        )
+        .unwrap();
+        assert_eq!(
+            super::classify_browser_permission_error(&prompt_msg),
+            super::BrowserPermissionStatus::Needed
+        );
+        assert!(prompt_msg.contains("Test"));
+
+        assert!(
+            super::browser_permission_error_message(
+                "granted",
+                super::LocalNetworkPermissionKind::Loopback,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            super::classify_browser_permission_error("Server is currently unreachable."),
+            super::BrowserPermissionStatus::None
+        );
     }
 }

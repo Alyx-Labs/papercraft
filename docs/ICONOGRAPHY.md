@@ -42,6 +42,7 @@ Additional Lucide `1.72.0` outline assets for writing tools, shape styling, sele
 - `globe.svg` (`Icon::Globe`) — discreet website link icon (`papercraft.ink`) in the Home library sidebar footer
 - `circle-question-mark.svg` (`Icon::Help`) — minimalist bottom-right keyboard shortcuts modal trigger button
 - `keyboard.svg` (`Icon::Keyboard`) — Keyboard Shortcuts modal header icon
+- `refresh-cw.svg` / `refresh-cw-off.svg` (`Icon::Sync` / `Icon::SyncOff`) — server sync controls and icon-only notebook card sync state indicators (slashed gray icon when local-only sync is off)
 - `lock.svg` (`Icon::Lock`) — Read-Only mode locked indicator in the editor toolbar
 - `lock-open.svg` (`Icon::LockOpen`) — Read-Only mode unlocked indicator in the editor toolbar
 

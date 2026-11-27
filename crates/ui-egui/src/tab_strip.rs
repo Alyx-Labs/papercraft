@@ -937,8 +937,8 @@ mod tests {
 
         let synced_text = collect_top_text(&mut app);
         assert!(
-            !synced_text.contains("Synced to cloud"),
-            "unexpected cloud sync pill in editor tab strip:\n{synced_text}"
+            !synced_text.contains("Synced to cloud") && !synced_text.contains("Synced to server"),
+            "unexpected server sync pill in editor tab strip:\n{synced_text}"
         );
     }
 }

@@ -196,81 +196,23 @@ struct StarterNotebookSpec {
     tags: &'static [&'static str],
 }
 
-/// Demo folder hierarchy seeded exclusively in the WebAssembly browser demo (`Session::open_web_cache`).
-const STARTER_FOLDERS: &[(&str, &str)] = &[
-    ("Computer Science", "#2563EB"),
-    ("Computer Science/Algorithms", "#7C3AED"),
-    ("Mathematics", "#0D9488"),
-    ("Mathematics/Calculus", "#16A34A"),
-    ("Natural Sciences", "#D97706"),
-    ("Humanities", "#DB2777"),
-];
+/// Demo folder seeded exclusively in the WebAssembly browser demo (`Session::open_web_cache`).
+const STARTER_FOLDERS: &[(&str, &str)] = &[("Notes", "#2563EB")];
 
-/// Demo tag palette seeded exclusively in the WebAssembly browser demo (`Session::open_web_cache`).
-const STARTER_TAG_COLORS: &[(&str, &str)] = &[
-    ("exam", "#DC2626"),
-    ("lecture", "#2563EB"),
-    ("homework", "#EA580C"),
-    ("lab", "#16A34A"),
-    ("core", "#7C3AED"),
-    ("math", "#0D9488"),
-    ("reading", "#D97706"),
-    ("review", "#DB2777"),
-];
+/// Demo tag seeded exclusively in the WebAssembly browser demo (`Session::open_web_cache`).
+const STARTER_TAG_COLORS: &[(&str, &str)] = &[("example", "#0D9488")];
 
-/// Demo notebooks seeded exclusively in the WebAssembly browser demo (`Session::open_web_cache`).
-const STARTER_NOTEBOOK_SPECS: &[StarterNotebookSpec] = &[
-    StarterNotebookSpec {
-        title: "Data Structures & Algorithms",
-        preset: NotebookPreset::EngineeringGrid,
-        cover: NotebookCover::ClassicNavy,
-        folder_path: "Computer Science/Algorithms",
-        favorite: true,
-        tags: &["exam", "core"],
-    },
-    StarterNotebookSpec {
-        title: "Linear Algebra",
-        preset: NotebookPreset::EngineeringGrid,
-        cover: NotebookCover::SlateGraphite,
-        folder_path: "Mathematics",
-        favorite: false,
-        tags: &["exam", "homework"],
-    },
-    StarterNotebookSpec {
-        title: "Differential Calculus",
-        preset: NotebookPreset::LectureCornell,
-        cover: NotebookCover::PlumStudio,
-        folder_path: "Mathematics/Calculus",
-        favorite: true,
-        tags: &["lecture", "math"],
-    },
-    StarterNotebookSpec {
-        title: "Organic Chemistry",
-        preset: NotebookPreset::BulletDotted,
-        cover: NotebookCover::SageGreen,
-        folder_path: "Natural Sciences",
-        favorite: false,
-        tags: &["lab", "review"],
-    },
-    StarterNotebookSpec {
-        title: "Modern World History",
-        preset: NotebookPreset::EverydayLined,
-        cover: NotebookCover::Terracotta,
-        folder_path: "Humanities",
-        favorite: false,
-        tags: &["lecture", "reading"],
-    },
-    StarterNotebookSpec {
-        title: "Physics Mechanics",
-        preset: NotebookPreset::SketchBlank,
-        cover: NotebookCover::WarmSand,
-        folder_path: "",
-        favorite: false,
-        tags: &["homework", "lab"],
-    },
-];
+/// Demo notebook seeded exclusively in the WebAssembly browser demo (`Session::open_web_cache`).
+const STARTER_NOTEBOOK_SPECS: &[StarterNotebookSpec] = &[StarterNotebookSpec {
+    title: "Sample Notebook",
+    preset: NotebookPreset::EverydayLined,
+    cover: NotebookCover::ClassicNavy,
+    folder_path: "Notes",
+    favorite: false,
+    tags: &["example"],
+}];
 
-/// Builds the pre-populated demo notebooks shown exclusively in the WebAssembly browser demo.
+/// Builds the pre-populated demo notebook shown exclusively in the WebAssembly browser demo.
 pub(crate) fn starter_documents() -> Vec<Document> {
     let now = unix_now_ms();
     STARTER_NOTEBOOK_SPECS
@@ -303,7 +245,7 @@ pub(crate) fn starter_documents() -> Vec<Document> {
         .collect()
 }
 
-/// Seeds the demo folders and tag colors used exclusively in the WebAssembly browser demo.
+/// Seeds the demo folder and tag color used exclusively in the WebAssembly browser demo.
 pub(crate) fn seed_starter_library_prefs(prefs: &mut UserStudioConfig) {
     let mut folders = prefs.library_folders.clone();
     for (folder_path, _) in STARTER_FOLDERS {
@@ -1876,7 +1818,10 @@ mod tests {
     }
 
     fn assert_starter_prefs_seeded(session: &Session) {
-        assert_eq!(session.notebooks.len(), 6);
+        assert_eq!(session.notebooks.len(), 1);
+        assert_eq!(session.prefs.library_folders.len(), 1);
+        assert_eq!(session.prefs.library_folder_colors.len(), 1);
+        assert_eq!(session.prefs.library_tag_colors.len(), 1);
         for (folder, _) in STARTER_FOLDERS {
             assert!(
                 session.prefs.library_folders.iter().any(|f| f == folder),
@@ -1899,17 +1844,7 @@ mod tests {
     fn starter_documents_use_pure_white_paper_and_empty_subject_notebooks() {
         let starters = starter_documents();
         let titles: Vec<&str> = starters.iter().map(|d| d.title.as_str()).collect();
-        assert_eq!(
-            titles,
-            vec![
-                "Data Structures & Algorithms",
-                "Linear Algebra",
-                "Differential Calculus",
-                "Organic Chemistry",
-                "Modern World History",
-                "Physics Mechanics",
-            ]
-        );
+        assert_eq!(titles, vec!["Sample Notebook"]);
         for doc in &starters {
             let empty_content = doc.strokes.is_empty()
                 && doc.shapes.is_empty()
@@ -1918,7 +1853,8 @@ mod tests {
                 && doc.pdf_documents.is_empty();
             assert!(empty_content);
             assert_eq!(doc.page_count(), 1);
-            assert!(!doc.tags.is_empty());
+            assert_eq!(doc.folder_path, "Notes");
+            assert_eq!(doc.tags, vec!["example"]);
             assert_eq!(doc.paper_color, papercraft_doc::PaperColor::PureWhite);
             for page in doc.resolved_pages() {
                 let page_empty = page.strokes.is_empty()
@@ -1939,9 +1875,12 @@ mod tests {
         let desktop_session = Session::open_desktop_library(desktop_guard.0.clone());
         assert_clean_empty_library(&desktop_session);
 
-        // Only the WebAssembly browser demo keeps starter folders, tag colors, and notebooks.
+        // Only the WebAssembly browser demo keeps the starter folder, tag color, and notebook.
         let web_session = Session::open_web_cache(None);
         assert_starter_prefs_seeded(&web_session);
+
+        let web_storage_session = Session::open_web_storage(None);
+        assert_starter_prefs_seeded(&web_storage_session);
     }
 
     #[test]

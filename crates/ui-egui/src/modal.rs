@@ -135,8 +135,8 @@ impl ActiveModal {
             },
             Self::AccountSync => DialogSpec {
                 icon: Icon::Account,
-                title: "Account & Cloud Sync",
-                subtitle: "Switch between device-local accounts and Offline-First cloud accounts.",
+                title: "Account & Server Sync",
+                subtitle: "Switch between device-local accounts and Offline-First server accounts.",
                 width: 530.0,
                 min_body_height: 0.0,
             },

@@ -1393,58 +1393,59 @@ fn apply_notebook_card_interaction(
     }
 }
 
+const NOTEBOOK_SYNC_BADGE_SIZE: f32 = 22.0;
+
+fn paint_notebook_sync_icon_badge(
+    painter: &egui::Painter,
+    badge_rect: Rect,
+    status: EntitySyncStatus,
+    t: &Tokens,
+) {
+    let (_, fg, fill, border) = crate::account_modal::notebook_status_badge_style(status, t);
+    let icon = crate::account_modal::notebook_status_sync_icon(status);
+    let radius = (badge_rect.height() * 0.5).round().clamp(1.0, 255.0) as u8;
+    painter.rect(
+        badge_rect,
+        CornerRadius::same(radius),
+        fill.gamma_multiply(0.92),
+        Stroke::new(1.0, border),
+        StrokeKind::Inside,
+    );
+    let icon_size = (badge_rect.height() - 9.0).max(12.0);
+    let icon_rect = Rect::from_center_size(badge_rect.center(), Vec2::splat(icon_size));
+    paint_icon(painter, icon_rect, icon, fg);
+}
+
 fn paint_notebook_sync_corner_badge(
     ui: &egui::Ui,
     well_rect: Rect,
     status: EntitySyncStatus,
     t: &Tokens,
 ) {
-    if !ui.is_rect_visible(well_rect) {
+    if !ui.is_rect_visible(well_rect)
+        || well_rect.width() < NOTEBOOK_SYNC_BADGE_SIZE
+        || well_rect.height() < NOTEBOOK_SYNC_BADGE_SIZE
+    {
         return;
     }
-    let (label, fg, fill, border) = crate::account_modal::notebook_status_badge_style(status, t);
-    let p = ui.painter();
-    let galley = p.layout_no_wrap(label.to_string(), egui::FontId::proportional(9.5), fg);
-    let pill_w =
-        (8.0 + 5.0 + 4.0 + galley.size().x + 7.0).min((well_rect.width() - 16.0).max(40.0));
-    let pill_h = 18.0_f32;
-    let pill_rect = Rect::from_min_size(
-        pos2(well_rect.right() - pill_w - 7.0, well_rect.top() + 7.0),
-        Vec2::new(pill_w, pill_h),
-    );
-    p.rect(
-        pill_rect,
-        CornerRadius::same(9),
-        fill.gamma_multiply(0.92),
-        Stroke::new(1.0, border),
-        StrokeKind::Inside,
-    );
-    p.circle_filled(pos2(pill_rect.left() + 8.5, pill_rect.center().y), 2.5, fg);
-    p.galley(
+    let badge_rect = Rect::from_min_size(
         pos2(
-            pill_rect.left() + 14.5,
-            pill_rect.center().y - galley.size().y * 0.5,
+            well_rect.right() - NOTEBOOK_SYNC_BADGE_SIZE - 7.0,
+            well_rect.top() + 7.0,
         ),
-        galley,
-        fg,
+        Vec2::splat(NOTEBOOK_SYNC_BADGE_SIZE),
     );
+    paint_notebook_sync_icon_badge(ui.painter(), badge_rect, status, t);
 }
 
 fn draw_notebook_sync_pill(ui: &mut egui::Ui, status: EntitySyncStatus, t: &Tokens) {
-    let (label, fg, fill, border) = crate::account_modal::notebook_status_badge_style(status, t);
-    egui::Frame::NONE
-        .fill(fill)
-        .stroke(Stroke::new(1.0, border))
-        .corner_radius(CornerRadius::same(9))
-        .inner_margin(Margin::symmetric(7, 2))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                let (dr, _) = ui.allocate_exact_size(Vec2::splat(6.0), Sense::hover());
-                ui.painter().circle_filled(dr.center(), 2.5, fg);
-                ui.label(RichText::new(label).size(10.0).strong().color(fg));
-            });
-        });
+    let (label, _, _, _) = crate::account_modal::notebook_status_badge_style(status, t);
+    let (badge_rect, resp) =
+        ui.allocate_exact_size(Vec2::splat(NOTEBOOK_SYNC_BADGE_SIZE), Sense::hover());
+    if ui.is_rect_visible(badge_rect) {
+        paint_notebook_sync_icon_badge(ui.painter(), badge_rect, status, t);
+    }
+    resp.on_hover_text(format!("Sync status: {label}"));
 }
 
 fn rect_hover_factor(ctx: &egui::Context, id: egui::Id) -> (bool, f32) {
@@ -4244,10 +4245,18 @@ mod tests {
             local_dots.contains(&egui::Color32::from_rgb(0x82, 0xCA, 0xF2)),
             "expected blue local status dot on header profile button, got {local_dots:?}"
         );
-        assert!(
-            local_text.contains("On device"),
-            "missing On device badge in:\n{local_text}"
-        );
+        for forbidden in [
+            "On device",
+            "Pending sync",
+            "Cloud",
+            "Synced to server",
+            "Sync issue",
+        ] {
+            assert!(
+                !local_text.contains(forbidden),
+                "notebook card sync badge must be icon-only without {forbidden:?} text:\n{local_text}"
+            );
+        }
 
         let acct = papercraft_sync::ActiveAccountSession {
             server_url: papercraft_sync_protocol::DEFAULT_SERVER_URL.to_string(),
@@ -4275,26 +4284,113 @@ mod tests {
         };
         app.session.enter_online_server_session(acct, empty_pull);
         app.session
-            .execute("notebook.create", &json!({ "title": "Cloud Notes" }))
+            .execute("notebook.create", &json!({ "title": "Server Notes" }))
             .unwrap();
 
-        let (cloud_text, cloud_dots) = render_home_snapshot(&ctx, &mut app);
-        let expected_cloud_dot = crate::account_modal::header_status_dot_color(
+        let (server_text, server_dots) = render_home_snapshot(&ctx, &mut app);
+        let expected_server_dot = crate::account_modal::header_status_dot_color(
             app.session.sync_status_summary().connection,
             &t,
         );
         assert!(
-            !cloud_text.contains("alex@example.com"),
-            "home sync button should be icon-only without email text:\n{cloud_text}"
+            !server_text.contains("alex@example.com"),
+            "home sync button should be icon-only without email text:\n{server_text}"
         );
         assert!(
-            cloud_dots.contains(&expected_cloud_dot),
-            "expected cloud status dot ({expected_cloud_dot:?}) on header sync button, got {cloud_dots:?}"
+            server_dots.contains(&expected_server_dot),
+            "expected server status dot ({expected_server_dot:?}) on header sync button, got {server_dots:?}"
         );
-        assert!(
-            cloud_text.contains("Pending sync"),
-            "missing Pending sync badge in:\n{cloud_text}"
-        );
+        for forbidden in [
+            "On device",
+            "Pending sync",
+            "Cloud",
+            "Synced to server",
+            "Sync issue",
+        ] {
+            assert!(
+                !server_text.contains(forbidden),
+                "notebook card sync badge must be icon-only without {forbidden:?} text:\n{server_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn notebook_sync_badges_render_icon_only_with_slashed_gray_disabled_state() {
+        let statuses = [
+            EntitySyncStatus::LocalOnly,
+            EntitySyncStatus::PendingPush,
+            EntitySyncStatus::Synced,
+            EntitySyncStatus::SyncError,
+        ];
+        for theme in [
+            papercraft_doc::UiTheme::Light,
+            papercraft_doc::UiTheme::Dark,
+        ] {
+            let t = Tokens::for_theme(theme);
+            assert_eq!(
+                crate::account_modal::notebook_status_sync_icon(EntitySyncStatus::LocalOnly),
+                Icon::SyncOff
+            );
+            assert_eq!(
+                crate::account_modal::notebook_status_badge_style(EntitySyncStatus::LocalOnly, &t)
+                    .1,
+                t.text_muted
+            );
+            assert_eq!(
+                crate::account_modal::notebook_status_badge_style(EntitySyncStatus::Synced, &t).0,
+                "Synced to server"
+            );
+
+            for status in statuses {
+                let ctx = egui::Context::default();
+                let mut text = String::new();
+                let raw = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(320.0, 220.0))),
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(raw, |ui| {
+                    crate::theme::apply_visuals(ui.ctx(), theme);
+                    let well = Rect::from_min_size(pos2(16.0, 16.0), Vec2::new(220.0, 120.0));
+                    paint_notebook_sync_corner_badge(ui, well, status, &t);
+                    ui.horizontal(|ui| {
+                        draw_notebook_sync_pill(ui, status, &t);
+                    });
+                });
+                fn collect_text(shape: &egui::Shape, buf: &mut String) {
+                    match shape {
+                        egui::Shape::Text(txt) => buf.push_str(txt.galley.text()),
+                        egui::Shape::Vec(items) => {
+                            for item in items {
+                                collect_text(item, buf);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for clipped in &out.shapes {
+                    collect_text(&clipped.shape, &mut text);
+                }
+                let primitives = ctx.tessellate(out.shapes.clone(), 1.0);
+                out.drop_without_applying_deltas();
+
+                assert!(
+                    text.is_empty(),
+                    "expected zero written text for icon-only sync badge ({status:?}), got {text:?}"
+                );
+                let expected_fg = crate::account_modal::notebook_status_badge_style(status, &t).1;
+                let has_fg_mesh = primitives.iter().any(|clipped| {
+                    matches!(
+                        &clipped.primitive,
+                        egui::epaint::Primitive::Mesh(mesh)
+                            if mesh.vertices.iter().any(|v| v.color == expected_fg)
+                    )
+                });
+                assert!(
+                    has_fg_mesh,
+                    "expected icon mesh tinted with {expected_fg:?} for {status:?} in {theme:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4377,8 +4473,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn empty_clean_desktop_library_renders_without_demo_clutter_in_light_and_dark_themes() {
+    fn render_home_theme_view_modes(
+        app: &mut PaperCraftApp,
+        mut verify: impl FnMut(papercraft_doc::UiTheme, LibraryViewMode, &HomeMetrics, &str),
+    ) {
         fn collect_all(shape: &egui::Shape, out: &mut String) {
             match shape {
                 egui::Shape::Text(text) => {
@@ -4393,31 +4491,6 @@ mod tests {
                 _ => {}
             }
         }
-
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!(
-            "papercraft_ui_empty_desktop_{}_{}",
-            std::process::id(),
-            nanos
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        struct TempDirGuard(std::path::PathBuf);
-        impl Drop for TempDirGuard {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let _guard = TempDirGuard(dir.clone());
-
-        let mut app = PaperCraftApp::new(
-            papercraft_engine::Session::open_desktop_library(dir),
-            crate::PlatformHooks::default(),
-        );
-        assert!(app.session.notebooks.is_empty());
-        assert!(app.session.prefs.library_folders.is_empty());
-        assert!(app.session.prefs.library_tag_colors.is_empty());
 
         for theme in [
             papercraft_doc::UiTheme::Light,
@@ -4451,7 +4524,7 @@ mod tests {
                     };
                     let out = ctx.run_ui(raw, |ui| {
                         crate::theme::apply_visuals(ui.ctx(), theme);
-                        metrics = show_inner(&mut app, ui);
+                        metrics = show_inner(app, ui);
                     });
                     rendered_text.clear();
                     for clipped in &out.shapes {
@@ -4459,29 +4532,101 @@ mod tests {
                     }
                     out.drop_without_applying_deltas();
                 }
-
-                assert!(
-                    metrics.card_rects.is_empty(),
-                    "expected zero notebook cards on fresh desktop ({theme:?}, {view_mode:?})"
-                );
-                assert!(
-                    metrics.create_card_rect.is_some(),
-                    "expected New Notebook affordance on fresh desktop ({theme:?}, {view_mode:?})"
-                );
-                assert!(rendered_text.contains("All Notebooks"));
-                assert!(rendered_text.contains("0 notebooks"));
-                assert!(
-                    rendered_text.contains("New Notebook")
-                        || rendered_text.contains("Create New Notebook...")
-                );
-                for demo in ["Data Structures & Algorithms", "Computer Science", "#exam"] {
-                    assert!(
-                        !rendered_text.contains(demo),
-                        "demo item `{demo}` leaked onto clean desktop ({theme:?}, {view_mode:?}):\n{rendered_text}"
-                    );
-                }
+                verify(theme, view_mode, &metrics, &rendered_text);
             }
         }
+    }
+
+    #[test]
+    fn empty_clean_desktop_library_renders_without_demo_clutter_in_light_and_dark_themes() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "papercraft_ui_empty_desktop_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        struct TempDirGuard(std::path::PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = TempDirGuard(dir.clone());
+
+        let mut app = PaperCraftApp::new(
+            papercraft_engine::Session::open_desktop_library(dir),
+            crate::PlatformHooks::default(),
+        );
+        assert!(app.session.notebooks.is_empty());
+        assert!(app.session.prefs.library_folders.is_empty());
+        assert!(app.session.prefs.library_tag_colors.is_empty());
+
+        render_home_theme_view_modes(&mut app, |theme, view_mode, metrics, rendered_text| {
+            assert!(
+                metrics.card_rects.is_empty(),
+                "expected zero notebook cards on fresh desktop ({theme:?}, {view_mode:?})"
+            );
+            assert!(
+                metrics.create_card_rect.is_some(),
+                "expected New Notebook affordance on fresh desktop ({theme:?}, {view_mode:?})"
+            );
+            assert!(rendered_text.contains("All Notebooks"));
+            assert!(rendered_text.contains("0 notebooks"));
+            assert!(
+                rendered_text.contains("New Notebook")
+                    || rendered_text.contains("Create New Notebook...")
+            );
+            for demo in ["Sample Notebook", "Notes", "#example"] {
+                assert!(
+                    !rendered_text.contains(demo),
+                    "demo item `{demo}` leaked onto clean desktop ({theme:?}, {view_mode:?}):\n{rendered_text}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn web_demo_library_renders_single_notebook_folder_and_tag_in_light_and_dark_themes() {
+        let mut app = PaperCraftApp::new(
+            papercraft_engine::Session::open_web_storage(None),
+            crate::PlatformHooks::default(),
+        );
+        app.view.active_modal = None;
+        assert_eq!(app.session.notebooks.len(), 1);
+        assert_eq!(app.session.prefs.library_folders, vec!["Notes".to_string()]);
+        assert_eq!(app.session.prefs.library_folder_colors.len(), 1);
+        assert_eq!(app.session.prefs.library_tag_colors.len(), 1);
+        assert!(app.session.prefs.tag_color("example").is_some());
+
+        render_home_theme_view_modes(&mut app, |theme, view_mode, metrics, rendered_text| {
+            assert_eq!(
+                metrics.card_rects.len(),
+                1,
+                "expected exactly 1 demo notebook card on fresh web ({theme:?}, {view_mode:?})"
+            );
+            assert!(
+                metrics.create_card_rect.is_some(),
+                "expected New Notebook affordance on fresh web ({theme:?}, {view_mode:?})"
+            );
+            assert!(rendered_text.contains("1 notebook"));
+            assert!(rendered_text.contains("Sample Notebook"));
+            assert!(rendered_text.contains("Notes"));
+            assert!(rendered_text.contains("example"));
+            for retired in [
+                "Data Structures & Algorithms",
+                "Linear Algebra",
+                "Computer Science",
+                "Mathematics",
+            ] {
+                assert!(
+                    !rendered_text.contains(retired),
+                    "retired multi-demo item `{retired}` appeared on web ({theme:?}, {view_mode:?}):\n{rendered_text}"
+                );
+            }
+        });
     }
 
     #[test]

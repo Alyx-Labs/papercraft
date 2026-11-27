@@ -12,7 +12,8 @@ use crate::account_modal::{
     render_auth_banners, render_change_password_card, render_expired_session_reauth_box,
     render_forget_server_account_confirmation, render_local_profile_identity_card,
     render_profile_identity_card, render_server_probe_section, render_signed_in_server_card,
-    render_unsynced_switch_confirmation, sync_draft_from_session, trigger_test_connection,
+    render_startup_picker_switch, render_unsynced_switch_confirmation, sync_draft_from_session,
+    trigger_test_connection,
 };
 use crate::icons::{
     Icon, SwitchLayout, SwitchOption, compact_icon_button, paint_icon, segmented_switch,
@@ -47,53 +48,99 @@ pub(crate) fn show_drawer_contents(app: &mut PaperCraftApp, ui: &mut egui::Ui, t
     let flow_opacity = app.view.motion.profile_section.opacity();
     let flow_offset_x = app.view.motion.profile_section.offset_x();
 
-    egui::ScrollArea::vertical()
+    let footer_h_id = ui.make_persistent_id("papercraft_profile_startup_footer_h");
+    let footer_top_gap = 10.0_f32;
+    let show_startup_card = app.view.account.profile_section == ProfileSection::Accounts
+        && app.session.is_sync_persistence_enabled();
+    let cached_footer_h = ui
+        .ctx()
+        .data(|d| d.get_temp::<f32>(footer_h_id))
+        .unwrap_or(92.0);
+    let avail_h = ui.available_height();
+    let pin_startup_footer =
+        show_startup_card && avail_h >= cached_footer_h + footer_top_gap + 140.0;
+
+    let prev_spacing_y = ui.spacing().item_spacing.y;
+    if pin_startup_footer {
+        ui.spacing_mut().item_spacing.y = 0.0;
+    }
+
+    let mut scroll = egui::ScrollArea::vertical()
         .id_salt("papercraft_inspector_profile_scroll")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let show_account_banners = !matches!(
-                app.view.account.profile_section,
-                ProfileSection::Appearance | ProfileSection::System
-            );
-            if show_account_banners {
-                ui.spacing_mut().item_spacing.y = 0.0;
-            }
+        .auto_shrink([false, false]);
+    if pin_startup_footer {
+        let max_h = (avail_h - cached_footer_h - footer_top_gap).max(140.0);
+        scroll = scroll.max_height(max_h);
+    }
+    scroll.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let show_account_banners = !matches!(
+            app.view.account.profile_section,
+            ProfileSection::Appearance | ProfileSection::System
+        );
+        if show_account_banners {
+            ui.spacing_mut().item_spacing.y = 0.0;
+        }
 
-            crate::motion::show_flow_content(ui, flow_opacity, flow_offset_x, |ui| {
-                match app.view.account.profile_section {
-                    ProfileSection::Accounts => {
-                        draw_active_account_summary_card(app, ui, &summary, cloud_pending, t);
-                        ui.add_space(10.0);
-                        render_accounts_switcher_section(app, ui, &summary, t);
-                    }
-                    ProfileSection::Profile => {
-                        draw_profile_details_tab(app, ui, &summary, t);
-                    }
-                    ProfileSection::Sync => {
-                        draw_sync_and_storage_tab(app, ui, &summary, t);
-                    }
-                    ProfileSection::Appearance => {
-                        crate::inspector::draw_appearance_tab_contents(app, ui, t);
-                    }
-                    ProfileSection::System => {
-                        crate::inspector::draw_system_tab_contents(app, ui, t);
+        crate::motion::show_flow_content(ui, flow_opacity, flow_offset_x, |ui| {
+            match app.view.account.profile_section {
+                ProfileSection::Accounts => {
+                    draw_active_account_summary_card(app, ui, &summary, cloud_pending, t);
+                    ui.add_space(10.0);
+                    render_accounts_switcher_section(app, ui, &summary, t);
+                    if show_startup_card && !pin_startup_footer {
+                        ui.add_space(footer_top_gap);
+                        draw_section_card(ui, t, |ui| {
+                            render_startup_picker_switch(app, ui, t, true);
+                        });
                     }
                 }
-            });
-
-            if show_account_banners {
-                if let Some(ref err) = summary.last_error
-                    && app.view.account.error_message.is_none()
-                    && summary.connection == SyncConnectionState::Error
-                {
-                    ui.add_space(8.0);
-                    draw_status_banner(ui, BannerTone::Error, err, t);
+                ProfileSection::Profile => {
+                    draw_profile_details_tab(app, ui, &summary, t);
                 }
-                render_auth_banners(app, ui, t);
+                ProfileSection::Sync => {
+                    draw_sync_and_storage_tab(app, ui, &summary, t);
+                }
+                ProfileSection::Appearance => {
+                    crate::inspector::draw_appearance_tab_contents(app, ui, t);
+                }
+                ProfileSection::System => {
+                    crate::inspector::draw_system_tab_contents(app, ui, t);
+                }
             }
-            ui.add_space(12.0);
         });
+
+        if show_account_banners {
+            if let Some(ref err) = summary.last_error
+                && app.view.account.error_message.is_none()
+                && summary.connection == SyncConnectionState::Error
+            {
+                ui.add_space(8.0);
+                draw_status_banner(ui, BannerTone::Error, err, t);
+            }
+            render_auth_banners(app, ui, t);
+        }
+        ui.add_space(12.0);
+    });
+
+    if pin_startup_footer {
+        ui.add_space(footer_top_gap);
+        let footer_resp = ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = prev_spacing_y;
+            crate::motion::show_flow_content(ui, flow_opacity, flow_offset_x, |ui| {
+                draw_section_card(ui, t, |ui| {
+                    render_startup_picker_switch(app, ui, t, true);
+                });
+            });
+        });
+        ui.spacing_mut().item_spacing.y = prev_spacing_y;
+        let measured_h = footer_resp.response.rect.height();
+        if (measured_h - cached_footer_h).abs() > 0.5 {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(footer_h_id, measured_h));
+            ui.ctx().request_repaint();
+        }
+    }
 }
 
 fn draw_profile_drawer_header(
@@ -305,12 +352,13 @@ pub(crate) fn draw_header_sync_button(
             } else {
                 Color32::TRANSPARENT
             };
+            let rest_alpha = if t.is_dark { 0.50 } else { 0.85 };
             (
                 crate::motion::lerp_color(Color32::TRANSPARENT, t.header_control_hover, hover_t),
                 crate::motion::lerp_color(base_stroke, t.header_border, hover_t),
                 crate::motion::lerp_color(
-                    t.header_fg_muted.gamma_multiply(0.50),
-                    t.header_fg_muted.gamma_multiply(0.90),
+                    t.header_fg_muted.gamma_multiply(rest_alpha),
+                    t.header_fg,
                     hover_t,
                 ),
             )
@@ -346,7 +394,12 @@ pub(crate) fn draw_header_sync_button(
             StrokeKind::Inside,
         );
         let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(18.0));
-        paint_icon(p, icon_rect, Icon::Sync, icon_fg);
+        let sync_icon = if summary.signed_in {
+            Icon::Sync
+        } else {
+            Icon::SyncOff
+        };
+        paint_icon(p, icon_rect, sync_icon, icon_fg);
     }
 
     let tip = if !summary.signed_in {
@@ -2370,5 +2423,85 @@ mod tests {
         // Click Profile -> returns to Accounts.
         click_label(&ctx, &mut app, &system_rects, "Profile", &mut time);
         assert_eq!(app.view.account.profile_section, ProfileSection::Accounts);
+    }
+
+    #[test]
+    fn remember_last_account_card_is_pinned_to_bottom_of_profile_drawer() {
+        let ctx = egui::Context::default();
+        let mut session = papercraft_engine::Session::open_web_cache(None);
+        session
+            .execute(
+                "profile.completeFirstAccess",
+                &serde_json::json!({ "nickname": "alyx" }),
+            )
+            .unwrap();
+        let mut app = PaperCraftApp::new(session, crate::PlatformHooks::default());
+        app.view.active_modal = None;
+        crate::open_profile_drawer(&mut app);
+
+        let visit = |ctx: &egui::Context,
+                     app: &mut PaperCraftApp,
+                     step: usize|
+         -> Vec<(String, egui::Rect)> {
+            fn collect(shape: &Shape, out: &mut Vec<(String, egui::Rect)>) {
+                match shape {
+                    Shape::Text(text) => {
+                        out.push((text.galley.text().to_string(), text.visual_bounding_rect()));
+                    }
+                    Shape::Vec(items) => {
+                        for item in items {
+                            collect(item, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 900.0),
+                    )),
+                    time: Some(f64::from(step as u32) * 0.05),
+                    predicted_dt: 0.05,
+                    ..Default::default()
+                },
+                |ui| {
+                    crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                    crate::inspector::show(app, ui);
+                },
+            );
+            let mut rects = Vec::new();
+            for clipped in &out.shapes {
+                collect(&clipped.shape, &mut rects);
+            }
+            out.drop_without_applying_deltas();
+            rects
+        };
+
+        let mut accounts_rects = Vec::new();
+        for step in 0..10 {
+            accounts_rects = visit(&ctx, &mut app, step);
+        }
+        let server_empty_r = accounts_rects
+            .iter()
+            .find(|(text, _)| text == "No server accounts saved yet.")
+            .map(|(_, r)| *r)
+            .expect("missing Server Accounts empty state");
+        let remember_r = accounts_rects
+            .iter()
+            .find(|(text, _)| text == "Remember last account and skip on startup")
+            .map(|(_, r)| *r)
+            .expect("missing pinned Remember last account title");
+        assert!(
+            remember_r.top() - server_empty_r.bottom() > 150.0,
+            "expected startup toggle pinned to drawer bottom (remember_top={}, server_bottom={})",
+            remember_r.top(),
+            server_empty_r.bottom()
+        );
+        assert!(
+            remember_r.bottom() > 750.0 && remember_r.bottom() < 900.0,
+            "expected startup toggle near bottom of 900px drawer, got {remember_r:?}"
+        );
     }
 }

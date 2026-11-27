@@ -199,6 +199,10 @@ impl Tokens {
     }
 
     fn enforce_infinite_contrast(&mut self) {
+        if !self.is_dark {
+            self.enforce_light_infinite_contrast();
+            return;
+        }
         let hdr_doc = to_doc_color(self.header_bg);
         let hdr_lum = relative_luminance(hdr_doc);
         let hdr_ok_l = oklch_lightness(hdr_doc);
@@ -322,6 +326,166 @@ impl Tokens {
             &[self.panel_bg, self.field_bg],
             1.28,
             Some(body_fg_is_light),
+        );
+    }
+
+    fn enforce_light_infinite_contrast(&mut self) {
+        const LIGHT_CHROME_WHITE: Color32 = Color32::WHITE;
+        const LIGHT_CHROME_WHITE_MUTED: Color32 = Color32::from_rgb(0xEC, 0xEE, 0xF2);
+        const LIGHT_CHROME_WHITE_CRAFT: Color32 = Color32::from_rgb(0xF0, 0xF2, 0xF6);
+        const LIGHT_CHROME_DARK_GRAY: Color32 = Color32::from_rgb(0x24, 0x25, 0x28);
+        const LIGHT_CHROME_DARK_GRAY_MUTED: Color32 = Color32::from_rgb(0x34, 0x36, 0x3A);
+        const LIGHT_CHROME_DARK_GRAY_CRAFT: Color32 = Color32::from_rgb(0x2C, 0x2D, 0x31);
+
+        let hdr_doc = to_doc_color(self.header_bg);
+        let hdr_lum = relative_luminance(hdr_doc);
+        let hdr_ok_l = oklch_lightness(hdr_doc);
+        // Prefer pure crisp white whenever it achieves AA (>= 4.5:1) against `header_bg`;
+        // otherwise adapt to clean dark charcoal gray (never muddy hue-tinted near-black).
+        let header_fg_is_light = wcag_contrast(LIGHT_CHROME_WHITE, self.header_bg) >= 4.5;
+
+        if header_fg_is_light {
+            let track_lum = relative_luminance(to_doc_color(self.header_track_bg));
+            if track_lum > hdr_lum + 0.03 || track_lum + 0.03 < hdr_lum {
+                self.header_track_bg =
+                    with_oklch_l(self.header_track_bg, (hdr_ok_l + 0.02).clamp(0.0, 0.44));
+            }
+            self.header_track_bg =
+                ensure_contrast_against(self.header_track_bg, &[Color32::WHITE], 4.8, Some(false));
+
+            let hover_ok_l = oklch_lightness(to_doc_color(self.header_control_hover));
+            let hover_lum = relative_luminance(to_doc_color(self.header_control_hover));
+            if hover_lum > hdr_lum + 0.06 || hover_ok_l < hdr_ok_l + 0.04 {
+                self.header_control_hover = with_oklch_l(
+                    self.header_control_hover,
+                    (hdr_ok_l + 0.07).clamp(0.0, 0.48),
+                );
+            }
+            self.header_control_hover = ensure_contrast_against(
+                self.header_control_hover,
+                &[Color32::WHITE],
+                4.8,
+                Some(false),
+            );
+
+            if wcag_contrast(self.header_border, self.header_bg) < 1.28
+                || relative_luminance(to_doc_color(self.header_border)) < hdr_lum
+            {
+                self.header_border = ensure_contrast_against(
+                    with_oklch_l(self.header_border, (hdr_ok_l + 0.11).clamp(0.0, 0.70)),
+                    &[self.header_bg],
+                    1.32,
+                    Some(true),
+                );
+            }
+        } else {
+            if oklch_lightness(to_doc_color(self.header_track_bg)) < hdr_ok_l {
+                self.header_track_bg =
+                    with_oklch_l(self.header_track_bg, (hdr_ok_l + 0.05).min(0.96));
+            }
+            if oklch_lightness(to_doc_color(self.header_control_hover)) < hdr_ok_l + 0.04 {
+                self.header_control_hover =
+                    with_oklch_l(self.header_control_hover, (hdr_ok_l + 0.10).min(0.98));
+            }
+            self.header_border =
+                ensure_contrast_against(self.header_border, &[self.header_bg], 1.32, Some(false));
+        }
+
+        let header_bgs = [
+            self.header_bg,
+            self.header_track_bg,
+            self.header_control_hover,
+        ];
+        if header_fg_is_light {
+            self.header_fg = LIGHT_CHROME_WHITE;
+            self.header_fg_muted =
+                ensure_contrast_against(LIGHT_CHROME_WHITE_MUTED, &header_bgs, 4.7, Some(true));
+            self.brand_craft = ensure_contrast_against(
+                LIGHT_CHROME_WHITE_CRAFT,
+                &[self.header_bg],
+                4.7,
+                Some(true),
+            );
+        } else {
+            self.header_fg =
+                ensure_contrast_against(LIGHT_CHROME_DARK_GRAY, &header_bgs, 4.8, Some(false));
+            self.header_fg_muted = ensure_contrast_against(
+                LIGHT_CHROME_DARK_GRAY_MUTED,
+                &header_bgs,
+                4.6,
+                Some(false),
+            );
+            self.brand_craft = ensure_contrast_against(
+                LIGHT_CHROME_DARK_GRAY_CRAFT,
+                &[self.header_bg],
+                4.6,
+                Some(false),
+            );
+        }
+
+        let active_fg_is_light = wcag_contrast(LIGHT_CHROME_WHITE, self.header_active_bg) >= 4.5;
+        self.header_active_fg = if active_fg_is_light {
+            LIGHT_CHROME_WHITE
+        } else {
+            ensure_contrast_against(
+                LIGHT_CHROME_DARK_GRAY,
+                &[self.header_active_bg],
+                7.0,
+                Some(false),
+            )
+        };
+
+        let tab_fg_is_light = wcag_contrast(LIGHT_CHROME_WHITE, self.tab_strip_bg) >= 4.5;
+        if tab_fg_is_light {
+            self.tab_strip_fg = LIGHT_CHROME_WHITE;
+            self.tab_strip_fg_muted = ensure_contrast_against(
+                LIGHT_CHROME_WHITE_MUTED,
+                &[self.tab_strip_bg],
+                4.7,
+                Some(true),
+            );
+        } else {
+            self.tab_strip_fg = ensure_contrast_against(
+                LIGHT_CHROME_DARK_GRAY,
+                &[self.tab_strip_bg],
+                4.8,
+                Some(false),
+            );
+            self.tab_strip_fg_muted = ensure_contrast_against(
+                LIGHT_CHROME_DARK_GRAY_MUTED,
+                &[self.tab_strip_bg],
+                4.6,
+                Some(false),
+            );
+        }
+
+        let body_bgs = [
+            self.panel_bg,
+            self.toolbar_bg,
+            self.field_bg,
+            self.accent_soft,
+        ];
+        let accent_bgs = [
+            self.panel_bg,
+            self.toolbar_bg,
+            self.field_bg,
+            self.accent_soft,
+            self.header_active_bg,
+        ];
+        self.text = ensure_contrast_against(self.text, &body_bgs, 7.0, Some(false));
+        self.text_muted = ensure_contrast_against(self.text_muted, &body_bgs, 4.5, Some(false));
+        self.accent = ensure_contrast_against(self.accent, &accent_bgs, 4.5, Some(false));
+        self.accent_hover = ensure_contrast_against(self.accent_hover, &body_bgs, 4.5, Some(false));
+        self.on_accent = if wcag_contrast(LIGHT_CHROME_WHITE, self.accent) >= 4.5 {
+            LIGHT_CHROME_WHITE
+        } else {
+            ensure_contrast_against(LIGHT_CHROME_DARK_GRAY, &[self.accent], 4.5, Some(false))
+        };
+        self.border = ensure_contrast_against(
+            self.border,
+            &[self.panel_bg, self.field_bg],
+            1.28,
+            Some(false),
         );
     }
 
@@ -1021,5 +1185,105 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn light_infinite_theme_adapts_chrome_foregrounds_to_crisp_white_or_neutral_dark_gray() {
+        use papercraft_doc::InfiniteThemeConfig;
+
+        let is_neutral_gray_or_white = |c: Color32| {
+            let max_ch = c.r().max(c.g()).max(c.b());
+            let min_ch = c.r().min(c.g()).min(c.b());
+            max_ch.saturating_sub(min_ch) <= 10
+        };
+
+        let mut saw_white_accent = false;
+        let mut saw_dark_gray_header = false;
+        for hue_step in 0..=24 {
+            let hue = hue_step as f32 * 15.0;
+            for sat in [0.0_f32, 50.0, 100.0, 150.0, 200.0, 250.0] {
+                let cfg = InfiniteThemeConfig {
+                    enabled: true,
+                    hue_degrees: hue,
+                    saturation_percent: sat,
+                };
+                if cfg.is_identity() {
+                    continue;
+                }
+                let t = Tokens::for_theme_with_infinite(UiTheme::Light, cfg);
+                assert!(
+                    is_neutral_gray_or_white(t.header_fg),
+                    "expected neutral white/dark-gray header_fg at hue={hue} sat={sat}, got {:?}",
+                    t.header_fg
+                );
+                assert!(
+                    is_neutral_gray_or_white(t.header_fg_muted),
+                    "expected neutral white/dark-gray header_fg_muted at hue={hue} sat={sat}, got {:?}",
+                    t.header_fg_muted
+                );
+                assert!(
+                    is_neutral_gray_or_white(t.tab_strip_fg),
+                    "expected neutral white/dark-gray tab_strip_fg at hue={hue} sat={sat}, got {:?}",
+                    t.tab_strip_fg
+                );
+                assert!(
+                    is_neutral_gray_or_white(t.tab_strip_fg_muted),
+                    "expected neutral white/dark-gray tab_strip_fg_muted at hue={hue} sat={sat}, got {:?}",
+                    t.tab_strip_fg_muted
+                );
+                assert!(
+                    is_neutral_gray_or_white(t.brand_craft),
+                    "expected neutral white/dark-gray brand_craft at hue={hue} sat={sat}, got {:?}",
+                    t.brand_craft
+                );
+                assert!(
+                    is_neutral_gray_or_white(t.on_accent),
+                    "expected neutral white/dark-gray on_accent at hue={hue} sat={sat}, got {:?}",
+                    t.on_accent
+                );
+                if t.on_accent == Color32::WHITE {
+                    saw_white_accent = true;
+                }
+                if t.header_fg != Color32::WHITE {
+                    saw_dark_gray_header = true;
+                    assert!(
+                        t.header_fg.r() <= 0x30,
+                        "expected dark gray header_fg at hue={hue} sat={sat}, got {:?}",
+                        t.header_fg
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_white_accent && saw_dark_gray_header,
+            "expected Light Infinite sweep to exercise white on_accent ({saw_white_accent}) and dark-gray header_fg ({saw_dark_gray_header})"
+        );
+
+        // When Light chrome bars reach darker luminance (<= ~0.183), the contrast solver
+        // switches header and tab strip text/icons cleanly to pure crisp white.
+        let mut dark_header_light_mode = Tokens::light();
+        dark_header_light_mode.header_bg = Color32::from_rgb(0x2B, 0x32, 0x8F);
+        dark_header_light_mode.tab_strip_bg = Color32::from_rgb(0x1E, 0x26, 0x6E);
+        dark_header_light_mode.enforce_infinite_contrast();
+        assert_eq!(dark_header_light_mode.header_fg, Color32::WHITE);
+        assert_eq!(dark_header_light_mode.tab_strip_fg, Color32::WHITE);
+        assert!(
+            contrast_ratio(
+                dark_header_light_mode.header_fg_muted,
+                dark_header_light_mode.header_bg
+            ) >= 4.5
+        );
+        assert!(
+            contrast_ratio(
+                dark_header_light_mode.brand_craft,
+                dark_header_light_mode.header_bg
+            ) >= 4.5
+        );
+        assert!(
+            contrast_ratio(
+                dark_header_light_mode.tab_strip_fg_muted,
+                dark_header_light_mode.tab_strip_bg
+            ) >= 4.5
+        );
     }
 }

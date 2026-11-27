@@ -361,7 +361,7 @@ PaperCraft works **100% locally and offline** without running any server—just 
 
 However, the **recommended everyday setup** is to keep the lightweight **`papercraft-server`** system-tray app running quietly in the background:
 
-- **Multiple local accounts & profile management:** Create isolated local workspaces and manage your cloud **Profile & Cloud Sync** screen directly in the app (`Display Name`, `@username`, email, password updates, and workspace switching).
+- **Multiple local accounts & profile management:** Create isolated local workspaces and manage your **Profile & Server Sync** screen directly in the app (`Display Name`, `@username`, email, password updates, and workspace switching).
 - **Seamless Desktop + Web sync:** Keep your notebooks and studio preferences synchronized automatically across clients while still working offline whenever the server is stopped or unreachable.
 - **Access from anywhere with a private mesh VPN:** Switch **Who can connect** to **Local network / VPN** (`0.0.0.0:8787`) and connect over your own encrypted mesh VPN so you can sync your notebooks from any of your devices anywhere—without exposing public ports or paying for third-party cloud storage. *(Note: if connecting from an `https://`-hosted Web client to a remote address, place the server behind a TLS reverse proxy to satisfy browser mixed-content rules.)*
 

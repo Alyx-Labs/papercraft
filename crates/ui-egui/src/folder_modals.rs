@@ -146,7 +146,7 @@ fn draw_name_field(ui: &mut egui::Ui, name: &mut String, focus_pending: &mut boo
         [ui.available_width(), 32.0],
         egui::TextEdit::singleline(name)
             .id(id)
-            .hint_text("Folder name, e.g. Biology")
+            .hint_text("Folder name...")
             .char_limit(crate::library_folders::MAX_FOLDER_NAME_CHARS)
             .margin(Margin::symmetric(8, 2))
             .align(egui::Align2::LEFT_CENTER),

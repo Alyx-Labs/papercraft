@@ -1499,13 +1499,13 @@ fn system_workspace_info(app: &PaperCraftApp) -> (String, Option<String>) {
         let handle = summary
             .username
             .as_deref()
-            .map_or_else(|| "Cloud".to_string(), |u| format!("@{u}"));
+            .map_or_else(|| "Server".to_string(), |u| format!("@{u}"));
         let tip = if summary.server_url.trim().is_empty() {
             None
         } else {
             Some(format!("Connected server: {}", summary.server_url))
         };
-        (format!("Cloud ({handle})"), tip)
+        (format!("Server ({handle})"), tip)
     } else {
         let prof = summary
             .active_local_profile_name

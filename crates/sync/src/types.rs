@@ -949,7 +949,7 @@ impl SyncStatusSummary {
             self.email
                 .clone()
                 .or_else(|| self.username.as_ref().map(|u| format!("@{u}")))
-                .unwrap_or_else(|| "Cloud".to_string())
+                .unwrap_or_else(|| "Server".to_string())
         } else {
             self.active_local_profile_name
                 .clone()

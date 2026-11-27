@@ -988,7 +988,7 @@ fn draw_page_scope_options(
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Pages:").size(12.0).color(t.text));
                         let edit = egui::TextEdit::singleline(&mut app.view.export_page_range_draft)
-                            .hint_text(format!("e.g. 1-{}, 12", page_count.min(10)))
+                            .hint_text("Enter page numbers or ranges...")
                             .desired_width((ui.available_width() - 8.0).max(120.0));
                         ui.add(edit);
                     });

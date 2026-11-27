@@ -505,7 +505,7 @@ impl AccountDraftState {
         self.server_url = norm;
         self.profile_section = ProfileSection::Accounts;
         self.status_message = Some(format!(
-            "Signed in as {label}. Offline-First cloud sync active."
+            "Signed in as {label}. Offline-First server sync active."
         ));
     }
 
@@ -958,7 +958,7 @@ pub(crate) fn render_add_account_body(
                         InputFieldSpec {
                             id_salt: "add_account_local_nickname_input",
                             width: ui.available_width(),
-                            hint: "e.g. Work or Study",
+                            hint: "Enter nickname...",
                             border_color: None,
                             trailing: InputTrailing::None,
                         },
@@ -1120,7 +1120,7 @@ pub(crate) fn render_first_access_body(
             InputFieldSpec {
                 id_salt: "first_access_nickname_input",
                 width: ui.available_width(),
-                hint: "e.g. Jordan or Alyx",
+                hint: "Enter nickname...",
                 border_color: None,
                 trailing: InputTrailing::None,
             },
@@ -2008,6 +2008,39 @@ pub(crate) fn render_select_local_account_footer(
     should_close
 }
 
+fn banner_tone_for_error(message: &str) -> BannerTone {
+    match crate::sync_worker::classify_browser_permission_error(message) {
+        crate::sync_worker::BrowserPermissionStatus::None => BannerTone::Error,
+        crate::sync_worker::BrowserPermissionStatus::Needed
+        | crate::sync_worker::BrowserPermissionStatus::Blocked => BannerTone::Warning,
+    }
+}
+
+fn failed_probe_input_style(message: &str, t: &Tokens) -> (Option<Color32>, InputTrailing) {
+    match crate::sync_worker::classify_browser_permission_error(message) {
+        crate::sync_worker::BrowserPermissionStatus::Blocked => (
+            Some(t.warning_fg),
+            InputTrailing::Icon(
+                Icon::AlertCircle,
+                t.warning_fg,
+                "Browser permission blocked",
+            ),
+        ),
+        crate::sync_worker::BrowserPermissionStatus::Needed => (
+            Some(t.warning_fg),
+            InputTrailing::Icon(
+                Icon::AlertCircle,
+                t.warning_fg,
+                "Allow browser permission when prompted",
+            ),
+        ),
+        crate::sync_worker::BrowserPermissionStatus::None => (
+            Some(t.danger_border),
+            InputTrailing::Icon(Icon::AlertCircle, t.danger_fg, "Server connection failed"),
+        ),
+    }
+}
+
 pub(crate) fn render_convert_local_account_body(
     app: &mut PaperCraftApp,
     ui: &mut egui::Ui,
@@ -2038,7 +2071,7 @@ pub(crate) fn render_convert_local_account_body(
             let (ir, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
             paint_icon(ui.painter(), ir, Icon::Sync, t.accent);
             ui.label(
-                egui::RichText::new(format!("Convert '{nick}' to Cloud Account?"))
+                egui::RichText::new(format!("Convert '{nick}' to Server Account?"))
                     .size(13.0)
                     .strong()
                     .color(t.text),
@@ -2048,7 +2081,7 @@ pub(crate) fn render_convert_local_account_body(
         ui.add(
             egui::Label::new(
                 egui::RichText::new(format!(
-                    "All {count_label}, folders, and settings stored locally in '{nick}' will be uploaded to your new cloud account {target_desc}. Your local copy stays right here on this device as the active Offline-First cache so you can continue working offline anytime."
+                    "All {count_label}, folders, and settings stored locally in '{nick}' will be uploaded to your new server account {target_desc}. Your local copy stays right here on this device as the active Offline-First cache so you can continue working offline anytime."
                 ))
                 .size(11.0)
                 .color(t.text_muted),
@@ -2079,7 +2112,7 @@ pub(crate) fn render_convert_local_account_body(
         draw_field_label_row(
             ui,
             "Email Address",
-            FieldHint::Muted("Used to sign in to your new cloud account"),
+            FieldHint::Muted("Used to sign in to your new server account"),
             t,
         );
         ui.add_space(4.0);
@@ -2089,7 +2122,7 @@ pub(crate) fn render_convert_local_account_body(
                 InputFieldSpec {
                     id_salt: "convert_local_email_input",
                     width: ui.available_width(),
-                    hint: "you@example.com",
+                    hint: "Enter email address...",
                     border_color: None,
                     trailing: InputTrailing::None,
                 },
@@ -2131,7 +2164,7 @@ pub(crate) fn render_convert_local_account_body(
 
     if let Some(ref err) = app.view.account.convert_error {
         ui.add_space(8.0);
-        draw_status_banner(ui, BannerTone::Error, err, t);
+        draw_status_banner(ui, banner_tone_for_error(err), err, t);
     }
     if busy {
         ui.add_space(8.0);
@@ -2146,7 +2179,7 @@ pub(crate) fn render_convert_local_account_body(
 
 fn render_convert_progress_card(app: &PaperCraftApp, ui: &mut egui::Ui, t: &Tokens) {
     let stage = if app.view.account.convert_progress_stage.trim().is_empty() {
-        "Creating cloud account and uploading local notebooks...".to_string()
+        "Creating server account and uploading local notebooks...".to_string()
     } else {
         app.view.account.convert_progress_stage.clone()
     };
@@ -2201,7 +2234,7 @@ pub(crate) fn render_convert_local_account_footer(
             let cta = if busy {
                 "Syncing to Server..."
             } else {
-                "Create Cloud Account & Sync"
+                "Create Server Account & Sync"
             };
             if primary_action_button(ui, cta, !busy && !blocked_closed, t).clicked() {
                 submit_convert_local_account(app, ui.ctx());
@@ -2258,7 +2291,7 @@ fn submit_convert_local_account(app: &mut PaperCraftApp, ctx: &egui::Context) {
     let password = app.view.account.convert_password.clone();
     app.view.account.server_url = url.clone();
     app.view.account.convert_busy = true;
-    app.view.account.convert_progress_stage = "Creating cloud account...".to_string();
+    app.view.account.convert_progress_stage = "Creating server account...".to_string();
     app.view.account.convert_progress_completed = 0;
     app.view.account.convert_progress_total = batch.local_docs.len().max(1) + 2;
     app.view.account.convert_error = None;
@@ -2504,7 +2537,7 @@ fn render_password_reset_flow_card(
         InputFieldSpec {
             id_salt: "acct_reset_identifier",
             width: ui.available_width(),
-            hint: "you@example.com",
+            hint: "Enter email address...",
             border_color: None,
             trailing: InputTrailing::None,
         },
@@ -2702,7 +2735,7 @@ fn render_signup_username_column(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: 
         InputFieldSpec {
             id_salt: "acct_signup_username",
             width: ui.available_width(),
-            hint: "alex_notes (auto if empty)",
+            hint: "Username (auto if empty)",
             border_color: None,
             trailing: InputTrailing::None,
         },
@@ -2768,7 +2801,7 @@ fn render_account_credentials_fields(
         InputFieldSpec {
             id_salt: "acct_email_or_username",
             width: ui.available_width(),
-            hint: "you@example.com",
+            hint: "Enter email address...",
             border_color: None,
             trailing: user_trailing,
         },
@@ -2880,7 +2913,7 @@ fn draw_server_probe_url_input(
         InputFieldSpec {
             id_salt,
             width,
-            hint: DEFAULT_SERVER_URL,
+            hint: "Enter server URL...",
             border_color: border_override,
             trailing,
         },
@@ -2935,10 +2968,7 @@ pub(crate) fn render_server_probe_section(
             Some(t.success_border),
             InputTrailing::GreenCheck("Server connection verified"),
         ),
-        ServerProbeState::Failed { .. } => (
-            Some(t.danger_border),
-            InputTrailing::Icon(Icon::AlertCircle, t.danger_fg, "Server connection failed"),
-        ),
+        ServerProbeState::Failed { message, .. } => failed_probe_input_style(message, t),
         ServerProbeState::Checking { .. } => (
             None,
             InputTrailing::Icon(Icon::Sync, t.accent, "Checking connection..."),
@@ -3154,7 +3184,7 @@ fn render_probe_feedback_row(
             );
         }
         ServerProbeState::Failed { message, .. } => {
-            draw_status_banner(ui, BannerTone::Error, message, t);
+            draw_status_banner(ui, banner_tone_for_error(message), message, t);
         }
     }
 }
@@ -3275,16 +3305,28 @@ fn draw_probe_status_pill_with_config(
                 "Connected",
             );
         }
-        ServerProbeState::Failed { .. } => {
+        ServerProbeState::Failed { message, .. } => {
+            let (label, fill, border, fg) =
+                match crate::sync_worker::classify_browser_permission_error(message) {
+                    crate::sync_worker::BrowserPermissionStatus::Blocked => {
+                        ("Blocked", t.toolbar_bg, t.border, t.warning_fg)
+                    }
+                    crate::sync_worker::BrowserPermissionStatus::Needed => {
+                        ("Allow Access", t.toolbar_bg, t.border, t.warning_fg)
+                    }
+                    crate::sync_worker::BrowserPermissionStatus::None => {
+                        ("Unreachable", t.danger_bg, t.danger_border, t.danger_fg)
+                    }
+                };
             draw_pill_badge(
                 ui,
                 PillStyle {
-                    fill: t.danger_bg,
-                    border: t.danger_border,
-                    fg: t.danger_fg,
+                    fill,
+                    border,
+                    fg,
                     icon: PillIcon::Vector(Icon::AlertCircle),
                 },
-                "Unreachable",
+                label,
             );
         }
     }
@@ -3356,7 +3398,7 @@ fn render_signed_in_body(app: &mut PaperCraftApp, ui: &mut egui::Ui, t: &Tokens)
         && app.view.account.error_message.is_none()
     {
         ui.add_space(8.0);
-        draw_status_banner(ui, BannerTone::Error, err, t);
+        draw_status_banner(ui, banner_tone_for_error(err), err, t);
     }
     if summary.last_error.is_none() || app.view.account.error_message.is_some() {
         render_auth_banners(app, ui, t);
@@ -3378,7 +3420,7 @@ pub(crate) fn render_signed_in_account_card(
     let primary_id = if summary.signed_in {
         summary_account_label(summary)
     } else {
-        "Cloud Account".to_string()
+        "Server Account".to_string()
     };
 
     ui.horizontal(|ui| {
@@ -3441,7 +3483,7 @@ pub(crate) fn render_signed_in_account_card(
         }
     } else {
         match cloud_pending {
-            0 => "Synced to cloud".to_string(),
+            0 => "Synced to server".to_string(),
             1 => "1 pending sync".to_string(),
             n => format!("{n} pending syncs"),
         }
@@ -3523,7 +3565,7 @@ fn render_account_email_row(
                 InputFieldSpec {
                     id_salt: "acct_change_email_new",
                     width: ui.available_width(),
-                    hint: "new@example.com",
+                    hint: "Enter new email address...",
                     border_color: None,
                     trailing: InputTrailing::None,
                 },
@@ -3757,7 +3799,7 @@ pub(crate) fn render_profile_identity_card(app: &mut PaperCraftApp, ui: &mut egu
         InputFieldSpec {
             id_salt: "profile_edit_username",
             width: ui.available_width(),
-            hint: "alex_notes",
+            hint: "Enter username...",
             border_color: None,
             trailing,
         },
@@ -4059,7 +4101,7 @@ fn draw_manual_agree_confirmation_input(
     t: &Tokens,
 ) -> ManualAgreeInputOutcome {
     ui.label(
-        egui::RichText::new("Example — type this manually:")
+        egui::RichText::new("Type this confirmation manually:")
             .size(10.5)
             .color(t.text_muted),
     );
@@ -4101,7 +4143,7 @@ fn draw_manual_agree_confirmation_input(
         InputFieldSpec {
             id_salt,
             width: ui.available_width(),
-            hint: "I agree ...",
+            hint: "Type confirmation phrase...",
             border_color: Some(if matched {
                 t.success_border
             } else {
@@ -4250,13 +4292,6 @@ pub(crate) fn render_accounts_switcher_section(
     );
 
     render_unsynced_switch_confirmation(app, ui, t);
-
-    if app.session.is_sync_persistence_enabled() {
-        ui.add_space(10.0);
-        draw_section_card(ui, t, |ui| {
-            render_startup_picker_switch(app, ui, t, true);
-        });
-    }
 }
 
 pub(crate) fn render_expired_session_reauth_box(
@@ -4268,7 +4303,7 @@ pub(crate) fn render_expired_session_reauth_box(
     t: &Tokens,
 ) {
     let queue_note = match cloud_pending {
-        0 => "Your session expired. Enter your password to resume cloud sync.".to_string(),
+        0 => "Your session expired. Enter your password to resume server sync.".to_string(),
         1 => "Your session expired. 1 offline change is queued locally and will sync as soon as you sign in.".to_string(),
         n => format!("Your session expired. {n} offline changes are queued locally and will sync as soon as you sign in."),
     };
@@ -5408,10 +5443,7 @@ pub(crate) fn render_signed_in_server_card(
             Some(t.success_border),
             InputTrailing::GreenCheck("Server connection verified"),
         ),
-        ServerProbeState::Failed { .. } => (
-            Some(t.danger_border),
-            InputTrailing::Icon(Icon::AlertCircle, t.danger_fg, "Server connection failed"),
-        ),
+        ServerProbeState::Failed { message, .. } => failed_probe_input_style(message, t),
         ServerProbeState::Checking { .. } => (
             None,
             InputTrailing::Icon(Icon::Sync, t.accent, "Checking connection..."),
@@ -5439,7 +5471,7 @@ pub(crate) fn render_signed_in_server_card(
             InputFieldSpec {
                 id_salt: "acct_server_url_signed_in",
                 width: avail_w,
-                hint: DEFAULT_SERVER_URL,
+                hint: "Enter server URL...",
                 border_color: border_override,
                 trailing,
             },
@@ -5478,7 +5510,7 @@ pub(crate) fn render_signed_in_server_card(
                 InputFieldSpec {
                     id_salt: "acct_server_url_signed_in",
                     width: input_w,
-                    hint: DEFAULT_SERVER_URL,
+                    hint: "Enter server URL...",
                     border_color: border_override,
                     trailing,
                 },
@@ -5970,7 +6002,7 @@ fn dispatch_password_reset_now(app: &mut PaperCraftApp, ctx: &egui::Context) {
 
 fn submit_update_profile(app: &mut PaperCraftApp, ctx: &egui::Context) {
     let Some(session) = app.session.active_account_session().cloned() else {
-        app.view.account.error_message = Some("Sign in to a cloud account first.".to_string());
+        app.view.account.error_message = Some("Sign in to a server account first.".to_string());
         return;
     };
     let (clean_username, _) = match normalize_username(&app.view.account.edit_username) {
@@ -6006,7 +6038,7 @@ fn submit_update_profile(app: &mut PaperCraftApp, ctx: &egui::Context) {
 
 fn submit_change_password(app: &mut PaperCraftApp, ctx: &egui::Context) {
     let Some(session) = app.session.active_account_session().cloned() else {
-        app.view.account.error_message = Some("Sign in to a cloud account first.".to_string());
+        app.view.account.error_message = Some("Sign in to a server account first.".to_string());
         return;
     };
     if app.view.account.current_password_draft.is_empty() {
@@ -6071,7 +6103,7 @@ fn build_sign_in_command(
 
 fn submit_change_email(app: &mut PaperCraftApp, ctx: &egui::Context) {
     let Some(session) = app.session.active_account_session().cloned() else {
-        app.view.account.error_message = Some("Sign in to a cloud account first.".to_string());
+        app.view.account.error_message = Some("Sign in to a server account first.".to_string());
         return;
     };
     let (new_email, _) = match normalize_email(&app.view.account.new_email_draft) {
@@ -6684,7 +6716,7 @@ pub(crate) fn render_auth_banners(app: &mut PaperCraftApp, ui: &mut egui::Ui, t:
         ui.add_space(8.0);
         ui.scope(|ui| {
             ui.multiply_opacity(banner_opacity);
-            draw_status_banner(ui, BannerTone::Error, err, t);
+            draw_status_banner(ui, banner_tone_for_error(err), err, t);
         });
     } else if let Some(ref msg) = app.view.account.status_message {
         ui.add_space(8.0);
@@ -6868,7 +6900,7 @@ pub(crate) fn header_status_dot_color(state: SyncConnectionState, t: &Tokens) ->
     }
 }
 
-/// Returns badge text and semantic color tokens for per-notebook sync indicators.
+/// Returns badge tooltip label and semantic color tokens for per-notebook sync indicators.
 pub(crate) fn notebook_status_badge_style(
     status: EntitySyncStatus,
     t: &Tokens,
@@ -6876,8 +6908,23 @@ pub(crate) fn notebook_status_badge_style(
     match status {
         EntitySyncStatus::LocalOnly => ("On device", t.text_muted, t.toolbar_bg, t.border),
         EntitySyncStatus::PendingPush => ("Pending sync", t.warning_fg, t.toolbar_bg, t.border),
-        EntitySyncStatus::Synced => ("Cloud", t.success_fg, t.success_bg, t.success_border),
+        EntitySyncStatus::Synced => (
+            "Synced to server",
+            t.success_fg,
+            t.success_bg,
+            t.success_border,
+        ),
         EntitySyncStatus::SyncError => ("Sync issue", t.danger_fg, t.danger_bg, t.danger_border),
+    }
+}
+
+/// Returns the sync icon representing a notebook's sync state (slashed when sync is disabled).
+pub(crate) const fn notebook_status_sync_icon(status: EntitySyncStatus) -> Icon {
+    match status {
+        EntitySyncStatus::LocalOnly => Icon::SyncOff,
+        EntitySyncStatus::PendingPush | EntitySyncStatus::Synced | EntitySyncStatus::SyncError => {
+            Icon::Sync
+        }
     }
 }
 
@@ -7042,6 +7089,7 @@ mod tests {
         assert!(signed_in_text.contains("SYNC QUEUE"));
         assert!(signed_in_text.contains("Offline-First • Synced"));
         assert!(!signed_in_text.contains("Detected Local Accounts on This Device"));
+        assert!(!signed_in_text.contains("Merge into Server"));
         assert!(!signed_in_text.contains("Merge into Cloud"));
     }
 
@@ -7086,14 +7134,14 @@ mod tests {
         app.view.account.convert_source_notebook_count = 2;
         modal::open(&mut app, modal::ActiveModal::ConvertLocalAccount);
         let convert_text = render_modal_settled(&ctx, &mut app);
-        assert!(convert_text.contains("Convert 'Bruno' to Cloud Account?"));
+        assert!(convert_text.contains("Convert 'Bruno' to Server Account?"));
         assert!(!convert_text.contains("Self-Hosted Server"));
         assert!(convert_text.contains("Sync Server Not Configured"));
         assert!(convert_text.contains("Open Sync Settings"));
         assert!(convert_text.contains("Offline-First cache"));
         assert!(convert_text.contains("Email Address"));
         assert!(convert_text.contains("Password"));
-        assert!(convert_text.contains("Create Cloud Account & Sync"));
+        assert!(convert_text.contains("Create Server Account & Sync"));
     }
 
     fn render_profile_frames(
@@ -8213,6 +8261,14 @@ mod tests {
             "{initial_text}"
         );
         assert!(initial_text.contains("Start Session"), "{initial_text}");
+        assert!(
+            initial_text.contains("Enter nickname..."),
+            "missing generic nickname placeholder:\n{initial_text}"
+        );
+        assert!(
+            !initial_text.contains("Alyx") && !initial_text.contains("Jordan"),
+            "nickname prompt must not suggest specific names:\n{initial_text}"
+        );
 
         // Create the first local account -> Option A now shows the account picker on subsequent launches.
         crate::sync_worker::create_local_account_and_switch(&mut app, &ctx, "LocalOne").unwrap();
@@ -8790,5 +8846,73 @@ mod tests {
         app.view.account.password = "SecretPass1!".to_string();
         super::submit_auth_request(&mut app, &ctx);
         assert_eq!(login_dispatches.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn server_probe_distinguishes_browser_permission_blocked_from_unreachable() {
+        let ctx = egui::Context::default();
+        let mut app = PaperCraftApp::default();
+        let t = crate::theme::Tokens::for_theme(app.session.prefs.theme);
+
+        let render_probe_text = |app: &mut PaperCraftApp| -> String {
+            let mut text = String::new();
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(520.0, 260.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                crate::theme::apply_visuals(ui.ctx(), app.session.prefs.theme);
+                super::render_server_probe_section(app, ui, &t, false);
+            });
+            fn collect_text(shape: &egui::Shape, buf: &mut String) {
+                match shape {
+                    egui::Shape::Text(txt) => {
+                        buf.push_str(txt.galley.text());
+                        buf.push('\n');
+                    }
+                    egui::Shape::Vec(items) => {
+                        for item in items {
+                            collect_text(item, buf);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for clipped in &out.shapes {
+                collect_text(&clipped.shape, &mut text);
+            }
+            out.drop_without_applying_deltas();
+            text
+        };
+
+        let blocked_msg = crate::sync_worker::browser_permission_error_message(
+            "denied",
+            crate::sync_worker::LocalNetworkPermissionKind::Loopback,
+        )
+        .unwrap();
+        app.view
+            .account
+            .apply_health_err(DEFAULT_SERVER_URL.to_string(), blocked_msg);
+        let blocked_text = render_probe_text(&mut app);
+        assert!(blocked_text.contains("Blocked"), "{blocked_text}");
+        assert!(!blocked_text.contains("Unreachable"), "{blocked_text}");
+        assert!(
+            blocked_text.contains("will not show the permission prompt again"),
+            "{blocked_text}"
+        );
+
+        app.view.account.apply_health_err(
+            DEFAULT_SERVER_URL.to_string(),
+            "Server is currently unreachable. Verify it is running, reachable, and allows browser requests."
+                .to_string(),
+        );
+        let unreachable_text = render_probe_text(&mut app);
+        assert!(
+            unreachable_text.contains("Unreachable"),
+            "{unreachable_text}"
+        );
     }
 }

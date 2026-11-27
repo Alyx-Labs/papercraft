@@ -1101,7 +1101,7 @@ fn render_delete_confirmation_drawer(
                 &ManualConfirmInputSpec {
                     id_salt: "bnc_srv_delete_user_confirm",
                     width: ui.available_width().min(460.0),
-                    hint: &expected,
+                    hint: "Type confirmation phrase...",
                     border_color: input_border,
                     matched,
                 },

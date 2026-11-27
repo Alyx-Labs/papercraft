@@ -499,7 +499,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "sync.setServerUrl",
         label: "Set Sync Server URL",
-        description: "Update the configured self-hosted server URL for server login and live cloud sessions",
+        description: "Update the configured self-hosted server URL for server login and live server sessions",
     },
     CommandSpec {
         id: "sync.signOut",
@@ -539,7 +539,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "profile.switch",
         label: "Switch Local Profile",
-        description: "Switch the workspace to a saved local profile on this device (disconnects any active cloud session)",
+        description: "Switch the workspace to a saved local profile on this device (disconnects any active server session)",
     },
     CommandSpec {
         id: "profile.delete",
